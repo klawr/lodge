@@ -1,33 +1,33 @@
-# graft
+# lodge
 
 **Inject your environment into any container.**
 
-`graft` copies your personal tools (editor, shell utilities, …) — together with
+`lodge` (command: `ldg`) copies your personal tools (editor, shell utilities, …) — together with
 the shared libraries they need — into a running Docker container and drops you
 into a shell inside it. You get your toolchain in someone else's image without
 rebuilding it, and **without** requiring your tools to be compatible with the
 container's (often much older) glibc.
 
 It also doubles as a lightweight [devcontainer](https://containers.dev) runner:
-`graft up` starts a project's `.devcontainer`, honors its lifecycle hooks and
-features, then grafts your environment on top.
+`ldg up` starts a project's `.devcontainer`, honors its lifecycle hooks and
+features, then injects your environment on top.
 
 ```sh
-graft up                        # find the devcontainer config, start it, graft in, open a shell
-graft up ./some/project         # same, for a specific project path
-graft up --build                # force-rebuild images and recreate the container
-graft down                      # stop the project's container (resume later with `graft up`)
-graft exec my-container         # graft into an already-running container by name/id
-graft up -r user@host           # operate against a remote Docker daemon over SSH
-graft up -r myhost ./project    # remote via a Host alias from ~/.ssh/config
-graft up -r user@host:2222      # remote on a non-standard SSH port
-graft up -v                     # verbose: print every docker/ssh command graft runs
-graft --version                 # print the installed version
+ldg up                        # find the devcontainer config, start it, inject your environment, open a shell
+ldg up ./some/project         # same, for a specific project path
+ldg up --build                # force-rebuild images and recreate the container
+ldg down                      # stop the project's container (resume later with `ldg up`)
+ldg exec my-container         # inject into an already-running container by name/id
+ldg up -r user@host           # operate against a remote Docker daemon over SSH
+ldg up -r myhost ./project    # remote via a Host alias from ~/.ssh/config
+ldg up -r user@host:2222      # remote on a non-standard SSH port
+ldg up -v                     # verbose: print every docker/ssh command lodge runs
+ldg --version                 # print the installed version
 ```
 
 `-r/--remote` and `-v/--verbose` work on every subcommand. `--verbose` prints
 each `docker`/`ssh` command before it runs; repeating it (`-vv`, `-vvv`) passes
-matching `-v` flags to graft's own ssh connections (config probe, port tunnels)
+matching `-v` flags to lodge's own ssh connections (config probe, port tunnels)
 for connection-level debugging.
 
 ## Install
@@ -35,26 +35,26 @@ for connection-level debugging.
 ### From a release (prebuilt binary)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/klawr/graft/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/klawr/lodge/master/install.sh | sh
 ```
 
 Downloads the latest static Linux binary into `~/.local/bin`. Overrides:
 
 | variable | default | meaning |
 | --- | --- | --- |
-| `GRAFT_BIN_DIR` | `~/.local/bin` | install location |
-| `GRAFT_VERSION` | latest | pin to e.g. `v0.1.0` |
+| `LODGE_BIN_DIR` | `~/.local/bin` | install location |
+| `LODGE_VERSION` | latest | pin to e.g. `v0.1.0` |
 
 ### From source
 
 ```sh
-cargo install --git https://github.com/klawr/graft   # needs a Rust toolchain
+cargo install --git https://github.com/klawr/lodge   # needs a Rust toolchain
 ```
 
 Or from a clone:
 
 ```sh
-make install                    # installs to /usr/local/bin/graft
+make install                    # installs to /usr/local/bin/ldg
 make install BINDIR=~/.local/bin  # install to a user-local bin directory
 ```
 
@@ -62,17 +62,17 @@ make install BINDIR=~/.local/bin  # install to a user-local bin directory
 
 On the host:
 
-- `docker` (and `docker compose` for `graft up`) — for local use. With
+- `docker` (and `docker compose` for `ldg up`) — for local use. With
   `--remote`, docker runs on the *remote* host instead; locally you only need
   `ssh` and `tar` (see [Remote containers](#remote-containers)).
 - `tmux` (for the interactive session; or set `multiplexer = "none"`)
-- `ldd` and `patchelf` (to resolve and re-link grafted binaries)
+- `ldd` and `patchelf` (to resolve and re-link injected binaries)
 - `oras` (only if your devcontainer uses `features`)
 - `ssh` and `tar` (only for `--remote`)
 
 ## Configuration
 
-`graft` reads `~/.config/graft/config.toml`. If it doesn't exist, nothing is
+`lodge` reads `~/.config/lodge/config.toml`. If it doesn't exist, nothing is
 injected (you still get a shell).
 
 ```toml
@@ -83,7 +83,7 @@ binary         = "/usr/local/bin/nvim"     # host binary to copy in
 config         = "~/.config/nvim"          # host config dir/file to copy in
 target_binary  = "/usr/local/bin/nvim"     # where the wrapper goes (optional)
 target_config  = "/root/.config/nvim"      # where the config goes (optional)
-skip_if_exists = false                     # re-copy on every graft (default: true)
+skip_if_exists = false                     # re-copy on every injection (default: true)
 copy_deps      = true                      # copy shared libs via ldd (default: true)
 
 # Neovim needs its runtime at the compiled-in $VIMRUNTIME path.
@@ -110,7 +110,7 @@ multiplexer = "tmux"        # "tmux" or "none" (default: "tmux")
 safe_directories = ["*"]
 
 [aliases]
-# Written to /etc/profile.d/graft.sh (login shells).
+# Written to /etc/profile.d/lodge.sh (login shells).
 ll = "ls -la"
 ```
 
@@ -128,7 +128,7 @@ ll = "ls -la"
 
 ## Devcontainer support
 
-`graft up [PATH]` looks for the devcontainer config under the project path
+`ldg up [PATH]` looks for the devcontainer config under the project path
 (default: current directory), in spec order:
 
 1. `PATH/.devcontainer/devcontainer.json`
@@ -136,17 +136,17 @@ ll = "ls -la"
 3. `PATH/.devcontainer/<folder>/devcontainer.json` (one level deep; with
    several, the alphabetically first wins and a warning lists the choice)
 
-The config is JSONC and graft supports a useful subset of the spec. All three
+The config is JSONC and lodge supports a useful subset of the spec. All three
 project forms work:
 
-- **`dockerComposeFile`** + `service` — graft drives `docker compose`, under a
-  project name derived from the project path (`-p graft-<name>-<hash>`), so
+- **`dockerComposeFile`** + `service` — lodge drives `docker compose`, under a
+  project name derived from the project path (`-p lodge-<name>-<hash>`), so
   two projects whose compose files both live in `.devcontainer/` don't collide
   on compose's directory-derived project name.
-- **`image`** — graft runs the image as a `sleep infinity` container with the
+- **`image`** — lodge runs the image as a `sleep infinity` container with the
   workspace bind-mounted (honoring `workspaceFolder`/`workspaceMount`, `mounts`,
   and `runArgs`).
-- **`build`** / **`dockerFile`** — graft builds the image (honoring `context`,
+- **`build`** / **`dockerFile`** — lodge builds the image (honoring `context`,
   `dockerfile`, `target`, `args`) and runs it the same way.
 
 On top of that:
@@ -159,29 +159,29 @@ On top of that:
 - **Features** — `features` are pulled with `oras` and their `install.sh` runs in
   the container at create-time: options become env vars, `installsAfter` /
   `overrideFeatureInstallOrder` ordering is honored, and `containerEnv` is written
-  to `/etc/profile.d` so login shells pick it up. graft installs features *in the
+  to `/etc/profile.d` so login shells pick it up. lodge installs features *in the
   container* rather than baking them into the image, so create-flag fields
   (`mounts`, `privileged`, `capAdd`, `entrypoint`) can't be applied — they're
   warned and skipped.
-- **Change detection** — if the container already exists, graft compares the
+- **Change detection** — if the container already exists, lodge compares the
   current `.devcontainer/` contents (canonicalized JSON, so comments and
   formatting don't count) against a hash recorded inside the container at
   creation. If they differ it offers to recreate; otherwise it reuses the
-  container. `graft up --build` forces a rebuild without prompting.
+  container. `ldg up --build` forces a rebuild without prompting.
 - **Port forwarding** — `forwardPorts` entries are forwarded eagerly, from the
   moment the container is up (connections just fail until the service starts
-  listening). This works even for minimal images where graft can't inspect
+  listening). This works even for minimal images where lodge can't inspect
   listeners (no shell in the container). All entry forms are supported:
   - `3000` / `"3000"` — local port 3000 → port 3000 of the primary container.
   - `"db:5432"` — local port 5432 → port 5432 of host `db` on the container
     network (e.g. another compose service). Resolved via DNS inside the
     primary container, falling back to matching container names / compose
-    naming on the container's networks; if the service isn't up yet, graft
+    naming on the container's networks; if the service isn't up yet, lodge
     keeps retrying and forwards once it appears.
   - `"3000:8080"` — local port 3000 → port 8080 of the primary container
     (docker `-p` style; a purely numeric prefix is read as a local port).
 
-  Beyond that, graft watches `/proc/net/tcp` inside the running container and
+  Beyond that, lodge watches `/proc/net/tcp` inside the running container and
   dynamically forwards any port that starts listening to the same port on the
   host (loopback-only listeners are skipped — they're unreachable from outside
   the container). Forwarding uses a built-in TCP proxy locally or an `ssh -L`
@@ -189,7 +189,7 @@ On top of that:
 
 ## Remote containers
 
-`graft up -r <dest>` (or `--remote`) runs the docker CLI *on the remote host*
+`ldg up -r <dest>` (or `--remote`) runs the docker CLI *on the remote host*
 over SSH (`ssh <dest> docker …`), so **no local docker CLI is required** — only
 an `ssh` client (and `tar`, for copying your local environment in). The
 devcontainer config is read from the remote host, features are installed in the
@@ -214,16 +214,16 @@ with `-v` to see each command and `-vv`/`-vvv` for ssh's own debug output.
 
 ## How it works
 
-For each tool in your config, `graft`:
+For each tool in your config, `lodge`:
 
 1. Resolves the binary's shared-library dependencies on the **host** with `ldd`,
    including the dynamic linker (`ld-linux-*.so`).
-2. Copies missing libraries into `/opt/graft/lib/` inside the container, and the
-   dynamic linker into `/graft/`.
+2. Copies missing libraries into `/opt/lodge/lib/` inside the container, and the
+   dynamic linker into `/lodge/`.
 3. Uses `patchelf` to rewrite a copy of the binary so it runs **directly** against
-   your grafted glibc, then copies it to `/opt/graft/bin/<name>`:
-   - `--set-interpreter /graft/<ld>` — your linker becomes the program interpreter.
-   - `--force-rpath --set-rpath /opt/graft/lib` — the search path is baked in as
+   your injected glibc, then copies it to `/opt/lodge/bin/<name>`:
+   - `--set-interpreter /lodge/<ld>` — your linker becomes the program interpreter.
+   - `--force-rpath --set-rpath /opt/lodge/lib` — the search path is baked in as
      `DT_RPATH` (not `RUNPATH`), so it also resolves *transitive* deps.
 4. Installs a thin wrapper at the target path that just `exec`s the patched binary.
 
@@ -239,27 +239,27 @@ gives two properties:
   `ld.so` wrapper that path would be the linker and the TUI wouldn't start.
 
 Statically linked binaries are copied and run directly, with no patching. After
-grafting, `graft` opens a per-container `tmux` session; run from *inside* tmux it
+injecting, `lodge` opens a per-container `tmux` session; run from *inside* tmux it
 `switch-client`s instead of nesting.
 
-The setup steps that write to root-owned locations (`/opt/graft`, `/graft`,
+The setup steps that write to root-owned locations (`/opt/lodge`, `/lodge`,
 `/etc/profile.d`, system wrappers) and feature install scripts run as root via
-`docker exec -u 0`, so grafting works even on images whose default `USER` is
+`docker exec -u 0`, so injecting works even on images whose default `USER` is
 unprivileged. The interactive shell and devcontainer lifecycle hooks run as the
 container's normal user, so your environment and `$HOME` are the user's own.
 
 ## Limitations
 
-- A grafted binary's libraries must all resolve on the host; anything `ldd`
+- An injected binary's libraries must all resolve on the host; anything `ldd`
   reports "not found" is skipped (with a warning) and may break the tool.
-- Host and container must share an architecture — grafted binaries, glibc, and
+- Host and container must share an architecture — injected binaries, glibc, and
   compiled assets (treesitter parsers, Mason servers) are host binaries run
   inside the container.
 - Host-built subprocesses the tool launches (e.g. a Mason language server) run
-  against the *container's* glibc. Grafting fixes the tool, not everything it
+  against the *container's* glibc. Injection fixes the tool, not everything it
   shells out to — for LSPs, prefer letting the container provide the toolchain
   (via a feature, or in the image itself).
-- A feature's `entrypoint` is ignored (graft runs the container as `sleep
+- A feature's `entrypoint` is ignored (lodge runs the container as `sleep
   infinity`); its `mounts`/`privileged`/`capAdd`/`securityOpt`/`init` *are*
   applied at creation.
 - Dynamic port forwarding requires the container's bridge IP to be reachable from
@@ -270,7 +270,7 @@ container's normal user, so your environment and `$HOME` are the user's own.
 
 ## Roadmap
 
-- Full round-based feature install ordering (graft does a simple topo sort today).
+- Full round-based feature install ordering (lodge does a simple topo sort today).
 - Support for other multiplexers.
 - Support for other container runtimes.
 

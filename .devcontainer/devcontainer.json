@@ -1,5 +1,5 @@
 {
-  "name": "graft-dev",
+  "name": "lodge-dev",
   "dockerComposeFile": "compose.yaml",
   "service": "dev",
   "workspaceFolder": "/workspace",

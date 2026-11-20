@@ -1,5 +1,5 @@
 [package]
-name = "graft"
+name = "lodge-cli"
 version = "0.4.2"
 edition = "2024"
 description = "Inject your environment into any container; a lightweight devcontainer runner."
@@ -7,6 +7,10 @@ license = "MIT"
 readme = "README.md"
 keywords = ["devcontainer", "docker", "container", "patchelf"]
 categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "ldg"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

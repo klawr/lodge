@@ -24,9 +24,9 @@ impl Docker {
     }
 
     /// Builds the `exec [-u 0] <container> <argv>` argument list. `root` forces
-    /// the command to run as uid 0 regardless of the image's `USER`, which graft
-    /// needs for setup that writes to root-owned locations (`/opt/graft`,
-    /// `/graft`, `/etc/profile.d`); `docker exec -u 0` works even when the
+    /// the command to run as uid 0 regardless of the image's `USER`, which lodge
+    /// needs for setup that writes to root-owned locations (`/opt/lodge`,
+    /// `/lodge`, `/etc/profile.d`); `docker exec -u 0` works even when the
     /// daemon's containers default to an unprivileged user.
     fn exec_args<'a>(container: &'a str, argv: &[&'a str], root: bool) -> Vec<&'a str> {
         let mut a = Vec::with_capacity(argv.len() + 4);
@@ -46,7 +46,7 @@ impl Docker {
         self.exec_with(container, argv, false)
     }
 
-    /// Like [`exec`](Self::exec) but runs as root (`-u 0`). Used for graft's own
+    /// Like [`exec`](Self::exec) but runs as root (`-u 0`). Used for lodge's own
     /// setup writes into root-owned paths, which would otherwise fail in images
     /// whose default `USER` is unprivileged.
     pub fn exec_root(&self, container: &str, argv: &[&str]) -> Result<()> {
@@ -182,7 +182,7 @@ impl Docker {
         let mut child = ssh.spawn().context("spawning ssh docker cp")?;
         let stdout = child.stdout.take().expect("piped");
 
-        let staging = std::env::temp_dir().join(format!("graft-cpout-{}", std::process::id()));
+        let staging = std::env::temp_dir().join(format!("lodge-cpout-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&staging);
         std::fs::create_dir_all(&staging).context("creating cp staging dir")?;
 
@@ -281,7 +281,7 @@ impl Docker {
             );
             // `-u 0`: local `docker cp` writes as root via the daemon, so this
             // streaming fallback must too, or destinations under root-owned trees
-            // (e.g. /opt/graft) fail in images with an unprivileged default USER.
+            // (e.g. /opt/lodge) fail in images with an unprivileged default USER.
             let script = remote_script(&["exec", "-u", "0", "-i", container, "sh", "-c", &inner]);
             let (mut ssh, dest_host) = crate::ssh::base_command(host);
             ssh.arg(dest_host).arg(script).stdin(Stdio::from(file));
@@ -322,6 +322,26 @@ impl Docker {
             .filter(|s| !s.is_empty())
             .map(String::from)
             .collect()
+    }
+
+    /// Resolves a container id/name to its docker name (e.g. compose gives us
+    /// a raw hex id from `docker compose ps -q`; this turns it back into
+    /// something readable like `myproj-app-1`).
+    pub fn name(&self, container: &str) -> Option<String> {
+        let out = command(
+            &self.remote,
+            &["inspect", "--format", "{{.Name}}", container],
+        )
+        .output()
+        .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .trim_start_matches('/')
+            .to_string();
+        if name.is_empty() { None } else { Some(name) }
     }
 
     /// True if `path` is a regular file inside the container.
@@ -366,8 +386,8 @@ impl Docker {
     }
 
     /// `mkdir -p` for one or more directories inside the container. Runs as root
-    /// because graft's directories live under root-owned trees (`/opt/graft`,
-    /// `/graft`, and parents of system wrappers).
+    /// because lodge's directories live under root-owned trees (`/opt/lodge`,
+    /// `/lodge`, and parents of system wrappers).
     pub fn mkdir_p(&self, container: &str, dirs: &[&str]) -> Result<()> {
         let mut argv = vec!["mkdir", "-p"];
         argv.extend_from_slice(dirs);
@@ -375,27 +395,27 @@ impl Docker {
     }
 
     /// True if the one-shot task `key` has already completed in this container.
-    /// Lets create-time hooks / feature installs retry on a later `graft up`
+    /// Lets create-time hooks / feature installs retry on a later `ldg up`
     /// (until they succeed) rather than only on a recreate.
     pub fn task_done(&self, container: &str, key: &str) -> bool {
-        self.path_exists(container, &format!("{GRAFT_STATE}/{}", sanitize_key(key)))
+        self.path_exists(container, &format!("{LODGE_STATE}/{}", sanitize_key(key)))
     }
 
     /// Records that the one-shot task `key` completed.
     pub fn mark_task_done(&self, container: &str, key: &str) -> Result<()> {
-        let path = format!("{GRAFT_STATE}/{}", sanitize_key(key));
+        let path = format!("{LODGE_STATE}/{}", sanitize_key(key));
         self.exec_root(
             container,
             &[
                 "sh",
                 "-c",
-                &format!("mkdir -p {GRAFT_STATE} && : > {}", shell_quote(&path)),
+                &format!("mkdir -p {LODGE_STATE} && : > {}", shell_quote(&path)),
             ],
         )
     }
 }
 
-const GRAFT_STATE: &str = "/opt/graft/state";
+const LODGE_STATE: &str = "/opt/lodge/state";
 
 fn sanitize_key(key: &str) -> String {
     key.chars()

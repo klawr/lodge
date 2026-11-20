@@ -11,10 +11,10 @@ use crate::docker::Docker;
 use crate::forward::PortForward;
 
 // Where the hash of the .devcontainer inputs is stored *inside* the container,
-// so we can tell on the next `graft up` whether the config drifted since this
+// so we can tell on the next `ldg up` whether the config drifted since this
 // container instance was created. Living in the container means it survives
 // reboots and is discarded automatically when the container is recreated.
-const HASH_PATH: &str = "/opt/graft/devcontainer.hash";
+const HASH_PATH: &str = "/opt/lodge/devcontainer.hash";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,7 +39,7 @@ struct DevcontainerConfig {
     override_feature_install_order: Option<Vec<String>>,
     container_env: Option<BTreeMap<String, String>>,
     remote_env: Option<BTreeMap<String, String>>,
-    // The user VSCode (and graft) connects as inside the container. Overrides
+    // The user VSCode (and lodge) connects as inside the container. Overrides
     // the image's default CMD user, which is often root even when a non-root
     // user exists in the image (e.g. mcr.microsoft.com/devcontainers/* images).
     remote_user: Option<String>,
@@ -111,7 +111,7 @@ struct Spec {
     // Extra files (besides the .devcontainer dir) to fold into the hash.
     hash_extra: Vec<PathBuf>,
     workspace_folder: String,
-    // Human-readable tmux session name (e.g. "graft-myproject-1a2b3c").
+    // Human-readable tmux session name (e.g. "lodge-myproject-1a2b3c").
     session_name: String,
     forward_ports: Vec<PortForward>,
     lifecycle: Lifecycle,
@@ -138,7 +138,7 @@ pub struct Started {
 }
 
 impl Started {
-    /// Runs `postAttachCommand`, if any. Called after graft has injected the
+    /// Runs `postAttachCommand`, if any. Called after lodge has injected the
     /// environment and right before attaching the interactive session.
     pub fn run_post_attach(&self, remote: &Option<String>) -> Result<()> {
         if let Some(cmd) = &self.post_attach {
@@ -328,7 +328,7 @@ struct ComposeBackend {
     // Explicit compose project name (-p). Without it, compose derives the
     // project from the compose file's directory — which is ".devcontainer"
     // for most devcontainers, so *every* such project on a daemon would share
-    // one project name and graft could adopt a different project's container.
+    // one project name and lodge could adopt a different project's container.
     project: String,
 }
 
@@ -367,12 +367,12 @@ impl Backend for ComposeBackend {
             let path = match &self.remote {
                 None => {
                     let p = std::env::temp_dir()
-                        .join(format!("graft-compose-override-{}.yml", std::process::id()));
+                        .join(format!("lodge-compose-override-{}.yml", std::process::id()));
                     std::fs::write(&p, &content).context("writing compose override")?;
                     p.to_string_lossy().into_owned()
                 }
                 Some(host) => {
-                    let p = format!("/tmp/graft-compose-override-{}.yml", std::process::id());
+                    let p = format!("/tmp/lodge-compose-override-{}.yml", std::process::id());
                     ssh_write_file(host, &p, &content).context("writing compose override")?;
                     p
                 }
@@ -425,7 +425,7 @@ enum ImageSource {
 
 // A plain (non-compose) devcontainer: an `image` to run or a `build` to build,
 // run detached as `sleep infinity` with the workspace mounted, under a stable
-// per-project name so graft can find/recreate it.
+// per-project name so lodge can find/recreate it.
 struct ContainerBackend {
     remote: Option<String>,
     name: String,
@@ -449,7 +449,7 @@ impl Backend for ContainerBackend {
     fn up(&self, recreate: bool, flags: &crate::features::CreateFlags) -> Result<String> {
         let exists = self.existing()?.is_some();
         if exists && !recreate {
-            println!("[graft] starting {}", self.name);
+            println!("[lodge] starting {}", self.name);
             let _ = self.docker(&["start", &self.name]).status();
             return Ok(self.name.clone());
         }
@@ -458,7 +458,7 @@ impl Backend for ContainerBackend {
         }
 
         let image = self.resolve_image()?;
-        println!("[graft] creating container {}", self.name);
+        println!("[lodge] creating container {}", self.name);
         let mut args: Vec<String> = vec![
             "run".into(),
             "-d".into(),
@@ -490,7 +490,7 @@ impl ContainerBackend {
                 args,
                 tag,
             } => {
-                println!("[graft] building image {tag}");
+                println!("[lodge] building image {tag}");
                 let mut a: Vec<String> = vec!["build".into(), "-t".into(), tag.clone()];
                 if let Some(df) = dockerfile {
                     a.push("-f".into());
@@ -531,14 +531,14 @@ fn container_name(project_path: &Path) -> String {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     let h = fnv1a(project_path.to_string_lossy().as_bytes(), FNV_OFFSET);
-    format!("graft-{base}-{:06x}", h & 0xff_ffff)
+    format!("lodge-{base}-{:06x}", h & 0xff_ffff)
 }
 
 // A readable tmux session name: the devcontainer's `name` (or the project
 // basename when it has none), sanitized for tmux, plus a short path hash so two
 // projects that share a label don't land on the same session. We derive this
 // from the human label rather than the container id, whose compose form is an
-// opaque hash that makes "graft-<hash>" sessions impossible to tell apart.
+// opaque hash that makes "lodge-<hash>" sessions impossible to tell apart.
 fn session_name(name: Option<&str>, basename: &str, project_path: &Path) -> String {
     let label: String = name
         .unwrap_or(basename)
@@ -548,7 +548,7 @@ fn session_name(name: Option<&str>, basename: &str, project_path: &Path) -> Stri
     let label = label.trim_matches('-');
     let label = if label.is_empty() { "workspace" } else { label };
     let h = fnv1a(project_path.to_string_lossy().as_bytes(), FNV_OFFSET);
-    format!("graft-{label}-{:06x}", h & 0xff_ffff)
+    format!("lodge-{label}-{:06x}", h & 0xff_ffff)
 }
 
 // Builds the `docker run` arguments for a ContainerBackend: the workspace mount
@@ -769,8 +769,8 @@ pub fn start(project_path: &Path, force_build: bool, remote: &Option<String>) ->
 
     // Create-time hooks run once *successfully*: each is skipped if its success
     // marker exists, and the marker is written only when it succeeds — so a
-    // failed hook retries on the next `graft up` rather than only on a recreate.
-    // A failure is reported but never aborts graft.
+    // failed hook retries on the next `ldg up` rather than only on a recreate.
+    // A failure is reported but never aborts lodge.
     for (label, key, cmd) in [
         ("onCreateCommand", "onCreate", &spec.lifecycle.on_create),
         (
@@ -823,17 +823,17 @@ pub fn start(project_path: &Path, force_build: bool, remote: &Option<String>) ->
     })
 }
 
-/// Stops the container `graft up` manages for this project, if one exists.
-/// The container is kept so `graft up` can resume it with everything intact.
+/// Stops the container `ldg up` manages for this project, if one exists.
+/// The container is kept so `ldg up` can resume it with everything intact.
 pub fn stop(project_path: &Path, remote: &Option<String>) -> Result<()> {
     let spec = load_spec(project_path, remote)?;
     match spec.backend.existing()? {
         Some(id) => {
-            println!("[graft] stopping {id}");
+            println!("[lodge] stopping {id}");
             docker_run(remote, &["stop".to_string(), id])
         }
         None => {
-            println!("[graft] no container exists for this devcontainer");
+            println!("[lodge] no container exists for this devcontainer");
             Ok(())
         }
     }
@@ -855,7 +855,7 @@ fn write_env_profile(
         .map(|(k, v)| crate::docker::shell_quote(&format!("export {k}={}", quote_env_value(v))))
         .collect();
     let script = format!(
-        "printf '%s\\n' {} > /etc/profile.d/graft-env.sh",
+        "printf '%s\\n' {} > /etc/profile.d/lodge-env.sh",
         lines.join(" ")
     );
     docker.exec_root(container, &["sh", "-c", &script])
@@ -902,7 +902,7 @@ fn exec_env(env: &BTreeMap<String, String>) -> Vec<(String, String)> {
 // Devcontainer config lookup, per spec precedence: .devcontainer/devcontainer.json,
 // .devcontainer.json, then .devcontainer/<folder>/devcontainer.json (one level
 // deep). With several subfolder configs the first (alphabetically) wins, with a
-// warning — graft has no UI to pick one.
+// warning — lodge has no UI to pick one.
 fn find_config(project_path: &Path) -> Result<PathBuf> {
     let candidates = [
         project_path.join(".devcontainer").join("devcontainer.json"),
@@ -922,7 +922,7 @@ fn find_config(project_path: &Path) -> Result<PathBuf> {
     subs.sort();
     if subs.len() > 1 {
         eprintln!(
-            "[graft] multiple devcontainer configs found, using {}",
+            "[lodge] multiple devcontainer configs found, using {}",
             subs[0].display()
         );
     }
@@ -1057,7 +1057,7 @@ fn ssh_hash_inputs(host: &str, config_path: &Path, extra: &[PathBuf]) -> Result<
 // ── lifecycle command execution ────────────────────────────────────────────────
 
 // Runs a lifecycle command inside the container, in the workspace folder, with
-// `env` exported. A failing command is reported but never aborts graft. Returns
+// `env` exported. A failing command is reported but never aborts lodge. Returns
 // true only if every command succeeded (used to decide whether to mark the hook
 // done).
 fn run_in_container(
@@ -1068,12 +1068,12 @@ fn run_in_container(
     label: &str,
     cmd: &Cmd,
 ) -> bool {
-    println!("[graft] {label}");
+    println!("[lodge] {label}");
     let run = |argv: &[&str]| -> bool {
         match docker.exec_in(container, Some(workdir), env, argv, false) {
             Ok(()) => true,
             Err(e) => {
-                eprintln!("[graft] {label} failed (continuing): {e}");
+                eprintln!("[lodge] {label} failed (continuing): {e}");
                 false
             }
         }
@@ -1084,7 +1084,7 @@ fn run_in_container(
         Cmd::Named(map) => {
             let mut ok = true;
             for (name, one) in map {
-                println!("[graft]   {name}");
+                println!("[lodge]   {name}");
                 ok &= match one {
                     OneCmd::Shell(s) => run(&["sh", "-c", s]),
                     OneCmd::Exec(argv) => run(&argv.iter().map(String::as_str).collect::<Vec<_>>()),
@@ -1099,7 +1099,7 @@ fn run_in_container(
 // "host" is wherever the project files live: the local machine, or — with
 // --remote — the remote host, over ssh (the dir doesn't exist locally there).
 fn run_on_host(dir: &Path, label: &str, cmd: &Cmd, remote: &Option<String>) -> Result<()> {
-    println!("[graft] {label} (host)");
+    println!("[lodge] {label} (host)");
 
     let run_one = |what: &str, one: &OneCmd| -> Result<()> {
         let status = match (remote, one) {
@@ -1145,7 +1145,7 @@ fn run_on_host(dir: &Path, label: &str, cmd: &Cmd, remote: &Option<String>) -> R
         Cmd::Exec(_) => Ok(()),
         Cmd::Named(map) => {
             for (name, one) in map {
-                println!("[graft]   {name}");
+                println!("[lodge]   {name}");
                 match one {
                     OneCmd::Shell(_) => run_one(name, one)?,
                     OneCmd::Exec(argv) if !argv.is_empty() => run_one(name, one)?,
@@ -1264,7 +1264,7 @@ fn compose_ps(
 // ── hash storage in the container ──────────────────────────────────────────────
 
 fn read_hash(docker: &Docker, container: &str) -> Option<String> {
-    let tmp = std::env::temp_dir().join(format!("graft-dchash-{container}"));
+    let tmp = std::env::temp_dir().join(format!("lodge-dchash-{container}"));
     let hash = docker
         .cp_out(container, HASH_PATH, &tmp.to_string_lossy())
         .ok()
@@ -1277,7 +1277,7 @@ fn read_hash(docker: &Docker, container: &str) -> Option<String> {
 
 fn write_hash(docker: &Docker, container: &str, hash: &str) -> Result<()> {
     let script = format!(
-        "mkdir -p /opt/graft && printf %s {} > {HASH_PATH}",
+        "mkdir -p /opt/lodge && printf %s {} > {HASH_PATH}",
         crate::docker::shell_quote(hash)
     );
     docker.exec_root(container, &["sh", "-c", &script])
@@ -1392,20 +1392,20 @@ fn select_workdir(docker: &Docker, container: &str, configured: &str) -> String 
 
     if candidates.is_empty() || !io::stdin().is_terminal() {
         eprintln!(
-            "[graft] workspaceFolder '{configured}' not found in the container; falling back to '/'.\n\
-             [graft]   Add \"workspaceFolder\": \"<path>\" to devcontainer.json to avoid this."
+            "[lodge] workspaceFolder '{configured}' not found in the container; falling back to '/'.\n\
+             [lodge]   Add \"workspaceFolder\": \"<path>\" to devcontainer.json to avoid this."
         );
         return "/".to_string();
     }
 
-    eprintln!("[graft] workspaceFolder '{configured}' not found in the container.");
-    eprintln!("[graft] Select a workspace directory (or press Enter for '/'):");
+    eprintln!("[lodge] workspaceFolder '{configured}' not found in the container.");
+    eprintln!("[lodge] Select a workspace directory (or press Enter for '/'):");
     for (i, dir) in candidates.iter().enumerate() {
         eprintln!("  {}) {dir}", i + 1);
     }
 
     loop {
-        print!("[graft] > ");
+        print!("[lodge] > ");
         io::stdout().flush().ok();
         let mut line = String::new();
         if io::stdin().read_line(&mut line).is_err() || line.trim().is_empty() {
@@ -1417,14 +1417,14 @@ fn select_workdir(docker: &Docker, container: &str, configured: &str) -> String 
                 return candidates[n - 1].clone();
             }
             eprintln!(
-                "[graft] Enter a number between 1 and {} or an absolute path.",
+                "[lodge] Enter a number between 1 and {} or an absolute path.",
                 candidates.len()
             );
         } else if input.starts_with('/') {
             return input.to_string();
         } else {
             eprintln!(
-                "[graft] Enter a number from the list or an absolute path starting with '/'."
+                "[lodge] Enter a number from the list or an absolute path starting with '/'."
             );
         }
     }
@@ -1463,12 +1463,12 @@ fn discover_workdirs(docker: &Docker, container: &str) -> Vec<String> {
 fn confirm(question: &str) -> Result<bool> {
     if !io::stdin().is_terminal() {
         eprintln!(
-            "[graft] {question}\n[graft] (no TTY — keeping the existing container; \
-             re-run with `graft up --build` to recreate)"
+            "[lodge] {question}\n[lodge] (no TTY — keeping the existing container; \
+             re-run with `ldg up --build` to recreate)"
         );
         return Ok(false);
     }
-    print!("[graft] {question} [y/N] ");
+    print!("[lodge] {question} [y/N] ");
     io::stdout().flush().ok();
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
@@ -1560,7 +1560,7 @@ mod tests {
     fn container_name_is_stable_and_path_scoped() {
         let a = container_name(Path::new("/home/me/proj"));
         assert_eq!(a, container_name(Path::new("/home/me/proj")));
-        assert!(a.starts_with("graft-proj-"), "got {a}");
+        assert!(a.starts_with("lodge-proj-"), "got {a}");
         // same basename, different path → different name (no collision)
         assert_ne!(a, container_name(Path::new("/elsewhere/proj")));
     }
@@ -1570,16 +1570,16 @@ mod tests {
         let p = Path::new("/home/me/proj");
         // The devcontainer's `name` wins and is sanitized for tmux.
         let s = session_name(Some("My App (dev)"), "proj", p);
-        assert!(s.starts_with("graft-My-App--dev-"), "got {s}");
+        assert!(s.starts_with("lodge-My-App--dev-"), "got {s}");
         // Falls back to the basename when there's no name.
-        assert!(session_name(None, "proj", p).starts_with("graft-proj-"));
+        assert!(session_name(None, "proj", p).starts_with("lodge-proj-"));
         // Same label, different path → different session (no collision).
         assert_ne!(
             session_name(Some("app"), "proj", Path::new("/a/proj")),
             session_name(Some("app"), "proj", Path::new("/b/proj")),
         );
         // An all-punctuation label degrades to a usable placeholder.
-        assert!(session_name(Some("***"), "proj", p).starts_with("graft-workspace-"));
+        assert!(session_name(Some("***"), "proj", p).starts_with("lodge-workspace-"));
     }
 
     #[test]

@@ -39,7 +39,7 @@ pub fn trace(cmd: &Command) {
         line.push(' ');
         line.push_str(&quote(&a.to_string_lossy()));
     }
-    eprintln!("[graft] $ {line}");
+    eprintln!("[lodge] $ {line}");
 }
 
 // Quote only when needed, so typical traces stay readable.

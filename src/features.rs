@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const FEATURES_DIR: &str = "/tmp/graft-features";
-const PROFILE_PATH: &str = "/etc/profile.d/graft-features.sh";
+const FEATURES_DIR: &str = "/tmp/lodge-features";
+const PROFILE_PATH: &str = "/etc/profile.d/lodge-features.sh";
 
 /// A feature as requested in devcontainer.json: an OCI reference plus the
 /// user-supplied options object.
@@ -39,7 +39,7 @@ struct FeatureMeta {
     security_opt: Vec<String>,
     #[serde(default)]
     init: bool,
-    // entrypoint would replace the container's command; graft runs `sleep
+    // entrypoint would replace the container's command; lodge runs `sleep
     // infinity`, so this is warned-and-skipped rather than applied.
     #[serde(default)]
     entrypoint: Option<String>,
@@ -62,7 +62,7 @@ struct Resolved {
 
 /// Container-creation settings a feature contributes, aggregated across all
 /// features. Applied to the backend at `up` time (compose override / `docker
-/// run` flags). `entrypoint` is intentionally not represented — graft runs the
+/// run` flags). `entrypoint` is intentionally not represented — lodge runs the
 /// container as `sleep infinity`.
 #[derive(Default)]
 pub struct CreateFlags {
@@ -238,7 +238,7 @@ impl Plan {
                     let _ = docker.mark_task_done(container, &marker_key(&r.reference));
                 }
                 Err(e) => eprintln!(
-                    "[graft] feature {} install failed (continuing): {e}",
+                    "[lodge] feature {} install failed (continuing): {e}",
                     r.reference
                 ),
             }
@@ -263,19 +263,19 @@ pub fn resolve(
     }
     if features.iter().any(|f| !is_local_ref(&f.reference)) && !oras_available() {
         eprintln!(
-            "[graft] warning: devcontainer features need `oras` (https://oras.land); \
+            "[lodge] warning: devcontainer features need `oras` (https://oras.land); \
              skipping {} feature(s)",
             features.len()
         );
         return Ok(Plan::default());
     }
 
-    let work = std::env::temp_dir().join(format!("graft-features-{}", std::process::id()));
+    let work = std::env::temp_dir().join(format!("lodge-features-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
 
     let mut resolved = Vec::with_capacity(features.len());
     for (i, req) in features.iter().enumerate() {
-        println!("[graft] fetching feature {}", req.reference);
+        println!("[lodge] fetching feature {}", req.reference);
         let fetched = if is_local_ref(&req.reference) {
             fetch_local(&req.reference, base_dir)
         } else {
@@ -289,7 +289,7 @@ pub fn resolve(
                 dir,
             }),
             Err(e) => eprintln!(
-                "[graft] feature {} could not be fetched (skipping): {e}",
+                "[lodge] feature {} could not be fetched (skipping): {e}",
                 req.reference
             ),
         }
@@ -361,7 +361,7 @@ fn validate_options(r: &Resolved) {
             && !allowed.contains(value)
         {
             eprintln!(
-                "[graft] warning: feature {} option {id}={} is not one of its declared values",
+                "[lodge] warning: feature {} option {id}={} is not one of its declared values",
                 r.reference, value
             );
         }
@@ -374,7 +374,7 @@ fn install_one(docker: &Docker, container: &str, r: &Resolved) -> Result<()> {
     docker.exec_root(container, &["rm", "-rf", &dest])?;
     docker.cp(&r.dir.to_string_lossy(), container, &dest)?;
 
-    println!("[graft] installing feature {}", r.reference);
+    println!("[lodge] installing feature {}", r.reference);
     let env = build_env(r);
     docker.exec_in(
         container,
@@ -427,7 +427,7 @@ fn pull_and_extract(reference: &str, work: &Path) -> Result<PathBuf> {
 fn warn_unsupported(r: &Resolved) {
     if r.meta.entrypoint.is_some() {
         eprintln!(
-            "[graft] warning: feature {} declares an entrypoint, which graft can't apply \
+            "[lodge] warning: feature {} declares an entrypoint, which lodge can't apply \
              (the container runs `sleep infinity`); ignoring it",
             r.reference
         );
@@ -436,7 +436,7 @@ fn warn_unsupported(r: &Resolved) {
 
 // Builds the env for install.sh: each declared option as an uppercased var
 // (user value or its default), plus the _REMOTE_USER/_CONTAINER_USER variables
-// scripts commonly read. graft runs as root.
+// scripts commonly read. lodge runs as root.
 fn build_env(r: &Resolved) -> Vec<(String, String)> {
     let mut env = Vec::new();
     for (id, spec) in &r.meta.options {
@@ -476,15 +476,15 @@ fn stringify(v: &Value) -> String {
     }
 }
 
-// Persists feature containerEnv so login shells (graft enters with `-l`) see it.
+// Persists feature containerEnv so login shells (lodge enters with `-l`) see it.
 // Values may reference other vars (e.g. PATH=".../bin:${PATH}"), so they're left
 // unquoted for the shell to expand.
 fn write_profile(docker: &Docker, container: &str, env: &BTreeMap<String, String>) -> Result<()> {
-    let mut script = String::from("# generated by graft from devcontainer feature containerEnv\n");
+    let mut script = String::from("# generated by lodge from devcontainer feature containerEnv\n");
     for (k, v) in env {
         script.push_str(&format!("export {k}={v}\n"));
     }
-    let tmp = std::env::temp_dir().join(format!("graft-profile-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("lodge-profile-{}", std::process::id()));
     std::fs::write(&tmp, script)?;
     let res = docker.cp(&tmp.to_string_lossy(), container, PROFILE_PATH);
     let _ = std::fs::remove_file(&tmp);

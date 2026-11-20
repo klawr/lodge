@@ -3,15 +3,15 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "graft",
+    name = "ldg",
     version,
     about = "Inject your environment into any container",
     long_about = "Inject your environment into any container.\n\n\
-        graft copies your personal tools (editor, shell config, …) together with \
+        lodge copies your personal tools (editor, shell config, …) together with \
         their shared-library dependencies into a running Docker container and drops \
-        you into a shell. It also drives devcontainers: `graft up` reads \
+        you into a shell. It also drives devcontainers: `ldg up` reads \
         devcontainer.json, starts the container, installs features, runs lifecycle \
-        hooks, grafts your environment on top, and forwards container ports to the host."
+        hooks, injects your environment on top, and forwards container ports to the host."
 )]
 pub struct Cli {
     /// SSH remote to operate on; the docker CLI is run on the remote host over
@@ -22,8 +22,8 @@ pub struct Cli {
     #[arg(long, short, global = true, value_name = "SSH_DEST")]
     pub remote: Option<String>,
 
-    /// Show what graft is doing: print every docker/ssh command it runs and
-    /// pass -v to graft's own ssh connections (config probe, port tunnels).
+    /// Show what lodge is doing: print every docker/ssh command it runs and
+    /// pass -v to lodge's own ssh connections (config probe, port tunnels).
     /// Repeat for more ssh verbosity (-vv, -vvv).
     #[arg(long, short, global = true, action = ArgAction::Count)]
     pub verbose: u8,
@@ -34,7 +34,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Start a devcontainer and graft in
+    /// Start a devcontainer and inject your environment
     #[command(
         long_about = "Read the project's devcontainer config — looked up under PATH (default: \
             current directory) as .devcontainer/devcontainer.json, .devcontainer.json, or \
@@ -42,7 +42,7 @@ pub enum Command {
             hooks and features, inject your environment, then open an interactive shell.\n\n\
             Supports dockerComposeFile, image, build, and dockerFile backends. \
             Forwards ports declared in forwardPorts and any port that starts \
-            listening at runtime. Config: ~/.config/graft/config.toml."
+            listening at runtime. Config: ~/.config/lodge/config.toml."
     )]
     Up {
         /// Project path containing the devcontainer config
@@ -54,17 +54,17 @@ pub enum Command {
     },
     /// Stop a project's devcontainer
     #[command(
-        long_about = "Stop the container that `graft up` started for the project. The \
+        long_about = "Stop the container that `ldg up` started for the project. The \
             port-forwarding daemon notices the container stopping and exits on its own. \
             The container is kept (with everything installed in it) and can be resumed \
-            with `graft up`."
+            with `ldg up`."
     )]
     Down {
         /// Project path containing the devcontainer config
         /// (defaults to current directory)
         path: Option<PathBuf>,
     },
-    /// Graft into an already-running container
+    /// Inject your environment into an already-running container
     #[command(
         long_about = "Inject your environment into a container that is already running, \
             then open an interactive shell. The container is identified by name or ID \
@@ -74,7 +74,7 @@ pub enum Command {
         /// Container name or ID
         container: String,
     },
-    /// Internal: port-forwarding daemon spawned by `graft up`
+    /// Internal: port-forwarding daemon spawned by `ldg up`
     #[command(name = "_forward", hide = true)]
     Forward {
         container: String,

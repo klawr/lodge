@@ -27,7 +27,7 @@ pub struct Injectable {
     /// Where to place the config inside the container
     pub target_config: Option<String>,
     /// If true, skip injecting the binary/config when it already exists in the
-    /// container. Set false to refresh it on every graft (e.g. an evolving
+    /// container. Set false to refresh it on every injection (e.g. an evolving
     /// editor config); leave true for large stable trees (plugins, runtime).
     #[serde(default = "default_true")]
     pub skip_if_exists: bool,
@@ -109,7 +109,7 @@ impl Config {
         }
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("reading config at {}", path.display()))?;
-        let mut cfg: Config = toml::from_str(&raw).context("parsing graft config")?;
+        let mut cfg: Config = toml::from_str(&raw).context("parsing lodge config")?;
         for item in &mut cfg.inject {
             item.binary = item.binary.take().map(expand_tilde);
             item.config = item.config.take().map(expand_tilde);
@@ -130,7 +130,7 @@ impl Config {
 pub fn config_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("~/.config"))
-        .join("graft")
+        .join("lodge")
         .join("config.toml")
 }
 

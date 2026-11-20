@@ -23,7 +23,7 @@ fn main() -> Result<()> {
             let project_path = path.unwrap_or_else(|| std::env::current_dir().unwrap());
             let started = devcontainer::start(&project_path, build, &cli.remote)?;
             forward::spawn_daemon(&started.container, &cli.remote, &started.forward_ports);
-            inject::graft(
+            inject::lodge(
                 &started.container,
                 &cli.remote,
                 started.remote_user.as_deref(),
@@ -42,8 +42,8 @@ fn main() -> Result<()> {
             devcontainer::stop(&project_path, &cli.remote)?;
         }
         Command::Exec { container } => {
-            inject::graft(&container, &cli.remote, None)?;
-            let session_name = format!("graft-{container}");
+            inject::lodge(&container, &cli.remote, None)?;
+            let session_name = format!("lodge-{container}");
             container::enter(&container, &session_name, "/", &cli.remote, None)?;
         }
         Command::Forward { container, port } => {

@@ -14,6 +14,21 @@ pub fn enter(
     let config = Config::load()?;
     let shell = &config.session.shell;
 
+    // `container` is a raw hex id for compose-based devcontainers (from
+    // `docker compose ps -q`), which makes an unreadable title — resolve it
+    // back to the docker-assigned name where possible.
+    let title = crate::docker::Docker::new(remote)
+        .name(container)
+        .unwrap_or_else(|| container.to_string());
+
+    // Setting the terminal title *before* `docker exec`/`ssh` runs doesn't
+    // stick: kitty (and others) track the foreground process of the pty and
+    // revert to showing its name (`docker`) the moment it becomes the active
+    // job, discarding any title set beforehand. So the title has to be
+    // (re)asserted from *inside* the exec'd command, once it's already the
+    // foreground process, right before dropping into the interactive shell.
+    let set_title = format!("printf '\\033]2;%s\\007' {}", shell_quote(&title));
+
     // The command that opens an interactive shell inside the container. Values
     // are shell-quoted because it's run through a shell (tmux pane / sh -c). The
     // local form runs the docker CLI directly; for a remote daemon we run the
@@ -22,11 +37,12 @@ pub fn enter(
     if let Some(u) = remote_user {
         exec.push_str(&format!(" -u {}", shell_quote(u)));
     }
+    let inner = format!("{set_title}; exec {} -l", shell_quote(shell));
     exec.push_str(&format!(
-        " --workdir {} {} {} -l",
+        " --workdir {} {} sh -c {}",
         shell_quote(workdir),
         shell_quote(container),
-        shell_quote(shell)
+        shell_quote(&inner)
     ));
     let run_cmd = match remote {
         None => exec,
@@ -48,9 +64,9 @@ pub fn enter(
         }
     };
 
-    println!("[graft] entering {container}");
+    println!("[lodge] entering {container}");
     if crate::verbose::enabled() {
-        eprintln!("[graft] $ {run_cmd}");
+        eprintln!("[lodge] $ {run_cmd}");
     }
 
     let started = Instant::now();
@@ -72,18 +88,18 @@ pub fn enter(
         && pty_denied(host)
     {
         eprintln!(
-            "[graft] the remote SSH server refused a PTY for this connection, so the\n\
-             [graft] interactive shell (`docker exec -it`) was dropped immediately. Fix it\n\
-             [graft] on the server: set `PermitTTY yes` in sshd_config, and remove any\n\
-             [graft] `restrict`/`no-pty` option on this key in ~/.ssh/authorized_keys, then\n\
-             [graft] reload sshd."
+            "[lodge] the remote SSH server refused a PTY for this connection, so the\n\
+             [lodge] interactive shell (`docker exec -it`) was dropped immediately. Fix it\n\
+             [lodge] on the server: set `PermitTTY yes` in sshd_config, and remove any\n\
+             [lodge] `restrict`/`no-pty` option on this key in ~/.ssh/authorized_keys, then\n\
+             [lodge] reload sshd."
         );
     }
     result
 }
 
 // Probes whether the remote SSH server denies PTY allocation, which makes
-// graft's interactive `docker exec -it` shell impossible. Forces a PTY (`-tt`)
+// lodge's interactive `docker exec -it` shell impossible. Forces a PTY (`-tt`)
 // and runs `tty`: a server that refuses it makes ssh fail with "Pseudo-terminal
 // allocation request failed" (or, if it proceeds without one, `tty` prints "not
 // a tty"). Best-effort and quiet — any spawn error just yields false.
@@ -106,9 +122,9 @@ fn pty_denied(remote: &str) -> bool {
     combined.contains("allocation request failed") || combined.contains("not a tty")
 }
 
-// Opens (or reuses) the named tmux session for this workspace. If graft itself is being run
+// Opens (or reuses) the named tmux session for this workspace. If lodge itself is being run
 // from inside tmux, we must not nest — `attach-session` refuses that — so we
-// `switch-client` the current client to the graft session instead. Outside
+// `switch-client` the current client to the lodge session instead. Outside
 // tmux we attach normally.
 fn enter_tmux(session_name: &str, run_cmd: &str) -> Result<()> {
     let session = sanitize(session_name);
@@ -123,6 +139,19 @@ fn enter_tmux(session_name: &str, run_cmd: &str) -> Result<()> {
     Command::new("tmux")
         .args(["set-option", "-t", &session, "default-command", run_cmd])
         .status()?;
+
+    // `run_cmd` sets the pane title via OSC once it's running (see `enter`);
+    // forward that into the real terminal's title instead of leaving tmux's
+    // own title machinery (which defaults to showing the session/window name)
+    // in charge of it.
+    Command::new("tmux")
+        .args(["set-option", "-t", &session, "set-titles", "on"])
+        .status()
+        .ok();
+    Command::new("tmux")
+        .args(["set-option", "-t", &session, "set-titles-string", "#T"])
+        .status()
+        .ok();
 
     let already_in_tmux = std::env::var_os("TMUX").is_some();
     let action = if already_in_tmux {

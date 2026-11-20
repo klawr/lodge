@@ -149,19 +149,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "graft"
-version = "0.4.2"
-dependencies = [
- "anyhow",
- "clap",
- "dirs",
- "json_comments",
- "serde",
- "serde_json",
- "toml",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -214,6 +201,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f02ab6bace2054fb888a3c16f990117b579d14a3088e472d63c6011fa185c9d3"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "lodge-cli"
+version = "0.4.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs",
+ "json_comments",
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

@@ -29,7 +29,7 @@ impl PortForward {
         }
     }
 
-    /// Serialized form for the internal `graft _forward --port` flag.
+    /// Serialized form for the internal `ldg _forward --port` flag.
     pub fn encode(&self) -> String {
         match &self.host {
             Some(h) => format!("{}:{}:{}", self.local, h, self.port),
@@ -55,7 +55,7 @@ impl PortForward {
     }
 }
 
-/// Spawns a detached `graft _forward` daemon that manages port forwarding for
+/// Spawns a detached `ldg _forward` daemon that manages port forwarding for
 /// `container`. Returns immediately; the daemon outlives the calling process.
 /// Daemon stderr goes to a log file; the path is printed so the user can tail it.
 pub fn spawn_daemon(container: &str, remote: &Option<String>, static_ports: &[PortForward]) {
@@ -75,12 +75,12 @@ pub fn spawn_daemon(container: &str, remote: &Option<String>, static_ports: &[Po
     {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("[graft] could not open forward log {}: {e}", log.display());
+            eprintln!("[lodge] could not open forward log {}: {e}", log.display());
             return;
         }
     };
 
-    println!("[graft] port forwarding log: {}", log.display());
+    println!("[lodge] port forwarding log: {}", log.display());
 
     let mut cmd = Command::new(exe);
     if let Some(r) = remote {
@@ -121,12 +121,12 @@ pub fn run_daemon(container: &str, remote: &Option<String>, static_ports: &[Port
         Some(ip) => ip,
         None => {
             eprintln!(
-                "[graft forward] could not determine container IP — port forwarding disabled"
+                "[lodge forward] could not determine container IP — port forwarding disabled"
             );
             return;
         }
     };
-    eprintln!("[graft forward] container IP: {container_ip}");
+    eprintln!("[lodge forward] container IP: {container_ip}");
 
     let mut active: HashMap<u16, Forwarder> = HashMap::new();
     // Local ports whose forwarder failed to start, so the retry every 2 s
@@ -140,7 +140,7 @@ pub fn run_daemon(container: &str, remote: &Option<String>, static_ports: &[Port
 
     loop {
         if !is_container_running(container, remote) {
-            eprintln!("[graft forward] container stopped, exiting");
+            eprintln!("[lodge forward] container stopped, exiting");
             break;
         }
 
@@ -161,7 +161,7 @@ pub fn run_daemon(container: &str, remote: &Option<String>, static_ports: &[Port
         active.retain(|&local, fwd| {
             let alive = wanted.contains_key(&local) && fwd.is_alive();
             if !alive {
-                eprintln!("[graft forward] stopped forwarding port {local}");
+                eprintln!("[lodge forward] stopped forwarding port {local}");
             }
             alive
         });
@@ -177,7 +177,7 @@ pub fn run_daemon(container: &str, remote: &Option<String>, static_ports: &[Port
                     Some(ip) => ip.clone(),
                     None => match resolve_target_ip(container, remote, h) {
                         Some(ip) => {
-                            eprintln!("[graft forward] resolved {h} → {ip}");
+                            eprintln!("[lodge forward] resolved {h} → {ip}");
                             resolved.insert(h.clone(), ip.clone());
                             unresolved.remove(h);
                             ip
@@ -185,7 +185,7 @@ pub fn run_daemon(container: &str, remote: &Option<String>, static_ports: &[Port
                         None => {
                             if unresolved.insert(h.clone()) {
                                 eprintln!(
-                                    "[graft forward] cannot resolve '{h}' on the container \
+                                    "[lodge forward] cannot resolve '{h}' on the container \
                                      network (service not up yet?) — will keep trying"
                                 );
                             }
@@ -196,21 +196,21 @@ pub fn run_daemon(container: &str, remote: &Option<String>, static_ports: &[Port
             };
             let target = format!("{target_ip}:{}", f.port);
             let fwd = if let Some(r) = remote {
-                eprintln!("[graft forward] port {local} — ssh -L {local}:{target} {r}");
+                eprintln!("[lodge forward] port {local} — ssh -L {local}:{target} {r}");
                 Forwarder::ssh_tunnel(local, &target, r)
             } else {
-                eprintln!("[graft forward] port {local} — proxy 0.0.0.0:{local} → {target}");
+                eprintln!("[lodge forward] port {local} — proxy 0.0.0.0:{local} → {target}");
                 Forwarder::proxy(local, target)
             };
             match fwd {
                 Some(fw) => {
-                    eprintln!("[graft forward] forwarding port {local}");
+                    eprintln!("[lodge forward] forwarding port {local}");
                     active.insert(local, fw);
                     failed.remove(&local);
                 }
                 None => {
                     if failed.insert(local) {
-                        eprintln!("[graft forward] could not forward port {local}");
+                        eprintln!("[lodge forward] could not forward port {local}");
                     }
                 }
             }
@@ -347,7 +347,7 @@ fn log_path(container: &str) -> PathBuf {
     let short = container.get(..12).unwrap_or(container);
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from(".local/share"))
-        .join("graft")
+        .join("lodge")
         .join(format!("forward-{short}.log"))
 }
 

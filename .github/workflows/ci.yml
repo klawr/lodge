@@ -77,7 +77,7 @@ jobs:
           # toolchain needed, which keeps this job lean.
           ver="${next#v}"
           ver="$ver" perl -0pi -e 's/(\[package\][^\[]*?\nversion = ")[^"]+(")/$1$ENV{ver}$2/' Cargo.toml
-          ver="$ver" perl -0pi -e 's/(name = "graft"\nversion = ")[^"]+(")/$1$ENV{ver}$2/' Cargo.lock
+          ver="$ver" perl -0pi -e 's/(name = "lodge-cli"\nversion = ")[^"]+(")/$1$ENV{ver}$2/' Cargo.lock
 
           # Regenerate the changelog including the new version.
           git cliff --bump -o CHANGELOG.md
@@ -114,8 +114,8 @@ jobs:
           ref: ${{ needs.release.outputs.tag }}
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: graft
+          bin: ldg
           target: ${{ matrix.target }}
-          archive: graft-$target
+          archive: ldg-$target
           ref: refs/tags/${{ needs.release.outputs.tag }}
           token: ${{ secrets.GITHUB_TOKEN }}

@@ -6,17 +6,17 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const GRAFT_LIB: &str = "/opt/graft/lib";
-const GRAFT_BIN: &str = "/opt/graft/bin";
+const LODGE_LIB: &str = "/opt/lodge/lib";
+const LODGE_BIN: &str = "/opt/lodge/bin";
 // The dynamic linker is also placed here so a binary whose PT_INTERP we patch
-// to /graft/<ld> resolves its interpreter when run directly. The prefix is
+// to /lodge/<ld> resolves its interpreter when run directly. The prefix is
 // 7 bytes, matching /lib64/, so PT_INTERP can be patched in place.
-const GRAFT_DIR: &str = "/graft";
+const LODGE_DIR: &str = "/lodge";
 
-pub fn graft(container: &str, remote: &Option<String>, remote_user: Option<&str>) -> Result<()> {
+pub fn lodge(container: &str, remote: &Option<String>, remote_user: Option<&str>) -> Result<()> {
     let config = Config::load()?;
     let docker = Docker::new(remote);
-    docker.mkdir_p(container, &[GRAFT_LIB, GRAFT_BIN, GRAFT_DIR])?;
+    docker.mkdir_p(container, &[LODGE_LIB, LODGE_BIN, LODGE_DIR])?;
 
     let home = container_home(&docker, container, remote_user);
     let uid_gid = container_user(&docker, container, remote_user);
@@ -64,12 +64,12 @@ fn configure_git_safe(docker: &Docker, container: &str, dirs: &[String]) -> Resu
         return Ok(());
     }
     if !docker.has_command(container, "git") {
-        eprintln!("[graft] warning: git not found in container; skipping safe.directory setup");
+        eprintln!("[lodge] warning: git not found in container; skipping safe.directory setup");
         return Ok(());
     }
 
     println!(
-        "[graft] marking {} git safe.director{}",
+        "[lodge] marking {} git safe.director{}",
         dirs.len(),
         if dirs.len() == 1 { "y" } else { "ies" }
     );
@@ -91,7 +91,7 @@ fn inject_binary(
     item: &Injectable,
     binary: &str,
 ) -> Result<()> {
-    let graft_binary = format!("{GRAFT_BIN}/{}", item.name);
+    let lodge_binary = format!("{LODGE_BIN}/{}", item.name);
     let target = resolve_home(
         item.target_binary
             .as_deref()
@@ -99,8 +99,8 @@ fn inject_binary(
         home,
     );
 
-    if item.skip_if_exists && docker.file_exists(container, &graft_binary) {
-        println!("[graft] {} already exists, skipping", item.name);
+    if item.skip_if_exists && docker.file_exists(container, &lodge_binary) {
+        println!("[lodge] {} already exists, skipping", item.name);
         return Ok(());
     }
 
@@ -110,9 +110,9 @@ fn inject_binary(
         None
     };
 
-    println!("[graft] injecting {} binary", item.name);
+    println!("[lodge] injecting {} binary", item.name);
 
-    // With grafted deps, patch a copy so the binary runs *directly* (no ld.so
+    // With injected deps, patch a copy so the binary runs *directly* (no ld.so
     // wrapper) against our glibc — see patch_binary. Running directly keeps
     // /proc/self/exe pointing at the binary, which tools like Neovim need when
     // they re-exec themselves (`--embed`); baking the search path into the binary
@@ -121,33 +121,33 @@ fn inject_binary(
     match linker.as_deref() {
         Some(ld) => {
             let patched = patch_binary(binary, ld)?;
-            docker.cp(&patched.path().to_string_lossy(), container, &graft_binary)?;
-            // Make our linker available at /graft/<ld> for the patched interpreter.
+            docker.cp(&patched.path().to_string_lossy(), container, &lodge_binary)?;
+            // Make our linker available at /lodge/<ld> for the patched interpreter.
             docker.exec_root(
                 container,
                 &[
                     "cp",
-                    &format!("{GRAFT_LIB}/{ld}"),
-                    &format!("{GRAFT_DIR}/{ld}"),
+                    &format!("{LODGE_LIB}/{ld}"),
+                    &format!("{LODGE_DIR}/{ld}"),
                 ],
             )?;
         }
         None => {
             let real = std::fs::canonicalize(binary).unwrap_or_else(|_| PathBuf::from(binary));
-            docker.cp(&real.to_string_lossy(), container, &graft_binary)?;
+            docker.cp(&real.to_string_lossy(), container, &lodge_binary)?;
         }
     }
 
-    docker.exec_root(container, &["chmod", "+x", &graft_binary])?;
+    docker.exec_root(container, &["chmod", "+x", &lodge_binary])?;
 
-    install_wrapper(docker, container, &graft_binary, &target)?;
+    install_wrapper(docker, container, &lodge_binary, &target)?;
 
     Ok(())
 }
 
 // Copies the binary to a self-cleaning temp file and uses `patchelf` to make it
-// run *directly* against our grafted glibc:
-//   --set-interpreter /graft/<ld> : our dynamic linker is the program interpreter
+// run *directly* against our injected glibc:
+//   --set-interpreter /lodge/<ld> : our dynamic linker is the program interpreter
 //   --force-rpath --set-rpath …   : DT_RPATH (not RUNPATH) so the search path
 //                                   also resolves *transitive* deps (e.g. libnsl
 //                                   pulling libtirpc); RUNPATH would not.
@@ -155,18 +155,18 @@ fn inject_binary(
 // original .dynstr/.dynamic — which is the common case for real binaries.
 fn patch_binary(binary: &str, linker_name: &str) -> Result<TempFile> {
     let data = std::fs::read(binary).with_context(|| format!("reading {binary} to patch"))?;
-    let tmp = TempFile::write(&format!("graft-patched-{}", file_stem(binary)), &data)?;
+    let tmp = TempFile::write(&format!("lodge-patched-{}", file_stem(binary)), &data)?;
 
     let mut cmd = Command::new("patchelf");
     cmd.arg("--set-interpreter")
-        .arg(format!("{GRAFT_DIR}/{linker_name}"))
+        .arg(format!("{LODGE_DIR}/{linker_name}"))
         .arg("--force-rpath")
         .arg("--set-rpath")
-        .arg(GRAFT_LIB)
+        .arg(LODGE_LIB)
         .arg(tmp.path());
     crate::verbose::trace(&cmd);
     let status = cmd.status().context(
-        "running patchelf — it is required to graft dynamically linked binaries \
+        "running patchelf — it is required to inject dynamically linked binaries \
              (install it, e.g. `pacman -S patchelf` / `apt install patchelf`)",
     )?;
     if !status.success() {
@@ -192,7 +192,7 @@ fn inject_config(
     );
 
     if item.skip_if_exists && docker.path_exists(container, &target) {
-        println!("[graft] {} config already present, skipping", item.name);
+        println!("[lodge] {} config already present, skipping", item.name);
         // Fix ownership even when skipping the copy — the files may be
         // root-owned from a previous run.
         if let Some(owner) = uid_gid {
@@ -201,7 +201,7 @@ fn inject_config(
         return Ok(());
     }
 
-    println!("[graft] injecting {} config → {target}", item.name);
+    println!("[lodge] injecting {} config → {target}", item.name);
 
     // Create parent dirs as the container user when the target is under their
     // home directory — `mkdir -p` as root would leave the whole chain
@@ -237,10 +237,10 @@ fn inject_config(
 
 // When the container user can't already write to their own `$HOME` (e.g. it
 // got auto-created as root — by Docker for a path with no image content, or
-// by an earlier graft run's `mkdir -p`, which runs as the container's default
+// by an earlier lodge run's `mkdir -p`, which runs as the container's default
 // user and so is root whenever that differs from `remoteUser`), chowns just
 // `home` itself, non-recursively. Gated on the writability probe rather than
-// done unconditionally: `home` is a directory graft didn't create, and may be
+// done unconditionally: `home` is a directory lodge didn't create, and may be
 // a bind mount from the host (chowning unconditionally would chown host
 // files) or — if `owner` were ever misdetected — could lock the real user out
 // of a `$HOME` that was already correctly owned. Non-recursive because
@@ -299,7 +299,7 @@ fn chown_home_chain(
 }
 
 // Copies all shared library deps (including the dynamic linker) into
-// /opt/graft/lib/, skipping ones already there. Returns the linker filename
+// /opt/lodge/lib/, skipping ones already there. Returns the linker filename
 // (e.g. "ld-linux-x86-64.so.2") so the wrapper can launch the binary through it.
 fn inject_deps(
     docker: &Docker,
@@ -318,10 +318,10 @@ fn inject_deps(
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned());
 
-    let missing = missing_graft_deps(docker, container, &deps.libs)?;
+    let missing = missing_lodge_deps(docker, container, &deps.libs)?;
     if !missing.is_empty() {
         println!(
-            "[graft] copying {} missing deps for {}",
+            "[lodge] copying {} missing deps for {}",
             missing.len(),
             name
         );
@@ -333,7 +333,7 @@ fn inject_deps(
             docker.cp(
                 &real.to_string_lossy(),
                 container,
-                &format!("{GRAFT_LIB}/{filename}"),
+                &format!("{LODGE_LIB}/{filename}"),
             )?;
         }
     }
@@ -341,8 +341,8 @@ fn inject_deps(
     Ok(linker_name)
 }
 
-// Returns deps whose filename is not yet present in /opt/graft/lib/.
-fn missing_graft_deps<'a>(
+// Returns deps whose filename is not yet present in /opt/lodge/lib/.
+fn missing_lodge_deps<'a>(
     docker: &Docker,
     container: &str,
     deps: &'a [PathBuf],
@@ -350,7 +350,7 @@ fn missing_graft_deps<'a>(
     let check = deps
         .iter()
         .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .map(|name| format!("test -f '{GRAFT_LIB}/{name}' || printf '%s\\n' '{name}'"))
+        .map(|name| format!("test -f '{LODGE_LIB}/{name}' || printf '%s\\n' '{name}'"))
         .collect::<Vec<_>>()
         .join("; ");
 
@@ -368,22 +368,22 @@ fn missing_graft_deps<'a>(
         .collect())
 }
 
-// Installs a thin wrapper at `target` that execs the grafted binary directly.
+// Installs a thin wrapper at `target` that execs the injected binary directly.
 //
 // The binary itself was patched (PT_INTERP + DT_RUNPATH) to run against our
-// grafted glibc, so the wrapper needs no LD_LIBRARY_PATH and no ld.so
+// injected glibc, so the wrapper needs no LD_LIBRARY_PATH and no ld.so
 // indirection — it just forwards args. Execing directly is what keeps
 // /proc/self/exe pointing at the binary for tools that re-exec themselves.
 fn install_wrapper(
     docker: &Docker,
     container: &str,
-    graft_binary: &str,
+    lodge_binary: &str,
     target: &str,
 ) -> Result<()> {
-    let script = format!("#!/bin/sh\nexec {graft_binary} \"$@\"\n");
+    let script = format!("#!/bin/sh\nexec {lodge_binary} \"$@\"\n");
 
     let tmp = TempFile::write(
-        &format!("graft-wrapper-{}", file_stem(target)),
+        &format!("lodge-wrapper-{}", file_stem(target)),
         script.as_bytes(),
     )?;
 
@@ -414,12 +414,12 @@ fn inject_docker_path(docker: &Docker, container: &str) -> Result<()> {
         return Ok(());
     }
     let script = format!("export PATH={}\n", crate::docker::shell_quote(&path));
-    let tmp = TempFile::write("graft-path.sh", script.as_bytes())?;
+    let tmp = TempFile::write("lodge-path.sh", script.as_bytes())?;
     docker.mkdir_p(container, &["/etc/profile.d"])?;
     docker.cp(
         &tmp.path().to_string_lossy(),
         container,
-        "/etc/profile.d/graft-path.sh",
+        "/etc/profile.d/lodge-path.sh",
     )
 }
 
@@ -473,7 +473,7 @@ fn file_stem(path: &str) -> String {
     Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "graft".to_string())
+        .unwrap_or_else(|| "lodge".to_string())
 }
 
 fn inject_aliases(
@@ -485,22 +485,22 @@ fn inject_aliases(
         return Ok(());
     }
 
-    let mut content = String::from("# Generated by graft — do not edit\n");
+    let mut content = String::from("# Generated by lodge — do not edit\n");
     let mut pairs: Vec<_> = aliases.iter().collect();
     pairs.sort_by_key(|(k, _)| k.as_str());
     for (name, cmd) in pairs {
         content.push_str(&format!("alias {}={}\n", name, shell_quote(cmd)));
     }
 
-    let tmp = TempFile::write("graft-aliases.sh", content.as_bytes())?;
+    let tmp = TempFile::write("lodge-aliases.sh", content.as_bytes())?;
     docker.mkdir_p(container, &["/etc/profile.d"])?;
     docker.cp(
         &tmp.path().to_string_lossy(),
         container,
-        "/etc/profile.d/graft.sh",
+        "/etc/profile.d/lodge.sh",
     )?;
     println!(
-        "[graft] installed {} alias{}",
+        "[lodge] installed {} alias{}",
         aliases.len(),
         if aliases.len() == 1 { "" } else { "es" }
     );
@@ -508,7 +508,7 @@ fn inject_aliases(
     Ok(())
 }
 
-/// A temp file that deletes itself on drop, so we don't leak `graft-*` files
+/// A temp file that deletes itself on drop, so we don't leak `lodge-*` files
 /// in the system temp dir when an error short-circuits the injection.
 struct TempFile {
     path: PathBuf,
@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn falls_back_when_no_basename() {
-        assert_eq!(file_stem("/"), "graft");
+        assert_eq!(file_stem("/"), "lodge");
     }
 
     #[test]

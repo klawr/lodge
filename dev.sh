@@ -10,7 +10,7 @@ if command -v jq &>/dev/null && [[ -f "$DEVCONTAINER" ]]; then
   session_name="$(jq -r '.name // empty' "$DEVCONTAINER")"
 fi
 
-session_name="${session_name:-graft-${workspace_name}}"
+session_name="${session_name:-lodge-${workspace_name}}"
 
 if tmux has-session -t "$session_name" 2>/dev/null; then
   tmux attach-session -t "$session_name"

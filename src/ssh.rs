@@ -39,7 +39,7 @@ pub fn split(remote: &str) -> (String, Option<u16>) {
 /// Socket used to multiplex every ssh invocation against the same `--remote`
 /// destination over one already-authenticated connection (`ControlMaster`),
 /// keyed by the raw `remote` string so distinct hosts/ports get distinct
-/// sockets. A `graft up` issues dozens of separate `ssh` calls (one per
+/// sockets. A `ldg up` issues dozens of separate `ssh` calls (one per
 /// `docker exec`/`cp`); without multiplexing each renegotiates its own TCP +
 /// auth handshake, which is slow and, on a flaky or non-default-port hop,
 /// occasionally just fails — silently degrading some operations (e.g.
@@ -47,7 +47,7 @@ pub fn split(remote: &str) -> (String, Option<u16>) {
 fn control_path(remote: &str) -> PathBuf {
     let mut hasher = DefaultHasher::new();
     remote.hash(&mut hasher);
-    let dir = std::env::temp_dir().join("graft-ssh");
+    let dir = std::env::temp_dir().join("lodge-ssh");
     let _ = std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)

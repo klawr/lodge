@@ -24,10 +24,10 @@ check:
 	cargo test
 
 install: build
-	install -Dm755 target/release/graft $(DESTDIR)$(BINDIR)/graft
+	install -Dm755 target/release/ldg $(DESTDIR)$(BINDIR)/ldg
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/graft
+	rm -f $(DESTDIR)$(BINDIR)/ldg
 
 clean:
 	cargo clean
