@@ -32,7 +32,7 @@ pub(super) fn ensure_home_writable(env: &dyn Env, user: &ContainerUser) -> Resul
     if !writable {
         // A user whose home doesn't exist at all (`nobody` → /nonexistent)
         // gets one: injected configs and the tools' own state live there.
-        if !env.path_exists(&user.home) {
+        if !env.exists(&user.home)? {
             env.mkdir_p(&[&user.home])?;
         }
         env.exec_root(&["chown", &user.owner(), &user.home])?;
@@ -45,7 +45,7 @@ pub(super) fn ensure_home_writable(env: &dyn Env, user: &ContainerUser) -> Resul
 // (e.g. nvim writing .local/state next to .local/share) at runtime. Nothing to
 // do for root, or for a target outside the home.
 pub(super) fn chown_home_chain(env: &dyn Env, user: &ContainerUser, target: &str) -> Result<()> {
-    if user.is_root() || !user.owns_path(target) {
+    if user.is_root() || !user.is_in_home(target) {
         return Ok(());
     }
     let home_path = Path::new(&user.home);

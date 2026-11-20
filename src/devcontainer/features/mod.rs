@@ -156,7 +156,7 @@ impl Plan {
                         );
                     }
                 }
-                Err(e) => warning!("feature {} install failed (continuing): {e}", r.reference),
+                Err(e) => warning!("feature {} install failed (continuing): {e:#}", r.reference),
             }
         }
         // Persisted so login shells (lodge enters with `-l`) see it.
@@ -214,11 +214,22 @@ pub fn resolve(
 }
 
 /// The features that haven't been installed successfully in `env` yet: all of
-/// them in a new container, the ones that failed before in a reused one.
+/// them in a new container, the ones that failed before in a reused one. One
+/// whose marker can't be checked is left out (with a warning) rather than
+/// installed again.
 pub fn pending(env: &dyn Env, features: &[FeatureRequest]) -> Vec<FeatureRequest> {
     features
         .iter()
-        .filter(|f| !markers::done(env, &marker_key(&f.reference)))
+        .filter(|f| match markers::done(env, &marker_key(&f.reference)) {
+            Ok(done) => !done,
+            Err(e) => {
+                warning!(
+                    "skipping feature {}: could not tell whether it is installed: {e:#}",
+                    f.reference
+                );
+                false
+            }
+        })
         .cloned()
         .collect()
 }

@@ -25,7 +25,7 @@ use crate::tree::{self, Denied, Links};
 /// complete: it is written beside the destination and renamed into place.
 pub fn pack_to_file(config: &Config, output: &Path) -> Result<Manifest> {
     let scratch = TempDir::new("pack")?;
-    let manifest = build(config, scratch.path())?;
+    let manifest = build(config, scratch.path(), &mut deps::Resolver::default())?;
 
     let partial = PathBuf::from(format!("{}.partial", output.display()));
     let written = std::fs::File::create(&partial)
@@ -42,14 +42,16 @@ pub fn pack_to_file(config: &Config, output: &Path) -> Result<Manifest> {
     Ok(manifest)
 }
 
-/// Builds the bundle's directory layout and manifest in `dir`.
-pub fn build(config: &Config, dir: &Path) -> Result<Manifest> {
-    let host = host_arch()?;
+/// Builds the bundle's directory layout and manifest in `dir`. `deps` answers
+/// which libraries a binary needs (and remembers what it was asked before).
+pub fn build(config: &Config, dir: &Path, deps: &mut deps::Resolver) -> Result<Manifest> {
+    let host = Arch::host()?;
     for sub in [BIN_DIR, LIB_DIR, CONFIG_DIR] {
         std::fs::create_dir_all(dir.join(sub))?;
     }
     let mut packer = Packer {
         dir,
+        deps,
         host,
         libs: BTreeMap::new(),
         linker: None,
@@ -68,6 +70,7 @@ pub fn build(config: &Config, dir: &Path) -> Result<Manifest> {
 
 struct Packer<'a> {
     dir: &'a Path,
+    deps: &'a mut deps::Resolver,
     host: Arch,
     /// Bundled libraries: file name to content hash.
     libs: BTreeMap<String, String>,
@@ -107,12 +110,12 @@ impl Packer<'_> {
     fn add_binary(&mut self, item: &Injectable, source: &Path) -> Result<Binary> {
         let name = &item.name;
         let path = source.to_string_lossy();
-        check_arch(name, source, self.host)?;
+        elf::check_arch(name, source, self.host)?;
 
         let dst = self.dir.join(BIN_DIR).join(name);
         let mut dynamic = false;
         if item.copy_deps {
-            let deps = deps::resolve(&path)?;
+            let deps = self.deps.resolve(&path)?;
             if !deps.is_empty() {
                 let linker = deps
                     .linker
@@ -224,26 +227,6 @@ impl Packer<'_> {
             git_safe_directories: config.git.safe_directories.clone(),
         }
     }
-}
-
-/// This machine's CPU architecture.
-pub(crate) fn host_arch() -> Result<Arch> {
-    Arch::from_uname(std::env::consts::ARCH).context("unsupported host architecture")
-}
-
-/// Refuses a binary built for another CPU than this machine's: it cannot be
-/// inspected with `ldd` here, and a bundle holds one architecture.
-pub(crate) fn check_arch(tool: &str, binary: &Path, host: Arch) -> Result<()> {
-    if let Some(arch) = elf::arch_of(binary)?
-        && arch != host
-    {
-        bail!(
-            "{tool}: {} is built for {arch}, but this machine is {host}; \
-             pack on a {arch} machine",
-            binary.display()
-        );
-    }
-    Ok(())
 }
 
 /// Copies a file or directory tree, keeping symlinks as symlinks and modes as they
@@ -379,12 +362,7 @@ mod tests {
         assert_eq!(tool.binary.as_ref().unwrap().target, "/usr/local/bin/hello");
         assert!(!tool.binary.as_ref().unwrap().dynamic);
         assert!(tool.config.as_ref().unwrap().is_dir);
-        assert_eq!(
-            manifest.arch,
-            Arch::from_uname(std::env::consts::ARCH)
-                .unwrap()
-                .to_string()
-        );
+        assert_eq!(manifest.arch, Arch::host().unwrap().to_string());
 
         let dest = TempDir::new("pack-dest").unwrap();
         assert_eq!(archive::extract(&file, dest.path()).unwrap(), manifest);
@@ -403,8 +381,8 @@ mod tests {
         let cfg = config_with(vec![tool]);
         let a = TempDir::new("id-a").unwrap();
         let b = TempDir::new("id-b").unwrap();
-        let ma = build(&cfg, a.path()).unwrap();
-        let mb = build(&cfg, b.path()).unwrap();
+        let ma = build(&cfg, a.path(), &mut deps::Resolver::default()).unwrap();
+        let mb = build(&cfg, b.path(), &mut deps::Resolver::default()).unwrap();
         assert_eq!(ma.id(), mb.id());
     }
 
@@ -413,9 +391,13 @@ mod tests {
         let work = TempDir::new("pack-bad").unwrap();
         let tool = script_tool(work.path(), "../evil");
         let out = TempDir::new("pack-bad-out").unwrap();
-        let err = build(&config_with(vec![tool]), out.path())
-            .unwrap_err()
-            .to_string();
+        let err = build(
+            &config_with(vec![tool]),
+            out.path(),
+            &mut deps::Resolver::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("not usable as a tool name"), "{err}");
     }
 
@@ -427,7 +409,12 @@ mod tests {
         let out = TempDir::new("pack-missing-out").unwrap();
         let err = format!(
             "{:#}",
-            build(&config_with(vec![tool]), out.path()).unwrap_err()
+            build(
+                &config_with(vec![tool]),
+                out.path(),
+                &mut deps::Resolver::default()
+            )
+            .unwrap_err()
         );
         assert!(
             err.contains("t: config path") && err.contains("does not exist"),
@@ -440,7 +427,7 @@ mod tests {
         let work = TempDir::new("pack-arch").unwrap();
         let mut tool = script_tool(work.path(), "foreign");
         // An ELF header for the architecture this machine is *not*.
-        let machine: [u8; 2] = if Arch::from_uname(std::env::consts::ARCH) == Some(Arch::Aarch64) {
+        let machine: [u8; 2] = if Arch::host().ok() == Some(Arch::Aarch64) {
             [0x3E, 0]
         } else {
             [0xB7, 0]
@@ -453,9 +440,13 @@ mod tests {
         std::fs::write(&path, elf).unwrap();
         tool.binary = Some(path);
         let out = TempDir::new("pack-arch-out").unwrap();
-        let err = build(&config_with(vec![tool]), out.path())
-            .unwrap_err()
-            .to_string();
+        let err = build(
+            &config_with(vec![tool]),
+            out.path(),
+            &mut deps::Resolver::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("pack on a"), "{err}");
     }
 

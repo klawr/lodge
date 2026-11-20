@@ -108,7 +108,7 @@ pub(super) fn run_in_container(env: &dyn Env, ctx: &HookCtx, label: &str, cmd: &
             CmdLine::Argv(argv) => argv.iter().map(String::as_str).collect(),
         };
         if let Err(e) = env.exec(&argv, &opts) {
-            warning!("{} failed (continuing): {e}", name.unwrap_or(label));
+            warning!("{} failed (continuing): {e:#}", name.unwrap_or(label));
             ok = false;
         }
     }

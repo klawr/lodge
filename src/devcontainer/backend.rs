@@ -6,12 +6,15 @@
 //! its id.
 
 use crate::output::info;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use super::vars::Vars;
+use super::config::{CreateConfig, SourceConfig};
+use super::vars::{Vars, path_tag};
 use crate::runtime::{BuildSpec, Containers, Runtime};
+use crate::shell::slug;
+use crate::target::Target;
 
 /// Label on every container lodge creates for a devcontainer: the project's
 /// path on its host. `ldg ls` lists containers by it.
@@ -27,10 +30,11 @@ pub(super) trait Backend {
     /// Brings the container up and returns its id. `existing` is what
     /// [`existing`](Self::existing) found; it is recreated from scratch when
     /// `recreate` is set. `extra` (what features ask for) applies when it is
-    /// created.
+    /// created. `target` is the project's host, where the engine reads files.
     fn up(
         &self,
         rt: &dyn Runtime,
+        target: &Target,
         existing: Option<&str>,
         recreate: bool,
         extra: &CreateSettings,
@@ -74,6 +78,7 @@ impl Backend for ComposeBackend {
     fn up(
         &self,
         rt: &dyn Runtime,
+        target: &Target,
         _existing: Option<&str>,
         recreate: bool,
         extra: &CreateSettings,
@@ -94,8 +99,7 @@ impl Backend for ComposeBackend {
         let mut files = self.files.clone();
         let project_path = self.project_path.to_string_lossy();
         let content = extra.compose_override(&self.service, &[(LABEL_PROJECT, &project_path)]);
-        let override_file = rt
-            .target()
+        let override_file = target
             .write_scratch("compose-override.yml", &content)
             .context("writing compose override")?;
         files.push(override_file.path().to_string());
@@ -160,6 +164,7 @@ impl Backend for ContainerBackend {
     fn up(
         &self,
         rt: &dyn Runtime,
+        _target: &Target,
         existing: Option<&str>,
         recreate: bool,
         extra: &CreateSettings,
@@ -392,7 +397,7 @@ fn yaml_string(s: &str) -> String {
 // Parses `appPort`: a port, a "host:container" string, or an array of either.
 // Published on the loopback interface only, so a devcontainer's ports are not
 // exposed to the whole network.
-pub(super) fn parse_app_ports(value: Option<serde_json::Value>) -> Vec<String> {
+fn parse_app_ports(value: Option<serde_json::Value>) -> Vec<String> {
     let items = match value {
         Some(serde_json::Value::Array(a)) => a,
         Some(v) => vec![v],
@@ -422,7 +427,7 @@ fn publish_spec(s: &str) -> String {
 // (or a default bind), the working dir, the settings that devcontainer.json
 // states directly (its `mounts` among them), and finally the user's `runArgs`
 // (last, so they can override).
-pub(super) fn build_run_args(
+fn build_run_args(
     user_args: Option<Vec<String>>,
     workspace_mount: Option<String>,
     settings: &CreateSettings,
@@ -454,6 +459,159 @@ pub(super) fn build_run_args(
             .map(|a| vars.apply(&a)),
     );
     args
+}
+
+// ── construction from devcontainer.json ────────────────────────────────────────
+
+/// What backend construction needs to know about the project.
+pub(super) struct BackendContext<'a> {
+    pub(super) project_path: &'a Path,
+    pub(super) base_dir: &'a Path,
+    pub(super) workspace_folder: &'a str,
+    pub(super) vars: &'a Vars<'a>,
+}
+
+pub(super) struct BuiltBackend {
+    pub(super) backend: Box<dyn Backend>,
+    /// Extra files (besides the `.devcontainer` dir) to fold into the drift hash.
+    pub(super) hash_extra: Vec<PathBuf>,
+    pub(super) is_compose: bool,
+}
+
+/// Picks the backend for whichever form the devcontainer uses.
+pub(super) fn build_backend(
+    source: SourceConfig,
+    create: CreateConfig,
+    container_user: Option<String>,
+    ctx: &BackendContext,
+) -> Result<BuiltBackend> {
+    if source.docker_compose_file.is_some() {
+        compose_backend(source, ctx)
+    } else if source.image.is_some() || source.build.is_some() || source.docker_file.is_some() {
+        Ok(container_backend(source, create, container_user, ctx))
+    } else {
+        bail!("devcontainer.json must set one of: dockerComposeFile, image, build, or dockerFile")
+    }
+}
+
+fn compose_backend(source: SourceConfig, ctx: &BackendContext) -> Result<BuiltBackend> {
+    let files = match source.docker_compose_file {
+        Some(serde_json::Value::String(s)) => vec![s],
+        Some(serde_json::Value::Array(a)) => a
+            .into_iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => bail!("unexpected dockerComposeFile format"),
+    };
+    let service = source
+        .service
+        .context("devcontainer.json with dockerComposeFile is missing 'service'")?;
+    let mut run_services = source.run_services.unwrap_or_default();
+    if !run_services.is_empty() && !run_services.contains(&service) {
+        run_services.push(service.clone());
+    }
+    let hash_extra = files.iter().map(|f| ctx.base_dir.join(f)).collect();
+    Ok(BuiltBackend {
+        backend: Box::new(ComposeBackend {
+            dir: ctx.base_dir.to_path_buf(),
+            files,
+            service,
+            run_services,
+            // Compose project names must be lowercase.
+            project: container_name(ctx.project_path).to_lowercase(),
+            project_path: ctx.project_path.to_path_buf(),
+        }),
+        hash_extra,
+        is_compose: true,
+    })
+}
+
+fn container_backend(
+    source: SourceConfig,
+    create: CreateConfig,
+    container_user: Option<String>,
+    ctx: &BackendContext,
+) -> BuiltBackend {
+    let name = container_name(ctx.project_path);
+    let image_source = image_source(source, &name, ctx.base_dir);
+    let settings = CreateSettings {
+        privileged: create.privileged.unwrap_or(false),
+        init: create.init.unwrap_or(false),
+        cap_add: create.cap_add.unwrap_or_default(),
+        security_opt: create.security_opt.unwrap_or_default(),
+        mounts: create
+            .mounts
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| Mount::parse(m, &|s| ctx.vars.apply(s)))
+            .collect(),
+        container_user,
+        published_ports: parse_app_ports(create.app_port),
+    };
+    let run_args = build_run_args(
+        create.run_args,
+        create.workspace_mount,
+        &settings,
+        ctx.vars,
+        ctx.project_path,
+        ctx.workspace_folder,
+    );
+    // The Dockerfile counts toward drift even when it lives outside the hashed
+    // folder (`"dockerfile": "../Dockerfile"`), like compose files do.
+    let hash_extra = match &image_source {
+        ImageSource::Build {
+            context,
+            dockerfile,
+            ..
+        } => vec![context.join(dockerfile.as_deref().unwrap_or("Dockerfile"))],
+        ImageSource::Image(_) => vec![],
+    };
+    BuiltBackend {
+        backend: Box::new(ContainerBackend {
+            name,
+            source: image_source,
+            run_args,
+            override_command: create.override_command.unwrap_or(true),
+        }),
+        hash_extra,
+        is_compose: false,
+    }
+}
+
+/// An `image` to run, or a `build` to build (with `dockerFile`/`context` as the
+/// older spellings of its fields).
+fn image_source(source: SourceConfig, container_name: &str, base_dir: &Path) -> ImageSource {
+    if let Some(image) = source.image {
+        return ImageSource::Image(image);
+    }
+    let build = source.build.unwrap_or_default();
+    let context = build
+        .context
+        .or(source.context)
+        .unwrap_or_else(|| ".".to_string());
+    ImageSource::Build {
+        context: base_dir.join(context),
+        dockerfile: build.dockerfile.or(source.docker_file),
+        target: build.target,
+        args: build.args,
+        tag: format!("{container_name}-img"),
+    }
+}
+
+// A stable container name for a non-compose devcontainer: project basename plus
+// a short hash of its path, so distinct projects with the same basename don't
+// collide.
+pub(super) fn container_name(project_path: &Path) -> String {
+    let base = slug(&project_basename(project_path));
+    format!("lodge-{base}-{}", path_tag(project_path))
+}
+
+/// The project folder's name, or `workspace` for `/`.
+pub(super) fn project_basename(project_path: &Path) -> String {
+    project_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "workspace".to_string())
 }
 
 #[cfg(test)]
@@ -605,6 +763,70 @@ mod tests {
                 "--privileged",
                 "--cap-drop=ALL"
             ]
+        );
+    }
+
+    #[test]
+    fn a_dockerfile_build_resolves_relative_to_the_config_directory() {
+        let source = SourceConfig {
+            docker_file: Some("Dockerfile".into()),
+            context: Some("..".into()),
+            ..Default::default()
+        };
+        match image_source(source, "lodge-proj-1", Path::new("/p/.devcontainer")) {
+            ImageSource::Build {
+                context,
+                dockerfile,
+                tag,
+                ..
+            } => {
+                assert_eq!(context, PathBuf::from("/p/.devcontainer/.."));
+                assert_eq!(dockerfile.as_deref(), Some("Dockerfile"));
+                assert_eq!(tag, "lodge-proj-1-img");
+            }
+            ImageSource::Image(_) => panic!("expected a build"),
+        }
+    }
+
+    #[test]
+    fn container_name_is_stable_and_path_scoped() {
+        let a = container_name(Path::new("/home/me/proj"));
+        assert_eq!(a, container_name(Path::new("/home/me/proj")));
+        assert!(a.starts_with("lodge-proj-"), "got {a}");
+        // same basename, different path → different name (no collision)
+        assert_ne!(a, container_name(Path::new("/elsewhere/proj")));
+    }
+
+    #[test]
+    fn a_dockerfile_outside_the_config_folder_feeds_the_drift_hash() {
+        let p = Path::new("/home/me/proj");
+        let base = p.join(".devcontainer");
+        let vars = Vars::new(p).with_container_workspace("/workspaces/proj");
+        let ctx = BackendContext {
+            project_path: p,
+            base_dir: &base,
+            workspace_folder: "/workspaces/proj",
+            vars: &vars,
+        };
+        let build = |source: SourceConfig| {
+            build_backend(source, CreateConfig::default(), None, &ctx)
+                .unwrap()
+                .hash_extra
+        };
+        assert_eq!(
+            build(SourceConfig {
+                docker_file: Some("Dockerfile".into()),
+                context: Some("..".into()),
+                ..Default::default()
+            }),
+            [PathBuf::from("/home/me/proj/.devcontainer/../Dockerfile")]
+        );
+        assert_eq!(
+            build(SourceConfig {
+                image: Some("debian".into()),
+                ..Default::default()
+            }),
+            Vec::<PathBuf>::new()
         );
     }
 }

@@ -6,7 +6,7 @@
 //! - [`config`]: parse `devcontainer.json` into a [`Spec`](config::Spec)
 //! - [`backend`]: create/start the container (compose, or image/build)
 //! - [`features`]: fetch, order and install devcontainer features
-//! - [`hash`]: detect that the config drifted since the container was created
+//! - [`drift`]: detect that the config drifted since the container was created
 //! - [`lifecycle`]: `initializeCommand`, `onCreateCommand`, … and container env
 //! - [`markers`]: remember which one-shot hooks and installs succeeded
 //! - [`profile`]: the env written for login shells
@@ -19,8 +19,8 @@
 
 mod backend;
 mod config;
+mod drift;
 mod features;
-mod hash;
 mod lifecycle;
 mod markers;
 mod profile;
@@ -36,13 +36,13 @@ use crate::port::PortForward;
 use crate::runtime::{Container, Env, Runtime};
 use crate::target::Target;
 use config::{Spec, load_spec};
-use hash::{config_state, hash_inputs, write_hash};
+use drift::{config_state, hash_inputs, write_hash};
 use lifecycle::{Cmd, HookCtx, exec_env, run_in_container, run_on_host};
 use profile::write_env_profile;
 use workdir::select_workdir;
 
 pub use backend::LABEL_PROJECT;
-pub use hash::ConfigState;
+pub use drift::ConfigState;
 
 /// What to do when the config changed since the container was created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +83,8 @@ pub struct Started {
     /// The user to run as inside the container (`remoteUser` in devcontainer.json).
     /// `None` means use the container's default CMD user.
     pub remote_user: Option<String>,
-    env: Vec<(String, String)>,
+    /// The env hooks run with (`containerEnv`/`remoteEnv` without references).
+    hook_env: Vec<(String, String)>,
     post_attach: Option<Cmd>,
 }
 
@@ -96,21 +97,23 @@ impl Started {
             let ctx = HookCtx {
                 workdir: &self.workdir,
                 user: self.remote_user.as_deref(),
-                vars: &self.env,
+                vars: &self.hook_env,
             };
             run_in_container(self.container.as_ref(), &ctx, "postAttachCommand", cmd);
         }
     }
 }
 
+/// Brings up the devcontainer of `project_path`, whose files are on `target`
+/// (where the engine `rt` runs too).
 pub fn start(
     project_path: &Path,
+    target: &Target,
     opts: StartOpts,
     rt: &dyn Runtime,
     prompt: &dyn Prompt,
 ) -> Result<Started> {
-    let target = rt.target();
-    let (spec, existing) = locate(project_path, rt)?;
+    let (spec, existing) = locate(project_path, target, rt)?;
     let current_hash = hash_inputs(&spec.config_path, &spec.hash_extra, target)?;
 
     // Has the config drifted since the existing container was created?
@@ -143,6 +146,7 @@ pub fn start(
 
     let id = spec.backend.up(
         rt,
+        target,
         existing.as_deref(),
         opts.build || recreate,
         &plan.create_settings(),
@@ -201,13 +205,19 @@ pub fn start(
             &spec.lifecycle.post_create,
         ),
     ] {
-        if let Some(c) = cmd {
-            if markers::done(env, key) {
+        let Some(c) = cmd else { continue };
+        // Not knowing whether it ran is not "it didn't": a create hook need
+        // not be safe to run twice, so it is skipped rather than repeated.
+        match markers::done(env, key) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => {
+                warning!("skipping {label}: could not tell whether it already ran: {e:#}");
                 continue;
             }
-            if run_in_container(env, &hooks, label, c) {
-                markers::mark_done(env, key)?;
-            }
+        }
+        if run_in_container(env, &hooks, label, c) {
+            markers::mark_done(env, key)?;
         }
     }
 
@@ -216,10 +226,17 @@ pub fn start(
         run_in_container(env, &hooks, "postStartCommand", c);
     }
 
-    let workdir = if env.path_exists(&spec.workspace_folder) {
-        spec.workspace_folder
-    } else {
-        select_workdir(container.as_ref(), &spec.workspace_folder, prompt)
+    let workdir = match env.exists(&spec.workspace_folder) {
+        Ok(true) => spec.workspace_folder,
+        Ok(false) => select_workdir(container.as_ref(), &spec.workspace_folder, prompt),
+        Err(e) => {
+            // Only a folder known to be missing is worth a question.
+            warning!(
+                "could not check that {} exists ({e:#}); using it",
+                spec.workspace_folder
+            );
+            spec.workspace_folder
+        }
     };
 
     Ok(Started {
@@ -228,14 +245,18 @@ pub fn start(
         workdir,
         forward_ports: spec.forward_ports,
         remote_user: spec.remote_user,
-        env: hook_env,
+        hook_env,
         post_attach: spec.lifecycle.post_attach,
     })
 }
 
 /// The project's spec and the id of its existing container, if there is one.
-fn locate(project_path: &Path, rt: &dyn Runtime) -> Result<(Spec, Option<String>)> {
-    let spec = load_spec(project_path, rt.target())?;
+fn locate(
+    project_path: &Path,
+    target: &Target,
+    rt: &dyn Runtime,
+) -> Result<(Spec, Option<String>)> {
+    let spec = load_spec(project_path, target)?;
     let existing = spec.backend.existing(rt)?;
     Ok((spec, existing))
 }
@@ -248,8 +269,8 @@ pub struct Found {
 }
 
 /// Finds the container `ldg up` manages for this project.
-pub fn find(project_path: &Path, rt: &dyn Runtime) -> Result<Option<Found>> {
-    let (spec, existing) = locate(project_path, rt)?;
+pub fn find(project_path: &Path, target: &Target, rt: &dyn Runtime) -> Result<Option<Found>> {
+    let (spec, existing) = locate(project_path, target, rt)?;
     Ok(existing.map(|id| Found {
         container: rt.container(&id),
         remote_user: spec.remote_user,
@@ -258,8 +279,8 @@ pub fn find(project_path: &Path, rt: &dyn Runtime) -> Result<Option<Found>> {
 
 /// Stops the container `ldg up` manages for this project, if one exists, and
 /// returns its id. The container is kept so `ldg up` can resume it.
-pub fn stop(project_path: &Path, rt: &dyn Runtime) -> Result<Option<String>> {
-    let (_, existing) = locate(project_path, rt)?;
+pub fn stop(project_path: &Path, target: &Target, rt: &dyn Runtime) -> Result<Option<String>> {
+    let (_, existing) = locate(project_path, target, rt)?;
     if let Some(id) = &existing {
         rt.stop(id)?;
     }
@@ -268,8 +289,8 @@ pub fn stop(project_path: &Path, rt: &dyn Runtime) -> Result<Option<String>> {
 
 /// Removes the project's container (and compose project), throwing away
 /// everything installed in it, and returns its id.
-pub fn remove(project_path: &Path, rt: &dyn Runtime) -> Result<Option<String>> {
-    let (spec, existing) = locate(project_path, rt)?;
+pub fn remove(project_path: &Path, target: &Target, rt: &dyn Runtime) -> Result<Option<String>> {
+    let (spec, existing) = locate(project_path, target, rt)?;
     if existing.is_some() {
         spec.backend.remove(rt)?;
     }
@@ -277,13 +298,17 @@ pub fn remove(project_path: &Path, rt: &dyn Runtime) -> Result<Option<String>> {
 }
 
 /// The project's container, if it has one, and whether its config drifted.
-pub fn status(project_path: &Path, rt: &dyn Runtime) -> Result<Option<(Found, ConfigState)>> {
-    let (spec, existing) = locate(project_path, rt)?;
+pub fn status(
+    project_path: &Path,
+    target: &Target,
+    rt: &dyn Runtime,
+) -> Result<Option<(Found, ConfigState)>> {
+    let (spec, existing) = locate(project_path, target, rt)?;
     let Some(id) = existing else {
         return Ok(None);
     };
     let container = rt.container(&id);
-    let current = hash_inputs(&spec.config_path, &spec.hash_extra, rt.target())?;
+    let current = hash_inputs(&spec.config_path, &spec.hash_extra, target)?;
     let state = config_state(container.as_ref(), &current);
     let found = Found {
         container,
@@ -395,21 +420,21 @@ mod tests {
     fn engine(dir: &TempDir, existing: bool) -> FakeRuntime {
         let rt = FakeRuntime::new(container);
         if existing {
-            rt.with_container(&config::container_name(dir.path()), container())
+            rt.with_container(&backend::container_name(dir.path()), container())
         } else {
             rt
         }
     }
 
     fn state(dir: &TempDir, rt: &FakeRuntime) -> ConfigState {
-        status(dir.path(), rt).unwrap().unwrap().1
+        status(dir.path(), &Target::Local, rt).unwrap().unwrap().1
     }
 
     #[test]
     fn a_new_container_is_created_and_records_its_config() {
         let dir = project(PLAIN);
         let rt = engine(&dir, false);
-        let started = start(dir.path(), ASK, &rt, &Answer::new(false)).unwrap();
+        let started = start(dir.path(), &Target::Local, ASK, &rt, &Answer::new(false)).unwrap();
         assert_eq!(started.workdir, "/w");
         assert!(
             rt.ops().iter().any(|o| o.starts_with("run lodge-")),
@@ -423,9 +448,9 @@ mod tests {
     fn an_unchanged_container_is_started_without_asking() {
         let dir = project(PLAIN);
         let rt = engine(&dir, false);
-        start(dir.path(), ASK, &rt, &Answer::new(true)).unwrap();
+        start(dir.path(), &Target::Local, ASK, &rt, &Answer::new(true)).unwrap();
         let prompt = Answer::new(true);
-        start(dir.path(), ASK, &rt, &prompt).unwrap();
+        start(dir.path(), &Target::Local, ASK, &rt, &prompt).unwrap();
         assert_eq!(prompt.asked.get(), 0);
         let ops = rt.ops();
         assert_eq!(
@@ -440,18 +465,18 @@ mod tests {
     fn a_changed_config_asks_and_the_answer_decides() {
         let dir = project(PLAIN);
         let rt = engine(&dir, false);
-        start(dir.path(), ASK, &rt, &Answer::new(false)).unwrap();
+        start(dir.path(), &Target::Local, ASK, &rt, &Answer::new(false)).unwrap();
         write_config(&dir, EDITED);
         assert_eq!(state(&dir, &rt), ConfigState::Changed);
 
         let keep = Answer::new(false);
-        start(dir.path(), ASK, &rt, &keep).unwrap();
+        start(dir.path(), &Target::Local, ASK, &rt, &keep).unwrap();
         assert_eq!(keep.asked.get(), 1);
         assert!(!rt.ops().iter().any(|o| o.starts_with("remove")));
         assert_eq!(state(&dir, &rt), ConfigState::Changed, "kept as it was");
 
         let recreate = Answer::new(true);
-        start(dir.path(), ASK, &rt, &recreate).unwrap();
+        start(dir.path(), &Target::Local, ASK, &rt, &recreate).unwrap();
         assert_eq!(recreate.asked.get(), 1);
         let ops = rt.ops();
         assert!(ops.iter().any(|o| o.starts_with("remove")), "{ops:?}");
@@ -468,7 +493,7 @@ mod tests {
         let dir = project(PLAIN);
         let rt = engine(&dir, true);
         let prompt = Answer::new(true);
-        start(dir.path(), ASK, &rt, &prompt).unwrap();
+        start(dir.path(), &Target::Local, ASK, &rt, &prompt).unwrap();
         assert_eq!(prompt.asked.get(), 0, "not knowing is not drift");
         let ops = rt.ops();
         assert!(ops.len() == 1 && ops[0].starts_with("start "), "{ops:?}");
@@ -484,7 +509,7 @@ mod tests {
             build: true,
             recreate: Recreate::Ask,
         };
-        start(dir.path(), opts, &rt, &prompt).unwrap();
+        start(dir.path(), &Target::Local, opts, &rt, &prompt).unwrap();
         assert_eq!(prompt.asked.get(), 0);
         let ops = rt.ops();
         assert!(
@@ -498,14 +523,14 @@ mod tests {
         let dir =
             project(r#"{"dockerComposeFile": "c.yml", "service": "app", "workspaceFolder": "/w"}"#);
         let rt = FakeRuntime::new(container);
-        let first = start(dir.path(), ASK, &rt, &Answer::new(false)).unwrap();
+        let first = start(dir.path(), &Target::Local, ASK, &rt, &Answer::new(false)).unwrap();
         assert!(
             first.container.id().ends_with("-app-1"),
             "{}",
             first.container.id()
         );
         let prompt = Answer::new(true);
-        let again = start(dir.path(), ASK, &rt, &prompt).unwrap();
+        let again = start(dir.path(), &Target::Local, ASK, &rt, &prompt).unwrap();
         assert_eq!(again.container.id(), first.container.id());
         assert_eq!(prompt.asked.get(), 0);
         assert_eq!(state(&dir, &rt), ConfigState::UpToDate);

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use super::tunnel::Forwarder;
 use super::{acquire_lock, lock_path, ports_path, truncate_log, write_ports};
 use crate::port::PortForward;
-use crate::runtime::{self, Container, ExecOpts};
+use crate::runtime::{Container, ExecOpts, Runtime};
 use crate::target::Target;
 
 /// A line in the daemon's log (its stderr).
@@ -37,12 +37,19 @@ const UNREACHABLE_POLLS: u32 = 150;
 /// can't be reached.
 ///
 /// `ports` are the declared forwards as `spawn_daemon` encoded them on the
-/// command line.
-pub fn run_daemon(container_id: &str, target: &Target, ports: &[String]) {
+/// command line; `rt` is the engine at `target`.
+pub fn run_daemon(rt: &dyn Runtime, target: &Target, container_id: &str, ports: &[String]) {
     let declared = decode_ports(ports);
+    let (lock_file, ports_file) = match (lock_path(container_id), ports_path(container_id)) {
+        (Ok(l), Ok(p)) => (l, p),
+        (Err(e), _) | (_, Err(e)) => {
+            log!("{e}; exiting");
+            return;
+        }
+    };
     // Every `ldg up` starts a daemon; only one per container may run, or they
     // fight over the same local ports. The lock lives as long as this process.
-    let _lock = match acquire_lock(&lock_path(container_id)) {
+    let _lock = match acquire_lock(&lock_file) {
         Ok(Some(lock)) => Some(lock),
         Ok(None) => {
             log!("already running for this container; exiting");
@@ -56,9 +63,8 @@ pub fn run_daemon(container_id: &str, target: &Target, ports: &[String]) {
     if let Err(e) = truncate_log(container_id) {
         log!("could not start a new log ({e}); appending");
     }
-    let rt = runtime::connect(target);
     let container = rt.container(container_id);
-    let mut forwards = Forwards::new(container.as_ref(), target, ports_path(container_id));
+    let mut forwards = Forwards::new(container.as_ref(), target, ports_file);
     let mut unreachable = 0;
 
     loop {

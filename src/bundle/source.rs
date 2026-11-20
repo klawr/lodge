@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use super::hash::hash_path;
 use super::manifest::{BIN_DIR, CONFIG_DIR, FORMAT, LIB_DIR, Manifest};
-use super::{archive, cache, deps, pack};
+use super::{archive, cache, deps, elf, pack};
 use crate::bundle::arch::Arch;
 use crate::config::Config;
 use crate::fingerprint::Fingerprint;
@@ -108,7 +108,9 @@ fn from_file(root: &Path, file: &Path) -> Result<Prepared> {
 }
 
 fn live(root: &Path, config: &Config) -> Result<Prepared> {
-    let dir = root.join(format!("p-{}", inputs_fingerprint(config)?));
+    // Shared by the fingerprint and the pack, so `ldd` runs once per binary.
+    let mut deps = deps::Resolver::default();
+    let dir = root.join(format!("p-{}", inputs_fingerprint(config, &mut deps)?));
     if let Some(manifest) = cache::load(&dir) {
         return Ok(Prepared {
             dir,
@@ -117,7 +119,7 @@ fn live(root: &Path, config: &Config) -> Result<Prepared> {
         });
     }
     let staging = cache::staging(root, "pack")?;
-    let manifest = pack::build(config, staging.path())?;
+    let manifest = pack::build(config, staging.path(), &mut deps)?;
     Ok(Prepared {
         dir: cache::install(staging, &dir)?,
         manifest,
@@ -127,15 +129,12 @@ fn live(root: &Path, config: &Config) -> Result<Prepared> {
 
 /// A fingerprint of everything a live pack depends on. Packing is skipped when it
 /// is unchanged.
-fn inputs_fingerprint(config: &Config) -> Result<String> {
+fn inputs_fingerprint(config: &Config, deps: &mut deps::Resolver) -> Result<String> {
+    let host = Arch::host()?;
     let mut h = Fingerprint::new();
     h.field(env!("CARGO_PKG_VERSION").as_bytes())
         .field(FORMAT.to_string().as_bytes())
-        .field(
-            Arch::from_uname(std::env::consts::ARCH)
-                .map_or_else(String::new, |a| a.to_string())
-                .as_bytes(),
-        );
+        .field(host.to_string().as_bytes());
 
     let mut parts = Vec::new();
     for item in &config.inject {
@@ -145,11 +144,10 @@ fn inputs_fingerprint(config: &Config) -> Result<String> {
         ));
         if let Some(binary) = &item.binary {
             // Before ldd, which cannot inspect a binary for another architecture.
-            pack::check_arch(&item.name, binary, pack::host_arch()?)?;
+            elf::check_arch(&item.name, binary, host)?;
             parts.push(stat_line(binary)?);
             if item.copy_deps {
-                let deps = deps::resolve(&binary.to_string_lossy())?;
-                for lib in &deps.libs {
+                for lib in &deps.resolve(&binary.to_string_lossy())?.libs {
                     parts.push(stat_line(lib)?);
                 }
             }
@@ -292,12 +290,12 @@ mod tests {
         let mut b = config(vec![]);
         b.aliases.insert("ll".into(), "ls -la".into());
         assert_ne!(
-            inputs_fingerprint(&a).unwrap(),
-            inputs_fingerprint(&b).unwrap()
+            inputs_fingerprint(&a, &mut deps::Resolver::default()).unwrap(),
+            inputs_fingerprint(&b, &mut deps::Resolver::default()).unwrap()
         );
         assert_eq!(
-            inputs_fingerprint(&a).unwrap(),
-            inputs_fingerprint(&config(vec![])).unwrap()
+            inputs_fingerprint(&a, &mut deps::Resolver::default()).unwrap(),
+            inputs_fingerprint(&config(vec![]), &mut deps::Resolver::default()).unwrap()
         );
     }
 

@@ -1,8 +1,7 @@
 //! Where a project lives: on this machine, or on a remote host reached over SSH.
 //!
 //! This is the single place that answers "local or remote?". Everything else
-//! takes a [`Target`] (or a [`Runtime`](crate::runtime::Runtime), which holds one)
-//! rather than a bare `--remote` string, so adding a new operation means
+//! takes a [`Target`] rather than a bare `--remote` string, so adding a new operation means
 //! handling the two cases once, here, instead of in every caller.
 
 use anyhow::{Context, Result};
@@ -37,6 +36,14 @@ impl Target {
             Self::Local => None,
             Self::Ssh(host) => Some(host),
         }
+    }
+
+    /// `" on <host>"` for a remote target, nothing for a local one: the tail of
+    /// a message about where something was (not) found.
+    pub fn on_host(&self) -> String {
+        self.ssh_host()
+            .map(|h| format!(" on {h}"))
+            .unwrap_or_default()
     }
 
     /// Runs `sh -c <script>` on the project's host and captures its output.

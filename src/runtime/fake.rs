@@ -6,7 +6,7 @@
 //! without an engine.
 //!
 //! It is deliberately strict. It emulates a small set of commands (`cat`, `cp`,
-//! `test`, `printenv`, `command -v`, [`Env::read_file`], and the no-output file
+//! `test`, `printenv`, `command -v`, [`Env::read_file`], [`Env::exists`], and the no-output file
 //! operations), and a test declares anything else it depends on
 //! (`with_output`, `with_failure`, `with_commands`). A command it neither
 //! emulates nor was told about **panics**, naming the command, so a test can't
@@ -28,7 +28,6 @@ use std::rc::Rc;
 use super::{
     BuildSpec, Compose, Container, Containers, Env, ExecOpts, Listed, Output, Runtime, User,
 };
-use crate::target::Target;
 
 /// Who a recorded command ran as ([`User`] without the borrow).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +188,10 @@ impl FakeEnv {
                     fail()
                 }
             }
+            ["sh", "-c", script, path] if *script == super::EXISTS_SCRIPT => {
+                let found = self.files.borrow().contains_key(*path);
+                ok(if found { "y" } else { "n" }.into())
+            }
             ["sh", "-c", script, path] if *script == super::READ_FILE_SCRIPT => {
                 match self.file(path) {
                     Some(text) => ok(format!("y{text}")),
@@ -284,7 +287,6 @@ pub struct FakeRuntime {
     /// Compose projects that are up.
     projects: RefCell<Vec<String>>,
     ops: RefCell<Vec<String>>,
-    target: Target,
 }
 
 impl FakeRuntime {
@@ -295,7 +297,6 @@ impl FakeRuntime {
             containers: RefCell::default(),
             projects: RefCell::default(),
             ops: RefCell::default(),
-            target: Target::Local,
         }
     }
 
@@ -326,10 +327,6 @@ impl FakeRuntime {
 }
 
 impl Runtime for FakeRuntime {
-    fn target(&self) -> &Target {
-        &self.target
-    }
-
     /// Panics for a container that doesn't exist: lodge only asks for handles
     /// to containers it found.
     fn container(&self, id: &str) -> Box<dyn Container> {

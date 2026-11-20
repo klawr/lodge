@@ -1,7 +1,8 @@
 //! Resolving and placing the declared secrets for one container, honouring each
 //! secret's `targets`. Prints names, never values.
 
-use super::{SecretDecl, place, resolve};
+use super::{place, resolve};
+use crate::config::secret::SecretDecl;
 use crate::output::{info, note, warning};
 use crate::runtime::{Container, ContainerUser};
 use crate::target::Target;
@@ -43,9 +44,7 @@ pub fn deliver(
         return Ok(String::new());
     }
     let hosts = host_names(target);
-    let name = container
-        .name()
-        .unwrap_or_else(|| container.id().to_string());
+    let name = container.display_name();
 
     let (wanted, skipped): (Vec<&SecretDecl>, Vec<&SecretDecl>) =
         decls.iter().partition(|d| d.applies_to(&hosts, &name));

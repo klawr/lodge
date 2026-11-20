@@ -29,7 +29,13 @@ pub fn spawn_daemon(container: &str, target: &Target, static_ports: &[PortForwar
         }
     };
 
-    let log = log_path(container);
+    let log = match log_path(container) {
+        Ok(l) => l,
+        Err(e) => {
+            warning!("cannot start port forwarding: {e}");
+            return;
+        }
+    };
     let log_file = match open_log(&log) {
         Ok(f) => f,
         Err(e) => {
@@ -89,7 +95,7 @@ fn write_ports(path: &Path, lines: &[String]) -> std::io::Result<()> {
 fn truncate_log(container: &str) -> std::io::Result<()> {
     std::fs::OpenOptions::new()
         .write(true)
-        .open(log_path(container))?
+        .open(log_path(container)?)?
         .set_len(0)
 }
 
@@ -104,11 +110,12 @@ pub struct ActivePort {
 
 /// The forwards the daemon for `container` has active, if it is running. `None`
 /// when no daemon is running (none started, or the one that wrote the file died).
-pub fn active_ports(container_id: &str) -> Option<Vec<ActivePort>> {
-    parse_ports(
-        &std::fs::read_to_string(ports_path(container_id)).ok()?,
-        is_daemon,
-    )
+/// An error only when there is nowhere the daemon could keep its state.
+pub fn active_ports(container_id: &str) -> std::io::Result<Option<Vec<ActivePort>>> {
+    let Ok(text) = std::fs::read_to_string(ports_path(container_id)?) else {
+        return Ok(None);
+    };
+    Ok(parse_ports(&text, is_daemon))
 }
 
 /// Whether `pid` is a running `ldg _forward`. Read from /proc rather than by
@@ -140,24 +147,31 @@ fn parse_ports(text: &str, alive: impl Fn(u32) -> bool) -> Option<Vec<ActivePort
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn state_path(container: &str, extension: &str) -> PathBuf {
+/// `~/.local/share/lodge/forward-<id>.<extension>`; an error when this system
+/// has no data directory (rather than a guess relative to wherever lodge runs).
+fn state_path(container: &str, extension: &str) -> std::io::Result<PathBuf> {
     let short = container.get(..12).unwrap_or(container);
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from(".local/share"))
+    let dir = dirs::data_local_dir().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "this system has no data directory for the port-forwarding state",
+        )
+    })?;
+    Ok(dir
         .join("lodge")
-        .join(format!("forward-{short}.{extension}"))
+        .join(format!("forward-{short}.{extension}")))
 }
 
 /// The port-forward daemon's log for `container`.
-pub fn log_path(container: &str) -> PathBuf {
+pub fn log_path(container: &str) -> std::io::Result<PathBuf> {
     state_path(container, "log")
 }
 
-fn ports_path(container: &str) -> PathBuf {
+fn ports_path(container: &str) -> std::io::Result<PathBuf> {
     state_path(container, "ports")
 }
 
-fn lock_path(container: &str) -> PathBuf {
+fn lock_path(container: &str) -> std::io::Result<PathBuf> {
     state_path(container, "lock")
 }
 

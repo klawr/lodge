@@ -21,11 +21,13 @@ pub(super) fn inject_config(
     let target = user.expand_home(&config.target);
     let key = format!("{name}.config");
 
+    // Asked strictly: a wrong "missing" would replace a tree the user
+    // protected with `skip_if_exists`.
     let decision = decide(
         env,
         &key,
         &config.hash,
-        env.path_exists(&target),
+        env.exists(&target)?,
         tool.skip_if_exists,
     );
     if decision != Decision::Install {
@@ -50,7 +52,7 @@ pub(super) fn inject_config(
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/".to_string());
-    if !user.is_root() && user.owns_path(&target) {
+    if !user.is_root() && user.is_in_home(&target) {
         env.exec(
             &["mkdir", "-p", &parent],
             &ExecOpts {

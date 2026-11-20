@@ -1,6 +1,6 @@
 //! The seam between lodge and whatever runs the workload.
 //!
-//! Three small traits, from narrow to broad:
+//! Three small traits, from narrow to broad, plus one for compose:
 //!
 //! - [`Env`]: a place you can run commands in and copy files into. Injection,
 //!   features, lifecycle hooks and the stored config hash only need this, so
@@ -8,11 +8,13 @@
 //! - [`Container`]: an `Env` that can also be inspected (name, mounts, address).
 //!   Port forwarding and workdir selection need this.
 //! - [`Runtime`]: the engine itself: find, build, run, start, stop. Devcontainer
-//!   backends need this; the compose backend also needs the engine's
-//!   [`Compose`].
+//!   backends need this.
+//! - [`Compose`]: an engine's compose support, which only the compose backend
+//!   needs.
 //!
-//! [`docker`] implements all three over the `docker` CLI (locally or over SSH);
-//! [`fake`] is an in-memory `Env` for tests.
+//! [`docker`] implements all four over the `docker` CLI (locally or over SSH).
+//! [`fake`] has the test doubles: `FakeEnv`, an in-memory `Env`, and
+//! `FakeRuntime`, an engine (with compose) whose containers each run in one.
 
 pub mod docker;
 #[cfg(test)]
@@ -41,6 +43,10 @@ pub const WRITE_SECRET_SCRIPT: &str = "umask 077; t=\"$0.tmp.$$\"; \
 /// and the contents, or `n` when there is no such file, and exits 0 either way,
 /// so a non-zero exit means the read itself failed.
 pub const READ_FILE_SCRIPT: &str = "if [ -f \"$0\" ]; then printf y; cat \"$0\"; else printf n; fi";
+
+/// The `sh -c` script behind [`Env::exists`]: `$0` is the path. Prints `y` or
+/// `n` and exits 0 either way, so a non-zero exit means the check itself failed.
+pub const EXISTS_SCRIPT: &str = "if [ -e \"$0\" ]; then printf y; else printf n; fi";
 
 /// How a command is run: as whom, from where, with what extra environment.
 #[derive(Debug, Default, Clone, Copy)]
@@ -128,14 +134,23 @@ pub trait Env {
             .is_ok_and(|o| o.success)
     }
 
-    /// True if `path` is a regular file.
+    /// True if `path` is a regular file. `false` also when the environment
+    /// couldn't be asked: only for checks where a wrong "no" is harmless (it
+    /// just repeats a copy). Otherwise use [`exists`](Self::exists).
     fn file_exists(&self, path: &str) -> bool {
         self.succeeds(&["test", "-f", path])
     }
 
-    /// True if `path` exists (file or directory).
-    fn path_exists(&self, path: &str) -> bool {
-        self.succeeds(&["test", "-e", path])
+    /// Whether `path` exists (file or directory), as root. An error means it
+    /// could not be found out, which callers must not mistake for "missing".
+    fn exists(&self, path: &str) -> Result<bool> {
+        let out = self.output(&["sh", "-c", EXISTS_SCRIPT, path], &ExecOpts::root())?;
+        match (out.success, out.stdout.as_str()) {
+            (true, "y") => Ok(true),
+            (true, "n") => Ok(false),
+            (true, _) => bail!("checking {path} failed: unexpected output"),
+            (false, _) => bail!("checking {path} failed: {}", out.stderr.trim()),
+        }
     }
 
     /// True if `cmd` is on `PATH`.
@@ -206,6 +221,11 @@ pub trait Container: Env {
     /// Resolves a peer by name (a compose service, container name or network
     /// alias) to an address reachable from the engine host.
     fn resolve_peer(&self, host: &str) -> Option<String>;
+
+    /// The name to show for it: its name, or its id when it has none.
+    fn display_name(&self) -> String {
+        self.name().unwrap_or_else(|| self.id().to_string())
+    }
 }
 
 /// An image to build before running a devcontainer.
@@ -238,9 +258,6 @@ pub struct Listed {
 
 /// A container engine.
 pub trait Runtime {
-    /// Where the engine runs (and so where project files must be read).
-    fn target(&self) -> &Target;
-
     /// A handle for the container with this id or name.
     fn container(&self, id: &str) -> Box<dyn Container>;
 

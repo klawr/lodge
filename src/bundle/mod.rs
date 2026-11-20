@@ -30,9 +30,10 @@ use std::path::Path;
 
 use manifest::Manifest;
 
-/// The file name `ldg pack` uses when none is given: `lodge-<arch>.tar`.
-pub fn default_file_name() -> String {
-    format!("lodge-{}.tar", std::env::consts::ARCH)
+/// The file name `ldg pack` uses when none is given: `lodge-<arch>.tar`, with
+/// the architecture named as the manifest names it.
+pub fn default_file_name() -> Result<String> {
+    Ok(format!("lodge-{}.tar", arch::Arch::host()?))
 }
 
 /// Checks that the bundle at `file` is intact: every file the manifest lists is

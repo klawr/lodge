@@ -22,8 +22,23 @@ fn create_new(
     name: &str,
     create: impl Fn(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<PathBuf> {
+    create_new_from(
+        parent,
+        name,
+        &mut || COUNTER.fetch_add(1, Ordering::Relaxed),
+        create,
+    )
+}
+
+/// [`create_new`] with the `n`s drawn from `next`.
+fn create_new_from(
+    parent: &Path,
+    name: &str,
+    next: &mut dyn FnMut() -> u64,
+    create: impl Fn(&Path) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
     for _ in 0..ATTEMPTS {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let n = next();
         let path = parent.join(format!("lodge-{}-{n}-{name}", std::process::id()));
         match create(&path) {
             Ok(()) => return Ok(path),
@@ -35,6 +50,17 @@ fn create_new(
         std::io::ErrorKind::AlreadyExists,
         format!("no free name for {name} in {}", parent.display()),
     ))
+}
+
+/// Creates the file `p`, owner-only, failing if anything (a symlink included)
+/// is already there.
+fn create_private_file(p: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(p)
+        .map(drop)
 }
 
 /// A temp file that deletes itself on drop, so an error that short-circuits an
@@ -52,14 +78,11 @@ impl TempFile {
 
     /// Like [`write`](Self::write) but in `dir`.
     pub fn write_in(dir: &Path, name: &str, contents: &[u8]) -> Result<Self> {
-        let path = create_new(dir, name, |p| {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(p)
-                .map(drop)
-        })?;
+        Self::fill(create_new(dir, name, create_private_file)?, contents)
+    }
+
+    /// Takes ownership of the new, empty file at `path` and writes `contents`.
+    fn fill(path: PathBuf, contents: &[u8]) -> Result<Self> {
         // Owned from here on, so a failed write still removes the file.
         let file = Self { path };
         std::fs::OpenOptions::new()
@@ -129,7 +152,7 @@ pub fn discard_dir(path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{TempDir, TempFile};
+    use super::{TempDir, TempFile, create_new_from, create_private_file};
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -139,20 +162,27 @@ mod tests {
             std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        // A name planted in advance (here: a symlink to a file of someone
-        // else's) is skipped, not written through.
+        // Names planted in advance (here: symlinks to a file of someone
+        // else's) are skipped, not written through. The counter is the test's
+        // own, so the planted names are exactly the ones tried first.
         let victim = dir.path().join("victim");
         std::fs::write(&victim, "keep").unwrap();
-        // The next names are all taken (other tests share the counter, so
-        // more than one is planted).
-        let n = super::COUNTER.load(std::sync::atomic::Ordering::Relaxed);
-        for k in n..n + 20 {
-            let planted = dir
-                .path()
-                .join(format!("lodge-{}-{k}-x", std::process::id()));
-            std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        let name = |k: u64| format!("lodge-{}-{k}-x", std::process::id());
+        for k in 0..3 {
+            std::os::unix::fs::symlink(&victim, dir.path().join(name(k))).unwrap();
         }
-        let f = TempFile::write_in(dir.path(), "x", b"new").unwrap();
+        let mut n = 0;
+        let mut next = || {
+            n += 1;
+            n - 1
+        };
+        let path = create_new_from(dir.path(), "x", &mut next, create_private_file).unwrap();
+        assert_eq!(
+            path,
+            dir.path().join(name(3)),
+            "the planted names were tried"
+        );
+        let f = TempFile::fill(path, b"new").unwrap();
         assert!(!f.path().is_symlink());
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
         assert_eq!(

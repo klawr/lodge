@@ -1,5 +1,5 @@
-//! Change detection: has `.devcontainer/` drifted since this container was
-//! created?
+//! Drift detection: have the devcontainer's inputs (`.devcontainer/`, and the
+//! files it names outside it) changed since this container was created?
 //!
 //! A fingerprint of the config inputs is stored *inside* the container, so it
 //! survives reboots and is discarded automatically when the container is
@@ -59,21 +59,21 @@ pub(super) fn config_state(env: &dyn Env, current: &str) -> ConfigState {
 
 // ── change detection ───────────────────────────────────────────────────────────
 
-// Hashes the inputs that define the container: the whole `.devcontainer/`
-// directory when the config lives in one (Dockerfile, compose file, scripts, …),
-// otherwise the standalone config, plus any `extra` files the backend declares
-// (compose files kept elsewhere). The files are read from the project's host
-// (copied over ssh with `--remote`) and hashed here, so local and remote
-// projects get the same answer for the same files.
+// Hashes the inputs that define the container: the folder the config lives in
+// when that is `.devcontainer/` or one of its subfolders
+// (`.devcontainer/<name>/devcontainer.json`), with everything in it (Dockerfile,
+// compose file, scripts, …); otherwise the standalone `.devcontainer.json`. Plus
+// any `extra` files the backend declares (a Dockerfile or compose files kept
+// elsewhere). The files are read from the project's host (copied over ssh with
+// `--remote`) and hashed here, so local and remote projects get the same answer
+// for the same files.
 pub(super) fn hash_inputs(
     config_path: &Path,
     extra: &[PathBuf],
     target: &Target,
 ) -> Result<String> {
     let mut entries: Vec<(String, Vec<u8>)> = vec![];
-    let devcontainer_dir = config_path
-        .parent()
-        .filter(|p| p.file_name() == Some(OsStr::new(".devcontainer")));
+    let devcontainer_dir = config_folder(config_path);
 
     let mut files: Vec<PathBuf> = Vec::new();
     // Kept alive until hashing is done: a remote directory is copied into it.
@@ -109,6 +109,15 @@ pub(super) fn hash_inputs(
         h.field(name.as_bytes()).put(bytes).put(&[0xff]);
     }
     Ok(h.hex())
+}
+
+/// The folder hashed whole for the config at `config_path`: `.devcontainer/`,
+/// or the `.devcontainer/<name>/` it is in. `None` for a standalone
+/// `.devcontainer.json`.
+fn config_folder(config_path: &Path) -> Option<&Path> {
+    let dir = config_path.parent()?;
+    let is_devcontainer = |p: &Path| p.file_name() == Some(OsStr::new(".devcontainer"));
+    (is_devcontainer(dir) || dir.parent().is_some_and(is_devcontainer)).then_some(dir)
 }
 
 // devcontainer.json is JSONC; canonicalize it before hashing so comment-only
@@ -183,6 +192,43 @@ mod tests {
             hash_inputs(&dc.join("devcontainer.json"), &[], &Target::Local).unwrap(),
             "2b104ffc92d7fc62"
         );
+    }
+
+    #[test]
+    fn a_subfolder_config_hashes_its_folder_not_its_siblings() {
+        let tmp = crate::tmpfile::TempDir::new("dc-sub").unwrap();
+        let dc = tmp.path().join(".devcontainer");
+        for (f, body) in [
+            ("py/devcontainer.json", "{}"),
+            ("py/Dockerfile", "FROM a\n"),
+            ("go/devcontainer.json", "{}"),
+        ] {
+            std::fs::create_dir_all(dc.join(f).parent().unwrap()).unwrap();
+            std::fs::write(dc.join(f), body).unwrap();
+        }
+        let config = dc.join("py/devcontainer.json");
+        let before = hash_inputs(&config, &[], &Target::Local).unwrap();
+        std::fs::write(dc.join("go/devcontainer.json"), r#"{"a":1}"#).unwrap();
+        assert_eq!(hash_inputs(&config, &[], &Target::Local).unwrap(), before);
+        std::fs::write(dc.join("py/Dockerfile"), "FROM b\n").unwrap();
+        assert_ne!(
+            hash_inputs(&config, &[], &Target::Local).unwrap(),
+            before,
+            "the Dockerfile beside the config counts"
+        );
+    }
+
+    #[test]
+    fn only_devcontainer_folders_are_hashed_whole() {
+        assert_eq!(
+            config_folder(Path::new("/p/.devcontainer/devcontainer.json")),
+            Some(Path::new("/p/.devcontainer"))
+        );
+        assert_eq!(
+            config_folder(Path::new("/p/.devcontainer/py/devcontainer.json")),
+            Some(Path::new("/p/.devcontainer/py"))
+        );
+        assert_eq!(config_folder(Path::new("/p/.devcontainer.json")), None);
     }
 
     #[test]

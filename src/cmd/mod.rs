@@ -129,7 +129,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
                 .context("writing the man page")?;
         }
         Command::Forward { container, port } => {
-            crate::forward::run_daemon(&container, &ctx.target, &port);
+            crate::forward::run_daemon(ctx.rt.as_ref(), &ctx.target, &container, &port);
         }
     }
     Ok(ExitCode::SUCCESS)

@@ -27,7 +27,7 @@ pub(super) fn inject_binary(
         env,
         &key,
         &binary.hash,
-        env.file_exists(&installed),
+        env.exists(&installed)?,
         tool.skip_if_exists,
     ) {
         Decision::UpToDate => {

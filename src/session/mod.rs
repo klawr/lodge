@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 /// Where and how to open the session.
 pub struct Session<'a> {
-    /// The tmux session name.
+    /// The tmux session name, already made of letters, digits and `-`
+    /// ([`crate::shell::slug`]), which tmux takes as is.
     pub name: &'a str,
     pub workdir: &'a str,
     /// Who the shell runs as.
@@ -36,9 +37,7 @@ pub fn enter(
     // `container` may be a raw hex id for compose-based devcontainers, which
     // makes an unreadable title — resolve it back to the engine-assigned name
     // where possible.
-    let title = container
-        .name()
-        .unwrap_or_else(|| container.id().to_string());
+    let title = container.display_name();
 
     // Setting the terminal title *before* `docker exec`/`ssh` runs doesn't
     // stick: kitty (and others) track the foreground process of the pty and
@@ -110,17 +109,15 @@ pub fn enter(
 // from inside tmux, we must not nest — `attach-session` refuses that — so we
 // `switch-client` the current client to the lodge session instead. Outside
 // tmux we attach normally.
-fn enter_tmux(session_name: &str, run_cmd: &str) -> Result<()> {
-    let session = crate::shell::slug(session_name);
-
+fn enter_tmux(session: &str, run_cmd: &str) -> Result<()> {
     // Create the session detached if it doesn't already exist (idempotent): a
     // failure just means the session is already there.
-    tmux_best_effort(&["new-session", "-d", "-s", &session, run_cmd]);
+    tmux_best_effort(&["new-session", "-d", "-s", session, run_cmd]);
 
     // New windows in this session also exec into the container.
     crate::host_tools::TMUX
         .command()
-        .args(["set-option", "-t", &session, "default-command", run_cmd])
+        .args(["set-option", "-t", session, "default-command", run_cmd])
         .status()?;
 
     // `run_cmd` sets the pane title via OSC once it's running (see `enter`);
@@ -128,8 +125,8 @@ fn enter_tmux(session_name: &str, run_cmd: &str) -> Result<()> {
     // own title machinery (which defaults to showing the session/window name)
     // in charge of it.
     // Cosmetic: without these the title is merely less pretty.
-    tmux_best_effort(&["set-option", "-t", &session, "set-titles", "on"]);
-    tmux_best_effort(&["set-option", "-t", &session, "set-titles-string", "#T"]);
+    tmux_best_effort(&["set-option", "-t", session, "set-titles", "on"]);
+    tmux_best_effort(&["set-option", "-t", session, "set-titles-string", "#T"]);
 
     let already_in_tmux = std::env::var_os("TMUX").is_some();
     let action = if already_in_tmux {
@@ -139,7 +136,7 @@ fn enter_tmux(session_name: &str, run_cmd: &str) -> Result<()> {
     };
     let status = crate::host_tools::TMUX
         .command()
-        .args([action, "-t", &session])
+        .args([action, "-t", session])
         .status()?;
     if !status.success() {
         bail!("tmux {action} -t {session} failed");

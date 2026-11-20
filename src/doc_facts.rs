@@ -42,10 +42,17 @@ fn the_readme_shows_every_command() {
 
 #[test]
 fn the_architecture_lists_every_command() {
+    // The command list itself (the first code block of its section), not any
+    // mention elsewhere in the document.
     let arch = read("docs/architecture.md");
+    let section = &arch[arch
+        .find("## Commands and control flow")
+        .expect("a Commands and control flow section")..];
+    let start = section.find("```\n").expect("a code block") + 4;
+    let list = &section[start..start + section[start..].find("```").expect("its end")];
     let missing: Vec<String> = subcommands()
         .into_iter()
-        .filter(|c| !arch.contains(&format!("ldg {c}")))
+        .filter(|c| !list.contains(&format!("ldg {c}")))
         .collect();
     assert!(
         missing.is_empty(),

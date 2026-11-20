@@ -1,6 +1,6 @@
 //! Just enough ELF to know which CPU a binary is built for.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::io::Read;
 use std::path::Path;
 
@@ -16,6 +16,22 @@ pub fn arch_of(path: &Path) -> Result<Option<Arch>> {
         return Ok(None); // shorter than an ELF header
     }
     Ok(arch_from_header(&header))
+}
+
+/// Refuses a binary built for another CPU than `host` (this machine's): it
+/// cannot be inspected with `ldd` here, and a bundle holds one architecture. A
+/// file that isn't ELF (a script) passes.
+pub fn check_arch(tool: &str, binary: &Path, host: Arch) -> Result<()> {
+    if let Some(arch) = arch_of(binary)?
+        && arch != host
+    {
+        bail!(
+            "{tool}: {} is built for {arch}, but this machine is {host}; \
+             pack on a {arch} machine",
+            binary.display()
+        );
+    }
+    Ok(())
 }
 
 fn arch_from_header(h: &[u8; 20]) -> Option<Arch> {
@@ -68,7 +84,7 @@ mod tests {
         // /bin/sh is an ELF file of the machine running the tests (or a script
         // on exotic systems, in which case there is nothing to compare).
         if let Ok(Some(arch)) = arch_of(Path::new("/bin/sh")) {
-            let host = Arch::from_uname(std::env::consts::ARCH);
+            let host = Arch::host().ok();
             assert!(host.is_none() || host == Some(arch));
         }
     }

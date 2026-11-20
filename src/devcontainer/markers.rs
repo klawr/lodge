@@ -7,9 +7,10 @@ use anyhow::Result;
 use crate::layout::MARKERS;
 use crate::runtime::Env;
 
-/// True if the one-shot task `key` already completed in `env`.
-pub(super) fn done(env: &dyn Env, key: &str) -> bool {
-    env.path_exists(&path(key))
+/// Whether the one-shot task `key` already completed in `env`; an error when
+/// the container can't be asked, which callers must not read as "not yet".
+pub(super) fn done(env: &dyn Env, key: &str) -> Result<bool> {
+    env.exists(&path(key))
 }
 
 /// Records that the one-shot task `key` completed.
@@ -39,10 +40,10 @@ mod tests {
     #[test]
     fn markers_make_hooks_run_once() {
         let env = FakeEnv::new();
-        assert!(!done(&env, "postCreate"));
+        assert!(!done(&env, "postCreate").unwrap());
         mark_done(&env, "postCreate").unwrap();
-        assert!(done(&env, "postCreate"));
-        assert!(!done(&env, "onCreate"));
+        assert!(done(&env, "postCreate").unwrap());
+        assert!(!done(&env, "onCreate").unwrap());
     }
 
     #[test]
@@ -53,8 +54,19 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_that_cannot_be_checked_is_an_error_not_missing() {
+        let env = FakeEnv::new().with_failure(&[
+            "sh",
+            "-c",
+            crate::runtime::EXISTS_SCRIPT,
+            "/opt/lodge/state/onCreate",
+        ]);
+        assert!(done(&env, "onCreate").is_err());
+    }
+
+    #[test]
     fn a_marker_from_an_earlier_run_is_respected() {
         let env = FakeEnv::new().with_file("/opt/lodge/state/onCreate", "");
-        assert!(done(&env, "onCreate"));
+        assert!(done(&env, "onCreate").unwrap());
     }
 }

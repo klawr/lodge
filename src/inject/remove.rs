@@ -1,8 +1,9 @@
 //! Taking an injection back out of a container (`ldg clean`).
 //!
 //! Removes what injection put there: the binaries, libraries and linker, the
-//! wrappers (only ones that still point at lodge), the shell setup and any
-//! placed secrets. Injected *configs* are left in place and reported, since the
+//! wrappers (only ones that still point at lodge) and the shell setup. Placed
+//! secrets are [`crate::secret`]'s to remove. Injected *configs* are left in
+//! place and reported, since the
 //! user may have changed them in the container. The devcontainer's own state
 //! (hook markers, the config hash, `containerEnv`) is kept, so a later `ldg up`
 //! neither re-runs create hooks nor thinks the config drifted.
@@ -35,10 +36,9 @@ fn script() -> String {
         .map(|p| crate::shell::shell_quote(p))
         .collect();
     format!(
-        "{wrappers} rm -rf {owned} {secrets}*; true",
+        "{wrappers} rm -rf {owned}; true",
         wrappers = remove_wrappers(WRAPPER_DIRS),
         owned = owned.join(" "),
-        secrets = crate::shell::shell_quote(layout::SECRETS_PREFIX),
     )
 }
 
@@ -91,7 +91,6 @@ mod tests {
         let s = script();
         assert!(s.contains("'/opt/lodge/bin'"));
         assert!(s.contains("'/lodge'"));
-        assert!(s.contains("'/dev/shm/lodge-secrets-'*"));
         assert!(s.contains("find /usr/local/bin"));
         // Hook markers, the config hash and containerEnv stay.
         assert!(!s.contains("/opt/lodge/state"));

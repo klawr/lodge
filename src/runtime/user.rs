@@ -126,8 +126,9 @@ impl ContainerUser {
         }
     }
 
-    /// Whether `path` is the home directory or inside it.
-    pub fn owns_path(&self, path: &str) -> bool {
+    /// Whether `path` is the home directory or inside it (by path, whoever
+    /// owns it).
+    pub fn is_in_home(&self, path: &str) -> bool {
         std::path::Path::new(path).starts_with(&self.home)
     }
 }
@@ -189,9 +190,9 @@ mod tests {
     }
 
     #[test]
-    fn owns_path_compares_whole_components() {
+    fn is_in_home_compares_whole_components() {
         let u = user("/home/dev");
-        assert!(u.owns_path("/home/dev/.config"));
-        assert!(!u.owns_path("/home/dev2/.config"));
+        assert!(u.is_in_home("/home/dev/.config"));
+        assert!(!u.is_in_home("/home/dev2/.config"));
     }
 }

@@ -142,8 +142,8 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
 
 /// Whether a declared secret's source resolves on this machine. The value is
 /// read to find out, then dropped; only the source's kind is shown.
-fn secret_check(decl: &crate::secret::SecretDecl) -> Check {
-    use crate::secret::Source;
+fn secret_check(decl: &crate::config::secret::SecretDecl) -> Check {
+    use crate::config::secret::Source;
     let source = match &decl.from {
         Source::Env(var) => format!("env {var}"),
         Source::File(path) => format!("file {}", path.display()),

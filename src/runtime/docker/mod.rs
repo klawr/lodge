@@ -39,8 +39,9 @@ impl DockerCli {
     /// Locally that's a plain `docker` invocation; for a remote target it becomes
     /// `ssh <host> docker <args>`. For remote commands stdin is closed
     /// (`/dev/null`) so ssh doesn't swallow the terminal; callers that need to
-    /// stream data override it. Traced at `-v`.
-    fn command(&self, args: &[&str]) -> Command {
+    /// stream data override it. Traced at `-v`. Every `docker` lodge runs is
+    /// built here or in [`command_in`](Self::command_in).
+    pub(super) fn command(&self, args: &[&str]) -> Command {
         let c = match &self.target {
             Target::Local => {
                 let mut c = Command::new("docker");
@@ -48,7 +49,7 @@ impl DockerCli {
                 c
             }
             Target::Ssh(host) => {
-                let mut c = crate::ssh::command(host, &remote_script(args));
+                let mut c = crate::ssh::command(host, &docker_line(args));
                 c.stdin(Stdio::null());
                 c
             }
@@ -75,7 +76,7 @@ impl DockerCli {
                 let cd = dir.map_or_else(String::new, |d| {
                     format!("cd {} && ", shell_quote(&d.to_string_lossy()))
                 });
-                crate::ssh::command(host, &format!("{cd}{}", remote_script(args)))
+                crate::ssh::command(host, &format!("{cd}{}", docker_line(args)))
             }
         };
         crate::output::trace(&c);
@@ -165,9 +166,9 @@ fn subcommand(args: &[&str]) -> String {
     }
 }
 
-/// Joins `docker <args>` into a single shell-quoted command line for the remote
-/// login shell that ssh hands the command to.
-pub(super) fn remote_script(args: &[&str]) -> String {
+/// Joins `docker <args>` into a single shell-quoted command line: what ssh
+/// hands the remote login shell, or what a local `sh -c` runs.
+pub(super) fn docker_line(args: &[&str]) -> String {
     let mut s = String::from("docker");
     for a in args {
         s.push(' ');
@@ -177,10 +178,6 @@ pub(super) fn remote_script(args: &[&str]) -> String {
 }
 
 impl Runtime for DockerCli {
-    fn target(&self) -> &Target {
-        &self.target
-    }
-
     fn container(&self, id: &str) -> Box<dyn Container> {
         Box::new(DockerContainer {
             cli: self.clone(),
@@ -327,7 +324,7 @@ fn parse_listed(out: &str) -> Vec<Listed> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_listed, remote_script, subcommand};
+    use super::{docker_line, parse_listed, subcommand};
 
     #[test]
     fn parses_listed_containers() {
@@ -347,9 +344,9 @@ mod tests {
     }
 
     #[test]
-    fn remote_script_quotes_each_arg() {
+    fn docker_line_quotes_each_arg() {
         assert_eq!(
-            remote_script(&["exec", "my container", "sh"]),
+            docker_line(&["exec", "my container", "sh"]),
             "docker 'exec' 'my container' 'sh'"
         );
     }

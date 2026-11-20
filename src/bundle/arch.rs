@@ -15,6 +15,14 @@ pub enum Arch {
 }
 
 impl Arch {
+    /// This machine's architecture: what `ldg pack` builds for. An error on a
+    /// CPU lodge doesn't know.
+    pub fn host() -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        Self::from_uname(std::env::consts::ARCH)
+            .with_context(|| format!("unsupported host architecture {}", std::env::consts::ARCH))
+    }
+
     /// Parses `uname -m` output (`x86_64`, `aarch64`, `arm64`, `armv7l`, …).
     pub fn from_uname(s: &str) -> Option<Self> {
         let s = s.trim();

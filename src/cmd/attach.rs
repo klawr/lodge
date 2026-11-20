@@ -21,7 +21,13 @@ pub fn up(
     let config = ctx.config()?;
     // Ready the bundle first, so a problem with it fails before anything starts.
     let prepared = bundle::source::prepare(&config, bundle_file)?;
-    let started = devcontainer::start(&project, opts, ctx.rt.as_ref(), &super::prompt::Terminal)?;
+    let started = devcontainer::start(
+        &project,
+        &ctx.target,
+        opts,
+        ctx.rt.as_ref(),
+        &super::prompt::Terminal,
+    )?;
     let container = started.container.as_ref();
     // After `start`, which may have changed the user's uid.
     let user = ContainerUser::resolve(container, started.remote_user.as_deref())?;
@@ -65,7 +71,8 @@ pub fn exec(
         container.as_ref(),
         &config,
         &user,
-        &format!("lodge-{name}"),
+        // A tmux session name: letters, digits and `-` only.
+        &format!("lodge-{}", crate::shell::slug(name)),
         workdir,
     )
 }

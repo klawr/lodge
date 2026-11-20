@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result, bail};
 
-use super::{DockerCli, remote_script};
+use super::{DockerCli, docker_line};
 use crate::runtime::{Container, Env, ExecOpts, Output, User};
 use crate::target::Target;
 
@@ -178,7 +178,7 @@ impl Env for DockerContainer {
         let mut args = self.exec_args(&["sh", "-c", inner], &opts);
         args.insert(1, "-it".into());
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let exec = remote_script(&refs);
+        let exec = docker_line(&refs);
         match &self.cli.target {
             Target::Local => exec,
             // Run the docker CLI *on the remote* over `ssh -tt`.

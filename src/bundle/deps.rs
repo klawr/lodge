@@ -1,8 +1,11 @@
+//! Which shared libraries a binary needs, and its dynamic linker, from `ldd`.
+
 use crate::output::warning;
 use anyhow::{Context, Result, bail};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+#[derive(Clone)]
 pub struct Deps {
     pub libs: Vec<PathBuf>,
     pub linker: Option<PathBuf>,
@@ -14,7 +17,26 @@ impl Deps {
     }
 }
 
-pub fn resolve(binary: &str) -> Result<Deps> {
+/// Asks `ldd` about each binary once, however often it is asked: a live pack
+/// needs the answer for the cache key and again to pack, and a missing library
+/// is warned about once.
+#[derive(Default)]
+pub struct Resolver {
+    known: HashMap<String, Deps>,
+}
+
+impl Resolver {
+    pub fn resolve(&mut self, binary: &str) -> Result<Deps> {
+        if let Some(deps) = self.known.get(binary) {
+            return Ok(deps.clone());
+        }
+        let deps = run_ldd(binary)?;
+        self.known.insert(binary.to_string(), deps.clone());
+        Ok(deps)
+    }
+}
+
+fn run_ldd(binary: &str) -> Result<Deps> {
     let mut cmd = crate::host_tools::LDD.command();
     cmd.arg(binary);
     crate::output::trace(&cmd);

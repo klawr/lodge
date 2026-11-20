@@ -10,7 +10,10 @@ use crate::output::{info, line, note, plural};
 
 pub fn pack(ctx: &Ctx, output: Option<PathBuf>) -> Result<()> {
     let config = ctx.config()?;
-    let output = output.unwrap_or_else(|| PathBuf::from(bundle::default_file_name()));
+    let output = match output {
+        Some(o) => o,
+        None => PathBuf::from(bundle::default_file_name()?),
+    };
     let manifest = bundle::pack::pack_to_file(&config, &output)?;
     info!(
         "packed {} and {} for {} into {} (id {})",

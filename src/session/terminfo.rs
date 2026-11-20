@@ -63,7 +63,10 @@ fn host_dirs() -> Vec<PathBuf> {
 /// Whether the container can already resolve `term`.
 fn container_knows(env: &dyn Env, term: &str) -> bool {
     let first = term.chars().next().unwrap_or('x');
-    env.path_exists(&format!("{CONTAINER_DIR}/{first}/{term}")) || env.succeeds(&["infocmp", term])
+    // Best effort: a wrong "no" only copies the entry again.
+    env.exists(&format!("{CONTAINER_DIR}/{first}/{term}"))
+        .unwrap_or(false)
+        || env.succeeds(&["infocmp", term])
 }
 
 /// The `TERM` a session should use, or `None` to leave the container's default

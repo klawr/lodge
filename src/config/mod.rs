@@ -7,8 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::secret::{self, SecretDecl};
+pub mod secret;
+
 use crate::shell::{container_path_problem, is_alias_name, is_plain_name};
+use secret::SecretDecl;
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -135,12 +137,13 @@ pub fn expand_tilde(path: PathBuf) -> PathBuf {
     path
 }
 
-/// `~/.config/lodge/config.toml` (or the platform's equivalent).
-pub fn default_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.config"))
+/// `~/.config/lodge/config.toml` (or the platform's equivalent); an error
+/// when this system has no config directory (give the file with `-c`).
+pub fn default_path() -> Result<PathBuf> {
+    Ok(dirs::config_dir()
+        .context("this system has no config directory; give the config with -c")?
         .join("lodge")
-        .join("config.toml")
+        .join("config.toml"))
 }
 
 /// The config file for this run: `-c FILE`, which must exist, or the default
@@ -148,7 +151,7 @@ pub fn default_path() -> PathBuf {
 /// wherever lodge runs from.
 pub fn path_for(flag: Option<PathBuf>) -> Result<PathBuf> {
     let Some(path) = flag else {
-        return Ok(default_path());
+        return default_path();
     };
     let path = expand_tilde(path);
     if !path.is_file() {
@@ -241,9 +244,7 @@ impl Config {
                 ));
             }
         }
-        if let Err(e) = secret::validate_all(&self.secret) {
-            problems.push(format!("{e:#}"));
-        }
+        problems.extend(secret::problems(&self.secret));
         match problems.len() {
             0 => Ok(()),
             1 => anyhow::bail!("{}", problems[0]),

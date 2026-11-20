@@ -11,7 +11,6 @@ use std::path::Path;
 use std::process::Stdio;
 
 use super::container::DockerContainer;
-use super::remote_script;
 use crate::runtime::Env;
 use crate::shell::shell_quote;
 use crate::target::Target;
@@ -42,7 +41,7 @@ impl DockerContainer {
                 }
                 Ok(())
             }
-            Target::Ssh(host) => self.cp_in_remote(host, src, dest),
+            Target::Ssh(_) => self.cp_in_remote(src, dest),
         }
     }
 
@@ -50,7 +49,7 @@ impl DockerContainer {
     //   - a directory is tar'd locally and `docker cp -`'d into `dest` (the
     //     daemon unpacks the tar, so the container needs no tar);
     //   - a file is streamed straight into `dest` via `docker exec -i … cat`.
-    fn cp_in_remote(&self, host: &str, src: &str, dest: &str) -> Result<()> {
+    fn cp_in_remote(&self, src: &str, dest: &str) -> Result<()> {
         let meta = std::fs::metadata(src).with_context(|| format!("stat {src}"))?;
         if meta.is_dir() {
             // `docker cp -` extracts into an existing directory, so create it
@@ -58,9 +57,8 @@ impl DockerContainer {
             // `src` regardless of their basenames).
             self.mkdir_p(&[dest])?;
             let target = format!("{}:{dest}", self.id);
-            let mut ssh = crate::ssh::command(host, &remote_script(&["cp", "-", &target]));
+            let mut ssh = self.cli.command(&["cp", "-", &target]);
             ssh.stdin(Stdio::piped());
-            crate::output::trace(&ssh);
             let mut child = ssh.spawn().context("spawning ssh docker cp")?;
 
             // Pack straight into ssh's stdin. Symlinks are stored as symlinks,
@@ -96,10 +94,10 @@ impl DockerContainer {
             // `-u 0`: local `docker cp` writes as root via the daemon, so this
             // streaming fallback must too, or destinations under root-owned trees
             // (e.g. /opt/lodge) fail in images with an unprivileged default USER.
-            let script = remote_script(&["exec", "-u", "0", "-i", &self.id, "sh", "-c", &inner]);
-            let mut ssh = crate::ssh::command(host, &script);
+            let mut ssh = self
+                .cli
+                .command(&["exec", "-u", "0", "-i", &self.id, "sh", "-c", &inner]);
             ssh.stdin(Stdio::from(file));
-            crate::output::trace(&ssh);
             let status = ssh.status().context("spawning ssh docker exec for cp")?;
             if !status.success() {
                 bail!("docker cp (stream) failed: {} -> {}:{}", src, self.id, dest);

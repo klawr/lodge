@@ -4,18 +4,20 @@
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::{Ctx, print_json};
+use crate::config::Config;
 use crate::devcontainer::{self, ConfigState, Found};
 use crate::output::{info, line, note, warning};
-use crate::runtime::{Container, ContainerUser};
+use crate::runtime::{Container, ContainerUser, Runtime};
+use crate::target::Target;
 
 /// The project's container, or an error saying there is none.
 fn require(ctx: &Ctx, path: Option<PathBuf>) -> Result<Found> {
     let project = ctx.project(path)?;
-    devcontainer::find(&project, ctx.rt.as_ref())?.with_context(|| {
+    devcontainer::find(&project, &ctx.target, ctx.rt.as_ref())?.with_context(|| {
         format!(
             "no container for {} (run `ldg up` to create it)",
             project.display()
@@ -25,7 +27,7 @@ fn require(ctx: &Ctx, path: Option<PathBuf>) -> Result<Found> {
 
 pub fn down(ctx: &Ctx, path: Option<PathBuf>) -> Result<()> {
     let project = ctx.project(path)?;
-    match devcontainer::stop(&project, ctx.rt.as_ref())? {
+    match devcontainer::stop(&project, &ctx.target, ctx.rt.as_ref())? {
         Some(id) => info!("stopped {id}"),
         None => info!("no container exists for this devcontainer"),
     }
@@ -34,7 +36,7 @@ pub fn down(ctx: &Ctx, path: Option<PathBuf>) -> Result<()> {
 
 pub fn rm(ctx: &Ctx, path: Option<PathBuf>) -> Result<()> {
     let project = ctx.project(path)?;
-    match devcontainer::remove(&project, ctx.rt.as_ref())? {
+    match devcontainer::remove(&project, &ctx.target, ctx.rt.as_ref())? {
         Some(id) => info!("removed {id}"),
         None => info!("no container exists for this devcontainer"),
     }
@@ -44,84 +46,136 @@ pub fn rm(ctx: &Ctx, path: Option<PathBuf>) -> Result<()> {
 pub fn status(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<()> {
     let project = ctx.project(path)?;
     let config = ctx.config()?;
-    let Some((found, state)) = devcontainer::status(&project, ctx.rt.as_ref())? else {
-        if as_json {
-            return print_json(&json!({ "project": project, "container": null }));
-        }
-        line!("project    {}", project.display());
-        line!("container  none (run `ldg up` to create it)");
-        return Ok(());
-    };
-    let c = found.container.as_ref();
-    let running = c.is_running()?;
-    let name = c.name().unwrap_or_else(|| c.id().to_string());
-    // `None` when the container could not say.
-    let bundle = crate::inject::installed_bundle(c)
-        .map_err(|e| warning!("could not tell which bundle is installed: {e:#}"))
-        .ok();
-    // Which declared secrets are in place. They live in memory, so a stopped
-    // container has none; `None` when a running one could not say.
-    let secrets: Option<Vec<(String, bool)>> = if !running || config.secret.is_empty() {
-        Some(
-            config
-                .secret
-                .iter()
-                .map(|d| (d.name.clone(), false))
-                .collect(),
-        )
-    } else {
-        ContainerUser::resolve(c, found.remote_user.as_deref())
-            .and_then(|user| crate::secret::place::status(c, &user, &config.secret))
-            .map_err(|e| warning!("could not tell which secrets are placed: {e:#}"))
-            .ok()
-    };
-
+    let report = StatusReport::gather(&project, &ctx.target, ctx.rt.as_ref(), &config)?;
     if as_json {
-        return print_json(&json!({
-            "project": project,
-            "container": {
-                "id": c.id(),
-                "name": name,
-                "running": running,
-                "config": state,
-                "bundle": bundle.clone().flatten(),
-                "secrets": secrets.as_ref().map(|s| s.iter().map(|(n, p)| json!({"name": n, "placed": p})).collect::<Vec<_>>()),
-            },
-        }));
+        return print_json(&report.to_json());
     }
-    line!("project    {}", project.display());
-    line!(
-        "container  {name} ({})",
-        if running { "running" } else { "stopped" }
-    );
-    line!(
-        "config     {}",
-        match state {
-            ConfigState::UpToDate => "up to date",
-            ConfigState::Changed =>
-                "changed since the container was created (`ldg up` offers to recreate it)",
-            ConfigState::Unknown => "unknown (no recorded config, or it could not be read)",
-        }
-    );
-    match bundle {
-        Some(Some(id)) => line!("bundle     {id}"),
-        Some(None) => {}
-        None => line!("bundle     unknown"),
-    }
-    match secrets {
-        None => line!("secrets    unknown"),
-        Some(s) if s.is_empty() => {}
-        Some(s) => {
-            let shown: Vec<String> = s
-                .iter()
-                .map(|(n, placed)| {
-                    format!("{n} ({})", if *placed { "placed" } else { "not placed" })
-                })
-                .collect();
-            line!("secrets    {}", shown.join(", "));
-        }
+    for l in report.lines() {
+        line!("{l}");
     }
     Ok(())
+}
+
+/// What `ldg status` reports about a project.
+struct StatusReport {
+    project: PathBuf,
+    /// `None` when the project has no container.
+    container: Option<ContainerStatus>,
+}
+
+struct ContainerStatus {
+    id: String,
+    name: String,
+    running: bool,
+    config: ConfigState,
+    /// The bundle installed (`Some(None)`: none); `None` when the container
+    /// could not say.
+    bundle: Option<Option<String>>,
+    /// Each declared secret and whether it is placed; `None` when a running
+    /// container could not say.
+    secrets: Option<Vec<(String, bool)>>,
+}
+
+impl StatusReport {
+    fn gather(project: &Path, target: &Target, rt: &dyn Runtime, config: &Config) -> Result<Self> {
+        let Some((found, state)) = devcontainer::status(project, target, rt)? else {
+            return Ok(Self {
+                project: project.to_path_buf(),
+                container: None,
+            });
+        };
+        let c = found.container.as_ref();
+        let running = c.is_running()?;
+        let bundle = crate::inject::installed_bundle(c)
+            .map_err(|e| warning!("could not tell which bundle is installed: {e:#}"))
+            .ok();
+        // Secrets live in memory, so a stopped container has none.
+        let secrets = if !running || config.secret.is_empty() {
+            Some(
+                config
+                    .secret
+                    .iter()
+                    .map(|d| (d.name.clone(), false))
+                    .collect(),
+            )
+        } else {
+            ContainerUser::resolve(c, found.remote_user.as_deref())
+                .and_then(|user| crate::secret::place::status(c, &user, &config.secret))
+                .map_err(|e| warning!("could not tell which secrets are placed: {e:#}"))
+                .ok()
+        };
+        Ok(Self {
+            project: project.to_path_buf(),
+            container: Some(ContainerStatus {
+                id: c.id().to_string(),
+                name: c.display_name(),
+                running,
+                config: state,
+                bundle,
+                secrets,
+            }),
+        })
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let Some(c) = &self.container else {
+            return json!({ "project": self.project, "container": null });
+        };
+        json!({
+            "project": self.project,
+            "container": {
+                "id": c.id,
+                "name": c.name,
+                "running": c.running,
+                "config": c.config,
+                "bundle": c.bundle.clone().flatten(),
+                "secrets": c.secrets.as_ref().map(|s| {
+                    s.iter()
+                        .map(|(n, p)| json!({"name": n, "placed": p}))
+                        .collect::<Vec<_>>()
+                }),
+            },
+        })
+    }
+
+    /// The text report, one line each.
+    fn lines(&self) -> Vec<String> {
+        let mut out = vec![format!("project    {}", self.project.display())];
+        let Some(c) = &self.container else {
+            out.push("container  none (run `ldg up` to create it)".into());
+            return out;
+        };
+        let state = if c.running { "running" } else { "stopped" };
+        out.push(format!("container  {} ({state})", c.name));
+        out.push(format!(
+            "config     {}",
+            match c.config {
+                ConfigState::UpToDate => "up to date",
+                ConfigState::Changed =>
+                    "changed since the container was created (`ldg up` offers to recreate it)",
+                ConfigState::Unknown => "unknown (no recorded config, or it could not be read)",
+            }
+        ));
+        match &c.bundle {
+            Some(Some(id)) => out.push(format!("bundle     {id}")),
+            Some(None) => {}
+            None => out.push("bundle     unknown".into()),
+        }
+        match &c.secrets {
+            None => out.push("secrets    unknown".into()),
+            Some(s) if s.is_empty() => {}
+            Some(s) => {
+                let shown: Vec<String> = s
+                    .iter()
+                    .map(|(n, placed)| {
+                        format!("{n} ({})", if *placed { "placed" } else { "not placed" })
+                    })
+                    .collect();
+                out.push(format!("secrets    {}", shown.join(", ")));
+            }
+        }
+        out
+    }
 }
 
 pub fn ls(ctx: &Ctx, as_json: bool) -> Result<()> {
@@ -137,10 +191,7 @@ pub fn ls(ctx: &Ctx, as_json: bool) -> Result<()> {
     if listed.is_empty() {
         note!(
             "no containers created by lodge{} (containers created before lodge labelled them are not listed)",
-            ctx.target
-                .ssh_host()
-                .map(|h| format!(" on {h}"))
-                .unwrap_or_default()
+            ctx.target.on_host()
         );
         return Ok(());
     }
@@ -156,7 +207,7 @@ pub fn ls(ctx: &Ctx, as_json: bool) -> Result<()> {
 pub fn ports(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<()> {
     let found = require(ctx, path)?;
     let id = found.container.id();
-    let active = crate::forward::active_ports(id);
+    let active = crate::forward::active_ports(id)?;
     if as_json {
         return print_json(&json!({ "daemon_running": active.is_some(), "ports": active }));
     }
@@ -176,7 +227,7 @@ pub fn ports(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<()> {
 
 pub fn logs(ctx: &Ctx, path: Option<PathBuf>, follow: bool) -> Result<()> {
     let found = require(ctx, path)?;
-    let log = crate::forward::log_path(found.container.id());
+    let log = crate::forward::log_path(found.container.id())?;
     let mut file = std::fs::File::open(&log)
         .with_context(|| format!("no forwarding log at {} yet", log.display()))?;
     let mut text = String::new();
@@ -214,12 +265,8 @@ pub fn clean(ctx: &Ctx, path: Option<PathBuf>, name: Option<&str>) -> Result<()>
         );
     }
     let removed = crate::inject::remove(container.as_ref())?;
-    info!(
-        "removed lodge from {}",
-        container
-            .name()
-            .unwrap_or_else(|| container.id().to_string())
-    );
+    crate::secret::place::clear_all(container.as_ref())?;
+    info!("removed lodge from {}", container.display_name());
     for w in &removed.wrappers {
         line!("wrapper  {w}");
     }
@@ -230,4 +277,91 @@ pub fn clean(ctx: &Ctx, path: Option<PathBuf>, name: Option<&str>) -> Result<()>
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devcontainer::{Prompt, Recreate, StartOpts};
+    use crate::runtime::fake::{FakeEnv, FakeRuntime};
+
+    struct NoQuestions;
+
+    impl Prompt for NoQuestions {
+        fn confirm_recreate(&self, _: &str) -> bool {
+            panic!("nothing to recreate")
+        }
+        fn choose_workdir(&self, _: &str, _: &[String]) -> String {
+            panic!("the workspace exists")
+        }
+    }
+
+    fn project() -> crate::tmpfile::TempDir {
+        let dir = crate::tmpfile::TempDir::new("status").unwrap();
+        let dc = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc).unwrap();
+        std::fs::write(
+            dc.join("devcontainer.json"),
+            r#"{"image": "debian", "workspaceFolder": "/w", "updateRemoteUserUID": false}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_project_without_a_container_says_so() {
+        let dir = project();
+        let rt = FakeRuntime::new(FakeEnv::new);
+        let r = StatusReport::gather(dir.path(), &Target::Local, &rt, &Config::default()).unwrap();
+        assert_eq!(r.lines()[1], "container  none (run `ldg up` to create it)");
+        assert_eq!(r.to_json()["container"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_fresh_container_reports_its_state_bundle_and_secrets() {
+        let dir = project();
+        let rt = FakeRuntime::new(|| FakeEnv::new().with_file("/w", ""));
+        let opts = StartOpts {
+            build: false,
+            recreate: Recreate::Ask,
+        };
+        devcontainer::start(dir.path(), &Target::Local, opts, &rt, &NoQuestions).unwrap();
+        let r = StatusReport::gather(dir.path(), &Target::Local, &rt, &Config::default()).unwrap();
+        let lines = r.lines();
+        assert!(lines[1].ends_with("(running)"), "{lines:?}");
+        assert_eq!(lines[2], "config     up to date");
+        assert_eq!(
+            lines.len(),
+            3,
+            "no bundle injected, no secrets declared: {lines:?}"
+        );
+        let json = r.to_json();
+        assert_eq!(json["container"]["config"], "up_to_date");
+        assert_eq!(json["container"]["bundle"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn secrets_a_container_cannot_be_asked_about_are_unknown_not_missing() {
+        let dir = project();
+        let rt = FakeRuntime::new(|| {
+            FakeEnv::new().with_file("/w", "").with_failure(&[
+                "sh",
+                "-c",
+                crate::runtime::PROBE_SCRIPT,
+            ])
+        });
+        let opts = StartOpts {
+            build: false,
+            recreate: Recreate::Ask,
+        };
+        devcontainer::start(dir.path(), &Target::Local, opts, &rt, &NoQuestions).unwrap();
+        let config = Config::parse(
+            "[[secret]]\nname = \"T\"\nfrom = { env = \"X\" }\nas = \"env\"\n",
+            Path::new("/c.toml"),
+        )
+        .unwrap();
+        let r = StatusReport::gather(dir.path(), &Target::Local, &rt, &config).unwrap();
+        assert_eq!(r.lines().last().unwrap(), "secrets    unknown");
+        assert_eq!(r.to_json()["container"]["secrets"], serde_json::Value::Null);
+    }
 }
