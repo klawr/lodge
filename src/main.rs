@@ -6,6 +6,7 @@
 // Ignoring a `Result` must be a decision: handle it, or say why in an `#[allow]`.
 #![cfg_attr(not(test), deny(clippy::let_underscore_must_use))]
 
+mod bundle;
 mod cli;
 mod config;
 mod container;
@@ -53,13 +54,17 @@ fn main() -> Result<()> {
             path,
             build,
             no_attach,
+            bundle,
         } => {
             let project_path = project_dir(path)?;
+            // Ready the bundle first, so a problem with it fails before anything
+            // is started.
+            let prepared = bundle::source::prepare(&config::Config::load()?, bundle.as_deref())?;
             let started = devcontainer::start(&project_path, build, rt.as_ref())?;
             let container = started.container.as_ref();
             let remote_user = started.remote_user.as_deref();
             forward::spawn_daemon(container.id(), &target, &started.forward_ports);
-            inject::lodge(container, remote_user)?;
+            inject::lodge(container, remote_user, &prepared)?;
             if !no_attach {
                 started.run_post_attach()?;
                 container::enter(
@@ -85,14 +90,34 @@ fn main() -> Result<()> {
         Command::Exec {
             container,
             no_attach,
+            bundle,
         } => {
+            let prepared = bundle::source::prepare(&config::Config::load()?, bundle.as_deref())?;
             let handle = rt.container(&container);
-            inject::lodge(handle.as_ref(), None)?;
+            inject::lodge(handle.as_ref(), None, &prepared)?;
             if !no_attach {
                 let session_name = format!("lodge-{container}");
                 container::enter(handle.as_ref(), &session_name, "/", None)?;
             }
         }
+        Command::Pack { output } => {
+            let config = config::Config::load()?;
+            let output = output.unwrap_or_else(|| PathBuf::from(bundle::default_file_name()));
+            let manifest = bundle::pack::pack_to_file(&config, &output)?;
+            output::info!(
+                "packed {} tool(s) and {} librar{} for {} into {} (id {})",
+                manifest.tools.len(),
+                manifest.libs.len(),
+                if manifest.libs.len() == 1 { "y" } else { "ies" },
+                manifest.arch,
+                output.display(),
+                manifest.id()
+            );
+        }
+        Command::Bundle { command } => match command {
+            cli::BundleCommand::Inspect { file } => bundle::inspect(&file)?,
+            cli::BundleCommand::Verify { file } => bundle::verify_file(&file)?,
+        },
         Command::Doctor => {
             if !doctor::run(rt.as_ref(), &target)? {
                 std::process::exit(1);

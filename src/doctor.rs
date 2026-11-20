@@ -60,18 +60,28 @@ pub fn run(rt: &dyn Runtime, target: &Target) -> Result<bool> {
     let config = Config::load();
     checks.push(config_check(&config));
 
+    // ldd and patchelf are needed only to *pack*: with a bundle, injection needs
+    // neither. So they are required only when this config would pack live.
+    let packs_live = config
+        .as_ref()
+        .is_ok_and(|c| c.bundle.is_none() && !c.inject.is_empty());
     checks.push(tool(
         "patchelf",
-        "needed to inject dynamically linked binaries",
-        true,
+        "needed to pack (not needed when injecting from a bundle)",
+        packs_live,
         "install patchelf (pacman -S patchelf / apt install patchelf)",
     ));
     checks.push(tool(
         "ldd",
-        "needed to find a binary's shared libraries",
-        true,
+        "needed to pack (not needed when injecting from a bundle)",
+        packs_live,
         "install your libc's developer tools (ldd ships with glibc)",
     ));
+    if let Ok(cfg) = &config
+        && let Some(bundle) = &cfg.bundle
+    {
+        checks.push(bundle_check(bundle));
+    }
     checks.push(tool(
         "oras",
         "only needed for devcontainer features",
@@ -144,6 +154,20 @@ fn old_config_hint() -> String {
         ),
         _ => String::new(),
     }
+}
+
+fn bundle_check(file: &Path) -> Check {
+    let status = match crate::bundle::archive::read_manifest(file) {
+        Ok(m) => Status::Ok(format!(
+            "{} ({}, {} tool(s), id {})",
+            file.display(),
+            m.arch,
+            m.tools.len(),
+            m.id()
+        )),
+        Err(e) => Status::Missing(format!("{e:#}")),
+    };
+    Check::new("bundle", status)
 }
 
 fn binary_check(name: &str, binary: &Path) -> Check {

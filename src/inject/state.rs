@@ -5,6 +5,21 @@ use anyhow::Result;
 use crate::output::warning;
 use crate::runtime::Env;
 // Stamps the injected-state format version, warning when a newer lodge wrote it.
+const BUNDLE_FILE: &str = "/opt/lodge/bundle";
+
+/// Records which bundle was injected, so `ldg status` can show it.
+pub(super) fn record_bundle(env: &dyn Env, id: &str) -> Result<()> {
+    env.write_file(BUNDLE_FILE, format!("{id}\n").as_bytes())
+}
+
+/// The id of the bundle last injected into this environment.
+pub fn installed_bundle(env: &dyn Env) -> Option<String> {
+    env.exec_capture(&["cat", BUNDLE_FILE])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 pub(super) fn ensure_state_version(env: &dyn Env) -> Result<()> {
     let found = env
         .exec_capture(&["cat", STATE_VERSION_FILE])

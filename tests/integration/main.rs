@@ -123,8 +123,8 @@ fn an_injected_binary_runs_against_the_injected_glibc() {
             > 0
     );
     assert!(
-        p.up().has("already exists, skipping"),
-        "a second run should skip"
+        p.up().has("is up to date"),
+        "a second run should find nothing to do"
     );
 }
 
@@ -410,4 +410,190 @@ fn doctor_reports_a_reachable_engine() {
     let sb = Sandbox::new();
     let out = sb.run(&["doctor"]);
     assert!(out.ok && out.has("container engine"), "{}", out.tail(12));
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn a_bundle_can_be_packed_inspected_verified_and_damage_is_caught() {
+    require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
+    let sb = Sandbox::new();
+    sb.config(&format!(
+        "{}\n[aliases]\nll = \"ls -la\"\n",
+        inject_sh_config(true)
+    ));
+    let bundle = sb.root().join("b.tar");
+    let bundle_arg = bundle.to_string_lossy().into_owned();
+
+    let out = sb.run(&["pack", "-o", &bundle_arg]);
+    assert!(out.ok, "pack failed:\n{}", out.tail(10));
+    let id = out
+        .text
+        .split("id ")
+        .nth(1)
+        .map(|s| s.trim().trim_end_matches(')').to_string());
+    assert!(id.is_some(), "pack did not report an id:\n{}", out.tail(5));
+
+    let inspect = sb.run(&["bundle", "inspect", &bundle_arg]);
+    assert!(
+        inspect.ok && inspect.has("hostsh") && inspect.has("relinked") && inspect.has("1 alias"),
+        "unexpected inspect output:\n{}",
+        inspect.text
+    );
+    assert!(sb.run(&["bundle", "verify", &bundle_arg]).ok);
+
+    // Packing the same inputs again gives the same bundle id.
+    let again = sb.root().join("again.tar");
+    let out2 = sb.run(&["pack", "-o", &again.to_string_lossy()]);
+    assert_eq!(
+        out.text.split("id ").nth(1),
+        out2.text.split("id ").nth(1),
+        "the id changed although nothing did"
+    );
+
+    // Flip one byte of file data: the tar is still a valid tar, but a library no
+    // longer matches its recorded hash.
+    let mut bytes = std::fs::read(&bundle).unwrap();
+    let at = bytes.len() * 3 / 4;
+    bytes[at] ^= 0xFF;
+    std::fs::write(&bundle, bytes).unwrap();
+    let damaged = sb.run(&["bundle", "verify", &bundle_arg]);
+    assert!(
+        !damaged.ok && damaged.has("damaged"),
+        "damage went unnoticed:\n{}",
+        damaged.tail(5)
+    );
+}
+
+/// Rewrites a bundle's manifest so it claims `arch`, leaving everything else as is.
+fn with_arch(src: &std::path::Path, dst: &std::path::Path, arch: &str) {
+    use std::io::Read;
+    let mut input = tar::Archive::new(std::fs::File::open(src).unwrap());
+    let mut out = tar::Builder::new(std::fs::File::create(dst).unwrap());
+    for entry in input.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let mut header = entry.header().clone();
+        let path = entry.path().unwrap().into_owned();
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data).unwrap();
+        if path == std::path::Path::new("manifest.json") {
+            let mut manifest: serde_json::Value = serde_json::from_slice(&data).unwrap();
+            manifest["arch"] = arch.into();
+            data = serde_json::to_vec(&manifest).unwrap();
+            header.set_size(data.len() as u64);
+        }
+        header.set_cksum();
+        out.append_data(&mut header, &path, &data[..]).unwrap();
+    }
+    out.finish().unwrap();
+}
+
+/// A config with one script tool (no libraries to resolve, so no ldd or patchelf).
+fn script_tool_config(sb: &Sandbox, name: &str, body: &str) -> std::path::PathBuf {
+    let script = sb.root().join(format!("{name}-src"));
+    std::fs::write(&script, body).unwrap();
+    sb.config(&format!(
+        "[[inject]]\nname = \"{name}\"\nbinary = \"{}\"\ncopy_deps = false\n",
+        script.display()
+    ));
+    script
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn a_bundle_for_another_architecture_is_refused() {
+    let sb = Sandbox::new();
+    script_tool_config(&sb, "hello", "#!/bin/sh\necho hi\n");
+    let p = sb.project("bundlearch", &json(r#"{ "image": "@IMAGE@" }"#));
+    p.up();
+
+    let bundle = sb.root().join("b.tar");
+    assert!(sb.run(&["pack", "-o", &bundle.to_string_lossy()]).ok);
+    let foreign = sb.root().join("foreign.tar");
+    let other = if p.exec(&["uname", "-m"]) == "x86_64" {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    with_arch(&bundle, &foreign, other);
+
+    let container = p.container();
+    let out = sb.run(&[
+        "exec",
+        "--no-attach",
+        "--bundle",
+        &foreign.to_string_lossy(),
+        &container,
+    ]);
+    assert!(
+        !out.ok && out.has("the bundle is for"),
+        "expected an architecture refusal:\n{}",
+        out.tail(6)
+    );
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn a_repeated_up_reuses_the_cached_bundle_and_a_change_updates_the_container() {
+    let sb = Sandbox::new();
+    let script = script_tool_config(&sb, "hello", "#!/bin/sh\necho one\n");
+    let p = sb.project("cached", &json(r#"{ "image": "@IMAGE@" }"#));
+
+    assert!(p.up().has("(packed)"), "the first run should pack");
+    assert_eq!(p.exec(&["/usr/local/bin/hello"]), "one");
+    let again = p.up();
+    assert!(
+        again.has("(cached)"),
+        "unchanged inputs should reuse the bundle:\n{}",
+        again.tail(8)
+    );
+    assert!(again.has("is up to date"));
+
+    // A different script: the bundle is repacked and the container updated.
+    std::fs::write(&script, "#!/bin/sh\necho two, and longer\n").unwrap();
+    let changed = p.up();
+    assert!(
+        changed.has("(packed)") && changed.has("injecting hello"),
+        "{}",
+        changed.tail(8)
+    );
+    assert_eq!(p.exec(&["/usr/local/bin/hello"]), "two, and longer");
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn injecting_from_a_bundle_needs_neither_ldd_nor_patchelf() {
+    require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
+    let sb = Sandbox::new();
+    sb.config(&inject_sh_config(false));
+    let bundle = sb.root().join("b.tar");
+    let bundle_arg = bundle.to_string_lossy().into_owned();
+    assert!(
+        sb.run(&["pack", "-o", &bundle_arg]).ok,
+        "packing needs the full PATH"
+    );
+
+    let p = sb.project("nodeps", &json(r#"{ "image": "@IMAGE@" }"#));
+    let path_arg = p.path().to_string_lossy().into_owned();
+    // `ldg` itself needs docker, and a shell and `id` for the uid check; nothing else.
+    let minimal = sb.restricted_path(&["docker", "sh", "id"]);
+
+    // Control: without a bundle ldg must pack, which needs ldd, so it cannot work here.
+    let live = sb.run_with_path(&minimal, &["up", "--no-attach", &path_arg]);
+    assert!(
+        !live.ok && (live.has("ldd") || live.has("patchelf")),
+        "the restricted PATH did not take away ldd and patchelf:\n{}",
+        live.tail(6)
+    );
+
+    // With the bundle it needs neither.
+    let out = sb.run_with_path(
+        &minimal,
+        &["up", "--no-attach", "--bundle", &bundle_arg, &path_arg],
+    );
+    assert!(
+        out.ok,
+        "injecting from a bundle failed without ldd/patchelf:\n{}",
+        out.tail(10)
+    );
+    assert_eq!(p.exec(&["/usr/local/bin/hostsh", "-c", "echo ok"]), "ok");
 }

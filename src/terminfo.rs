@@ -119,7 +119,7 @@ mod tests {
 
     /// A host terminfo directory holding a compiled entry for `term`.
     fn host_with(term: &str) -> (crate::tmpfile::TempDir, PathBuf) {
-        let dir = crate::tmpfile::TempDir::new(&format!("terminfo-{term}"));
+        let dir = crate::tmpfile::TempDir::new(&format!("terminfo-{term}")).unwrap();
         let entry = dir
             .path()
             .join(term.chars().next().unwrap().to_string())

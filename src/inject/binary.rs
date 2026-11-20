@@ -1,124 +1,79 @@
-//! Injecting a binary: check it fits the container, relink it to the injected
-//! glibc, and put a wrapper where the user expects it.
+//! Injecting a binary: put the bundle's relinked copy in place and a wrapper where
+//! the user expects it, and check that it fits the container.
 
-use anyhow::{Context, Result, bail};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use anyhow::{Result, bail};
 
+use super::LODGE_BIN;
 use super::config_files::resolve_home;
-use super::libs::inject_deps;
-use super::{LODGE_BIN, LODGE_DIR, LODGE_LIB};
-use crate::config::Injectable;
+use super::installed::{Decision, decide, record};
+use crate::bundle::manifest::{Binary, Manifest, Tool};
+use crate::bundle::source::Prepared;
+use crate::elf::Arch;
 use crate::output::info;
 use crate::runtime::Env;
-use crate::tmpfile::TempFile;
+
 pub(super) fn inject_binary(
     env: &dyn Env,
     home: &str,
-    item: &Injectable,
-    binary: &str,
+    bundle: &Prepared,
+    tool: &Tool,
+    binary: &Binary,
 ) -> Result<()> {
-    let lodge_binary = format!("{LODGE_BIN}/{}", item.name);
-    let target = resolve_home(
-        item.target_binary
-            .as_deref()
-            .unwrap_or(&format!("/usr/local/bin/{}", item.name)),
-        home,
-    );
+    let name = &tool.name;
+    let installed = format!("{LODGE_BIN}/{name}");
+    let target = resolve_home(&binary.target, home);
+    let key = format!("{name}.bin");
 
-    if item.skip_if_exists && env.file_exists(&lodge_binary) {
-        info!("{} already exists, skipping", item.name);
+    match decide(
+        env,
+        &key,
+        &binary.hash,
+        env.file_exists(&installed),
+        tool.skip_if_exists,
+    ) {
+        Decision::UpToDate => {
+            info!("{name} is up to date");
+            return Ok(());
+        }
+        Decision::KeepExisting => {
+            info!("{name} already exists, skipping");
+            return Ok(());
+        }
+        Decision::Install => {}
+    }
+
+    info!("injecting {name} binary");
+    // The bundle's copy was relinked when it was packed, so it runs *directly*
+    // against the injected glibc (no ld.so wrapper). Running directly keeps
+    // /proc/self/exe pointing at the binary, which tools like Neovim need when
+    // they re-exec themselves (`--embed`).
+    env.cp_in(&bundle.bin(name).to_string_lossy(), &installed)?;
+    env.exec_root(&["chmod", "+x", &installed])?;
+    install_wrapper(env, &installed, &target)?;
+    record(env, &key, &binary.hash)
+}
+
+// Refuses a bundle built for a different CPU than the container runs on: its
+// binaries would otherwise fail at startup with an unhelpful "exec format error"
+// or "no such file". A bundle with no binaries (just configs) fits anywhere, and
+// an architecture we can't identify is let through.
+pub(super) fn check_architecture(env: &dyn Env, manifest: &Manifest) -> Result<()> {
+    if !manifest.tools.iter().any(|t| t.binary.is_some()) {
         return Ok(());
     }
-
-    check_architecture(env, &item.name, binary)?;
-
-    let linker = if item.copy_deps {
-        inject_deps(env, binary, &item.name)?
-    } else {
-        None
-    };
-
-    info!("injecting {} binary", item.name);
-
-    // With injected deps, patch a copy so the binary runs *directly* (no ld.so
-    // wrapper) against our glibc — see patch_binary. Running directly keeps
-    // /proc/self/exe pointing at the binary, which tools like Neovim need when
-    // they re-exec themselves (`--embed`); baking the search path into the binary
-    // (rather than exporting LD_LIBRARY_PATH) keeps subprocesses it spawns — git,
-    // shells, LSPs — on the container's own glibc.
-    match linker.as_deref() {
-        Some(ld) => {
-            let patched = patch_binary(binary, ld)?;
-            env.cp_in(&patched.path().to_string_lossy(), &lodge_binary)?;
-            // Make our linker available at /lodge/<ld> for the patched interpreter.
-            env.exec_root(&[
-                "cp",
-                &format!("{LODGE_LIB}/{ld}"),
-                &format!("{LODGE_DIR}/{ld}"),
-            ])?;
-        }
-        None => {
-            let real = std::fs::canonicalize(binary).unwrap_or_else(|_| PathBuf::from(binary));
-            env.cp_in(&real.to_string_lossy(), &lodge_binary)?;
-        }
-    }
-
-    env.exec_root(&["chmod", "+x", &lodge_binary])?;
-
-    install_wrapper(env, &lodge_binary, &target)?;
-
-    Ok(())
-}
-
-// Copies the binary to a self-cleaning temp file and uses `patchelf` to make it
-// run *directly* against our injected glibc:
-//   --set-interpreter /lodge/<ld> : our dynamic linker is the program interpreter
-//   --force-rpath --set-rpath …   : DT_RPATH (not RUNPATH) so the search path
-//                                   also resolves *transitive* deps (e.g. libnsl
-//                                   pulling libtirpc); RUNPATH would not.
-// patchelf handles the ELF rewriting robustly even when there's no slack in the
-// original .dynstr/.dynamic — which is the common case for real binaries.
-fn patch_binary(binary: &str, linker_name: &str) -> Result<TempFile> {
-    let data = std::fs::read(binary).with_context(|| format!("reading {binary} to patch"))?;
-    let tmp = TempFile::write(&format!("lodge-patched-{}", file_stem(binary)), &data)?;
-
-    let mut cmd = Command::new("patchelf");
-    cmd.arg("--set-interpreter")
-        .arg(format!("{LODGE_DIR}/{linker_name}"))
-        .arg("--force-rpath")
-        .arg("--set-rpath")
-        .arg(LODGE_LIB)
-        .arg(tmp.path());
-    crate::output::trace(&cmd);
-    let status = cmd.status().context(
-        "running patchelf — it is required to inject dynamically linked binaries \
-             (install it, e.g. `pacman -S patchelf` / `apt install patchelf`)",
-    )?;
-    if !status.success() {
-        bail!("patchelf failed to patch {binary}");
-    }
-
-    Ok(tmp)
-}
-
-// Refuses to inject a binary built for a different CPU than the container runs
-// on: it would otherwise fail at startup with an unhelpful "exec format error"
-// or "no such file". Scripts (not ELF) and unknown architectures are let through.
-fn check_architecture(env: &dyn Env, name: &str, binary: &str) -> Result<()> {
-    let Some(built_for) = crate::elf::arch_of(Path::new(binary))? else {
+    let Ok(bundle_arch) = manifest.arch() else {
         return Ok(());
     };
     let Ok(uname) = env.exec_capture(&["uname", "-m"]) else {
         return Ok(());
     };
-    let Some(runs_on) = crate::elf::Arch::from_uname(&uname) else {
+    let Some(runs_on) = Arch::from_uname(&uname) else {
         return Ok(());
     };
-    if built_for != runs_on {
+    if bundle_arch != runs_on {
         bail!(
-            "{name}: {binary} is built for {built_for}, but the container runs {runs_on}. \
-             Inject a build for {runs_on} instead."
+            "the bundle is for {bundle_arch}, but the container runs {runs_on}. \
+             Use a {runs_on} bundle (pack one on a {runs_on} machine)."
         );
     }
     Ok(())
@@ -126,7 +81,7 @@ fn check_architecture(env: &dyn Env, name: &str, binary: &str) -> Result<()> {
 
 // Installs a thin wrapper at `target` that execs the injected binary directly.
 //
-// The binary itself was patched (PT_INTERP + DT_RUNPATH) to run against our
+// The binary itself was relinked (interpreter + search path) to run against our
 // injected glibc, so the wrapper needs no LD_LIBRARY_PATH and no ld.so
 // indirection — it just forwards args. Execing directly is what keeps
 // /proc/self/exe pointing at the binary for tools that re-exec themselves.
@@ -139,27 +94,55 @@ fn install_wrapper(env: &dyn Env, lodge_binary: &str, target: &str) -> Result<()
     Ok(())
 }
 
-fn file_stem(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "lodge".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bundle::manifest::{FORMAT, Lib};
+    use crate::bundle::source::Origin;
     use crate::runtime::fake::FakeEnv;
+    use crate::tmpfile::TempDir;
+    use std::collections::BTreeMap;
 
-    #[test]
-    fn takes_basename() {
-        assert_eq!(file_stem("/usr/local/bin/nvim"), "nvim");
-        assert_eq!(file_stem("nvim"), "nvim");
+    fn tool(skip: bool, hash: &str) -> Tool {
+        Tool {
+            name: "hello".into(),
+            binary: Some(Binary {
+                target: "/usr/local/bin/hello".into(),
+                dynamic: false,
+                hash: hash.into(),
+            }),
+            config: None,
+            skip_if_exists: skip,
+        }
     }
 
-    #[test]
-    fn falls_back_when_no_basename() {
-        assert_eq!(file_stem("/"), "lodge");
+    /// A bundle directory with one binary `hello`.
+    fn bundle(tool: Tool, arch: &str) -> (TempDir, Prepared) {
+        let dir = TempDir::new("bin-bundle").unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        std::fs::write(dir.path().join("bin/hello"), "#!/bin/sh\necho hi\n").unwrap();
+        let manifest = Manifest {
+            format: FORMAT,
+            lodge_version: "0".into(),
+            created: 0,
+            arch: arch.into(),
+            linker: None,
+            libs: Vec::<Lib>::new(),
+            tools: vec![tool],
+            aliases: BTreeMap::new(),
+            git_safe_directories: vec![],
+        };
+        let prepared = Prepared {
+            dir: dir.path().to_path_buf(),
+            manifest,
+            origin: Origin::Packed,
+        };
+        (dir, prepared)
+    }
+
+    fn inject(env: &FakeEnv, bundle: &Prepared) {
+        let tool = &bundle.manifest.tools[0];
+        inject_binary(env, "/root", bundle, tool, tool.binary.as_ref().unwrap()).unwrap();
     }
 
     #[test]
@@ -173,33 +156,80 @@ mod tests {
         assert!(env.ran(&["chmod", "+x", "/usr/local/bin/nvim"]));
     }
 
-    fn elf_file(machine: [u8; 2]) -> crate::tmpfile::TempFile {
-        let mut h = vec![0u8; 64];
-        h[..4].copy_from_slice(b"\x7fELF");
-        h[5] = 1;
-        h[18] = machine[0];
-        h[19] = machine[1];
-        crate::tmpfile::TempFile::write("arch-test", &h).unwrap()
+    #[test]
+    fn a_binary_is_installed_with_its_wrapper_and_recorded() {
+        let (_dir, b) = bundle(tool(false, "aaaaaaaaaaaaaaaa"), "x86_64");
+        let env = FakeEnv::new();
+        inject(&env, &b);
+        assert_eq!(
+            env.file("/opt/lodge/bin/hello").unwrap(),
+            "#!/bin/sh\necho hi\n"
+        );
+        assert!(
+            env.file("/usr/local/bin/hello")
+                .unwrap()
+                .contains("exec /opt/lodge/bin/hello")
+        );
+        assert_eq!(
+            env.file("/opt/lodge/installed/hello.bin").unwrap().trim(),
+            "aaaaaaaaaaaaaaaa"
+        );
     }
 
     #[test]
-    fn injecting_for_the_wrong_architecture_is_refused() {
-        let x86 = elf_file([0x3E, 0]);
+    fn an_unchanged_binary_is_not_copied_again() {
+        let (_dir, b) = bundle(tool(false, "aaaaaaaaaaaaaaaa"), "x86_64");
+        let env = FakeEnv::new()
+            .with_file("/opt/lodge/bin/hello", "old contents")
+            .with_file("/opt/lodge/installed/hello.bin", "aaaaaaaaaaaaaaaa\n");
+        inject(&env, &b);
+        assert_eq!(env.file("/opt/lodge/bin/hello").unwrap(), "old contents");
+    }
+
+    #[test]
+    fn a_changed_binary_is_replaced_unless_protected() {
+        let installed = |env: FakeEnv| {
+            env.with_file("/opt/lodge/bin/hello", "old contents")
+                .with_file("/opt/lodge/installed/hello.bin", "1111111111111111\n")
+        };
+        let (_d1, replace) = bundle(tool(false, "aaaaaaaaaaaaaaaa"), "x86_64");
+        let env = installed(FakeEnv::new());
+        inject(&env, &replace);
+        assert_eq!(
+            env.file("/opt/lodge/bin/hello").unwrap(),
+            "#!/bin/sh\necho hi\n"
+        );
+
+        let (_d2, protect) = bundle(tool(true, "aaaaaaaaaaaaaaaa"), "x86_64");
+        let env = installed(FakeEnv::new());
+        inject(&env, &protect);
+        assert_eq!(env.file("/opt/lodge/bin/hello").unwrap(), "old contents");
+    }
+
+    #[test]
+    fn a_bundle_for_another_architecture_is_refused() {
+        let (_dir, b) = bundle(tool(false, "aaaaaaaaaaaaaaaa"), "x86_64");
         let env = FakeEnv::new().with_output(&["uname", "-m"], "aarch64\n");
-        let err = check_architecture(&env, "nvim", &x86.path().to_string_lossy()).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("x86_64") && msg.contains("aarch64"), "{msg}");
+        let err = check_architecture(&env, &b.manifest)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("x86_64") && err.contains("aarch64"), "{err}");
     }
 
     #[test]
-    fn matching_architecture_and_non_elf_files_pass() {
-        let x86 = elf_file([0x3E, 0]);
+    fn matching_architecture_and_bundles_without_binaries_pass() {
+        let (_dir, b) = bundle(tool(false, "aaaaaaaaaaaaaaaa"), "x86_64");
         let env = FakeEnv::new().with_output(&["uname", "-m"], "x86_64\n");
-        check_architecture(&env, "nvim", &x86.path().to_string_lossy()).unwrap();
+        check_architecture(&env, &b.manifest).unwrap();
 
-        let script =
-            crate::tmpfile::TempFile::write("script-test", b"#!/bin/sh\necho hi\n").unwrap();
-        let wrong = FakeEnv::new().with_output(&["uname", "-m"], "aarch64\n");
-        check_architecture(&wrong, "tool", &script.path().to_string_lossy()).unwrap();
+        let mut configs_only = b.manifest.clone();
+        configs_only.tools[0].binary = None;
+        configs_only.tools[0].config = Some(crate::bundle::manifest::ConfigTree {
+            target: "~/.x".into(),
+            is_dir: false,
+            hash: "0000000000000000".into(),
+        });
+        // No `uname` is declared: a bundle with no binaries must not even ask.
+        check_architecture(&FakeEnv::new(), &configs_only).unwrap();
     }
 }

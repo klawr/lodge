@@ -5,6 +5,9 @@ use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
+    /// A bundle file to inject from instead of packing the `[[inject]]` entries.
+    #[serde(default)]
+    pub bundle: Option<PathBuf>,
     #[serde(default)]
     pub inject: Vec<Injectable>,
     #[serde(default)]
@@ -26,10 +29,11 @@ pub struct Injectable {
     pub target_binary: Option<String>,
     /// Where to place the config inside the container
     pub target_config: Option<String>,
-    /// If true, skip injecting the binary/config when it already exists in the
-    /// container. Set false to refresh it on every injection (e.g. an evolving
-    /// editor config); leave true for large stable trees (plugins, runtime).
-    #[serde(default = "default_true")]
+    /// If true, never replace the binary/config once it exists in the container,
+    /// even when the bundle has a newer version (for a tree you update inside the
+    /// container yourself, such as installed plugins). The default, false, keeps
+    /// it current: replaced when the bundle changed, left alone when it did not.
+    #[serde(default)]
     pub skip_if_exists: bool,
     /// Copy shared library dependencies discovered via ldd (skips libs already present)
     #[serde(default = "default_true")]
@@ -102,6 +106,12 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
 }
 
 impl Config {
+    /// An empty config, for tests elsewhere in the crate.
+    #[cfg(test)]
+    pub fn for_tests() -> Self {
+        Self::default()
+    }
+
     pub fn load() -> Result<Self> {
         let path = config_path();
         if !path.exists() {
@@ -110,6 +120,7 @@ impl Config {
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("reading config at {}", path.display()))?;
         let mut cfg: Config = toml::from_str(&raw).context("parsing lodge config")?;
+        cfg.bundle = cfg.bundle.take().map(expand_tilde);
         for item in &mut cfg.inject {
             item.binary = item.binary.take().map(expand_tilde);
             item.config = item.config.take().map(expand_tilde);
@@ -119,6 +130,7 @@ impl Config {
 
     fn default() -> Self {
         Self {
+            bundle: None,
             inject: vec![],
             session: SessionConfig::default(),
             git: GitConfig::default(),

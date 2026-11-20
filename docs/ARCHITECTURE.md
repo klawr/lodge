@@ -46,8 +46,9 @@ flags, available on every subcommand.
 | `terminfo.rs` | Makes the user's terminal work in the container: passes `TERM`, copies a missing terminfo entry. |
 | `config.rs` | The user's `~/.config/lodge/config.toml`: `[[inject]]`, `[session]`, `[git]`, `[aliases]`. |
 | `devcontainer/` | Everything about running a `devcontainer.json` (see below). |
-| `inject/` | Copies binaries, libraries and configs into a container and wires them up: `binary`, `libs` (tracked by content hash), `config_files` (and ownership), `shell_env` (`PATH`, aliases, git, terminal), `state` (format version). |
-| `deps.rs` | Resolves a binary's shared libraries and dynamic linker by parsing `ldd`. |
+| `bundle/` | A bundle is a portable tar of relinked binaries, their libraries and configs, with a manifest. `manifest` defines and validates it (paths derive from names, so a bundle can't point outside itself), `archive` writes, reads and verifies the tar, `pack` builds one from the config (the only step needing `ldd` and `patchelf`), and `source` readies a bundle *directory* to inject from (extracted from a file, or packed live) and caches it under `~/.cache/lodge/bundles/`, keyed by the file's hash or a fingerprint of the live inputs. Commands: `ldg pack`, `ldg bundle inspect`, `ldg bundle verify`, and `--bundle` on `up`/`exec`. |
+| `inject/` | Copies a bundle's binaries, libraries and configs into a container and wires them up, reading only from the bundle directory: `binary`, `libs` (tracked by content hash), `config_files` (and ownership), `installed` (a hash per installed piece), `shell_env` (`PATH`, aliases, git, terminal), `state` (format version, installed bundle id). |
+| `deps.rs` | Resolves a binary's shared libraries and dynamic linker by parsing `ldd`. Used only when packing. |
 | `features.rs` | Devcontainer *features*: fetch via `oras`, order, apply creation flags, install. |
 | `container.rs` | Opens the interactive session: `docker exec -it`, optionally inside tmux. |
 | `forward.rs` | Port forwarding: the `_forward` daemon, in-process TCP proxy, `ssh -L` tunnels. |
@@ -101,17 +102,29 @@ features and hooks all work from the resulting container id.
 
 ## Injection
 
-For each `[[inject]]` entry in the config (`inject/`):
+Injection reads only from a **bundle directory** (`bundle/source`), never from the
+host's own files. The directory comes from a bundle file (`--bundle`, or `bundle =`
+in the config), extracted once and cached by the file's hash, or from a live pack of
+the `[[inject]]` entries, cached by a fingerprint of the config and of each source
+file's size and mtime and the libraries `ldd` finds. If nothing changed, the cached
+directory is reused and `ldd` and `patchelf` do not run. The live path and the
+bundle-file path end in the same place, so there is one injector. It is prepared
+*before* anything starts, so a problem with it fails without leaving a half-started
+container.
 
-- **Dynamic binaries.** `deps.rs` runs `ldd` on the host binary. Missing
-  libraries are copied to `/opt/lodge/lib/` and the dynamic linker to
-  `/lodge/<ld>`. The binary is then *copied and patched with `patchelf`*:
-  `--set-interpreter /lodge/<ld>` and `--force-rpath --set-rpath /opt/lodge/lib`.
-  The patched copy lives at `/opt/lodge/bin/<name>`, so it runs directly,
-  without an `ld.so` indirection, and `/proc/self/exe` stays correct for tools
-  that re-exec themselves. A two-line wrapper at the target path
-  (`/usr/local/bin/<name>`) just `exec`s it.
-- **Static binaries** are copied as they are.
+For each tool in the bundle (`inject/`):
+
+- **Libraries first.** Copied to `/opt/lodge/lib/` when their hash differs from
+  `/opt/lodge/lib/.manifest`, and the dynamic linker to `/lodge/<ld>` whenever it
+  changed or is missing, so a linker and libc never come from different versions.
+- **Binaries.** The relinked copy from the bundle goes to `/opt/lodge/bin/<name>`,
+  so it runs directly, without an `ld.so` indirection, and `/proc/self/exe` stays
+  correct for tools that re-exec themselves. A two-line wrapper at the target
+  path (`/usr/local/bin/<name>`) just `exec`s it. A static binary is simply
+  copied (relinking happens at pack time, where `patchelf` runs).
+- **Skipping.** A hash is recorded per installed piece (`/opt/lodge/installed/`):
+  unchanged is a no-op, changed is replaced, and `skip_if_exists = true` keeps a
+  piece that is already there even when the bundle changed.
 - **Configs** are copied to their target, and ownership under the user's home is
   fixed up to the container user (never on a host bind mount, where it would
   change the host's files).
@@ -131,7 +144,9 @@ things that change, such as an editor config.
 | Path | Contents |
 | --- | --- |
 | `/opt/lodge/lib/`, `/lodge/<ld>` | Copied libraries and the dynamic linker. |
-| `/opt/lodge/bin/` | Patched binaries. |
+| `/opt/lodge/bin/` | Relinked binaries. |
+| `/opt/lodge/installed/` | A content hash per installed binary and config, so an unchanged piece is skipped and a changed one replaced (`skip_if_exists` protects a piece from replacement). |
+| `/opt/lodge/bundle` | The id of the bundle last injected; `ldg status` shows it. |
 | `/opt/lodge/state/` | One-shot markers (`onCreate`, `postCreate`, feature installs). |
 | `/opt/lodge/devcontainer.hash` | Fingerprint of the devcontainer inputs. |
 | `/opt/lodge/version` | Format version of this layout, so a future lodge can migrate it. |
@@ -147,6 +162,7 @@ when the container is recreated, with no host bookkeeping to go stale.
 | Path | Contents |
 | --- | --- |
 | `~/.config/lodge/config.toml` | Your configuration. |
+| `~/.cache/lodge/bundles/` | Extracted or packed bundles, the four most recently used. |
 | `~/.local/share/lodge/forward-<id>.log`, `.lock` | Log of the port-forward daemon, and the lock that keeps it to one per container. |
 | `$TMPDIR/lodge-ssh/*.sock` | SSH `ControlMaster` sockets (`--remote` only). |
 | `$TMPDIR/lodge-<pid>-*` | Short-lived staging files, removed when done. |

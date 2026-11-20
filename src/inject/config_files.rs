@@ -4,25 +4,36 @@
 use anyhow::Result;
 use std::path::Path;
 
-use crate::config::Injectable;
+use super::installed::{Decision, decide, record};
+use crate::bundle::manifest::{ConfigTree, Tool};
+use crate::bundle::source::Prepared;
 use crate::output::{info, warning};
 use crate::runtime::{Env, ExecOpts};
 pub(super) fn inject_config(
     env: &dyn Env,
     home: &str,
-    item: &Injectable,
-    cfg: &str,
+    bundle: &Prepared,
+    tool: &Tool,
+    config: &ConfigTree,
     uid_gid: Option<&str>,
 ) -> Result<()> {
-    let target = resolve_home(
-        item.target_config
-            .as_deref()
-            .unwrap_or(&format!("~/.config/{}", item.name)),
-        home,
-    );
+    let name = &tool.name;
+    let target = resolve_home(&config.target, home);
+    let key = format!("{name}.config");
 
-    if item.skip_if_exists && env.path_exists(&target) {
-        info!("{} config already present, skipping", item.name);
+    let decision = decide(
+        env,
+        &key,
+        &config.hash,
+        env.path_exists(&target),
+        tool.skip_if_exists,
+    );
+    if decision != Decision::Install {
+        if decision == Decision::UpToDate {
+            info!("{name} config is up to date");
+        } else {
+            info!("{name} config already present, skipping");
+        }
         // Fix ownership even when skipping the copy — the files may be
         // root-owned from a previous run.
         if let Some(owner) = uid_gid {
@@ -31,7 +42,7 @@ pub(super) fn inject_config(
         return Ok(());
     }
 
-    info!("injecting {} config → {target}", item.name);
+    info!("injecting {name} config → {target}");
 
     // Create parent dirs as the container user when the target is under their
     // home directory — `mkdir -p` as root would leave the whole chain
@@ -49,10 +60,10 @@ pub(super) fn inject_config(
 
     // Replace any existing target before copying: `docker cp` of a directory
     // onto an existing directory nests it (dest/src) instead of overwriting, so
-    // removing first makes the copy mirror the host exactly (and drops files
-    // deleted on the host).
+    // removing first makes the copy mirror the bundle exactly (and drops files
+    // that are no longer in it).
     env.exec_root(&["rm", "-rf", &target])?;
-    env.cp_in(cfg, &target)?;
+    env.cp_in(&bundle.config(name).to_string_lossy(), &target)?;
 
     // Fix ownership of the entire path chain from home to target. The parent
     // dirs were created as the container user above, but docker cp (especially
@@ -62,7 +73,7 @@ pub(super) fn inject_config(
         chown_home_chain(env, home, &target, owner)?;
     }
 
-    Ok(())
+    record(env, &key, &config.hash)
 }
 
 // When the container user can't already write to their own `$HOME` (e.g. it

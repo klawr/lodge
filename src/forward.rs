@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn only_one_holder_of_the_lock_at_a_time() {
-        let dir = crate::tmpfile::TempDir::new("locktest");
+        let dir = crate::tmpfile::TempDir::new("locktest").unwrap();
         let path = dir.path().join("forward.lock");
         let first = acquire_lock(&path)
             .unwrap()

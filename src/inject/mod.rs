@@ -2,38 +2,39 @@
 //!
 //! [`lodge`] is the entry point. The work is split by what is being injected:
 //!
-//! - [`binary`]: a binary, relinked to the injected glibc, behind a wrapper
+//! Everything is read from a bundle directory ([`crate::bundle::source`]), never
+//! from the host's own files, so injecting needs neither `ldd` nor `patchelf`.
+//!
+//! - [`binary`]: a binary, already relinked, behind a wrapper
 //! - [`libs`]: its shared libraries and the dynamic linker, tracked by content
+//! - [`installed`]: a hash per installed piece, so unchanged means a cheap no-op
 //! - [`config_files`]: config files and directories, and their ownership
 //! - [`shell_env`]: `PATH`, aliases, git's `safe.directory`, the terminal
 //! - [`state`]: the format version of what is kept under `/opt/lodge`
 
 mod binary;
 mod config_files;
+mod installed;
 mod libs;
 mod shell_env;
 mod state;
 
 use anyhow::Result;
 
-use crate::config::Config;
+use crate::bundle::source::Prepared;
+use crate::bundle::{LODGE_BIN, LODGE_DIR, LODGE_LIB};
 use crate::runtime::Env;
-use binary::inject_binary;
+use binary::{check_architecture, inject_binary};
 use config_files::{container_home, container_user, ensure_home_writable, inject_config};
+use libs::inject_libs;
 use shell_env::{configure_git_safe, inject_aliases, inject_docker_path, inject_terminfo};
-use state::ensure_state_version;
+pub use state::installed_bundle;
+use state::{ensure_state_version, record_bundle};
 
-const LODGE_LIB: &str = "/opt/lodge/lib";
-
-const LODGE_BIN: &str = "/opt/lodge/bin";
-
-// The dynamic linker is also placed here so a binary whose PT_INTERP we patch
-// to /lodge/<ld> resolves its interpreter when run directly. The prefix is
-// 7 bytes, matching /lib64/, so PT_INTERP can be patched in place.
-const LODGE_DIR: &str = "/lodge";
-
-pub fn lodge(env: &dyn Env, remote_user: Option<&str>) -> Result<()> {
-    let config = Config::load()?;
+/// Injects `bundle` into the environment: libraries first, then each tool's
+/// binary and config, then the shell-level setup.
+pub fn lodge(env: &dyn Env, remote_user: Option<&str>, bundle: &Prepared) -> Result<()> {
+    check_architecture(env, &bundle.manifest)?;
     env.mkdir_p(&[LODGE_LIB, LODGE_BIN, LODGE_DIR])?;
     ensure_state_version(env)?;
 
@@ -43,24 +44,20 @@ pub fn lodge(env: &dyn Env, remote_user: Option<&str>) -> Result<()> {
         ensure_home_writable(env, &home, remote_user, owner)?;
     }
 
-    for item in &config.inject {
-        if let Some(binary) = &item.binary {
-            inject_binary(env, &home, item, binary.to_string_lossy().as_ref())?;
+    inject_libs(env, bundle)?;
+    for tool in &bundle.manifest.tools {
+        if let Some(binary) = &tool.binary {
+            inject_binary(env, &home, bundle, tool, binary)?;
         }
-        if let Some(cfg) = &item.config {
-            inject_config(
-                env,
-                &home,
-                item,
-                cfg.to_string_lossy().as_ref(),
-                uid_gid.as_deref(),
-            )?;
+        if let Some(config) = &tool.config {
+            inject_config(env, &home, bundle, tool, config, uid_gid.as_deref())?;
         }
     }
+    record_bundle(env, &bundle.manifest.id())?;
 
     inject_docker_path(env)?;
-    configure_git_safe(env, &config.git.safe_directories)?;
-    inject_aliases(env, &config.aliases)?;
+    configure_git_safe(env, &bundle.manifest.git_safe_directories)?;
+    inject_aliases(env, &bundle.manifest.aliases)?;
     inject_terminfo(env);
 
     Ok(())

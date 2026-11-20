@@ -35,20 +35,27 @@ impl Drop for TempFile {
     }
 }
 
-/// A scratch directory that removes itself, and everything in it, on drop, so a
-/// test that fails halfway doesn't leave files behind.
-#[cfg(test)]
+/// A scratch directory that removes itself, and everything in it, on drop, so an
+/// error (or a test failing halfway) doesn't leave files behind.
 pub struct TempDir {
     path: PathBuf,
 }
 
-#[cfg(test)]
 impl TempDir {
-    pub fn new(name: &str) -> Self {
+    pub fn new(name: &str) -> std::io::Result<Self> {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("lodge-{}-{n}-{name}", std::process::id()));
-        std::fs::create_dir_all(&path).expect("creating a temp dir");
-        Self { path }
+        std::fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    /// Like [`new`](Self::new) but inside `parent`, so the directory can later be
+    /// renamed into place on the same filesystem.
+    pub fn new_in(parent: &Path, name: &str) -> std::io::Result<Self> {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!("lodge-{}-{n}-{name}", std::process::id()));
+        std::fs::create_dir_all(&path)?;
+        Ok(Self { path })
     }
 
     pub fn path(&self) -> &Path {
@@ -56,7 +63,6 @@ impl TempDir {
     }
 }
 
-#[cfg(test)]
 impl Drop for TempDir {
     fn drop(&mut self) {
         discard_dir(&self.path);

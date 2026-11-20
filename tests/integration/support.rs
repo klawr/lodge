@@ -134,6 +134,7 @@ impl Sandbox {
         std::fs::create_dir_all(root.join("config/lodge")).expect("creating sandbox");
         std::fs::create_dir_all(root.join("data")).expect("creating sandbox");
         std::fs::create_dir_all(root.join("tmp")).expect("creating sandbox");
+        std::fs::create_dir_all(root.join("cache")).expect("creating sandbox");
         let sb = Self {
             root,
             fake_ssh: false,
@@ -173,6 +174,7 @@ impl Sandbox {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ldg"));
         cmd.env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("XDG_DATA_HOME", self.root.join("data"))
+            .env("XDG_CACHE_HOME", self.root.join("cache"))
             // Scratch files and ssh control sockets land here, not in /tmp, and go
             // away with the sandbox.
             .env("TMPDIR", self.root.join("tmp"));
@@ -190,6 +192,29 @@ impl Sandbox {
     pub fn run(&self, args: &[&str]) -> Out {
         let mut cmd = self.command();
         cmd.args(args);
+        capture(cmd)
+    }
+
+    /// A directory containing only the named tools (symlinks to the real ones),
+    /// for running `ldg` with a `PATH` that lacks everything else.
+    pub fn restricted_path(&self, tools: &[&str]) -> PathBuf {
+        let dir = self.root.join("minpath");
+        std::fs::create_dir_all(&dir).expect("creating minpath");
+        let real = std::env::var_os("PATH").unwrap_or_default();
+        for tool in tools {
+            let found = std::env::split_paths(&real)
+                .map(|d| d.join(tool))
+                .find(|p| p.is_file())
+                .unwrap_or_else(|| panic!("`{tool}` is not on PATH"));
+            let _ = std::os::unix::fs::symlink(found, dir.join(tool));
+        }
+        dir
+    }
+
+    /// Runs `ldg <args>` with `PATH` set to `path` alone.
+    pub fn run_with_path(&self, path: &Path, args: &[&str]) -> Out {
+        let mut cmd = self.command();
+        cmd.env("PATH", path).args(args);
         capture(cmd)
     }
 

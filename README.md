@@ -20,6 +20,10 @@ ldg down                      # stop the project's container (resume later with 
 ldg status                    # show the project's container and whether its config changed
 ldg rm                        # remove the project's container (next `ldg up` creates a fresh one)
 ldg doctor                    # check the host: engine, helper tools, config, listed binaries
+ldg pack                      # pack your tools and configs into a portable bundle (lodge-<arch>.tar)
+ldg up --bundle lodge.tar     # inject from a bundle file instead of packing your config
+ldg bundle inspect lodge.tar  # show what a bundle contains
+ldg bundle verify lodge.tar   # check a bundle is intact (for example after copying it)
 ldg exec my-container         # inject into an already-running container by name/id
 ldg up -r user@host           # operate against a remote Docker daemon over SSH
 ldg up -r myhost ./project    # remote via a Host alias from ~/.ssh/config
@@ -68,7 +72,9 @@ On the host:
 - `docker` (and `docker compose` for `ldg up`) — for local use. With
   `--remote`, docker runs on the *remote* host instead; locally you only need
   `ssh` (see [Remote containers](#remote-containers)).
-- `ldd` and `patchelf` (to resolve and re-link injected binaries)
+- `ldd` and `patchelf`, **only to pack** (to resolve and re-link your binaries). Injecting
+  from a bundle needs neither, so a bundle made on one Linux machine can be used from
+  any machine that can reach a container (see [Bundles](#bundles)).
 - `oras` (only if your devcontainer uses `features`)
 - `ssh` (only for `--remote`)
 - `tmux` is optional: without it the session opens directly (or set
@@ -89,8 +95,8 @@ binary         = "/usr/local/bin/nvim"     # host binary to copy in
 config         = "~/.config/nvim"          # host config dir/file to copy in
 target_binary  = "/usr/local/bin/nvim"     # where the wrapper goes (optional)
 target_config  = "/root/.config/nvim"      # where the config goes (optional)
-skip_if_exists = false                     # re-copy on every injection (default: true)
-copy_deps      = true                      # copy shared libs via ldd (default: true)
+skip_if_exists = false                     # true: never replace it once it exists (default: false)
+copy_deps      = true                      # copy shared libs via ldd when packing (default: true)
 
 # Neovim needs its runtime at the compiled-in $VIMRUNTIME path.
 [[inject]]
@@ -129,8 +135,8 @@ ll = "ls -la"
 | `config`         | no       | —                       | host path to a config file/dir to inject                                      |
 | `target_binary`  | no       | `/usr/local/bin/<name>` | wrapper location in the container                                             |
 | `target_config`  | no       | `/root/.config/<name>`  | config location in the container                                              |
-| `skip_if_exists` | no       | `true`                  | skip if already present; `false` re-copies every run                          |
-| `copy_deps`      | no       | `true`                  | copy shared-library dependencies via `ldd`                                    |
+| `skip_if_exists` | no       | `false`                 | `true`: never replace it once present, even if the bundle changed (for a tree you update in the container yourself). `false`: replaced when the bundle changed, left alone when it did not |
+| `copy_deps`      | no       | `true`                  | copy shared-library dependencies via `ldd` when packing                       |
 
 ## Devcontainer support
 
@@ -218,20 +224,47 @@ in. That is why `tar` is needed locally for `--remote`.
 Connections must be non-interactive (key/agent auth); if something fails, run
 with `-v` to see each command and `-vv`/`-vvv` for ssh's own debug output.
 
+## Bundles
+
+Injection always works from a **bundle**: a plain tar holding your tools already
+relinked to a bundled glibc, their libraries, your configs, your aliases and git
+settings, and a manifest. Without any options, `ldg up` packs your config into a
+bundle itself and keeps it in `~/.cache/lodge/bundles/`. It is reused as long as
+nothing it depends on has changed (the config, each source file's size and mtime,
+the libraries `ldd` finds), so a repeated `up` neither runs `ldd` nor `patchelf`.
+
+To use your setup on a machine that isn't your Linux workstation, pack once and
+carry the file:
+
+```sh
+ldg pack -o lodge-x86_64.tar             # on the Linux/WSL machine: resolves, relinks, snapshots
+ldg bundle verify lodge-x86_64.tar       # after copying it somewhere
+ldg up --bundle lodge-x86_64.tar         # anywhere with a container runtime (or just ssh with -r)
+```
+
+or set `bundle = "~/lodge-x86_64.tar"` at the top of `config.toml`. A configured
+bundle replaces the `[[inject]]` entries on that machine; `[session]` stays local.
+A bundle is for one CPU architecture and must match the container's. It can hold
+credentials if you list the wrong directory, so `pack` warns about `~/.ssh`,
+`~/.config/gh`, `~/.claude` and similar.
+
 ## How it works
 
-For each tool in your config, `lodge`:
+When packing, for each tool in your config, `lodge`:
 
 1. Resolves the binary's shared-library dependencies on the **host** with `ldd`,
-   including the dynamic linker (`ld-linux-*.so`).
-2. Copies missing libraries into `/opt/lodge/lib/` inside the container, and the
-   dynamic linker into `/lodge/`.
-3. Uses `patchelf` to rewrite a copy of the binary so it runs **directly** against
-   your injected glibc, then copies it to `/opt/lodge/bin/<name>`:
-   - `--set-interpreter /lodge/<ld>` — your linker becomes the program interpreter.
+   including the dynamic linker (`ld-linux-*.so`), and puts them in the bundle.
+2. Uses `patchelf` to rewrite a copy of the binary so it runs **directly** against
+   the bundled glibc:
+   - `--set-interpreter /lodge/<ld>` — the bundled linker becomes the program interpreter.
    - `--force-rpath --set-rpath /opt/lodge/lib` — the search path is baked in as
      `DT_RPATH` (not `RUNPATH`), so it also resolves *transitive* deps.
-4. Installs a thin wrapper at the target path that just `exec`s the patched binary.
+
+When injecting from a bundle, `lodge` copies the libraries into `/opt/lodge/lib/`
+(only those whose content changed) and the linker into `/lodge/`, copies each
+relinked binary to `/opt/lodge/bin/<name>`, and installs a thin wrapper at the
+target path that just `exec`s it. A hash is recorded per installed piece, so an
+unchanged tool is a no-op and a changed one is replaced.
 
 Baking the search path into the binary (rather than exporting `LD_LIBRARY_PATH`)
 gives two properties:
@@ -256,7 +289,7 @@ container's normal user, so your environment and `$HOME` are the user's own.
 
 ## Limitations
 
-- An injected binary's libraries must all resolve on the host; anything `ldd`
+- An injected binary's libraries must all resolve on the packing machine; anything `ldd`
   reports "not found" is skipped (with a warning) and may break the tool.
 - Host and container must share an architecture — injected binaries, glibc, and
   compiled assets (treesitter parsers, Mason servers) are host binaries run

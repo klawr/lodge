@@ -257,6 +257,9 @@ pub fn status(project_path: &Path, rt: &dyn Runtime) -> Result<()> {
         None => "unknown (the container has no recorded config)",
     };
     info!("config     {config}");
+    if let Some(id) = crate::inject::installed_bundle(container.as_ref()) {
+        info!("bundle     {id}");
+    }
     Ok(())
 }
 

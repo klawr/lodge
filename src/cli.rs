@@ -33,6 +33,20 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
+pub enum BundleCommand {
+    /// Show what a bundle contains
+    Inspect {
+        /// The bundle file
+        file: PathBuf,
+    },
+    /// Check that a bundle is intact (for example after copying it)
+    Verify {
+        /// The bundle file
+        file: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum Command {
     /// Start a devcontainer and inject your environment
     #[command(
@@ -54,6 +68,9 @@ pub enum Command {
         /// Set everything up, but don't open a shell (for scripts and CI)
         #[arg(long)]
         no_attach: bool,
+        /// Inject from this bundle file instead of packing your config
+        #[arg(long, value_name = "FILE")]
+        bundle: Option<PathBuf>,
     },
     /// Stop a project's devcontainer
     #[command(
@@ -96,6 +113,28 @@ pub enum Command {
         /// Inject, but don't open a shell (for scripts and CI)
         #[arg(long)]
         no_attach: bool,
+        /// Inject from this bundle file instead of packing your config
+        #[arg(long, value_name = "FILE")]
+        bundle: Option<PathBuf>,
+    },
+    /// Pack your tools and configs into a portable bundle
+    #[command(
+        long_about = "Build a bundle from the [[inject]] entries, [aliases] and [git] settings \
+            in your config: your binaries relinked to a bundled glibc, their libraries, \
+            and your configs, in one tar. This is the only step that needs ldd and \
+            patchelf, and it must run on a Linux machine of the architecture the bundle \
+            is for. Credentials directories (~/.ssh, ~/.config/gh, …) trigger a warning: \
+            a bundle is meant to be shared."
+    )]
+    Pack {
+        /// Where to write the bundle (default: lodge-<arch>.tar here)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Work with bundle files
+    Bundle {
+        #[command(subcommand)]
+        command: BundleCommand,
     },
     /// Check that everything lodge needs is available
     #[command(
