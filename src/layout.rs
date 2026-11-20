@@ -1,5 +1,6 @@
 //! Where lodge keeps things inside a container: the one list of every path it
-//! writes there, so injecting, `ldg clean` and the docs agree.
+//! writes there (and the default destinations of injected tools), so injecting,
+//! `ldg clean` and the docs agree.
 //!
 //! `/opt/lodge/` holds what injection installs plus the devcontainer's own state.
 //! `ldg clean` removes the first group ([`INJECTED`]) and keeps the second.
@@ -23,6 +24,24 @@ pub const BUNDLE_ID: &str = "/opt/lodge/bundle";
 pub const VERSION: &str = "/opt/lodge/version";
 /// Terminfo entries copied from the host.
 pub const TERMINFO: &str = "/opt/lodge/terminfo";
+/// Where a tool's wrapper goes when the config names no `target_binary`.
+pub fn default_binary_dest(tool: &str) -> String {
+    format!("/usr/local/bin/{tool}")
+}
+/// Where a tool's config goes when the config names no `target_config`.
+pub fn default_config_dest(tool: &str) -> String {
+    format!("~/.config/{tool}")
+}
+/// Folders searched for wrappers by `ldg clean`, besides the recorded paths: a
+/// container injected by an older ldg has no recorded paths.
+pub const WRAPPER_SEARCH: &[&str] = &[
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/bin",
+    "/bin",
+    "/root/.local/bin",
+    "/home/*/.local/bin",
+];
 /// Aliases, for login shells.
 pub const PROFILE_ALIASES: &str = "/etc/profile.d/lodge.sh";
 /// The container's own `PATH`, preserved for login shells.
@@ -34,8 +53,11 @@ pub const MARKERS: &str = "/opt/lodge/state";
 pub const DEVCONTAINER_HASH: &str = "/opt/lodge/devcontainer.hash";
 /// `containerEnv` and `remoteEnv`, for login shells.
 pub const PROFILE_ENV: &str = "/etc/profile.d/lodge-env.sh";
-/// Feature `containerEnv`, for login shells.
-pub const PROFILE_FEATURES: &str = "/etc/profile.d/lodge-features.sh";
+/// Feature `containerEnv`, for login shells: one profile per installed feature,
+/// so retrying one feature never loses another's.
+pub fn profile_feature(feature_id: &str) -> String {
+    format!("/etc/profile.d/lodge-feature-{feature_id}.sh")
+}
 /// Where feature files are copied to run their `install.sh`.
 pub const FEATURES: &str = "/tmp/lodge-features";
 
@@ -66,7 +88,8 @@ mod tests {
 
     #[test]
     fn clean_keeps_the_devcontainers_state() {
-        for kept in [MARKERS, DEVCONTAINER_HASH, PROFILE_ENV, PROFILE_FEATURES] {
+        let feature = profile_feature("node");
+        for kept in [MARKERS, DEVCONTAINER_HASH, PROFILE_ENV, &feature] {
             assert!(
                 !INJECTED.iter().any(|p| kept.starts_with(p)),
                 "{kept} would be removed by `ldg clean`"

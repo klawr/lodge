@@ -55,12 +55,10 @@ mod tests {
 
     #[test]
     fn a_marker_that_cannot_be_checked_is_an_error_not_missing() {
-        let env = FakeEnv::new().with_failure(&[
-            "sh",
-            "-c",
+        let env = FakeEnv::new().with_failure(&crate::shell::script_argv(
             crate::runtime::EXISTS_SCRIPT,
-            "/opt/lodge/state/onCreate",
-        ]);
+            &["/opt/lodge/state/onCreate"],
+        ));
         assert!(done(&env, "onCreate").is_err());
     }
 

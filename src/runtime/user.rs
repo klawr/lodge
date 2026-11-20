@@ -45,12 +45,11 @@ pub struct ContainerUser {
 impl ContainerUser {
     /// Asks the container about `requested` (or its default user).
     pub fn resolve(env: &dyn Env, requested: Option<&str>) -> Result<Self> {
-        let opts = ExecOpts {
-            user: requested.into(),
-            ..ExecOpts::default()
-        };
         let out = env
-            .output(&["sh", "-c", PROBE_SCRIPT], &opts)
+            .output(
+                &["sh", "-c", PROBE_SCRIPT],
+                &ExecOpts::as_user(requested.into()),
+            )
             .context("asking the container who the user is")?;
         if !out.success {
             bail!(

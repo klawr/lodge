@@ -5,15 +5,16 @@
 //! - [`Env`]: a place you can run commands in and copy files into. Injection,
 //!   features, lifecycle hooks and the stored config hash only need this, so
 //!   they work the same for a container, and later for a plain host.
-//! - [`Container`]: an `Env` that can also be inspected (name, mounts, address).
-//!   Port forwarding and workdir selection need this.
+//! - [`Container`]: an `Env` that can also be inspected (name, mounts, address,
+//!   files even while stopped). Port forwarding, workdir selection, drift and
+//!   status need this.
 //! - [`Runtime`]: the engine itself: find, build, run, start, stop. Devcontainer
 //!   backends need this.
 //! - [`Compose`]: an engine's compose support, which only the compose backend
 //!   needs.
 //!
 //! [`docker`] implements all four over the `docker` CLI (locally or over SSH).
-//! [`fake`] has the test doubles: `FakeEnv`, an in-memory `Env`, and
+//! `fake` (in tests) has the test doubles: `FakeEnv`, an in-memory `Env`, and
 //! `FakeRuntime`, an engine (with compose) whose containers each run in one.
 
 pub mod docker;
@@ -29,24 +30,24 @@ use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::shell::shell_quote;
+use crate::shell::{script_argv, shell_quote};
 use crate::target::Target;
 use crate::tmpfile::TempFile;
 
-/// The `sh -c` script behind [`Env::write_secret`]: `$0` is the destination, the
-/// value arrives on stdin and `%MODE%` is replaced by an octal mode. Written to a
+/// The script behind [`Env::write_secret`]: `$1` is the destination, the value
+/// arrives on stdin and `%MODE%` is replaced by an octal mode. Written to a
 /// sibling temp file under `umask 077`, then moved into place.
-pub const WRITE_SECRET_SCRIPT: &str = "umask 077; t=\"$0.tmp.$$\"; \
-     { cat > \"$t\" && chmod %MODE% \"$t\" && mv -f \"$t\" \"$0\"; } || { rm -f \"$t\"; exit 1; }";
+pub const WRITE_SECRET_SCRIPT: &str = "umask 077; t=\"$1.tmp.$$\"; \
+     { cat > \"$t\" && chmod %MODE% \"$t\" && mv -f \"$t\" \"$1\"; } || { rm -f \"$t\"; exit 1; }";
 
-/// The `sh -c` script behind [`Env::read_file`]: `$0` is the path. Prints `y`
-/// and the contents, or `n` when there is no such file, and exits 0 either way,
-/// so a non-zero exit means the read itself failed.
-pub const READ_FILE_SCRIPT: &str = "if [ -f \"$0\" ]; then printf y; cat \"$0\"; else printf n; fi";
+/// The script behind [`Env::read_file`]: `$1` is the path. Prints `y` and the
+/// contents, or `n` when there is no such file, and exits 0 either way, so a
+/// non-zero exit means the read itself failed.
+pub const READ_FILE_SCRIPT: &str = "if [ -f \"$1\" ]; then printf y; cat \"$1\"; else printf n; fi";
 
-/// The `sh -c` script behind [`Env::exists`]: `$0` is the path. Prints `y` or
-/// `n` and exits 0 either way, so a non-zero exit means the check itself failed.
-pub const EXISTS_SCRIPT: &str = "if [ -e \"$0\" ]; then printf y; else printf n; fi";
+/// The script behind [`Env::exists`]: `$1` is the path. Prints `y` or `n` and
+/// exits 0 either way, so a non-zero exit means the check itself failed.
+pub const EXISTS_SCRIPT: &str = "if [ -e \"$1\" ]; then printf y; else printf n; fi";
 
 /// How a command is run: as whom, from where, with what extra environment.
 #[derive(Debug, Default, Clone, Copy)]
@@ -56,13 +57,18 @@ pub struct ExecOpts<'a> {
     pub env: &'a [(String, String)],
 }
 
-impl ExecOpts<'_> {
-    pub fn root() -> ExecOpts<'static> {
+impl<'a> ExecOpts<'a> {
+    /// As `user`, from the default directory, with no extra environment.
+    pub fn as_user(user: User<'a>) -> Self {
         ExecOpts {
-            user: User::Root,
+            user,
             workdir: None,
             env: &[],
         }
+    }
+
+    pub fn root() -> ExecOpts<'static> {
+        ExecOpts::as_user(User::Root)
     }
 }
 
@@ -117,11 +123,7 @@ pub trait Env {
 
     /// Like [`exec_capture`](Self::exec_capture) as `user`.
     fn exec_capture_as(&self, user: User, argv: &[&str]) -> Result<String> {
-        let opts = ExecOpts {
-            user,
-            ..ExecOpts::default()
-        };
-        let out = self.output(argv, &opts)?;
+        let out = self.output(argv, &ExecOpts::as_user(user))?;
         if !out.success {
             bail!("exec failed: {argv:?}\n{}", out.stderr.trim());
         }
@@ -144,7 +146,7 @@ pub trait Env {
     /// Whether `path` exists (file or directory), as root. An error means it
     /// could not be found out, which callers must not mistake for "missing".
     fn exists(&self, path: &str) -> Result<bool> {
-        let out = self.output(&["sh", "-c", EXISTS_SCRIPT, path], &ExecOpts::root())?;
+        let out = self.output(&script_argv(EXISTS_SCRIPT, &[path]), &ExecOpts::root())?;
         match (out.success, out.stdout.as_str()) {
             (true, "y") => Ok(true),
             (true, "n") => Ok(false),
@@ -188,7 +190,7 @@ pub trait Env {
     /// file. An error means it could not be found out, which callers must not
     /// mistake for "missing".
     fn read_file(&self, path: &str) -> Result<Option<String>> {
-        let out = self.output(&["sh", "-c", READ_FILE_SCRIPT, path], &ExecOpts::root())?;
+        let out = self.output(&script_argv(READ_FILE_SCRIPT, &[path]), &ExecOpts::root())?;
         if !out.success {
             bail!("reading {path} failed: {}", out.stderr.trim());
         }
@@ -214,6 +216,12 @@ pub trait Container: Env {
     /// an error when the engine could not be asked (which is not "stopped").
     fn is_running(&self) -> Result<bool>;
 
+    /// The text of the regular file `path` in the container, `None` if there is
+    /// no such file. Read through the engine rather than by running a command
+    /// in it, so a stopped container can be read too. An error means it could
+    /// not be found out, which callers must not mistake for "missing".
+    fn read_stored_file(&self, path: &str) -> Result<Option<String>>;
+
     /// The container's address on its first network, reachable from the host
     /// that runs the engine.
     fn ip_address(&self) -> Option<String>;
@@ -232,7 +240,8 @@ pub trait Container: Env {
 pub struct BuildSpec {
     pub context: PathBuf,
     pub dockerfile: Option<String>,
-    pub target: Option<String>,
+    /// The stage to build (`docker build --target`).
+    pub stage: Option<String>,
     pub args: BTreeMap<String, String>,
     pub tag: String,
 }
@@ -347,8 +356,9 @@ mod write_secret_script_tests {
 
     fn run(dest: &str, mode: u32, input: &[u8]) -> bool {
         let script = WRITE_SECRET_SCRIPT.replace("%MODE%", &format!("{mode:o}"));
-        let mut child = Command::new("sh")
-            .args(["-c", &script, dest])
+        let argv = crate::shell::script_argv(&script, &[dest]);
+        let mut child = Command::new(argv[0])
+            .args(&argv[1..])
             .stdin(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()

@@ -24,7 +24,7 @@ impl Forwarder {
     /// `local<TAB>dest`, for the ports file.
     pub(super) fn describe(&self) -> String {
         match self {
-            Forwarder::Proxy(h) => format!("{}\t{}", h.bound.port(), h.target),
+            Forwarder::Proxy(h) => format!("{}\t{}", h.bound.port(), h.dest),
             Forwarder::Ssh { local, dest, .. } => format!("{local}\t{dest}"),
         }
     }
@@ -32,18 +32,18 @@ impl Forwarder {
     /// Where it forwards to: `ip:port` as reachable from the engine's host.
     pub(super) fn dest(&self) -> &str {
         match self {
-            Forwarder::Proxy(h) => &h.target,
+            Forwarder::Proxy(h) => &h.dest,
             Forwarder::Ssh { dest, .. } => dest,
         }
     }
 
-    // `target` is "ip:port" as reachable from the Docker host.
-    pub(super) fn proxy(local: u16, target: String) -> std::io::Result<Self> {
-        ProxyHandle::spawn(local, target).map(Forwarder::Proxy)
+    // `dest` is "ip:port" as reachable from the engine's host.
+    pub(super) fn proxy(local: u16, dest: String) -> std::io::Result<Self> {
+        ProxyHandle::spawn(local, dest).map(Forwarder::Proxy)
     }
 
-    pub(super) fn ssh_tunnel(local: u16, target: &str, remote: &str) -> std::io::Result<Self> {
-        let mut cmd = crate::ssh::tunnel(remote, local, target);
+    pub(super) fn ssh_tunnel(local: u16, dest: &str, remote: &str) -> std::io::Result<Self> {
+        let mut cmd = crate::ssh::tunnel(remote, local, dest);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             // With --verbose, let ssh's own chatter land in the daemon log.
@@ -56,7 +56,7 @@ impl Forwarder {
         cmd.spawn().map(|child| Forwarder::Ssh {
             child,
             local,
-            dest: target.to_string(),
+            dest: dest.to_string(),
         })
     }
 
@@ -90,18 +90,18 @@ pub(super) struct ProxyHandle {
     stop: Arc<AtomicBool>,
     /// The address actually listened on: loopback only, never all interfaces.
     bound: SocketAddr,
-    target: String,
+    /// Where it forwards to: "ip:port" as reachable from the engine's host.
+    dest: String,
 }
 
 impl ProxyHandle {
-    // `target` is "ip:port" as reachable from the Docker host.
-    fn spawn(local: u16, target: String) -> std::io::Result<Self> {
+    fn spawn(local: u16, dest: String) -> std::io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, local))?;
         let bound = listener.local_addr()?;
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
-        let shown = target.clone();
+        let shown = dest.clone();
 
         std::thread::spawn(move || {
             loop {
@@ -110,9 +110,9 @@ impl ProxyHandle {
                 }
                 match listener.accept() {
                     Ok((client, _)) => {
-                        let target = target.clone();
+                        let dest = dest.clone();
                         std::thread::spawn(move || {
-                            if let Ok(server) = TcpStream::connect(&target) {
+                            if let Ok(server) = TcpStream::connect(&dest) {
                                 proxy_conn(client, server);
                             }
                         });
@@ -132,7 +132,7 @@ impl ProxyHandle {
         Ok(ProxyHandle {
             stop,
             bound,
-            target: shown,
+            dest: shown,
         })
     }
 }
@@ -173,7 +173,7 @@ mod tests {
         use std::io::{Read, Write};
         // A server for the proxy to forward to.
         let server = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let target = server.local_addr().unwrap().to_string();
+        let dest = server.local_addr().unwrap().to_string();
         let echo = std::thread::spawn(move || {
             let (mut s, _) = server.accept().unwrap();
             let mut buf = [0u8; 4];
@@ -182,7 +182,7 @@ mod tests {
         });
 
         // Port 0 lets the OS pick; what matters is the interface.
-        let handle = ProxyHandle::spawn(0, target).unwrap();
+        let handle = ProxyHandle::spawn(0, dest).unwrap();
         assert!(handle.bound.ip().is_loopback(), "{}", handle.bound);
 
         let mut client = TcpStream::connect(handle.bound).unwrap();

@@ -78,14 +78,14 @@ struct ContainerStatus {
 
 impl StatusReport {
     fn gather(project: &Path, target: &Target, rt: &dyn Runtime, config: &Config) -> Result<Self> {
-        let Some((found, state)) = devcontainer::status(project, target, rt)? else {
+        let Some(status) = devcontainer::status(project, target, rt)? else {
             return Ok(Self {
                 project: project.to_path_buf(),
                 container: None,
             });
         };
+        let (found, running) = (&status.found, status.running);
         let c = found.container.as_ref();
-        let running = c.is_running()?;
         let bundle = crate::inject::installed_bundle(c)
             .map_err(|e| warning!("could not tell which bundle is installed: {e:#}"))
             .ok();
@@ -110,7 +110,7 @@ impl StatusReport {
                 id: c.id().to_string(),
                 name: c.display_name(),
                 running,
-                config: state,
+                config: status.config,
                 bundle,
                 secrets,
             }),
@@ -317,50 +317,87 @@ mod tests {
         assert_eq!(r.to_json()["container"], serde_json::Value::Null);
     }
 
-    #[test]
-    fn a_fresh_container_reports_its_state_bundle_and_secrets() {
-        let dir = project();
-        let rt = FakeRuntime::new(|| FakeEnv::new().with_file("/w", ""));
+    fn start(dir: &crate::tmpfile::TempDir, rt: &FakeRuntime) -> Box<dyn Container> {
         let opts = StartOpts {
             build: false,
             recreate: Recreate::Ask,
         };
-        devcontainer::start(dir.path(), &Target::Local, opts, &rt, &NoQuestions).unwrap();
-        let r = StatusReport::gather(dir.path(), &Target::Local, &rt, &Config::default()).unwrap();
-        let lines = r.lines();
-        assert!(lines[1].ends_with("(running)"), "{lines:?}");
-        assert_eq!(lines[2], "config     up to date");
-        assert_eq!(
-            lines.len(),
-            3,
-            "no bundle injected, no secrets declared: {lines:?}"
-        );
-        let json = r.to_json();
-        assert_eq!(json["container"]["config"], "up_to_date");
-        assert_eq!(json["container"]["bundle"], serde_json::Value::Null);
+        devcontainer::start(dir.path(), &Target::Local, opts, rt, &NoQuestions)
+            .unwrap()
+            .container
     }
 
-    #[test]
-    fn secrets_a_container_cannot_be_asked_about_are_unknown_not_missing() {
-        let dir = project();
-        let rt = FakeRuntime::new(|| {
-            FakeEnv::new().with_file("/w", "").with_failure(&[
-                "sh",
-                "-c",
-                crate::runtime::PROBE_SCRIPT,
-            ])
-        });
-        let opts = StartOpts {
-            build: false,
-            recreate: Recreate::Ask,
-        };
-        devcontainer::start(dir.path(), &Target::Local, opts, &rt, &NoQuestions).unwrap();
-        let config = Config::parse(
+    fn one_secret() -> Config {
+        Config::parse(
             "[[secret]]\nname = \"T\"\nfrom = { env = \"X\" }\nas = \"env\"\n",
             Path::new("/c.toml"),
         )
-        .unwrap();
-        let r = StatusReport::gather(dir.path(), &Target::Local, &rt, &config).unwrap();
+        .unwrap()
+    }
+
+    const PROBE: [&str; 3] = ["sh", "-c", crate::runtime::PROBE_SCRIPT];
+
+    #[test]
+    fn a_running_container_reports_its_config_bundle_and_secrets() {
+        let dir = project();
+        let list = crate::shell::script_argv(
+            crate::secret::place::LIST_SCRIPT,
+            &["/dev/shm/lodge-secrets-1000"],
+        );
+        let rt = FakeRuntime::new(move || {
+            FakeEnv::new()
+                .with_file("/w", "")
+                .with_output(&PROBE, "1000\n1000\ndev\n/home/dev\n")
+                .with_output(&list, "T\n")
+        });
+        let c = start(&dir, &rt);
+        c.write_file("/opt/lodge/bundle", b"0123456789abcdef\n")
+            .unwrap();
+
+        let r = StatusReport::gather(dir.path(), &Target::Local, &rt, &one_secret()).unwrap();
+        assert_eq!(
+            r.lines()[1..],
+            [
+                format!("container  {} (running)", c.id()),
+                "config     up to date".into(),
+                "bundle     0123456789abcdef".into(),
+                "secrets    T (placed)".into(),
+            ]
+        );
+        let json = r.to_json();
+        assert_eq!(json["container"]["config"], "up_to_date");
+        assert_eq!(json["container"]["bundle"], "0123456789abcdef");
+        assert_eq!(json["container"]["secrets"][0]["placed"], true);
+    }
+
+    #[test]
+    fn a_stopped_container_is_reported_in_full_without_running_anything_in_it() {
+        let dir = project();
+        let rt = FakeRuntime::new(|| FakeEnv::new().with_file("/w", ""));
+        let c = start(&dir, &rt);
+        c.write_file("/opt/lodge/bundle", b"0123456789abcdef\n")
+            .unwrap();
+        rt.stop(c.id()).unwrap();
+        // The fake refuses commands in a stopped container, so a command would
+        // show up as "unknown" (and a warning).
+        let r = StatusReport::gather(dir.path(), &Target::Local, &rt, &one_secret()).unwrap();
+        assert_eq!(
+            r.lines()[1..],
+            [
+                format!("container  {} (stopped)", c.id()),
+                "config     up to date".into(),
+                "bundle     0123456789abcdef".into(),
+                "secrets    T (not placed)".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn secrets_are_unknown_when_the_container_user_cannot_be_looked_up() {
+        let dir = project();
+        let rt = FakeRuntime::new(|| FakeEnv::new().with_file("/w", "").with_failure(&PROBE));
+        start(&dir, &rt);
+        let r = StatusReport::gather(dir.path(), &Target::Local, &rt, &one_secret()).unwrap();
         assert_eq!(r.lines().last().unwrap(), "secrets    unknown");
         assert_eq!(r.to_json()["container"]["secrets"], serde_json::Value::Null);
     }

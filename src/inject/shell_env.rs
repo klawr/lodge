@@ -34,13 +34,7 @@ pub(super) fn configure_git_safe(env: &dyn Env, dirs: &[String], user: User) -> 
             "git config --global --get-all safe.directory 2>/dev/null | grep -qxF {q} \
              || git config --global --add safe.directory {q}"
         );
-        env.exec(
-            &["sh", "-c", &script],
-            &ExecOpts {
-                user,
-                ..ExecOpts::default()
-            },
-        )?;
+        env.exec(&["sh", "-c", &script], &ExecOpts::as_user(user))?;
     }
     Ok(())
 }
@@ -48,10 +42,15 @@ pub(super) fn configure_git_safe(env: &dyn Env, dirs: &[String], user: User) -> 
 // Login shells source /etc/profile, which on many distros resets PATH to a
 // minimal system default — dropping anything added via Docker ENV. Read the
 // container's current PATH and write it into /etc/profile.d/ so it survives.
+// Not being able to is reported, not fatal: login shells then get the distro's
+// default PATH.
 pub(super) fn preserve_path(env: &dyn Env) -> Result<()> {
     let path = match env.exec_capture(&["printenv", "PATH"]) {
         Ok(p) => p.trim().to_string(),
-        Err(_) => return Ok(()),
+        Err(e) => {
+            warning!("could not read the container's PATH, so login shells may not keep it: {e:#}");
+            return Ok(());
+        }
     };
     if path.is_empty() {
         return Ok(());
@@ -126,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_path_is_not_an_error() {
+    fn a_path_that_cannot_be_read_is_skipped_not_fatal() {
         let env = FakeEnv::new(); // no PATH variable
         preserve_path(&env).unwrap();
         assert!(env.file("/etc/profile.d/lodge-path.sh").is_none());

@@ -331,12 +331,10 @@ mod tests {
 
     #[test]
     fn an_unreadable_group_file_stops_the_change() {
-        let env = probe("1500\n1500\ndev\n/home/dev\n").with_failure(&[
-            "sh",
-            "-c",
+        let env = probe("1500\n1500\ndev\n/home/dev\n").with_failure(&crate::shell::script_argv(
             crate::runtime::READ_FILE_SCRIPT,
-            "/etc/group",
-        ]);
+            &["/etc/group"],
+        ));
         assert!(sync_user_uid(&env, Some("dev"), 1000, 1000).is_err());
         assert!(change_scripts(&env).is_empty());
     }

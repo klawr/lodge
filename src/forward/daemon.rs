@@ -137,9 +137,13 @@ struct Forwards<'a> {
 
 impl<'a> Forwards<'a> {
     fn new(container: &'a dyn Container, target: &'a Target, ports_file: PathBuf) -> Self {
+        let lookup = move |host: Option<&str>| match host {
+            None => container.ip_address(),
+            Some(h) => container.resolve_peer(h),
+        };
         Self {
             target,
-            addresses: Addresses::new(container, REFRESH),
+            addresses: Addresses::new(Box::new(lookup), REFRESH),
             active: HashMap::new(),
             failed: HashSet::new(),
             ports_file,
@@ -212,12 +216,16 @@ impl<'a> Forwards<'a> {
     }
 }
 
+/// Looks up an address on the container network: the primary container's
+/// (`None`) or a peer's by name.
+type Lookup<'a> = Box<dyn Fn(Option<&str>) -> Option<String> + 'a>;
+
 /// Addresses on the container network, as reachable from the engine's host:
 /// the primary container's (`None`) and its peers' by name. Each is looked up
 /// again after `refresh`, so a restarted container or service is followed; a
 /// failed lookup keeps the last known address.
 struct Addresses<'a> {
-    container: &'a dyn Container,
+    lookup: Lookup<'a>,
     refresh: Duration,
     known: HashMap<Option<String>, (String, Instant)>,
     /// Names already reported as unresolvable (reported once).
@@ -225,9 +233,9 @@ struct Addresses<'a> {
 }
 
 impl<'a> Addresses<'a> {
-    fn new(container: &'a dyn Container, refresh: Duration) -> Self {
+    fn new(lookup: Lookup<'a>, refresh: Duration) -> Self {
         Self {
-            container,
+            lookup,
             refresh,
             known: HashMap::new(),
             unresolved: HashSet::new(),
@@ -241,10 +249,7 @@ impl<'a> Addresses<'a> {
         {
             return Some(ip.clone());
         }
-        let found = match host {
-            None => self.container.ip_address(),
-            Some(h) => self.container.resolve_peer(h),
-        };
+        let found = (self.lookup)(host);
         let name = host.unwrap_or("the container");
         match found {
             Some(ip) => {
@@ -337,67 +342,22 @@ fn is_loopback_hex(addr: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// A container whose address (and its peer `db`'s) the test sets.
-    struct Moving {
-        ip: std::cell::RefCell<Option<String>>,
-    }
-
-    impl crate::runtime::Env for Moving {
-        fn exec(&self, _: &[&str], _: &ExecOpts) -> anyhow::Result<()> {
-            unreachable!()
-        }
-        fn output(&self, _: &[&str], _: &ExecOpts) -> anyhow::Result<crate::runtime::Output> {
-            unreachable!()
-        }
-        fn cp_in(&self, _: &str, _: &str) -> anyhow::Result<()> {
-            unreachable!()
-        }
-        fn write_secret(
-            &self,
-            _: &str,
-            _: &[u8],
-            _: u32,
-            _: crate::runtime::User,
-        ) -> anyhow::Result<()> {
-            unreachable!()
-        }
-        fn interactive_command(&self, _: crate::runtime::User, _: &str, _: &str) -> String {
-            unreachable!()
-        }
-    }
-
-    impl Container for Moving {
-        fn id(&self) -> &str {
-            "c"
-        }
-        fn name(&self) -> Option<String> {
-            None
-        }
-        fn mounts(&self) -> Vec<String> {
-            Vec::new()
-        }
-        fn is_running(&self) -> anyhow::Result<bool> {
-            Ok(true)
-        }
-        fn ip_address(&self) -> Option<String> {
-            self.ip.borrow().clone()
-        }
-        fn resolve_peer(&self, host: &str) -> Option<String> {
-            (host == "db").then(|| self.ip.borrow().clone()).flatten()
-        }
-    }
-
     #[test]
     fn addresses_follow_a_move_and_survive_a_failed_lookup() {
-        let c = Moving {
-            ip: std::cell::RefCell::new(Some("10.0.0.2".into())),
+        // The container and its peer `db`, at an address the test moves.
+        let ip = std::cell::RefCell::new(Some("10.0.0.2".to_string()));
+        let lookup = || -> Lookup<'_> {
+            Box::new(|host| match host {
+                None | Some("db") => ip.borrow().clone(),
+                Some(_) => None,
+            })
         };
-        let mut fresh = Addresses::new(&c, Duration::ZERO);
-        let mut cached = Addresses::new(&c, Duration::from_secs(3600));
+        let mut fresh = Addresses::new(lookup(), Duration::ZERO);
+        let mut cached = Addresses::new(lookup(), Duration::from_secs(3600));
         assert_eq!(fresh.get(None).as_deref(), Some("10.0.0.2"));
         assert_eq!(cached.get(Some("db")).as_deref(), Some("10.0.0.2"));
 
-        *c.ip.borrow_mut() = Some("10.0.0.9".into());
+        *ip.borrow_mut() = Some("10.0.0.9".into());
         assert_eq!(fresh.get(None).as_deref(), Some("10.0.0.9"), "moved");
         assert_eq!(
             cached.get(Some("db")).as_deref(),
@@ -405,7 +365,7 @@ mod tests {
             "not yet due"
         );
 
-        *c.ip.borrow_mut() = None;
+        *ip.borrow_mut() = None;
         assert_eq!(
             fresh.get(None).as_deref(),
             Some("10.0.0.9"),
@@ -424,9 +384,17 @@ mod tests {
         let w = wanted(HashSet::from([8080, 3000]), &declared);
         assert_eq!(w[&3000], PortForward::same(3000));
         assert_eq!(w[&8080], declared[0]);
+    }
+
+    #[test]
+    fn malformed_declared_ports_are_skipped() {
         assert_eq!(
-            decode_ports(&["8080:80".into(), "nonsense".into()]).len(),
-            1
+            decode_ports(&["8080:80".into(), "nonsense".into()]),
+            [PortForward {
+                local: 8080,
+                host: None,
+                port: 80
+            }]
         );
     }
 

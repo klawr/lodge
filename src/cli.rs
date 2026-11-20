@@ -18,9 +18,9 @@ use std::path::PathBuf;
 pub struct Cli {
     /// SSH remote to operate on; the docker CLI is run on the remote host over
     /// SSH (`ssh <dest> docker …`), so no local docker CLI is needed — only an
-    /// ssh client. Accepts any form the SSH client understands: a bare Host
-    /// alias from ~/.ssh/config, user@host, or user@host:port (for a
-    /// non-standard SSH port).
+    /// ssh client. Accepts a Host alias from ~/.ssh/config, `user@host`,
+    /// `user@host:port` (for a non-standard SSH port), `[v6addr]:port`, and any
+    /// of those with an `ssh://` prefix.
     #[arg(long, short, global = true, value_name = "SSH_DEST")]
     pub remote: Option<String>,
 
@@ -200,7 +200,7 @@ pub enum Command {
             a bundle is meant to be shared."
     )]
     Pack {
-        /// Where to write the bundle (default: lodge-<arch>.tar here)
+        /// Where to write the bundle (default: `lodge-<arch>.tar` here)
         #[arg(short, long)]
         output: Option<PathBuf>,
     },

@@ -47,12 +47,34 @@ pub fn container_path_problem(path: &str) -> Option<&'static str> {
     }
 }
 
-/// `s` with every character but ASCII letters and digits turned into `-`: a
-/// name for tmux sessions and containers.
+/// `s` with every character but ASCII letters and digits turned into `-`: the
+/// stem of container and tmux session names.
 pub fn slug(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
+}
+
+/// The name of the tmux session for `label`: `lodge-<label>`, made of letters,
+/// digits and `-` only (`workspace` when nothing usable is left), plus `-<tag>`
+/// when given (a short hash that keeps two projects with one label apart).
+pub fn session_name(label: &str, tag: Option<&str>) -> String {
+    let label = slug(label);
+    let label = label.trim_matches('-');
+    let label = if label.is_empty() { "workspace" } else { label };
+    match tag {
+        Some(tag) => format!("lodge-{label}-{tag}"),
+        None => format!("lodge-{label}"),
+    }
+}
+
+/// The argv that runs `script` with `sh -c`, its arguments as `$1`, `$2`, …
+/// (`$0` is `sh`). Every script lodge runs with arguments is started this way,
+/// so they all number their arguments alike.
+pub fn script_argv<'a>(script: &'a str, args: &[&'a str]) -> Vec<&'a str> {
+    let mut argv = vec!["sh", "-c", script, "sh"];
+    argv.extend_from_slice(args);
+    argv
 }
 
 /// A command in one of the two forms devcontainer.json allows.
@@ -93,9 +115,30 @@ fn which_in(name: &str, path_var: &std::ffi::OsStr) -> Option<std::path::PathBuf
 #[cfg(test)]
 mod tests {
     use super::{
-        container_path_problem, is_alias_name, is_plain_name, is_var_name, shell_quote, slug,
-        which_in,
+        container_path_problem, is_alias_name, is_plain_name, is_var_name, script_argv,
+        session_name, shell_quote, slug, which_in,
     };
+
+    #[test]
+    fn session_names_are_tmux_safe_and_never_empty() {
+        assert_eq!(
+            session_name("My App (dev)", Some("1a2b3c")),
+            "lodge-My-App--dev-1a2b3c"
+        );
+        assert_eq!(session_name("web_1", None), "lodge-web-1");
+        assert_eq!(session_name("***", Some("x")), "lodge-workspace-x");
+        assert_eq!(session_name("/abc", None), "lodge-abc");
+    }
+
+    #[test]
+    fn script_arguments_start_at_one() {
+        let argv = script_argv("printf '%s|%s' \"$1\" \"$2\"", &["a b", "c"]);
+        let out = std::process::Command::new(argv[0])
+            .args(&argv[1..])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "a b|c");
+    }
 
     #[test]
     fn var_names_are_portable_identifiers() {

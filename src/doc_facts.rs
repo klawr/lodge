@@ -117,7 +117,8 @@ fn every_doc_the_readme_links_exists() {
 
 #[test]
 fn the_config_schema_is_current() {
-    let schema = schemars::schema_for!(crate::config::Config);
+    // The schema describes the file as written, so secrets in their raw form.
+    let schema = schemars::schema_for!(crate::config::Config<crate::config::secret::RawSecret>);
     let text = serde_json::to_string_pretty(&schema).unwrap() + "\n";
     let path = root().join("docs/config.schema.json");
     if std::env::var_os("UPDATE_SCHEMA").is_some() {

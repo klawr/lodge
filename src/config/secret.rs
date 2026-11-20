@@ -30,8 +30,8 @@ pub enum As {
     File { path: String, mode: u32 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "RawSecret")]
+/// A checked `[[secret]]` declaration, made from a [`RawSecret`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SecretDecl {
     pub name: String,
     #[serde(rename = "from")]
@@ -43,9 +43,9 @@ pub struct SecretDecl {
 }
 
 /// Where the value comes from on this machine: exactly one of the three.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, derive(Serialize, schemars::JsonSchema))]
 struct RawFrom {
     env: Option<String>,
     file: Option<PathBuf>,
@@ -53,36 +53,32 @@ struct RawFrom {
 }
 
 /// `"env"`, or a file in the container.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(untagged)]
-#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, derive(Serialize, schemars::JsonSchema))]
 enum RawAs {
     Kind(String),
     File { file: String, mode: Option<String> },
 }
 
-#[derive(Deserialize)]
+// A `[[secret]]` entry as written in the file: what the config is parsed into
+// (and its schema made from). Checked and turned into a `SecretDecl` by
+// `TryFrom`, whose error says what is wrong with it. (A plain comment: doc
+// comments become the schema's text.)
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[cfg_attr(test, derive(schemars::JsonSchema))]
-struct RawSecret {
+#[cfg_attr(
+    test,
+    derive(Serialize, schemars::JsonSchema),
+    schemars(rename = "Secret")
+)]
+pub struct RawSecret {
     name: String,
     from: RawFrom,
     #[serde(rename = "as")]
     as_: RawAs,
     #[serde(default)]
     targets: Vec<String>,
-}
-
-// The config schema describes what is written in the file, which is RawSecret.
-#[cfg(test)]
-impl schemars::JsonSchema for SecretDecl {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "Secret".into()
-    }
-
-    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        RawSecret::json_schema(generator)
-    }
 }
 
 const DEFAULT_FILE_MODE: u32 = 0o600;
@@ -186,15 +182,21 @@ mod tests {
 
     #[derive(Deserialize)]
     struct Doc {
-        secret: Vec<SecretDecl>,
+        secret: Vec<RawSecret>,
     }
 
-    fn parse(toml: &str) -> Result<Vec<SecretDecl>, toml::de::Error> {
-        toml::from_str::<Doc>(toml).map(|d| d.secret)
+    /// The declarations in `toml`, or the first thing wrong with them.
+    fn parse(toml: &str) -> Result<Vec<SecretDecl>, String> {
+        toml::from_str::<Doc>(toml)
+            .map_err(|e| e.to_string())?
+            .secret
+            .into_iter()
+            .map(SecretDecl::try_from)
+            .collect()
     }
 
     fn err(toml: &str) -> String {
-        parse(toml).unwrap_err().to_string()
+        parse(toml).unwrap_err()
     }
 
     #[test]

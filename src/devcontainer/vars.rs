@@ -2,7 +2,7 @@
 //!
 //! Resolves the host-side variables of the spec. `${containerEnv:X}` is not
 //! handled here: it is rewritten for the container's own shell to expand (see
-//! `config::normalize_env_value`).
+//! `spec::normalize_env_value`).
 
 use std::path::Path;
 

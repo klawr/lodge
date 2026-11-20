@@ -146,11 +146,8 @@ impl Env for DockerContainer {
         use std::io::Write as _;
         let script = crate::runtime::WRITE_SECRET_SCRIPT.replace("%MODE%", &format!("{mode:o}"));
         // The value goes on stdin; argv carries only the script and the path.
-        let opts = ExecOpts {
-            user,
-            ..ExecOpts::default()
-        };
-        let mut args = self.exec_args(&["sh", "-c", &script, dest], &opts);
+        let argv = crate::shell::script_argv(&script, &[dest]);
+        let mut args = self.exec_args(&argv, &ExecOpts::as_user(user));
         args.insert(1, "-i".into());
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         // `command` closes stdin for ssh; this one streams, so override it.
@@ -171,9 +168,8 @@ impl Env for DockerContainer {
 
     fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> String {
         let opts = ExecOpts {
-            user,
             workdir: Some(workdir),
-            ..ExecOpts::default()
+            ..ExecOpts::as_user(user)
         };
         let mut args = self.exec_args(&["sh", "-c", inner], &opts);
         args.insert(1, "-it".into());
@@ -231,6 +227,11 @@ impl Container for DockerContainer {
             return Ok(false);
         }
         bail!("docker inspect failed: {}", err.trim())
+    }
+
+    /// `docker cp <id>:<path> -`; see [`copy`](super::copy).
+    fn read_stored_file(&self, path: &str) -> Result<Option<String>> {
+        self.copy_out(path)
     }
 
     fn ip_address(&self) -> Option<String> {

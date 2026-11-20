@@ -103,14 +103,14 @@
           "default": false
         },
         "target_binary": {
-          "description": "Where the wrapper goes in the container (default: /usr/local/bin/<name>).",
+          "description": "Where the wrapper goes in the container (default: `/usr/local/bin/<name>`).",
           "type": [
             "string",
             "null"
           ]
         },
         "target_config": {
-          "description": "Where the config goes in the container (default: ~/.config/<name>).",
+          "description": "Where the config goes in the container (default: `~/.config/<name>`).",
           "type": [
             "string",
             "null"

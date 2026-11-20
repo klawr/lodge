@@ -3,8 +3,9 @@
 //!
 //! [`start`] is the orchestration; each step lives in its own module:
 //!
-//! - [`config`]: parse `devcontainer.json` into a [`Spec`](config::Spec)
+//! - [`spec`]: parse `devcontainer.json` into a [`Spec`]
 //! - [`backend`]: create/start the container (compose, or image/build)
+//! - [`create`]: how a container is created (flags, mounts, published ports)
 //! - [`features`]: fetch, order and install devcontainer features
 //! - [`drift`]: detect that the config drifted since the container was created
 //! - [`lifecycle`]: `initializeCommand`, `onCreateCommand`, … and container env
@@ -18,12 +19,13 @@
 //! command layer implements.
 
 mod backend;
-mod config;
+mod create;
 mod drift;
 mod features;
 mod lifecycle;
 mod markers;
 mod profile;
+mod spec;
 mod uid;
 mod vars;
 mod workdir;
@@ -35,11 +37,10 @@ use std::path::Path;
 use crate::port::PortForward;
 use crate::runtime::{Container, Env, Runtime};
 use crate::target::Target;
-use config::{Spec, load_spec};
 use drift::{config_state, hash_inputs, write_hash};
-use lifecycle::{Cmd, HookCtx, exec_env, run_in_container, run_on_host};
+use lifecycle::{Hook, HookCtx, exec_env, run_create_hooks, run_in_container, run_on_host};
 use profile::write_env_profile;
-use workdir::select_workdir;
+use spec::{Spec, load_spec};
 
 pub use backend::LABEL_PROJECT;
 pub use drift::ConfigState;
@@ -85,7 +86,7 @@ pub struct Started {
     pub remote_user: Option<String>,
     /// The env hooks run with (`containerEnv`/`remoteEnv` without references).
     hook_env: Vec<(String, String)>,
-    post_attach: Option<Cmd>,
+    post_attach: Option<Hook>,
 }
 
 impl Started {
@@ -146,7 +147,6 @@ pub fn start(
 
     let id = spec.backend.up(
         rt,
-        target,
         existing.as_deref(),
         opts.build || recreate,
         &plan.create_settings(),
@@ -187,58 +187,13 @@ pub fn start(
         user: spec.remote_user.as_deref(),
         vars: &hook_env,
     };
-
-    // Create-time hooks run once *successfully*: each is skipped if its success
-    // marker exists, and the marker is written only when it succeeds — so a
-    // failed hook retries on the next `ldg up` rather than only on a recreate.
-    // A failure is reported but never aborts lodge.
-    for (label, key, cmd) in [
-        ("onCreateCommand", "onCreate", &spec.lifecycle.on_create),
-        (
-            "updateContentCommand",
-            "updateContent",
-            &spec.lifecycle.update_content,
-        ),
-        (
-            "postCreateCommand",
-            "postCreate",
-            &spec.lifecycle.post_create,
-        ),
-    ] {
-        let Some(c) = cmd else { continue };
-        // Not knowing whether it ran is not "it didn't": a create hook need
-        // not be safe to run twice, so it is skipped rather than repeated.
-        match markers::done(env, key) {
-            Ok(true) => continue,
-            Ok(false) => {}
-            Err(e) => {
-                warning!("skipping {label}: could not tell whether it already ran: {e:#}");
-                continue;
-            }
-        }
-        if run_in_container(env, &hooks, label, c) {
-            markers::mark_done(env, key)?;
-        }
-    }
-
+    run_create_hooks(env, &spec.lifecycle, &hooks)?;
     // postStartCommand runs on every start; a failure is a warning, not fatal.
     if let Some(c) = &spec.lifecycle.post_start {
         run_in_container(env, &hooks, "postStartCommand", c);
     }
 
-    let workdir = match env.exists(&spec.workspace_folder) {
-        Ok(true) => spec.workspace_folder,
-        Ok(false) => select_workdir(container.as_ref(), &spec.workspace_folder, prompt),
-        Err(e) => {
-            // Only a folder known to be missing is worth a question.
-            warning!(
-                "could not check that {} exists ({e:#}); using it",
-                spec.workspace_folder
-            );
-            spec.workspace_folder
-        }
-    };
-
+    let workdir = workdir::resolve(container.as_ref(), &spec.workspace_folder, prompt);
     Ok(Started {
         container,
         session_name: spec.session_name,
@@ -297,24 +252,33 @@ pub fn remove(project_path: &Path, target: &Target, rt: &dyn Runtime) -> Result<
     Ok(existing)
 }
 
-/// The project's container, if it has one, and whether its config drifted.
-pub fn status(
-    project_path: &Path,
-    target: &Target,
-    rt: &dyn Runtime,
-) -> Result<Option<(Found, ConfigState)>> {
+/// What [`status`] finds out about a project's container.
+pub struct Status {
+    pub found: Found,
+    pub running: bool,
+    /// Whether the config drifted (read from the container, running or not).
+    pub config: ConfigState,
+}
+
+/// The project's container, if it has one: whether it runs, and whether its
+/// config drifted.
+pub fn status(project_path: &Path, target: &Target, rt: &dyn Runtime) -> Result<Option<Status>> {
     let (spec, existing) = locate(project_path, target, rt)?;
     let Some(id) = existing else {
         return Ok(None);
     };
     let container = rt.container(&id);
+    let running = container.is_running()?;
     let current = hash_inputs(&spec.config_path, &spec.hash_extra, target)?;
-    let state = config_state(container.as_ref(), &current);
-    let found = Found {
-        container,
-        remote_user: spec.remote_user,
-    };
-    Ok(Some((found, state)))
+    let config = config_state(container.as_ref(), &current);
+    Ok(Some(Status {
+        found: Found {
+            container,
+            remote_user: spec.remote_user,
+        },
+        running,
+        config,
+    }))
 }
 
 /// Which optional host tools a project's devcontainer needs.
@@ -332,7 +296,7 @@ pub struct Needs {
 pub fn needs(project_path: &Path, target: &Target) -> Result<Needs> {
     let spec = load_spec(project_path, target)?;
     Ok(Needs {
-        compose: spec.is_compose,
+        compose: spec.backend.uses_compose(),
         registry_features: spec
             .features
             .iter()
@@ -427,7 +391,10 @@ mod tests {
     }
 
     fn state(dir: &TempDir, rt: &FakeRuntime) -> ConfigState {
-        status(dir.path(), &Target::Local, rt).unwrap().unwrap().1
+        status(dir.path(), &Target::Local, rt)
+            .unwrap()
+            .unwrap()
+            .config
     }
 
     #[test]
@@ -498,6 +465,25 @@ mod tests {
         let ops = rt.ops();
         assert!(ops.len() == 1 && ops[0].starts_with("start "), "{ops:?}");
         assert_eq!(state(&dir, &rt), ConfigState::Unknown);
+    }
+
+    #[test]
+    fn a_stopped_container_whose_config_changed_is_offered_a_recreate() {
+        let dir = project(PLAIN);
+        let rt = engine(&dir, false);
+        let started = start(dir.path(), &Target::Local, ASK, &rt, &Answer::new(false)).unwrap();
+        rt.stop(started.container.id()).unwrap();
+        write_config(&dir, EDITED);
+        // The fake refuses commands in a stopped container, so the record is
+        // read without one.
+        let s = status(dir.path(), &Target::Local, &rt).unwrap().unwrap();
+        assert!(!s.running);
+        assert_eq!(s.config, ConfigState::Changed);
+
+        let recreate = Answer::new(true);
+        start(dir.path(), &Target::Local, ASK, &rt, &recreate).unwrap();
+        assert_eq!(recreate.asked.get(), 1, "the drift was noticed");
+        assert_eq!(state(&dir, &rt), ConfigState::UpToDate);
     }
 
     #[test]

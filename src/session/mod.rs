@@ -4,7 +4,7 @@
 pub mod terminfo;
 
 use crate::config::{Multiplexer, SessionConfig};
-use crate::output::{info, note, warning};
+use crate::output::{info, warning};
 use crate::runtime::{Container, User};
 use crate::shell::shell_quote;
 use crate::target::Target;
@@ -66,9 +66,7 @@ pub fn enter(
     let container_id = container.id();
 
     info!("entering {container_id}");
-    if crate::output::is_verbose() {
-        note!("$ {run_cmd}");
-    }
+    crate::output::trace_line(&run_cmd);
 
     let started = Instant::now();
     let result = match config.multiplexer {
@@ -112,42 +110,41 @@ pub fn enter(
 fn enter_tmux(session: &str, run_cmd: &str) -> Result<()> {
     // Create the session detached if it doesn't already exist (idempotent): a
     // failure just means the session is already there.
-    tmux_best_effort(&["new-session", "-d", "-s", session, run_cmd]);
+    #[allow(clippy::let_underscore_must_use, reason = "the session may exist")]
+    let _ = tmux(&["new-session", "-d", "-s", session, run_cmd]);
 
-    // New windows in this session also exec into the container.
-    crate::host_tools::TMUX
-        .command()
-        .args(["set-option", "-t", session, "default-command", run_cmd])
-        .status()?;
+    // New windows in this session also exec into the container. Without it
+    // the session still works; new windows just open on this machine.
+    if let Err(e) = tmux(&["set-option", "-t", session, "default-command", run_cmd]) {
+        warning!("new tmux windows will open on this machine, not in the container: {e:#}");
+    }
 
     // `run_cmd` sets the pane title via OSC once it's running (see `enter`);
     // forward that into the real terminal's title instead of leaving tmux's
     // own title machinery (which defaults to showing the session/window name)
     // in charge of it.
-    // Cosmetic: without these the title is merely less pretty.
-    tmux_best_effort(&["set-option", "-t", session, "set-titles", "on"]);
-    tmux_best_effort(&["set-option", "-t", session, "set-titles-string", "#T"]);
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "cosmetic: without these the title is merely less pretty"
+    )]
+    let _ = tmux(&["set-option", "-t", session, "set-titles", "on"])
+        .and_then(|()| tmux(&["set-option", "-t", session, "set-titles-string", "#T"]));
 
-    let already_in_tmux = std::env::var_os("TMUX").is_some();
-    let action = if already_in_tmux {
+    let action = if std::env::var_os("TMUX").is_some() {
         "switch-client"
     } else {
         "attach-session"
     };
-    let status = crate::host_tools::TMUX
-        .command()
-        .args([action, "-t", session])
-        .status()?;
-    if !status.success() {
-        bail!("tmux {action} -t {session} failed");
-    }
-    Ok(())
+    tmux(&[action, "-t", session])
 }
 
-// Runs a tmux command whose failure doesn't matter to the session.
-#[allow(clippy::let_underscore_must_use, reason = "failure is harmless here")]
-fn tmux_best_effort(args: &[&str]) {
-    let _ = crate::host_tools::TMUX.command().args(args).status();
+/// Runs `tmux <args>`; an error when it can't be run or exits non-zero.
+fn tmux(args: &[&str]) -> Result<()> {
+    let status = crate::host_tools::TMUX.command().args(args).status()?;
+    if !status.success() {
+        bail!("tmux {} failed ({status})", args.join(" "));
+    }
+    Ok(())
 }
 
 // Execs straight into the container with no multiplexer.

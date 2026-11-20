@@ -58,11 +58,11 @@ every subcommand.
 | --- | --- |
 | `cli.rs` | `clap` definitions: subcommands and the global flags. |
 | `cmd/` | One file per group of commands (`attach`: up/exec, `project`: down/status/rm/ls/ports/logs/clean, `doctor`, `init`, `bundle`: pack/bundle/cache), plus `prompt`, the terminal side of `devcontainer::Prompt`. The only layer that loads the config, prints reports and reads the terminal. |
-| `config/` | The user's `config.toml`: `[[inject]]`, `[session]`, `[git]`, `[aliases]`, `[[secret]]` (its declaration types are in `config/secret.rs`), `bundle`. Unknown keys are errors (with a "did you mean"), and `validate` reports every problem at once. A relative `bundle =` resolves against the file's folder. The JSON schema in `docs/config.schema.json` is generated from these types. |
+| `config/` | The user's `config.toml`: `[[inject]]`, `[session]`, `[git]`, `[aliases]`, `[[secret]]` (its declaration types are in `config/secret.rs`: `RawSecret` as written, `SecretDecl` once checked), `bundle`. Unknown keys and wrong types are errors (with a "did you mean"); past those, every problem, secrets included, is reported at once. A relative `bundle =` resolves against the file's folder. The JSON schema in `docs/config.schema.json` is generated from these types. |
 | `devcontainer/` | Everything about running a `devcontainer.json` (see below). |
 | `bundle/` | A bundle is a portable tar of relinked binaries, their libraries and configs, with a manifest. `manifest` defines and validates it (paths derive from names, so a bundle can't point outside itself), `archive` writes, reads and verifies the tar, `pack` builds one from the config (the only step needing `patchelf`; `deps` parses `ldd`, asking it once per binary however often the answer is needed, `elf` reads a binary's architecture, as an `arch::Arch`, the one name for a CPU that bundles, binaries and machines are compared by, and `Arch::host()` is this machine's), `source` readies a bundle *directory* to inject from (extracted from a file, or packed live), keyed by the file's hash or a fingerprint of the live inputs, and `cache` keeps those directories under `~/.cache/lodge/bundles/`. `hash` is the content hash of a file or tree. |
 | `inject/` | Copies a bundle's binaries, libraries and configs into a container and wires them up for the `ContainerUser`, reading only from the bundle directory: `binary`, `libs` (tracked by content hash), `config_files` (and ownership), `installed` (a hash and the destination per installed piece; a record that can't be read means that piece is installed again, and the list of records `ldg clean` works from is an error when it can't be read, not "nothing installed"), `home` (the user's home is writable, and the user owns what lodge puts in it), `shell_env` (`PATH`, aliases, git), `state` (format version, installed bundle id), `remove` (`ldg clean`, apart from the secrets, which `secret::place::clear_all` removes). |
-| `layout.rs` | Every path lodge writes inside a container (the table under "What lives where"), and `INJECTED`, the part `ldg clean` removes. Nothing else spells these paths out. |
+| `layout.rs` | Every path lodge writes inside a container (the table under "What lives where"), the default destinations of an injected tool, the folders `ldg clean` searches for wrappers, and `INJECTED`, the part `ldg clean` removes. Nothing else spells these paths out. |
 | `secret/` | Secrets that must not be in a bundle. Their `[[secret]]` declarations are config (`config/secret.rs`: validated; names reach shell scripts). `mod` is the `Secret` value type (redacted `Debug`, no `Display`), matching `targets` globs, and `resolve` (env, file or a command run on *this* machine with a timeout, with errors that never contain the value). `place` writes values into a container under `/dev/shm/lodge-secrets-<uid>/` and builds the session lines that export them; `clear_all` removes everyone's (`ldg clean`). `deliver` picks the secrets whose `targets` match, resolves and places them (or clears them when none are declared), and prints names only. |
 | `session/` | Opens the interactive session: `docker exec -it`, optionally inside tmux. `terminfo` makes the terminal the session is opened from work in the container (copies its entry from this machine when the container lacks it, and sets `TERM`). |
 | `forward/` | Port forwarding. `mod` spawns the daemon and owns its state files (log, lock, and the ports file `ldg ports` reads, which starts with the daemon's pid so a dead daemon's file is ignored), `daemon` is the `_forward` loop (declared ports plus whatever starts listening), `tunnel` one forward: the in-process TCP proxy or an `ssh -L` tunnel. The daemon decodes its own `--port` flags, re-points a forward when its destination's address changes (looked up again every 30 s), and exits when the container stops, not when the engine merely can't be reached for a while. |
@@ -71,12 +71,12 @@ every subcommand.
 | `target.rs` | `Target` (`Local` or `Ssh(host)`): the one place that decides local vs remote, plus host-side file helpers (`read_first` finds files by pattern and reads the first in one round trip, `read_file` reads one, `fetch_dir` copies a folder from the project's host). |
 | `runtime/` | The seam to whatever runs the workload: the `Env`, `Container`, `Runtime` and `Compose` traits (see below), `User` (who a command runs as) and `ContainerUser` (the session user's name, uid, gid and home, looked up once), the docker CLI implementation (`docker/`: the engine, the per-container `Env`, and the file-copy streaming), and strict in-memory fakes for tests (`FakeEnv`, and `FakeRuntime`, whose containers each run in one). |
 | `ssh.rs` | `--remote` destination parsing, connection multiplexing, small SSH helpers. |
-| `shell.rs` | POSIX `shell_quote`, which everything that builds a command string goes through; the rules for names written into scripts unquoted (`is_plain_name`, `is_alias_name`, `is_var_name`) and for destinations in a container (`container_path_problem`); `slug` for container and session names; and `CmdLine`, a command as `sh -c` script or argv. |
+| `shell.rs` | POSIX `shell_quote`, which everything that builds a command string goes through; `script_argv`, how every script with arguments is started (`sh -c <script> sh <args…>`, so arguments are `$1`, `$2`, …); the rules for names written into scripts unquoted (`is_plain_name`, `is_alias_name`, `is_var_name`) and for destinations in a container (`container_path_problem`); `slug` for container names and `session_name` for tmux sessions; and `CmdLine`, a command as `sh -c` script or argv. |
 | `fingerprint.rs` | The small content hash used to notice changes (devcontainer inputs, updated libraries, bundle contents), as a `Fingerprint` builder. Its values are stored, so a test pins them. |
 | `tmpfile.rs` | Self-deleting staging files for `docker cp`. |
 | `tree.rs` | Walking a file tree on this machine in one stable order (name order, a directory before its contents), with an explicit choice about symlinks (a followed link loop is entered once) and unreadable directories. Every hash, fingerprint and copy of a tree goes through it. |
-| `output.rs` | Everything lodge says (`info!`, `warning!`, `note!`, `prompt!`, `line!` for reports), the `[lodge]` prefix on every line, `plural`, and the verbosity setting with command tracing. |
-| `conventions.rs`, `doc_facts.rs` | Test-only: architecture rules, and facts the docs state checked against the code. |
+| `output.rs` | Everything lodge says (`info!`, `note!`, `warning!`, `error!`, `prompt!`, `line!` for reports, and `line_err!`, `scoped!`, `raw_stdout`, `raw_stderr` for the special cases), the `[lodge]` prefix on every line, `plural`, and the verbosity setting with command tracing (`trace`, `trace_line`). |
+| `conventions.rs`, `doc_facts.rs` | Test-only: architecture rules (one place per external program, the direction of dependencies), and facts the docs state checked against the code. |
 
 ### `devcontainer/`
 
@@ -84,22 +84,24 @@ every subcommand.
 
 | File | Responsibility |
 | --- | --- |
-| `mod.rs` | `start` / `stop` / `remove` / `status` / `find`, the `Started` result, the recreate policy (`--yes`, `--no-recreate`, or ask), and `Prompt`, the questions only a person can answer (the command layer implements it). |
-| `config.rs` | Find the config on the project's host (through `Target`, so local and `--remote` share one lookup order); parse `devcontainer.json` (JSONC) into a backend-agnostic `Spec`; derive the session name. |
-| `backend.rs` | Picks and builds the backend from the parsed config (with the stable container name, and the files outside the hashed folder that count toward drift: a Dockerfile, compose files). The `Backend` trait with two implementations: `ComposeBackend` (`docker compose`) and `ContainerBackend` (`docker run` of an image or a local build). Both label the container `dev.lodge.project=<path>`. `CreateSettings` holds how a container is created (privileged, capabilities, mounts, …), from devcontainer.json and from features alike, rendered as `docker run` flags or a compose override. |
-| `features/` | Devcontainer *features*: `fetch` (OCI with `oras`, or a local folder from the project's host; a feature's `id` must be a plain name, since it names a folder), and in `mod.rs` the order, the creation settings they ask for, and the install (as root, told `_REMOTE_USER`). |
-| `lifecycle.rs` | The hook types (string / argv / named map, all run as the same steps), and running them on the host or in the container (as `remoteUser`). |
+| `mod.rs` | `start` / `stop` / `remove` / `status` / `find`, the `Started` result, the recreate policy (`--yes`, `--no-recreate`, or ask), and `Prompt`, the questions only a person can answer (the command layer implements it). Drift and the installed bundle are read with `Container::read_stored_file`, which works on a stopped container too. |
+| `spec.rs` | Find the config on the project's host (through `Target`, so local and `--remote` share one lookup order); parse `devcontainer.json` (JSONC) into a backend-agnostic `Spec`; derive the session name. |
+| `backend.rs` | Picks and builds the backend from the parsed config (with the stable container name, and the files outside the hashed folder that count toward drift: a Dockerfile, compose files). The `Backend` trait with two implementations: `ComposeBackend` (`docker compose`, run on the project's host) and `ContainerBackend` (`docker run` of an image or a local build). Both label the container `dev.lodge.project=<path>`. |
+| `create.rs` | `CreateSettings`, how a container is created (privileged, capabilities, mounts, published `appPort`s, …), from devcontainer.json and from features alike, rendered as `docker run` flags or a compose override. |
+| `features/` | Devcontainer *features*: `fetch` (OCI with `oras`, or a local folder from the project's host; a feature's `id` must be a plain name, since it names a folder), and in `mod.rs` the order, the creation settings they ask for, and the install (as root, told `_REMOTE_USER`), with one env profile per feature. |
+| `lifecycle.rs` | The `Hook` type (string / argv / named map, all run as the same steps), running hooks on the host or in the container (as `remoteUser`), and the create-time hooks that run once successfully (`run_create_hooks`). |
 | `profile.rs` | The env profiles written into the container (`containerEnv`/`remoteEnv`, and what features add): literals quoted, variable references left for the login shell. |
 | `markers.rs` | One-shot markers: which create-time hooks and feature installs already succeeded. |
 | `drift.rs` | Drift detection: fingerprint the folder the config is in (`.devcontainer/`, or `.devcontainer/<name>/`), or a standalone `.devcontainer.json`, plus the files the backend names outside it (a Dockerfile, compose files), and compare with the value stored in the container. `config_state` is the one comparison, used by `ldg up` and `ldg status` alike: `UpToDate`, `Changed`, or `Unknown` when no hash is recorded or it can't be read, which is not drift. The files are read through `Target` (`fetch_dir`, `read_file`), so a remote project is hashed exactly like a local one. |
-| `workdir.rs` | Offer fallback directories when `workspaceFolder` doesn't exist. |
+| `workdir.rs` | The directory a session lands in: `workspaceFolder`, or one the person picks when it doesn't exist. |
 | `uid.rs` | Lines the container user's uid/gid up with the host user's so a bind-mounted workspace is writable. Planned in Rust from `/etc/passwd`, applied by a small script. |
 | `vars.rs` | `${localEnv:X:default}`, `${containerWorkspaceFolder}`, `${devcontainerId}` and friends, and `path_tag`, the short hash of the project path behind `${devcontainerId}` and the container and session names. |
 
 The `Backend` split is what keeps `start()` simple: a backend only knows how to
-find an existing container and how to create or start one (`up` is handed what
-`existing` found, so it doesn't look again). Hashing, env,
-features and hooks all work from the resulting container id.
+find an existing container and how to create or start one. `up` is handed what
+`existing` found, so the image backend doesn't look again; compose finds its own
+container (and is asked for its id after `up` anyway). Hashing, env, features
+and hooks all work from the resulting container id.
 
 ## What `ldg up` does, step by step
 
@@ -195,7 +197,8 @@ inside the container (installed plugins, for example).
 | `/dev/shm/lodge-secrets-<uid>/` | Placed secret values (memory only, 0700 directory, 0600 files); see `secret/`. |
 | `/opt/lodge/terminfo/` | The user's terminfo entry, when the container lacked it. |
 | `/tmp/lodge-features/` | Devcontainer feature files, copied in to run their `install.sh` (left in place; `ldg clean` doesn't touch them). |
-| `/etc/profile.d/lodge{,-env,-path,-features}.sh` | Aliases, `containerEnv`/`remoteEnv`, `PATH`, feature env. |
+| `/etc/profile.d/lodge{,-env,-path}.sh` | Aliases, `containerEnv`/`remoteEnv`, `PATH`. |
+| `/etc/profile.d/lodge-feature-<id>.sh` | One feature's `containerEnv`, so installing one feature again leaves the others' env alone. |
 
 Because all state is *in* the container, it survives reboots and disappears
 when the container is recreated, with no host bookkeeping to go stale. Every
@@ -244,7 +247,7 @@ small traits from narrow to broad, plus one for compose:
 | Trait | A… | Used by |
 |---|---|---|
 | `Env` | place you can run commands in and copy files into | injection, features, lifecycle hooks, markers, the stored config hash |
-| `Container: Env` | `Env` that can also be inspected (name, mounts, address, peers, running: `Result<bool>`, so "stopped" and "couldn't ask" differ) | port forwarding, workdir selection, the session |
+| `Container: Env` | `Env` that can also be inspected (name, mounts, address, peers, running: `Result<bool>`, so "stopped" and "couldn't ask" differ) and read while stopped (`read_stored_file`, through `docker cp`) | port forwarding, workdir selection, the session, drift, `ldg status` |
 | `Runtime` | container engine: find, build, run, start, stop | devcontainer backends, `start`/`stop` |
 | `Compose` | an engine's compose support (`Runtime::compose()`, an error where there is none): up, down, ps | the compose backend, `doctor` |
 
@@ -293,11 +296,14 @@ override with `write_scratch`, whose guard removes it again.
 Most of these are enforced by the compiler or a test, so they can't quietly
 erode.
 
-- **Output.** Everything goes through `output`: `info!` for progress, `warning!`
-  for something that went wrong but lodge carries on, `error!` for why a command
-  failed, `note!` for hints, `prompt!` for a question, all on stderr, and
-  `line!` for reports and lists (no prefix), the only thing on stdout, so a
-  script reading lodge's output gets just the data. Counts use `output::plural`.
+- **Output.** Everything goes through `output`: `info!` for progress, `note!`
+  for hints (tagged `note:`), `warning!` for something that went wrong but lodge
+  carries on, `error!` for why a command failed, `prompt!` for a question, all on
+  stderr, and `line!` for reports and lists (no prefix), the only thing on
+  stdout, so a script reading lodge's output gets just the data. `line_err!`
+  (an unprefixed line on stderr, such as a question's choices), `scoped!` (the
+  forward daemon's log) and `raw_stdout`/`raw_stderr` (a generated file, a log,
+  another program's output, passed through untouched) cover the rest. Counts use `output::plural`.
   Every message line gets the `[lodge]` prefix, including continuation lines of
   a multi-line message, so call sites write plain text. `--verbose` also traces
   every command lodge spawns, in shell-pasteable form; `-vv` / `-vvv` pass `-v`
@@ -313,6 +319,12 @@ erode.
   `tunnel`, `pty_denied` and `interactive_line`, all built on one private
   `base`; nothing else builds an `ssh` command. *Enforced:* the tests in
   `conventions.rs`.
+- **Dependencies point one way.** `cmd/` on top (the only layer that knows
+  `cli`), lodge's features below it (`config`, `devcontainer`, `bundle`,
+  `inject`, `secret`, `session`, `forward`), and a foundation (`runtime`,
+  `target`, `ssh`, `shell`, `layout`, `output`, `tmpfile`, `tree`,
+  `fingerprint`, `host_tools`, `port`) that names none of them. *Enforced:* the
+  tests in `conventions.rs`.
 - **Paths in the container** come from `layout.rs`; **the container user** is a
   `ContainerUser` resolved once by the command, after `devcontainer::start`
   (inside `start` the user's uid may still change, so uid alignment and feature
@@ -326,7 +338,8 @@ erode.
   `run_in`, `canonical_dir`, `read_first`, `read_file`, `write_scratch`, `remove_file`,
   `uid_gid`).
 - **Quoting.** Anything interpolated into `sh -c` or an SSH command string goes
-  through `shell::shell_quote`. Don't build such strings by hand.
+  through `shell::shell_quote`. Don't build such strings by hand; a script that
+  takes arguments gets them through `shell::script_argv`, as `$1`, `$2`, ….
 - **Writing files into a container.** Use `Env::write_file` (creates parent
   directories, works over `--remote`).
 - **No panics for errors.** Non-test code returns `Result`; it does not
@@ -342,7 +355,7 @@ erode.
   error. "Could not find out" is never treated as "absent": `Env::read_file`
   tells a missing file from a failed read, and `Env::exists` a missing path
   from a failed check (a create hook whose marker can't be checked is skipped,
-  not run again). The `bool` checks (`file_exists`, `succeeds`) are only for
+  not run again), and `ldg clean` fails when something could not be removed. The `bool` checks (`file_exists`, `succeeds`) are only for
   answers where a wrong "no" is harmless.
 - **Docs follow the code.** `doc_facts.rs` checks what the docs can be checked
   on: every command appears in the README and in the list above, the documented
@@ -355,17 +368,19 @@ erode.
 (config parsing and building a `Spec`, ldd parsing, shell quoting, SSH
 destination parsing, port-forward parsing, hash normalisation, feature ordering,
 the uid plan, library refresh) and, through `FakeEnv`, the logic that writes into
-a container: aliases, `PATH` preservation, the wrapper script, the env profile,
-the stored hash and the hook markers. Through `FakeRuntime` they cover what
-`ldg up` decides about an existing container (create, start, ask, recreate,
-keep one with no recorded config) and what `ldg status` reports.
-`conventions.rs` checks the architecture rules above.
+a container: binaries, configs and the home's ownership, aliases, `PATH`
+preservation, the wrapper script, the env profiles, feature installs, the stored
+hash, the hook markers and a whole `inject::run`. Through `FakeRuntime` they
+cover what `ldg up` decides about an existing container (create, start, ask,
+recreate, keep one with no recorded config) and what `ldg status` reports,
+running or stopped. `conventions.rs` checks the architecture rules above.
 
 `FakeEnv` is strict on purpose. It emulates a handful of commands, and a test
-declares anything else it depends on (`with_output`, `with_failure`,
-`with_commands`). A command it neither emulates nor was told about panics, so a
-test can't pass because the fake said "success" to something a real container
-might refuse. The one exception is a `sh -c` script run for its effect, which is
+declares anything else it depends on (`with_output`, `with_failure`, which
+`recover` lifts again, and `with_commands`). A command it neither emulates nor
+was told about panics, so a test can't pass because the fake said "success" to
+something a real container might refuse; and a `FakeRuntime` container that is
+stopped refuses every command, as `docker exec` does. The one exception is a `sh -c` script run for its effect, which is
 recorded and assumed to work; tests assert on the recorded script, and scripts
 whose behaviour matters (secrets, `ldg clean`'s wrapper search) are also run for
 real against a temp directory. The fake records who each command ran as
@@ -402,7 +417,8 @@ codes meaningful. Terminals are pseudo-terminals made by `script`; nothing
 checks what a person would see on screen.
 
 CI (`.github/workflows/ci.yml`) runs, on every push and PR: fmt, clippy
-`-D warnings`, the unit tests and a release build; the integration tests; a build
+`-D warnings`, rustdoc with warnings as errors, the unit tests and a release
+build; the integration tests; a build
 with the minimum supported Rust (`rust-version` in `Cargo.toml`); `cargo deny`
 (`.github/deny.toml`: licenses, advisories, sources); and the static musl builds for
 x86_64 and aarch64. On `master`, once all of those pass, release-please

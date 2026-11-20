@@ -139,10 +139,10 @@ impl Packer<'_> {
         std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
 
         Ok(Binary {
-            target: item
+            dest: item
                 .target_binary
                 .clone()
-                .unwrap_or_else(|| format!("/usr/local/bin/{name}")),
+                .unwrap_or_else(|| layout::default_binary_dest(name)),
             dynamic,
             hash: hash_path(&dst)?,
         })
@@ -195,10 +195,10 @@ impl Packer<'_> {
         let dst = self.dir.join(CONFIG_DIR).join(name);
         copy_tree(&real, &dst)?;
         Ok(ConfigTree {
-            target: item
+            dest: item
                 .target_config
                 .clone()
-                .unwrap_or_else(|| format!("~/.config/{name}")),
+                .unwrap_or_else(|| layout::default_config_dest(name)),
             is_dir: real.is_dir(),
             hash: hash_path(&dst)?,
         })
@@ -274,11 +274,12 @@ fn sensitive_reason(path: &Path, home: Option<&Path>) -> Option<&'static str> {
 
 /// Relinks a copy of `binary` so it runs *directly* against the bundled glibc,
 /// with `patchelf`:
-///   --set-interpreter /lodge/<ld> : the bundled dynamic linker is the program
-///                                   interpreter
-///   --force-rpath --set-rpath …   : DT_RPATH (not RUNPATH) so the search path
-///                                   also resolves *transitive* deps (e.g. libnsl
-///                                   pulling libtirpc); RUNPATH would not.
+///
+/// - `--set-interpreter /lodge/<ld>`: the bundled dynamic linker is the program
+///   interpreter;
+/// - `--force-rpath --set-rpath …`: DT_RPATH (not RUNPATH), so the search path
+///   also resolves *transitive* deps (e.g. libnsl pulling libtirpc); RUNPATH
+///   would not.
 ///
 /// Running directly keeps `/proc/self/exe` pointing at the binary, which tools
 /// like Neovim need when they re-exec themselves (`--embed`); baking the search
@@ -359,7 +360,7 @@ mod tests {
 
         let tool = &manifest.tools[0];
         assert_eq!(tool.name, "hello");
-        assert_eq!(tool.binary.as_ref().unwrap().target, "/usr/local/bin/hello");
+        assert_eq!(tool.binary.as_ref().unwrap().dest, "/usr/local/bin/hello");
         assert!(!tool.binary.as_ref().unwrap().dynamic);
         assert!(tool.config.as_ref().unwrap().is_dir);
         assert_eq!(manifest.arch, Arch::host().unwrap().to_string());

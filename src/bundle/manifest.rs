@@ -58,7 +58,9 @@ pub struct Tool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Binary {
     /// Where the wrapper goes in the container (`~/` is the user's home).
-    pub target: String,
+    /// Called `target` in the manifest, after the config's `target_binary`.
+    #[serde(rename = "target")]
+    pub dest: String,
     /// Whether it was relinked to the bundled glibc (false: static, or copied as is).
     pub dynamic: bool,
     pub hash: String,
@@ -67,8 +69,10 @@ pub struct Binary {
 /// A config file or tree, stored at `config/<tool name>`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigTree {
-    /// Where it goes in the container (`~/` is the user's home).
-    pub target: String,
+    /// Where it goes in the container (`~/` is the user's home). Called
+    /// `target` in the manifest, after the config's `target_config`.
+    #[serde(rename = "target")]
+    pub dest: String,
     pub is_dir: bool,
     pub hash: String,
 }
@@ -140,7 +144,7 @@ impl Manifest {
                 bail!("tool '{}' has neither a binary nor a config", tool.name);
             }
             if let Some(b) = &tool.binary {
-                check_target(&tool.name, &b.target)?;
+                check_dest(&tool.name, &b.dest)?;
                 check_hash(&tool.name, &b.hash)?;
                 if b.dynamic && self.linker.is_none() {
                     bail!(
@@ -150,7 +154,7 @@ impl Manifest {
                 }
             }
             if let Some(c) = &tool.config {
-                check_target(&tool.name, &c.target)?;
+                check_dest(&tool.name, &c.dest)?;
                 check_hash(&tool.name, &c.hash)?;
             }
         }
@@ -180,9 +184,9 @@ fn check_hash(what: &str, hash: &str) -> Result<()> {
 }
 
 /// A container path: absolute or under `~/`, without `..` or control characters.
-fn check_target(tool: &str, target: &str) -> Result<()> {
-    if let Some(why) = container_path_problem(target) {
-        bail!("tool '{tool}' has an unusable target path {target:?}: it {why}");
+fn check_dest(tool: &str, dest: &str) -> Result<()> {
+    if let Some(why) = container_path_problem(dest) {
+        bail!("tool '{tool}' has an unusable target path {dest:?}: it {why}");
     }
     Ok(())
 }
@@ -211,12 +215,12 @@ mod tests {
             tools: vec![Tool {
                 name: "nvim".into(),
                 binary: Some(Binary {
-                    target: "/usr/local/bin/nvim".into(),
+                    dest: "/usr/local/bin/nvim".into(),
                     dynamic: true,
                     hash: "00000000000000aa".into(),
                 }),
                 config: Some(ConfigTree {
-                    target: "~/.config/nvim".into(),
+                    dest: "~/.config/nvim".into(),
                     is_dir: true,
                     hash: "00000000000000bb".into(),
                 }),
@@ -276,11 +280,11 @@ mod tests {
     #[test]
     fn targets_must_be_absolute_or_home_relative_without_dotdot() {
         assert!(
-            invalid(|m| m.tools[0].binary.as_mut().unwrap().target = "bin/nvim".into())
+            invalid(|m| m.tools[0].binary.as_mut().unwrap().dest = "bin/nvim".into())
                 .contains("unusable target")
         );
         assert!(
-            invalid(|m| m.tools[0].config.as_mut().unwrap().target = "/etc/../x".into())
+            invalid(|m| m.tools[0].config.as_mut().unwrap().dest = "/etc/../x".into())
                 .contains("unusable target")
         );
     }

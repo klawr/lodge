@@ -1,17 +1,23 @@
-//! Picking the directory to land in when the configured `workspaceFolder`
-//! doesn't exist inside the container.
+//! The directory a session lands in: the configured `workspaceFolder`, or one
+//! the person picks when it doesn't exist inside the container.
 
 use super::Prompt;
+use crate::output::warning;
 use crate::runtime::Container;
 
-// Called when the configured workspaceFolder doesn't exist in the container:
-// offers mount destinations and /workspaces/* entries, and lets `prompt` decide.
-pub(super) fn select_workdir(
-    container: &dyn Container,
-    configured: &str,
-    prompt: &dyn Prompt,
-) -> String {
-    prompt.choose_workdir(configured, &discover_workdirs(container))
+/// `configured` if it exists in the container; otherwise `prompt` decides,
+/// offered mount destinations and `/workspaces/*` entries. When existence
+/// can't be checked, `configured` is used: only a folder known to be missing is
+/// worth a question.
+pub(super) fn resolve(container: &dyn Container, configured: &str, prompt: &dyn Prompt) -> String {
+    match container.exists(configured) {
+        Ok(true) => configured.to_string(),
+        Ok(false) => prompt.choose_workdir(configured, &discover_workdirs(container)),
+        Err(e) => {
+            warning!("could not check that {configured} exists ({e:#}); using it");
+            configured.to_string()
+        }
+    }
 }
 
 // Collects workspace candidates: actual mount destinations from `docker inspect`

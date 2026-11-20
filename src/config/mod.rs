@@ -10,12 +10,20 @@ use std::path::{Path, PathBuf};
 pub mod secret;
 
 use crate::shell::{container_path_problem, is_alias_name, is_plain_name};
-use secret::SecretDecl;
+use secret::{RawSecret, SecretDecl};
 
-#[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-#[cfg_attr(test, derive(schemars::JsonSchema))]
-pub struct Config {
+// The user's config. `S` is how a `[[secret]]` entry is held: as written
+// (`RawSecret`, what the file is parsed into and the schema is made from), or
+// checked (`SecretDecl`, the default, what the rest of lodge works with). A
+// plain comment, not a doc comment: doc comments become the schema's text.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, bound(deserialize = "S: Deserialize<'de>"))]
+#[cfg_attr(
+    test,
+    derive(Serialize, schemars::JsonSchema),
+    schemars(rename = "Config")
+)]
+pub struct Config<S = SecretDecl> {
     /// A bundle file to inject from instead of packing the `[[inject]]` entries.
     /// A relative path is relative to this file's folder.
     #[serde(default)]
@@ -34,7 +42,22 @@ pub struct Config {
     pub aliases: BTreeMap<String, String>,
     /// Secrets to deliver at attach time. Local config only, never in a bundle.
     #[serde(default)]
-    pub secret: Vec<SecretDecl>,
+    // Generic, so schemars can't work the default out itself.
+    #[cfg_attr(test, schemars(extend("default" = [])))]
+    pub secret: Vec<S>,
+}
+
+impl<S> Default for Config<S> {
+    fn default() -> Self {
+        Self {
+            bundle: None,
+            inject: Vec::new(),
+            session: SessionConfig::default(),
+            git: GitConfig::default(),
+            aliases: BTreeMap::new(),
+            secret: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -47,9 +70,9 @@ pub struct Injectable {
     pub binary: Option<PathBuf>,
     /// Host path to a config file or directory to inject.
     pub config: Option<PathBuf>,
-    /// Where the wrapper goes in the container (default: /usr/local/bin/<name>).
+    /// Where the wrapper goes in the container (default: `/usr/local/bin/<name>`).
     pub target_binary: Option<String>,
-    /// Where the config goes in the container (default: ~/.config/<name>).
+    /// Where the config goes in the container (default: `~/.config/<name>`).
     pub target_config: Option<String>,
     /// If true, never replace the binary/config once it exists in the container,
     /// even when the bundle has a newer version (for a tree you update inside the
@@ -183,29 +206,62 @@ impl Config {
         Self::parse(&raw, path)
     }
 
-    /// Parses `raw` as if read from `path` (which relative paths resolve against).
+    /// Parses `raw` as if read from `path` (which relative paths resolve
+    /// against), and checks it. What the file's syntax and types get wrong is
+    /// reported on its own; everything else is reported together.
     pub fn parse(raw: &str, path: &Path) -> Result<Self> {
-        let mut cfg: Config = toml::from_str(raw).map_err(|e| {
-            anyhow::anyhow!("{}{}", e.message(), location(raw, &e))
-                .context(format!("invalid config {}", path.display()))
+        let invalid = || format!("invalid config {}", path.display());
+        let file: Config<RawSecret> = toml::from_str(raw).map_err(|e| {
+            anyhow::anyhow!("{}{}", e.message(), location(raw, &e)).context(invalid())
         })?;
-        cfg.bundle = cfg.bundle.take().map(|b| resolve_against(path, b));
-        for item in &mut cfg.inject {
+        let mut problems = Vec::new();
+        let cfg = Self::from_file(file, path, &mut problems);
+        problems.extend(cfg.problems());
+        let report = match problems.len() {
+            0 => return Ok(cfg),
+            1 => problems.swap_remove(0),
+            _ => format!("\n  - {}", problems.join("\n  - ")),
+        };
+        Err(anyhow::anyhow!(report).context(invalid()))
+    }
+
+    /// The config as read from `path`, with its host paths resolved and each
+    /// `[[secret]]` checked; what is wrong with a secret goes to `problems`.
+    fn from_file(file: Config<RawSecret>, path: &Path, problems: &mut Vec<String>) -> Self {
+        let Config {
+            bundle,
+            mut inject,
+            session,
+            git,
+            aliases,
+            secret,
+        } = file;
+        for item in &mut inject {
             item.binary = item.binary.take().map(expand_tilde);
             item.config = item.config.take().map(expand_tilde);
         }
-        for decl in &mut cfg.secret {
-            if let secret::Source::File(p) = &mut decl.from {
-                *p = expand_tilde(std::mem::take(p));
-            }
+        let secret = secret
+            .into_iter()
+            .filter_map(|raw| SecretDecl::try_from(raw).map_err(|e| problems.push(e)).ok())
+            .map(|mut decl| {
+                if let secret::Source::File(p) = &mut decl.from {
+                    *p = expand_tilde(std::mem::take(p));
+                }
+                decl
+            })
+            .collect();
+        Self {
+            bundle: bundle.map(|b| resolve_against(path, b)),
+            inject,
+            session,
+            git,
+            aliases,
+            secret,
         }
-        cfg.validate()
-            .with_context(|| format!("invalid config {}", path.display()))?;
-        Ok(cfg)
     }
 
-    /// Checks what the types can't, and reports every problem at once.
-    fn validate(&self) -> Result<()> {
+    /// What the types can't check: every problem, so they are reported at once.
+    fn problems(&self) -> Vec<String> {
         let mut problems = Vec::new();
         let mut seen = HashSet::new();
         for item in &self.inject {
@@ -245,11 +301,7 @@ impl Config {
             }
         }
         problems.extend(secret::problems(&self.secret));
-        match problems.len() {
-            0 => Ok(()),
-            1 => anyhow::bail!("{}", problems[0]),
-            _ => anyhow::bail!("\n  - {}", problems.join("\n  - ")),
-        }
+        problems
     }
 }
 
@@ -421,6 +473,8 @@ mod tests {
                  [[inject]]\nname = \"c\"\n\
                  [[inject]]\nname = \"../up\"\nbinary = \"/u\"\n\
                  [[inject]]\nname = \"t\"\nbinary = \"/t\"\ntarget_config = \"rel/x\"\n\
+                 [[secret]]\nname = \"S\"\nfrom = { env = \"A\", file = \"/b\" }\nas = \"env\"\n\
+                 [[secret]]\nname = \"T\"\nfrom = { env = \"A\" }\nas = \"socket\"\n\
                  [aliases]\n\"rm -rf\" = \"x\"\n"
             )
             .unwrap_err()
@@ -433,6 +487,11 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("`rm -rf` is not a valid alias name"), "{err}");
+        assert!(
+            err.contains("secret \"S\": `from` needs exactly one"),
+            "{err}"
+        );
+        assert!(err.contains("secret \"T\": unknown `as`"), "{err}");
     }
 
     #[test]

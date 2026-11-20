@@ -12,17 +12,18 @@ use std::path::{Path, PathBuf};
 
 use crate::fingerprint::Fingerprint;
 use crate::output::warning;
-use crate::runtime::Env;
+use crate::runtime::{Container, Env};
 use crate::target::Target;
 use crate::tree::{self, Denied, Links};
 
 use crate::layout::DEVCONTAINER_HASH as HASH_PATH;
 
-/// The hash recorded in the container: `None` if it has none, an error if it
-/// could not be read (which must not be mistaken for drift).
-pub(super) fn read_hash(env: &dyn Env) -> Result<Option<String>> {
-    Ok(env
-        .read_file(HASH_PATH)?
+/// The hash recorded in the container, running or stopped: `None` if it has
+/// none, an error if it could not be read (which must not be mistaken for
+/// drift).
+pub(super) fn read_hash(container: &dyn Container) -> Result<Option<String>> {
+    Ok(container
+        .read_stored_file(HASH_PATH)?
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty()))
 }
@@ -45,8 +46,8 @@ pub enum ConfigState {
 /// Compares the hash recorded in the container with `current`, the hash of
 /// the config as it is now. The one place drift is decided, for `ldg up` and
 /// `ldg status` alike.
-pub(super) fn config_state(env: &dyn Env, current: &str) -> ConfigState {
-    match read_hash(env) {
+pub(super) fn config_state(container: &dyn Container, current: &str) -> ConfigState {
+    match read_hash(container) {
         Ok(Some(stored)) if stored == current => ConfigState::UpToDate,
         Ok(Some(_)) => ConfigState::Changed,
         Ok(None) => ConfigState::Unknown,
@@ -175,7 +176,8 @@ fn lexical(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::fake::FakeEnv;
+    use crate::runtime::Runtime;
+    use crate::runtime::fake::{FakeEnv, FakeRuntime};
 
     #[test]
     fn the_hash_is_stable_across_releases() {
@@ -290,39 +292,50 @@ mod tests {
         );
     }
 
+    /// A container `c` running in `env`, on an engine.
+    fn engine(env: FakeEnv) -> FakeRuntime {
+        FakeRuntime::new(FakeEnv::new).with_container("c", env)
+    }
+
     #[test]
-    fn stored_hash_round_trips_through_the_environment() {
-        let env = FakeEnv::new();
+    fn stored_hash_round_trips_through_the_container() {
+        let rt = engine(FakeEnv::new());
+        let c = rt.container("c");
         assert_eq!(
-            read_hash(&env).unwrap(),
+            read_hash(c.as_ref()).unwrap(),
             None,
             "no hash before the first create"
         );
-        write_hash(&env, "00ff11ee22dd33cc").unwrap();
+        write_hash(c.as_ref(), "00ff11ee22dd33cc").unwrap();
         assert_eq!(
-            read_hash(&env).unwrap().as_deref(),
+            read_hash(c.as_ref()).unwrap().as_deref(),
             Some("00ff11ee22dd33cc")
         );
     }
 
     #[test]
     fn an_unreadable_hash_is_an_error_not_a_missing_one() {
-        let env =
-            FakeEnv::new().with_failure(&["sh", "-c", crate::runtime::READ_FILE_SCRIPT, HASH_PATH]);
-        assert!(read_hash(&env).is_err());
-        assert_eq!(config_state(&env, "aa"), ConfigState::Unknown);
+        let rt = engine(FakeEnv::new().with_failure(&crate::shell::script_argv(
+            crate::runtime::READ_FILE_SCRIPT,
+            &[HASH_PATH],
+        )));
+        let c = rt.container("c");
+        assert!(read_hash(c.as_ref()).is_err());
+        assert_eq!(config_state(c.as_ref(), "aa"), ConfigState::Unknown);
     }
 
     #[test]
-    fn only_a_different_recorded_hash_is_drift() {
-        let env = FakeEnv::new();
+    fn only_a_different_recorded_hash_is_drift_running_or_stopped() {
+        let rt = engine(FakeEnv::new());
+        let c = rt.container("c");
         assert_eq!(
-            config_state(&env, "aa"),
+            config_state(c.as_ref(), "aa"),
             ConfigState::Unknown,
             "none recorded"
         );
-        write_hash(&env, "aa").unwrap();
-        assert_eq!(config_state(&env, "aa"), ConfigState::UpToDate);
-        assert_eq!(config_state(&env, "bb"), ConfigState::Changed);
+        write_hash(c.as_ref(), "aa").unwrap();
+        assert_eq!(config_state(c.as_ref(), "aa"), ConfigState::UpToDate);
+        rt.stop("c").unwrap();
+        assert_eq!(config_state(c.as_ref(), "bb"), ConfigState::Changed);
     }
 }

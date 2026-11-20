@@ -41,11 +41,14 @@ impl Check {
 pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
     let mut checks = Vec::new();
     let remote = ctx.target.ssh_host();
-    let place = remote.map_or("local".to_string(), |h| format!("on {h}"));
 
     let engine = ctx.rt.version();
     checks.push(match &engine {
-        Ok(v) => Check::new("container engine", Level::Ok, format!("{v} ({place})")),
+        Ok(v) => Check::new(
+            "container engine",
+            Level::Ok,
+            format!("{v}{}", ctx.target.on_host()),
+        ),
         Err(e) => Check::new("container engine", Level::Missing, e.to_string()),
     });
 

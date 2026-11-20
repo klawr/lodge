@@ -2,7 +2,7 @@
 //!
 //! Injection reads only from a bundle *directory*: a manifest plus `bin/`, `lib/`
 //! and `config/`. This module produces one, from either source, and keeps it in
-//! the [`cache`](super::cache) so work is not repeated:
+//! the [`cache`] so work is not repeated:
 //!
 //! - a bundle **file** (`--bundle`, or `bundle = …` in the config) is extracted
 //!   once, keyed by the hash of the file;
@@ -129,6 +129,11 @@ fn live(root: &Path, config: &Config) -> Result<Prepared> {
 
 /// A fingerprint of everything a live pack depends on. Packing is skipped when it
 /// is unchanged.
+///
+/// [`pack::build`] reads the `[[inject]]` entries, `[aliases]` and `[git]`, and
+/// the files they name. The entries and settings go in whole, serialized, so a
+/// setting added to them later counts without anyone remembering to list it
+/// here; the files go in by size, mtime and mode.
 fn inputs_fingerprint(config: &Config, deps: &mut deps::Resolver) -> Result<String> {
     let host = Arch::host()?;
     let mut h = Fingerprint::new();
@@ -138,10 +143,7 @@ fn inputs_fingerprint(config: &Config, deps: &mut deps::Resolver) -> Result<Stri
 
     let mut parts = Vec::new();
     for item in &config.inject {
-        parts.push(format!(
-            "tool {} deps={} skip={} bin={:?} cfg={:?}",
-            item.name, item.copy_deps, item.skip_if_exists, item.target_binary, item.target_config
-        ));
+        parts.push(serde_json::to_string(item)?);
         if let Some(binary) = &item.binary {
             // Before ldd, which cannot inspect a binary for another architecture.
             elf::check_arch(&item.name, binary, host)?;
@@ -156,10 +158,9 @@ fn inputs_fingerprint(config: &Config, deps: &mut deps::Resolver) -> Result<Stri
             stat_tree(cfg, &mut parts)?;
         }
     }
-    let mut aliases: Vec<_> = config.aliases.iter().collect();
-    aliases.sort();
-    parts.push(format!("aliases {aliases:?}"));
-    parts.push(format!("git {:?}", config.git.safe_directories));
+    // A BTreeMap serializes in key order, so this is stable.
+    parts.push(serde_json::to_string(&config.aliases)?);
+    parts.push(serde_json::to_string(&config.git)?);
 
     for part in &parts {
         h.field(part.as_bytes());
@@ -282,6 +283,27 @@ mod tests {
         let second = prepare_in(cache.path(), &cfg, None).unwrap();
         assert_eq!(second.origin, Origin::Packed);
         assert_ne!(first.dir, second.dir);
+    }
+
+    #[test]
+    fn every_setting_of_an_entry_is_part_of_the_fingerprint() {
+        let work = TempDir::new("src7").unwrap();
+        let base = || script_tool(work.path(), "t", "#!/bin/sh\n");
+        let key = |item: Injectable| {
+            inputs_fingerprint(&config(vec![item]), &mut deps::Resolver::default()).unwrap()
+        };
+        let plain = key(base());
+        // (`copy_deps` too, but turning it on asks ldd about the binary.)
+        let changes: [fn(&mut Injectable); 3] = [
+            |i| i.skip_if_exists = true,
+            |i| i.target_binary = Some("/opt/t".into()),
+            |i| i.target_config = Some("~/.t".into()),
+        ];
+        for change in changes {
+            let mut item = base();
+            change(&mut item);
+            assert_ne!(key(item), plain);
+        }
     }
 
     #[test]

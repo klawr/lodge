@@ -3,7 +3,7 @@
 
 use anyhow::{Result, bail};
 
-use super::installed::{Decision, decide, record};
+use super::installed::{Decision, Kind, Piece, decide, record};
 use crate::bundle::arch::Arch;
 use crate::bundle::manifest::{Binary, Manifest, Tool};
 use crate::bundle::source::Prepared;
@@ -20,12 +20,15 @@ pub(super) fn inject_binary(
 ) -> Result<()> {
     let name = &tool.name;
     let installed = format!("{}/{name}", layout::BIN);
-    let target = user.expand_home(&binary.target);
-    let key = format!("{name}.bin");
+    let dest = user.expand_home(&binary.dest);
+    let piece = Piece {
+        tool: name,
+        kind: Kind::Binary,
+    };
 
     match decide(
         env,
-        &key,
+        piece,
         &binary.hash,
         env.exists(&installed)?,
         tool.skip_if_exists,
@@ -48,8 +51,8 @@ pub(super) fn inject_binary(
     // they re-exec themselves (`--embed`).
     env.cp_in(&bundle.bin(name).to_string_lossy(), &installed)?;
     env.exec_root(&["chmod", "+x", &installed])?;
-    install_wrapper(env, &installed, &target)?;
-    record(env, &key, &binary.hash, &target)
+    install_wrapper(env, &installed, &dest)?;
+    record(env, piece, &binary.hash, &dest)
 }
 
 // Refuses a bundle built for a different CPU than the container runs on: its
@@ -78,17 +81,17 @@ pub(super) fn check_architecture(env: &dyn Env, manifest: &Manifest) -> Result<(
     Ok(())
 }
 
-// Installs a thin wrapper at `target` that execs the injected binary directly.
+// Installs a thin wrapper at `dest` that execs the injected binary directly.
 //
 // The binary itself was relinked (interpreter + search path) to run against our
 // injected glibc, so the wrapper needs no LD_LIBRARY_PATH and no ld.so
 // indirection — it just forwards args. Execing directly is what keeps
 // /proc/self/exe pointing at the binary for tools that re-exec themselves.
-fn install_wrapper(env: &dyn Env, lodge_binary: &str, target: &str) -> Result<()> {
+fn install_wrapper(env: &dyn Env, lodge_binary: &str, dest: &str) -> Result<()> {
     let script = format!("#!/bin/sh\nexec {lodge_binary} \"$@\"\n");
 
-    env.write_file(target, script.as_bytes())?;
-    env.exec_root(&["chmod", "+x", target])?;
+    env.write_file(dest, script.as_bytes())?;
+    env.exec_root(&["chmod", "+x", dest])?;
 
     Ok(())
 }
@@ -106,7 +109,7 @@ mod tests {
         Tool {
             name: "hello".into(),
             binary: Some(Binary {
-                target: "/usr/local/bin/hello".into(),
+                dest: "/usr/local/bin/hello".into(),
                 dynamic: false,
                 hash: hash.into(),
             }),
@@ -231,7 +234,7 @@ mod tests {
         let mut configs_only = b.manifest.clone();
         configs_only.tools[0].binary = None;
         configs_only.tools[0].config = Some(crate::bundle::manifest::ConfigTree {
-            target: "~/.x".into(),
+            dest: "~/.x".into(),
             is_dir: false,
             hash: "0000000000000000".into(),
         });

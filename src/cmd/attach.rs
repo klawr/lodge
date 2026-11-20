@@ -71,8 +71,7 @@ pub fn exec(
         container.as_ref(),
         &config,
         &user,
-        // A tmux session name: letters, digits and `-` only.
-        &format!("lodge-{}", crate::shell::slug(name)),
+        &crate::shell::session_name(name, None),
         workdir,
     )
 }

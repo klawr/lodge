@@ -6,12 +6,13 @@
 //! without an engine.
 //!
 //! It is deliberately strict. It emulates a small set of commands (`cat`, `cp`,
-//! `test`, `printenv`, `command -v`, [`Env::read_file`], [`Env::exists`], and the no-output file
-//! operations), and a test declares anything else it depends on
-//! (`with_output`, `with_failure`, `with_commands`). A command it neither
-//! emulates nor was told about **panics**, naming the command, so a test can't
-//! pass by accident because the fake answered "success" to something the real
-//! container might refuse.
+//! `rm`, `test`, `printenv`, `command -v`, [`Env::read_file`], [`Env::exists`],
+//! and the no-output file operations), and a test declares anything else it
+//! depends on (`with_output`, `with_failure`, `with_commands`). A command it
+//! neither emulates nor was told about **panics**, naming the command, so a test
+//! can't pass by accident because the fake answered "success" to something the
+//! real container might refuse. A container of a [`FakeRuntime`] that is
+//! stopped refuses every command, as `docker exec` does.
 //!
 //! One exception: a `sh -c` script run for its effect (with `exec`, not
 //! captured) is recorded and reported as succeeded, since its effect can't be
@@ -20,7 +21,7 @@
 //! temp directory (see `secret/place.rs`).
 
 use anyhow::{Context, Result};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::rc::Rc;
@@ -28,6 +29,7 @@ use std::rc::Rc;
 use super::{
     BuildSpec, Compose, Container, Containers, Env, ExecOpts, Listed, Output, Runtime, User,
 };
+use crate::tree::{self, Denied, Links};
 
 /// Who a recorded command ran as ([`User`] without the borrow).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +53,7 @@ pub struct FakeEnv {
     files: RefCell<HashMap<String, Vec<u8>>>,
     vars: HashMap<String, String>,
     canned: HashMap<Vec<String>, String>,
-    failing: Vec<Vec<String>>,
+    failing: RefCell<Vec<Vec<String>>>,
     commands: Vec<String>,
     modes: RefCell<HashMap<String, u32>>,
     /// Every command run, with whom it ran as.
@@ -64,7 +66,7 @@ impl FakeEnv {
             files: RefCell::default(),
             vars: HashMap::new(),
             canned: HashMap::new(),
-            failing: Vec::new(),
+            failing: RefCell::default(),
             commands: Vec::new(),
             modes: RefCell::default(),
             calls: RefCell::default(),
@@ -85,10 +87,18 @@ impl FakeEnv {
     }
 
     /// Makes the exact command `argv` exit non-zero.
-    pub fn with_failure(mut self, argv: &[&str]) -> Self {
+    pub fn with_failure(self, argv: &[&str]) -> Self {
         self.failing
+            .borrow_mut()
             .push(argv.iter().map(|s| s.to_string()).collect());
         self
+    }
+
+    /// Makes `argv`, declared with [`with_failure`](Self::with_failure),
+    /// succeed from now on: something that failed once works on a later run.
+    pub fn recover(&self, argv: &[&str]) {
+        let key: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        self.failing.borrow_mut().retain(|f| *f != key);
     }
 
     /// Declares which programs exist in the container, for `command -v` checks.
@@ -160,7 +170,7 @@ impl FakeEnv {
             stderr: String::new(),
         };
         let key: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
-        if self.failing.contains(&key) {
+        if self.failing.borrow().contains(&key) {
             return fail();
         }
         if let Some(stdout) = self.canned.get(&key) {
@@ -181,18 +191,25 @@ impl FakeEnv {
                     None => fail(),
                 }
             }
-            ["test", "-f" | "-e", path] => {
+            ["test", "-f", path] => {
                 if self.files.borrow().contains_key(*path) {
                     ok(String::new())
                 } else {
                     fail()
                 }
             }
-            ["sh", "-c", script, path] if *script == super::EXISTS_SCRIPT => {
-                let found = self.files.borrow().contains_key(*path);
+            ["test", "-e", path] => {
+                if self.path_exists(path) {
+                    ok(String::new())
+                } else {
+                    fail()
+                }
+            }
+            ["sh", "-c", script, "sh", path] if *script == super::EXISTS_SCRIPT => {
+                let found = self.path_exists(path);
                 ok(if found { "y" } else { "n" }.into())
             }
-            ["sh", "-c", script, path] if *script == super::READ_FILE_SCRIPT => {
+            ["sh", "-c", script, "sh", path] if *script == super::READ_FILE_SCRIPT => {
                 match self.file(path) {
                     Some(text) => ok(format!("y{text}")),
                     None => ok("n".into()),
@@ -203,7 +220,10 @@ impl FakeEnv {
                 None => fail(),
             },
             ["rm", .., path] => {
-                self.files.borrow_mut().remove(*path);
+                let below = format!("{}/", path.trim_end_matches('/'));
+                self.files
+                    .borrow_mut()
+                    .retain(|p, _| p != path && !p.starts_with(&below));
                 ok(String::new())
             }
             // File operations with nothing to report.
@@ -232,6 +252,15 @@ impl FakeEnv {
         }
     }
 
+    /// Whether `path` is a file, or a directory holding one.
+    fn path_exists(&self, path: &str) -> bool {
+        let below = format!("{}/", path.trim_end_matches('/'));
+        self.files
+            .borrow()
+            .keys()
+            .any(|p| p == path || p.starts_with(&below))
+    }
+
     fn record(&self, argv: &[&str], user: User) {
         self.calls
             .borrow_mut()
@@ -253,9 +282,23 @@ impl Env for FakeEnv {
         Ok(self.handle(argv, opts.user, true))
     }
 
+    /// A file becomes `dest`; a directory's files are merged into `dest`, as
+    /// [`Env::cp_in`] promises.
     fn cp_in(&self, src: &str, dest: &str) -> Result<()> {
-        let bytes = std::fs::read(src).with_context(|| format!("reading {src}"))?;
-        self.files.borrow_mut().insert(dest.into(), bytes);
+        let mut copied = Vec::new();
+        tree::walk(Path::new(src), Links::Keep, Denied::Fail, &mut |e| {
+            if !e.meta.is_dir() {
+                let to = if e.relative.is_empty() {
+                    dest.to_string()
+                } else {
+                    format!("{}/{}", dest.trim_end_matches('/'), e.relative)
+                };
+                copied.push((to, std::fs::read(e.path)?));
+            }
+            Ok(())
+        })
+        .with_context(|| format!("reading {src}"))?;
+        self.files.borrow_mut().extend(copied);
         Ok(())
     }
 
@@ -283,7 +326,7 @@ impl Env for FakeEnv {
 /// to act on a container that doesn't exist, or to create one that does.
 pub struct FakeRuntime {
     new_env: Box<dyn Fn() -> FakeEnv>,
-    containers: RefCell<BTreeMap<String, Rc<FakeEnv>>>,
+    containers: RefCell<BTreeMap<String, Rc<Fake>>>,
     /// Compose projects that are up.
     projects: RefCell<Vec<String>>,
     ops: RefCell<Vec<String>>,
@@ -300,12 +343,25 @@ impl FakeRuntime {
         }
     }
 
-    /// Adds an existing container `name`, running in `env`.
+    /// Adds an existing, running container `name`, running in `env`.
     pub fn with_container(self, name: &str, env: FakeEnv) -> Self {
         self.containers
             .borrow_mut()
-            .insert(name.to_string(), Rc::new(env));
+            .insert(name.to_string(), Fake::running(env));
         self
+    }
+
+    fn create(&self) -> Rc<Fake> {
+        Fake::running((self.new_env)())
+    }
+
+    fn set_running(&self, id: &str, running: bool) -> Result<()> {
+        let containers = self.containers.borrow();
+        let c = containers
+            .get(id)
+            .with_context(|| format!("no such container: {id}"))?;
+        c.running.set(running);
+        Ok(())
     }
 
     /// The engine operations so far.
@@ -326,11 +382,26 @@ impl FakeRuntime {
     }
 }
 
+/// One container of a [`FakeRuntime`]: its environment, and whether it runs.
+struct Fake {
+    env: FakeEnv,
+    running: Cell<bool>,
+}
+
+impl Fake {
+    fn running(env: FakeEnv) -> Rc<Self> {
+        Rc::new(Self {
+            env,
+            running: Cell::new(true),
+        })
+    }
+}
+
 impl Runtime for FakeRuntime {
     /// Panics for a container that doesn't exist: lodge only asks for handles
     /// to containers it found.
     fn container(&self, id: &str) -> Box<dyn Container> {
-        let env = self
+        let fake = self
             .containers
             .borrow()
             .get(id)
@@ -338,7 +409,7 @@ impl Runtime for FakeRuntime {
             .unwrap_or_else(|| panic!("FakeRuntime: no container {id}"));
         Box::new(FakeContainer {
             id: id.to_string(),
-            env,
+            fake,
         })
     }
 
@@ -374,18 +445,18 @@ impl Runtime for FakeRuntime {
         self.op(format!("run {name}"));
         self.containers
             .borrow_mut()
-            .insert(name.to_string(), Rc::new((self.new_env)()));
+            .insert(name.to_string(), self.create());
         Ok(())
     }
 
     fn start(&self, id: &str) -> Result<()> {
-        self.exists(id)?;
+        self.set_running(id, true)?;
         self.op(format!("start {id}"));
         Ok(())
     }
 
     fn stop(&self, id: &str) -> Result<()> {
-        self.exists(id)?;
+        self.set_running(id, false)?;
         self.op(format!("stop {id}"));
         Ok(())
     }
@@ -400,6 +471,7 @@ impl Runtime for FakeRuntime {
 
 /// Compose with one container per service, named `<project>-<service>-1` as
 /// compose names them, created when a project that is up is first asked about.
+/// `up` starts the project's containers again.
 impl Compose for FakeRuntime {
     fn version(&self) -> Result<String> {
         Ok("fake".into())
@@ -410,6 +482,12 @@ impl Compose for FakeRuntime {
         let mut projects = self.projects.borrow_mut();
         if !projects.iter().any(|p| p == project) {
             projects.push(project.to_string());
+        }
+        let prefix = format!("{project}-");
+        for (name, c) in self.containers.borrow().iter() {
+            if name.starts_with(&prefix) {
+                c.running.set(true);
+            }
         }
         Ok(())
     }
@@ -437,38 +515,58 @@ impl Compose for FakeRuntime {
             self.containers
                 .borrow_mut()
                 .entry(name.clone())
-                .or_insert_with(|| Rc::new((self.new_env)()));
+                .or_insert_with(|| self.create());
         }
         self.find_by_name(&name)
     }
 }
 
 /// The handle [`FakeRuntime::container`] returns: its commands go to the
-/// runtime's shared [`FakeEnv`].
+/// runtime's shared [`FakeEnv`], and are refused while it is stopped.
 struct FakeContainer {
     id: String,
-    env: Rc<FakeEnv>,
+    fake: Rc<Fake>,
+}
+
+impl FakeContainer {
+    /// The environment, if the container runs, as `docker exec` requires.
+    fn env(&self) -> Result<&FakeEnv> {
+        if self.fake.running.get() {
+            Ok(&self.fake.env)
+        } else {
+            anyhow::bail!("container {} is not running", self.id)
+        }
+    }
 }
 
 impl Env for FakeContainer {
     fn exec(&self, argv: &[&str], opts: &ExecOpts) -> Result<()> {
-        self.env.exec(argv, opts)
+        self.env()?.exec(argv, opts)
     }
 
+    /// Like `docker exec`, a stopped container is a failed command, not a
+    /// failure to run one.
     fn output(&self, argv: &[&str], opts: &ExecOpts) -> Result<Output> {
-        self.env.output(argv, opts)
+        match self.env() {
+            Ok(env) => env.output(argv, opts),
+            Err(e) => Ok(Output {
+                success: false,
+                stdout: String::new(),
+                stderr: e.to_string(),
+            }),
+        }
     }
 
     fn cp_in(&self, src: &str, dest: &str) -> Result<()> {
-        self.env.cp_in(src, dest)
+        self.env()?.cp_in(src, dest)
     }
 
     fn write_secret(&self, dest: &str, contents: &[u8], mode: u32, user: User) -> Result<()> {
-        self.env.write_secret(dest, contents, mode, user)
+        self.env()?.write_secret(dest, contents, mode, user)
     }
 
     fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> String {
-        self.env.interactive_command(user, workdir, inner)
+        self.fake.env.interactive_command(user, workdir, inner)
     }
 }
 
@@ -486,7 +584,13 @@ impl Container for FakeContainer {
     }
 
     fn is_running(&self) -> Result<bool> {
-        Ok(true)
+        Ok(self.fake.running.get())
+    }
+
+    /// Answered as the environment answers [`Env::read_file`] (including a
+    /// failure declared for it), whether the container runs or not.
+    fn read_stored_file(&self, path: &str) -> Result<Option<String>> {
+        self.fake.env.read_file(path)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -535,6 +639,41 @@ mod tests {
         assert_eq!(env.mode("/dev/shm/s/TOKEN"), Some(0o600));
         assert!(env.ran(&["write_secret", "/dev/shm/s/TOKEN", "600"]));
         assert!(!env.ran_matching(|c| c.iter().any(|a| a.contains("hunter2"))));
+    }
+
+    #[test]
+    fn a_directory_is_merged_into_the_destination_and_removed_whole() {
+        let src = crate::tmpfile::TempDir::new("fake-cp").unwrap();
+        std::fs::create_dir_all(src.path().join("sub")).unwrap();
+        std::fs::write(src.path().join("a"), "A").unwrap();
+        std::fs::write(src.path().join("sub/b"), "B").unwrap();
+        let env = FakeEnv::new().with_file("/d/old", "kept");
+        env.cp_in(&src.path().to_string_lossy(), "/d").unwrap();
+        assert_eq!(env.file("/d/a").as_deref(), Some("A"));
+        assert_eq!(env.file("/d/sub/b").as_deref(), Some("B"));
+        assert_eq!(env.file("/d/old").as_deref(), Some("kept"));
+        assert!(env.exists("/d/sub").unwrap());
+        env.exec_root(&["rm", "-rf", "/d"]).unwrap();
+        assert!(!env.exists("/d").unwrap() && env.file("/d/sub/b").is_none());
+    }
+
+    #[test]
+    fn a_declared_failure_can_recover() {
+        let env = FakeEnv::new().with_failure(&["sh", "-c", "make"]);
+        assert!(env.exec_root(&["sh", "-c", "make"]).is_err());
+        env.recover(&["sh", "-c", "make"]);
+        assert!(env.exec_root(&["sh", "-c", "make"]).is_ok());
+    }
+
+    #[test]
+    fn a_stopped_container_refuses_commands_until_started() {
+        let rt = FakeRuntime::new(FakeEnv::new).with_container("c", FakeEnv::new());
+        rt.stop("c").unwrap();
+        let c = rt.container("c");
+        assert!(!c.is_running().unwrap());
+        assert!(c.read_file("/x").is_err());
+        rt.start("c").unwrap();
+        assert_eq!(c.read_file("/x").unwrap(), None);
     }
 
     #[test]

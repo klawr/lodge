@@ -94,7 +94,7 @@ const KNOWN: &[Known] = &[
 
 pub fn run(ctx: &Ctx, force: bool, print: bool) -> Result<()> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    let found: Vec<Found> = KNOWN
+    let found: Vec<Detected> = KNOWN
         .iter()
         .filter_map(|k| {
             let binary = crate::shell::which(k.binary)?;
@@ -105,7 +105,7 @@ pub fn run(ctx: &Ctx, force: bool, print: bool) -> Result<()> {
                 .map(|c| home.join(c))
                 .filter(|p| p.exists())
                 .collect();
-            Some(Found {
+            Some(Detected {
                 known: k,
                 binary,
                 configs,
@@ -143,7 +143,7 @@ pub fn run(ctx: &Ctx, force: bool, print: bool) -> Result<()> {
     Ok(())
 }
 
-struct Found {
+struct Detected {
     known: &'static Known,
     binary: PathBuf,
     configs: Vec<PathBuf>,
@@ -157,7 +157,7 @@ fn tilde(path: &Path, home: &Path) -> String {
     }
 }
 
-fn render(found: &[Found], home: &Path) -> String {
+fn render(found: &[Detected], home: &Path) -> String {
     let mut s = format!(
         "#:schema {SCHEMA_URL}\n\
          #\n\
@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn the_rendered_config_parses_and_injects_nothing_until_uncommented() {
         let home = Path::new("/home/me");
-        let found = [Found {
+        let found = [Detected {
             known: &NVIM,
             binary: PathBuf::from("/usr/bin/nvim"),
             configs: vec![home.join(".config/nvim")],

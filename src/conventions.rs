@@ -2,7 +2,9 @@
 //!
 //! Each external program lodge runs on the user's behalf is started from one
 //! place. That keeps quoting, tracing, connection reuse and the local/remote
-//! decision in one spot instead of copied around.
+//! decision in one spot instead of copied around. And dependencies point one
+//! way: the command layer on top, lodge's features below it, and a foundation
+//! (running things, quoting, paths, output) that knows none of them.
 
 #![cfg(test)]
 
@@ -86,4 +88,91 @@ fn host_tools_are_started_through_the_registry_only() {
     // lodge no longer needs a local `tar`: features and remote copies unpack
     // in-process.
     assert_eq!(spawners("tar"), Vec::<String>::new());
+}
+
+/// The top-level modules each non-test source file names through `crate::`,
+/// keyed by the module the file belongs to. Comments are left out, so a doc
+/// link is not a dependency.
+fn dependencies() -> Vec<(String, String, String)> {
+    let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let src = Path::new(&root).join("src");
+    let mut files = Vec::new();
+    rust_files(&src, &mut files);
+    let mut out = Vec::new();
+    for f in files {
+        let rel = f.strip_prefix(&src).unwrap().to_string_lossy().into_owned();
+        let module = rel
+            .split('/')
+            .next()
+            .unwrap()
+            .trim_end_matches(".rs")
+            .to_string();
+        let text = std::fs::read_to_string(&f).unwrap();
+        let code = text.split("#[cfg(test)]\nmod ").next().unwrap();
+        for line in code.lines().filter(|l| !l.trim_start().starts_with("//")) {
+            for (i, _) in line.match_indices("crate::") {
+                let rest = &line[i + "crate::".len()..];
+                // `crate::a::…`, or a group: `crate::{a, b::c}`.
+                let names: Vec<&str> = match rest.strip_prefix('{') {
+                    Some(group) => group.split('}').next().unwrap().split(',').collect(),
+                    None => vec![rest],
+                };
+                for name in names {
+                    let named: String = name
+                        .trim()
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    if !named.is_empty() && named != module {
+                        out.push((rel.clone(), module.clone(), named));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// What everything else is built on: running things, quoting, paths, output.
+/// None of it knows about lodge's features.
+const FOUNDATION: &[&str] = &[
+    "fingerprint",
+    "host_tools",
+    "layout",
+    "output",
+    "port",
+    "runtime",
+    "shell",
+    "ssh",
+    "target",
+    "tmpfile",
+    "tree",
+];
+
+#[test]
+fn the_foundation_depends_on_nothing_above_it() {
+    let wrong: Vec<String> = dependencies()
+        .into_iter()
+        .filter(|(_, from, to)| {
+            FOUNDATION.contains(&from.as_str()) && !FOUNDATION.contains(&to.as_str())
+        })
+        .map(|(file, _, to)| format!("{file} uses crate::{to}"))
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[test]
+fn only_the_command_layer_knows_the_command_line() {
+    // `main.rs` hands the parsed `cli` to `cmd`; `doc_facts.rs` checks the docs
+    // against it.
+    let wrong: Vec<String> = dependencies()
+        .into_iter()
+        .filter(|(file, from, to)| {
+            matches!(to.as_str(), "cmd" | "cli")
+                && from != "cmd"
+                && !matches!(file.as_str(), "main.rs" | "doc_facts.rs")
+        })
+        .map(|(file, _, to)| format!("{file} uses crate::{to}"))
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

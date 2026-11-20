@@ -1,4 +1,5 @@
-//! The `docker` CLI as a [`Runtime`], [`Container`] and [`Env`].
+//! The `docker` CLI as a [`Runtime`], [`Compose`], [`Container`] and
+//! [`Env`](super::Env).
 //!
 //! Locally this runs `docker …`. For a remote target it runs the docker CLI *on
 //! the remote host* over SSH (`ssh <host> docker …`), so no local docker CLI is
@@ -216,7 +217,7 @@ impl Runtime for DockerCli {
             a.push("-f".into());
             a.push(spec.context.join(df).to_string_lossy().into_owned());
         }
-        if let Some(t) = &spec.target {
+        if let Some(t) = &spec.stage {
             a.push("--target".into());
             a.push(t.clone());
         }

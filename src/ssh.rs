@@ -141,9 +141,9 @@ pub fn write_scratch(host: &str, content: &str) -> anyhow::Result<String> {
     Ok(path)
 }
 
-/// A tunnel from local port `local` to `target` ("ip:port", as reachable from
-/// the remote host). Runs until killed; the caller sets stdio and spawns it.
-pub fn tunnel(remote: &str, local: u16, target: &str) -> Command {
+/// A tunnel from local port `local` to `to` ("ip:port", as reachable from the
+/// remote host). Runs until killed; the caller sets stdio and spawns it.
+pub fn tunnel(remote: &str, local: u16, to: &str) -> Command {
     let (mut c, dest) = base(remote);
     c.args([
         "-N",
@@ -152,7 +152,7 @@ pub fn tunnel(remote: &str, local: u16, target: &str) -> Command {
         "-o",
         "ExitOnForwardFailure=yes",
         "-L",
-        &format!("{local}:{target}"),
+        &format!("{local}:{to}"),
     ])
     .arg(dest);
     c

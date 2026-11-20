@@ -98,7 +98,25 @@ fn status_down_and_rm_follow_the_container_lifecycle() {
     p.up();
     assert!(p.ldg("status", &[]).has("running"));
     assert!(p.ldg("down", &[]).ok);
-    assert!(p.ldg("status", &[]).has("stopped"));
+    // What lodge recorded is read from the stopped container (without
+    // starting it), so drift is still noticed.
+    let out = p.ldg("status", &[]);
+    assert!(
+        out.has("stopped") && out.has("up to date") && !out.has("warning"),
+        "{}",
+        out.tail(6)
+    );
+    p.write(
+        ".devcontainer/devcontainer.json",
+        &json(r#"{ "image": "@IMAGE@", "containerEnv": { "A": "2" } }"#),
+    );
+    assert!(p.ldg("status", &[]).has("changed since"));
+    let out = p.ldg("up", &["--no-attach", "--no-recreate"]);
+    assert!(
+        out.ok && out.has("keeping it: --no-recreate"),
+        "`up` of a stopped container missed the drift:\n{}",
+        out.tail(6)
+    );
     assert!(p.ldg("rm", &[]).ok);
     assert!(p.containers().is_empty(), "rm left a container behind");
     assert!(p.ldg("status", &[]).has("none"));

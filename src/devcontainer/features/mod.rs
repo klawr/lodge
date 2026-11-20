@@ -5,12 +5,12 @@
 //!
 //! The container-creation settings features ask for (mounts, `privileged`,
 //! capabilities, `init`) are gathered into the same
-//! [`CreateSettings`](super::backend::CreateSettings) devcontainer.json's own
+//! [`CreateSettings`] devcontainer.json's own
 //! settings use.
 
 mod fetch;
 
-use super::backend::{CreateSettings, Mount};
+use super::create::{CreateSettings, Mount};
 use super::markers;
 use crate::output::{info, plural, warning};
 use crate::runtime::{ContainerUser, Env, ExecOpts, User};
@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 pub use fetch::is_local_ref;
 
-use crate::layout::{FEATURES as FEATURES_DIR, PROFILE_FEATURES as PROFILE_PATH};
+use crate::layout::FEATURES as FEATURES_DIR;
 
 /// A feature as requested in devcontainer.json: an OCI reference plus the
 /// user-supplied options object.
@@ -128,7 +128,9 @@ impl Plan {
     }
 
     /// Runs each feature's `install.sh` (as root, options as env), records a
-    /// success marker, and persists merged `containerEnv` for login shells.
+    /// success marker, and writes the feature's `containerEnv` for login
+    /// shells. Each feature has its own profile, so installing some features
+    /// again (the ones that failed before) leaves the others' env alone.
     pub fn install(&self, env: &dyn Env, remote_user: Option<&str>) -> Result<()> {
         if self.resolved.is_empty() {
             return Ok(());
@@ -139,29 +141,28 @@ impl Plan {
             return Ok(());
         }
         let users = [script_user(env, remote_user), script_user(env, None)];
-        let mut container_env: BTreeMap<String, String> = BTreeMap::new();
         for r in &self.resolved {
             warn_unsupported(r);
             validate_options(r);
-            match install_one(env, r, &users) {
-                Ok(()) => {
-                    for (k, v) in &r.meta.container_env {
-                        container_env.insert(k.clone(), v.clone());
-                    }
-                    if let Err(e) = markers::mark_done(env, &marker_key(&r.reference)) {
-                        // Not fatal, but the feature will be installed again next run.
-                        warning!(
-                            "could not record that feature {} is installed: {e:#}",
-                            r.reference
-                        );
-                    }
-                }
-                Err(e) => warning!("feature {} install failed (continuing): {e:#}", r.reference),
+            if let Err(e) = install_one(env, r, &users) {
+                warning!("feature {} install failed (continuing): {e:#}", r.reference);
+                continue;
             }
-        }
-        // Persisted so login shells (lodge enters with `-l`) see it.
-        if !container_env.is_empty() {
-            super::profile::write_profile(env, PROFILE_PATH, &container_env)?;
+            // Persisted so login shells (lodge enters with `-l`) see it.
+            if !r.meta.container_env.is_empty() {
+                super::profile::write_profile(
+                    env,
+                    &crate::layout::profile_feature(&r.meta.id),
+                    &r.meta.container_env,
+                )?;
+            }
+            if let Err(e) = markers::mark_done(env, &marker_key(&r.reference)) {
+                // Not fatal, but the feature will be installed again next run.
+                warning!(
+                    "could not record that feature {} is installed: {e:#}",
+                    r.reference
+                );
+            }
         }
         Ok(())
     }
@@ -407,6 +408,74 @@ mod tests {
             },
             dir: PathBuf::new(),
         }
+    }
+
+    /// A fetched feature `id` whose metadata sets `containerEnv` to `vars`.
+    fn fetched(work: &Path, id: &str, vars: &[(&str, &str)]) -> Resolved {
+        let dir = work.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("install.sh"), "true\n").unwrap();
+        let mut r = resolved(&format!("ghcr.io/x/{id}:1"), id, &[]);
+        r.meta.container_env = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        r.dir = dir;
+        r
+    }
+
+    fn container() -> crate::runtime::fake::FakeEnv {
+        crate::runtime::fake::FakeEnv::new().with_output(
+            &["sh", "-c", crate::runtime::PROBE_SCRIPT],
+            "0\n0\nroot\n/root\n",
+        )
+    }
+
+    fn plan(resolved: Vec<Resolved>) -> Plan {
+        Plan {
+            resolved,
+            _work: None,
+        }
+    }
+
+    #[test]
+    fn installing_a_feature_again_keeps_the_others_env() {
+        let work = TempDir::new("features-env").unwrap();
+        let env = container();
+        let a = fetched(work.path(), "a", &[("A_HOME", "/opt/a")]);
+        let b = fetched(work.path(), "b", &[("B_HOME", "/opt/b")]);
+
+        // The first run installs `a`; `b` could not be fetched, say.
+        plan(vec![a]).install(&env, None).unwrap();
+        assert!(env.file("/etc/profile.d/lodge-feature-a.sh").is_some());
+        assert!(env.file("/etc/profile.d/lodge-feature-b.sh").is_none());
+        let features = [
+            FeatureRequest {
+                reference: "ghcr.io/x/a:1".into(),
+                options: Map::new(),
+            },
+            FeatureRequest {
+                reference: "ghcr.io/x/b:1".into(),
+                options: Map::new(),
+            },
+        ];
+        let retried: Vec<_> = pending(&env, &features)
+            .into_iter()
+            .map(|f| f.reference)
+            .collect();
+        assert_eq!(retried, ["ghcr.io/x/b:1"], "only the failed one is retried");
+
+        // The retry installs only `b`; `a`'s env stays.
+        plan(vec![b]).install(&env, None).unwrap();
+        assert_eq!(
+            env.file("/etc/profile.d/lodge-feature-a.sh").as_deref(),
+            Some("export A_HOME='/opt/a'\n")
+        );
+        assert_eq!(
+            env.file("/etc/profile.d/lodge-feature-b.sh").as_deref(),
+            Some("export B_HOME='/opt/b'\n")
+        );
+        assert!(pending(&env, &features).is_empty());
     }
 
     #[test]

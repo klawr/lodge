@@ -2,7 +2,7 @@ PREFIX ?= /usr/local/bin
 BINDIR  = $(PREFIX)
 
 .DEFAULT_GOAL := help
-.PHONY: help all build install uninstall clean dev test lint fmt check integration deny hooks schema
+.PHONY: help all build install uninstall clean dev test lint doc fmt check integration deny hooks schema
 
 help: ## Show this list
 	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -18,12 +18,16 @@ test: ## Unit tests (no docker needed)
 lint: ## Clippy with warnings as errors
 	cargo clippy --all-targets -- -D warnings
 
+doc: ## The code's docs, with broken links and markup as errors
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --quiet
+
 fmt: ## Format the code
 	cargo fmt
 
-check: ## What CI gates on: fmt, clippy, unit tests
+check: ## What CI gates on: fmt, clippy, docs, unit tests
 	cargo fmt --check
 	cargo clippy --all-targets -- -D warnings
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --quiet
 	cargo test
 
 # Needs a running docker daemon (with compose), patchelf, tmux and ssh. Quiet on success.

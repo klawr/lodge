@@ -61,11 +61,11 @@ fn inspect(file: &Path) -> Result<()> {
         let mut parts = Vec::new();
         if let Some(b) = &tool.binary {
             let kind = if b.dynamic { "relinked" } else { "as is" };
-            parts.push(format!("bin → {} ({kind})", b.target));
+            parts.push(format!("bin → {} ({kind})", b.dest));
         }
         if let Some(c) = &tool.config {
             let kind = if c.is_dir { "dir" } else { "file" };
-            parts.push(format!("config → {} ({kind})", c.target));
+            parts.push(format!("config → {} ({kind})", c.dest));
         }
         line!("tool      {:<12} {}", tool.name, parts.join(" · "));
     }

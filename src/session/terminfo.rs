@@ -102,7 +102,7 @@ fn ensure_from(env: &dyn Env, term: &str, dirs: &[PathBuf]) -> Result<bool> {
 }
 
 /// Shell lines for the start of a session: set `TERM`, and let ncurses find
-/// entries copied by [`ensure`]. The trailing `:` keeps the system directories
+/// entries copied by [`prepare`]. The trailing `:` keeps the system directories
 /// in the search path.
 pub fn session_setup(term: &str) -> String {
     format!(

@@ -1,17 +1,21 @@
 //! Everything lodge says to the user, and the verbosity setting.
 //!
-//! Messages come in four kinds, each with a macro:
+//! Messages come in five kinds, each with a macro, all on stderr:
 //!
-//! - `info!`: progress, on stderr.
-//! - `warning!`: something went wrong but lodge carries on,
-//!   on stderr, prefixed `warning:`.
-//! - `error!`: why a command failed, on stderr, prefixed `error:`.
-//! - `note!`: a hint or the context of a question, on
-//!   stderr.
+//! - `info!`: progress.
+//! - `note!`: a hint, or the context of a question, tagged `note:`.
+//! - `warning!`: something went wrong but lodge carries on, tagged `warning:`.
+//! - `error!`: why a command failed, tagged `error:`.
+//! - `prompt!`: a question, without a line break, flushed.
 //!
 //! Reports and lists (`status`, `ls`, `--json`) are program output and use
 //! `line!`, without the prefix, on stdout. Everything else goes to stderr, so
-//! stdout carries only what a script would want to read.
+//! stdout carries only what a script would want to read. The rest are for
+//! special cases: `line_err!` (an unprefixed line on stderr, such as the
+//! choices of a question), `scoped!` (a message from a named part of lodge,
+//! such as the forward daemon's log), and `raw_stdout` / `raw_stderr` (text
+//! passed through untouched: a generated file, a log, another program's
+//! output). `trace` and `trace_line` show what lodge runs, under `--verbose`.
 //!
 //! Every line carries the `[lodge]` prefix, including the continuation lines of
 //! a multi-line message, so call sites write plain text. Verbosity is set once
@@ -79,7 +83,7 @@ pub fn print_error(args: fmt::Arguments) {
 }
 
 pub fn print_note(args: fmt::Arguments) {
-    emit("lodge", "", args);
+    emit("lodge", "note: ", args);
 }
 
 /// A message from a named part of lodge, such as the port-forward daemon, whose
@@ -125,6 +129,14 @@ pub fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+/// Prints a command line lodge runs (already in shell form) to stderr. No-op
+/// unless `--verbose` is set.
+pub fn trace_line(line: &str) {
+    if is_verbose() {
+        emit("lodge", "$ ", format_args!("{line}"));
+    }
+}
+
 /// Prints the command (with any explicitly-set env vars) to stderr in
 /// shell-pasteable form. No-op unless `--verbose` is set.
 pub fn trace(cmd: &Command) {
@@ -146,7 +158,7 @@ pub fn trace(cmd: &Command) {
         line.push(' ');
         line.push_str(&quote(&a.to_string_lossy()));
     }
-    emit("lodge", "$ ", format_args!("{line}"));
+    trace_line(&line);
 }
 
 // Quote only when needed, so typical traces stay readable.

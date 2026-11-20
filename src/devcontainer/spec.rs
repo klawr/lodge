@@ -1,8 +1,9 @@
 //! Parsing `devcontainer.json` into a backend-agnostic [`Spec`].
 //!
 //! Handles config discovery, JSONC parsing, `${localEnv:…}`-style variable
-//! substitution, port-forward entries, and the stable container/session names
-//! derived from the project path.
+//! substitution, port-forward entries, and the session name derived from the
+//! project path. The backend (and the container's name) is
+//! [`backend`](super::backend)'s.
 
 use crate::output::warning;
 use anyhow::{Context, Result, bail};
@@ -12,10 +13,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::backend::{Backend, BackendContext, build_backend, project_basename};
-use super::lifecycle::{Cmd, Lifecycle};
+use super::lifecycle::{Hook, Lifecycle};
 use super::vars::{Vars, path_tag};
 use crate::port::PortForward;
-use crate::shell::slug;
 use crate::target::Target;
 
 /// A parsed devcontainer.json, grouped by what the fields are for.
@@ -90,12 +90,12 @@ pub(super) struct CreateConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HookConfig {
-    initialize_command: Option<Cmd>,
-    on_create_command: Option<Cmd>,
-    update_content_command: Option<Cmd>,
-    post_create_command: Option<Cmd>,
-    post_start_command: Option<Cmd>,
-    post_attach_command: Option<Cmd>,
+    initialize_command: Option<Hook>,
+    on_create_command: Option<Hook>,
+    update_content_command: Option<Hook>,
+    post_create_command: Option<Hook>,
+    post_start_command: Option<Hook>,
+    post_attach_command: Option<Hook>,
 }
 
 impl HookConfig {
@@ -141,25 +141,26 @@ pub(super) struct Spec {
     pub(super) remote_user: Option<String>,
     // Whether to line the container user's uid up with the host user's.
     pub(super) sync_uid: bool,
-    pub(super) is_compose: bool,
     pub(super) backend: Box<dyn Backend>,
 }
 
 pub(super) fn load_spec(project_path: &Path, target: &Target) -> Result<Spec> {
     let (config_path, raw) = find_config(project_path, target)?;
-    build_spec(parse_config(&raw)?, config_path, project_path)
+    build_spec(parse_config(&raw)?, config_path, project_path, target)
 }
 
 fn parse_config(raw: &str) -> Result<DevcontainerConfig> {
     serde_json::from_reader(StripComments::new(raw.as_bytes())).context("parsing devcontainer.json")
 }
 
-/// Turns a parsed config into the backend-agnostic [`Spec`]. Pure: it touches no
-/// file and no container, so it can be tested on its own.
+/// Turns a parsed config into the backend-agnostic [`Spec`] for the project at
+/// `project_path` on `target`. Pure: it touches no file and no container, so it
+/// can be tested on its own.
 fn build_spec(
     config: DevcontainerConfig,
     config_path: PathBuf,
     project_path: &Path,
+    target: &Target,
 ) -> Result<Spec> {
     let DevcontainerConfig {
         name,
@@ -191,6 +192,7 @@ fn build_spec(
         container_user.clone(),
         &BackendContext {
             project_path,
+            target,
             base_dir: &base_dir,
             workspace_folder: &workspace_folder,
             vars: &vars,
@@ -212,8 +214,7 @@ fn build_spec(
         env,
         // remoteUser defaults to containerUser.
         remote_user: remote_user.or(container_user),
-        sync_uid: update_remote_user_uid.unwrap_or(true) && !built.is_compose,
-        is_compose: built.is_compose,
+        sync_uid: update_remote_user_uid.unwrap_or(true) && !built.backend.uses_compose(),
         backend: built.backend,
     })
 }
@@ -251,15 +252,12 @@ fn build_env(
 }
 
 // A readable tmux session name: the devcontainer's `name` (or the project
-// basename when it has none), sanitized for tmux, plus a short path hash so two
-// projects that share a label don't land on the same session. We derive this
-// from the human label rather than the container id, whose compose form is an
-// opaque hash that makes "lodge-<hash>" sessions impossible to tell apart.
+// basename when it has none) plus a short path hash so two projects that share
+// a label don't land on the same session. We derive this from the human label
+// rather than the container id, whose compose form is an opaque hash that makes
+// "lodge-<hash>" sessions impossible to tell apart.
 fn session_name(name: Option<&str>, basename: &str, project_path: &Path) -> String {
-    let label = slug(name.unwrap_or(basename));
-    let label = label.trim_matches('-');
-    let label = if label.is_empty() { "workspace" } else { label };
-    format!("lodge-{label}-{}", path_tag(project_path))
+    crate::shell::session_name(name.unwrap_or(basename), Some(&path_tag(project_path)))
 }
 
 // Parses forwardPorts entries. The spec allows an integer (a port of the
@@ -426,6 +424,7 @@ mod tests {
             parse_config(json)?,
             PathBuf::from("/home/me/proj/.devcontainer/devcontainer.json"),
             Path::new("/home/me/proj"),
+            &Target::Local,
         )
     }
 
@@ -452,8 +451,8 @@ mod tests {
             Some(&["SYS_PTRACE".to_string()][..])
         );
         assert_eq!(c.create.privileged, Some(true));
-        assert!(matches!(c.hooks.post_create_command, Some(Cmd::Shell(_))));
-        assert!(matches!(c.hooks.initialize_command, Some(Cmd::Exec(_))));
+        assert!(matches!(c.hooks.post_create_command, Some(Hook::Shell(_))));
+        assert!(matches!(c.hooks.initialize_command, Some(Hook::Exec(_))));
         assert!(c.hooks.on_create_command.is_none());
     }
 

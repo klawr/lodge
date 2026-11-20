@@ -127,12 +127,12 @@ mod tests {
             tools: vec![Tool {
                 name: "hello".into(),
                 binary: Some(Binary {
-                    target: "/usr/local/bin/hello".into(),
+                    dest: "/usr/local/bin/hello".into(),
                     dynamic: true,
                     hash: hash_path(&p.join("bin/hello")).unwrap(),
                 }),
                 config: Some(ConfigTree {
-                    target: "~/.config/hello".into(),
+                    dest: "~/.config/hello".into(),
                     is_dir: true,
                     hash: hash_path(&p.join("config/hello")).unwrap(),
                 }),

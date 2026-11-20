@@ -19,13 +19,14 @@ use anyhow::{Context, Result};
 use super::Secret;
 use crate::config::secret::{As, SecretDecl};
 use crate::runtime::{ContainerUser, Env, ExecOpts};
-use crate::shell::shell_quote;
+use crate::shell::{script_argv, shell_quote};
 
 /// Mode of an `env` secret's file.
 const ENV_MODE: u32 = 0o600;
 
 /// `$1` is the directory, the rest are the names to keep. Creates it private to
 /// the caller and refuses one somebody else made (`/dev/shm` is shared).
+/// Every script here is started with [`script_argv`].
 const PREPARE_SCRIPT: &str = r#"d=$1; shift
 umask 077
 mkdir -p "$d" && [ -d "$d" ] && [ ! -L "$d" ] && [ -O "$d" ] \
@@ -82,17 +83,14 @@ pub fn place(
     user: &ContainerUser,
     items: &[(&SecretDecl, &Secret)],
 ) -> Result<Placed> {
-    let opts = ExecOpts {
-        user: user.exec_as(),
-        ..ExecOpts::default()
-    };
+    let opts = ExecOpts::as_user(user.exec_as());
     let dir = secrets_dir(user);
 
     // Names are validated to [A-Za-z0-9_], so they are safe as arguments and as
     // shell variable names.
-    let mut prepare = vec!["sh", "-c", PREPARE_SCRIPT, "sh", &dir];
-    prepare.extend(items.iter().map(|(d, _)| d.name.as_str()));
-    env.exec(&prepare, &opts)
+    let mut args = vec![dir.as_str()];
+    args.extend(items.iter().map(|(d, _)| d.name.as_str()));
+    env.exec(&script_argv(PREPARE_SCRIPT, &args), &opts)
         .context("preparing the secrets directory")?;
 
     let mut placed = Placed {
@@ -111,7 +109,7 @@ pub fn place(
             As::File { path, mode } => {
                 env.write_secret(&stored, value.expose(), *mode, user.exec_as())
                     .with_context(|| format!("placing secret {}", decl.name))?;
-                env.exec(&["sh", "-c", LINK_SCRIPT, "sh", path, &stored], &opts)
+                env.exec(&script_argv(LINK_SCRIPT, &[path, &stored]), &opts)
                     .with_context(|| format!("linking secret {} at {path}", decl.name))?;
                 placed.file_names.push(decl.name.clone());
             }
@@ -127,12 +125,11 @@ fn secrets_dir(user: &ContainerUser) -> String {
 /// Removes every secret placed for `user`. Cheaper than [`place`] with nothing to
 /// place, which would first create the directory.
 pub fn clear(env: &dyn Env, user: &ContainerUser) -> Result<()> {
-    let opts = ExecOpts {
-        user: user.exec_as(),
-        ..ExecOpts::default()
-    };
-    env.exec(&["rm", "-rf", &secrets_dir(user)], &opts)
-        .context("removing placed secrets")
+    env.exec(
+        &["rm", "-rf", &secrets_dir(user)],
+        &ExecOpts::as_user(user.exec_as()),
+    )
+    .context("removing placed secrets")
 }
 
 /// The `sh -c` script behind [`clear_all`]: `$1` is the prefix of the secrets
@@ -142,13 +139,7 @@ const CLEAR_ALL_SCRIPT: &str = "rm -rf \"$1\"*";
 /// Removes the secrets placed for every user (`ldg clean`), as root.
 pub fn clear_all(env: &dyn Env) -> Result<()> {
     env.exec(
-        &[
-            "sh",
-            "-c",
-            CLEAR_ALL_SCRIPT,
-            "sh",
-            crate::layout::SECRETS_PREFIX,
-        ],
+        &script_argv(CLEAR_ALL_SCRIPT, &[crate::layout::SECRETS_PREFIX]),
         &ExecOpts::root(),
     )
     .context("removing placed secrets")
@@ -172,16 +163,16 @@ pub fn status(
         .collect())
 }
 
-/// The script behind [`present_names`]: lists the directory `$0`, and nothing
+/// The script behind [`present_names`]: lists the directory `$1`, and nothing
 /// (successfully) when there is none.
-const LIST_SCRIPT: &str = "[ -d \"$0\" ] || exit 0; ls -1 \"$0\"";
+pub(crate) const LIST_SCRIPT: &str = "[ -d \"$1\" ] || exit 0; ls -1 \"$1\"";
 
 /// Names of the secrets currently placed for `user`.
 fn present_names(env: &dyn Env, user: &ContainerUser) -> Result<Vec<String>> {
     let out = env
         .exec_capture_as(
             user.exec_as(),
-            &["sh", "-c", LIST_SCRIPT, &secrets_dir(user)],
+            &script_argv(LIST_SCRIPT, &[&secrets_dir(user)]),
         )
         .context("listing placed secrets")?;
     Ok(out
@@ -269,7 +260,7 @@ mod tests {
 
     #[test]
     fn status_says_which_declared_secrets_are_placed() {
-        let list = ["sh", "-c", LIST_SCRIPT, "/dev/shm/lodge-secrets-1000"];
+        let list = script_argv(LIST_SCRIPT, &["/dev/shm/lodge-secrets-1000"]);
         let env = FakeEnv::new().with_output(&list, "A\nOLD\n");
         let decls = [decl("A", As::Env), decl("B", As::Env)];
         assert_eq!(
@@ -288,10 +279,9 @@ mod tests {
         let tmp = crate::tmpfile::TempDir::new("list").unwrap();
         std::fs::write(tmp.path().join("A"), "").unwrap();
         let run = |dir: &std::path::Path| {
-            let out = Command::new("sh")
-                .args(["-c", LIST_SCRIPT, &dir.to_string_lossy()])
-                .output()
-                .unwrap();
+            let dir = dir.to_string_lossy();
+            let argv = script_argv(LIST_SCRIPT, &[&dir]);
+            let out = Command::new(argv[0]).args(&argv[1..]).output().unwrap();
             (
                 out.status.success(),
                 String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -313,13 +303,7 @@ mod tests {
         let env = FakeEnv::new();
         clear_all(&env).unwrap();
         assert_eq!(
-            env.ran_as(&[
-                "sh",
-                "-c",
-                CLEAR_ALL_SCRIPT,
-                "sh",
-                "/dev/shm/lodge-secrets-"
-            ]),
+            env.ran_as(&script_argv(CLEAR_ALL_SCRIPT, &["/dev/shm/lodge-secrets-"])),
             Some(crate::runtime::fake::Who::Root)
         );
     }
@@ -341,9 +325,9 @@ mod tests {
 
     // The scripts, run for real against a temp directory.
     fn sh(script: &str, args: &[&str]) -> bool {
-        Command::new("sh")
-            .args(["-c", script, "sh"])
-            .args(args)
+        let argv = script_argv(script, args);
+        Command::new(argv[0])
+            .args(&argv[1..])
             .env("HOME", "/nonexistent-home")
             .stderr(std::process::Stdio::null())
             .status()
@@ -402,8 +386,9 @@ mod tests {
         // `~/` expands to the session user's home.
         let home = base.join("home");
         std::fs::create_dir(&home).unwrap();
-        let ok = Command::new("sh")
-            .args(["-c", LINK_SCRIPT, "sh", "~/.tok", target])
+        let argv = script_argv(LINK_SCRIPT, &["~/.tok", target]);
+        let ok = Command::new(argv[0])
+            .args(&argv[1..])
             .env("HOME", &home)
             .status()
             .unwrap()

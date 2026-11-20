@@ -1,10 +1,11 @@
-//! The format version of what lodge keeps under `/opt/lodge`.
+//! What lodge records about an injection as a whole: the format version of what
+//! it keeps under `/opt/lodge`, and the id of the bundle last injected.
 
 use anyhow::Result;
 
 use crate::layout::{BUNDLE_ID as BUNDLE_FILE, VERSION as STATE_VERSION_FILE};
 use crate::output::warning;
-use crate::runtime::Env;
+use crate::runtime::{Container, Env};
 
 // The layout under /opt/lodge is a format. Stamping it lets a future lodge
 // migrate it, and keeps an older lodge from silently altering newer state.
@@ -15,11 +16,11 @@ pub(super) fn record_bundle(env: &dyn Env, id: &str) -> Result<()> {
     env.write_file(BUNDLE_FILE, format!("{id}\n").as_bytes())
 }
 
-/// The id of the bundle last injected into this environment, `None` if none
-/// was; an error if that can't be read.
-pub fn installed_bundle(env: &dyn Env) -> Result<Option<String>> {
-    Ok(env
-        .read_file(BUNDLE_FILE)?
+/// The id of the bundle last injected into `container` (running or stopped),
+/// `None` if none was; an error if that can't be read.
+pub fn installed_bundle(container: &dyn Container) -> Result<Option<String>> {
+    Ok(container
+        .read_stored_file(BUNDLE_FILE)?
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty()))
 }
