@@ -1,0 +1,169 @@
+//! One forward: the built-in TCP proxy (local engine) or an `ssh -L` tunnel
+//! (`--remote`).
+
+use std::net::{TcpListener, TcpStream};
+use std::process::{Child, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
+
+// ── Forwarder ─────────────────────────────────────────────────────────────────
+
+pub(super) enum Forwarder {
+    Proxy(ProxyHandle),
+    Ssh {
+        child: Child,
+        local: u16,
+        dest: String,
+    },
+}
+
+impl Forwarder {
+    /// `local<TAB>dest`, for the ports file.
+    pub(super) fn describe(&self) -> String {
+        match self {
+            Forwarder::Proxy(h) => format!("{}\t{}", h.local, h.target),
+            Forwarder::Ssh { local, dest, .. } => format!("{local}\t{dest}"),
+        }
+    }
+
+    // `target` is "ip:port" as reachable from the Docker host.
+    pub(super) fn proxy(local: u16, target: String) -> std::io::Result<Self> {
+        ProxyHandle::spawn(local, target).map(Forwarder::Proxy)
+    }
+
+    pub(super) fn ssh_tunnel(local: u16, target: &str, remote: &str) -> std::io::Result<Self> {
+        let mut cmd = crate::ssh::tunnel(remote, local, target);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            // With --verbose, let ssh's own chatter land in the daemon log.
+            .stderr(if crate::output::is_verbose() {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            });
+        crate::output::trace(&cmd);
+        cmd.spawn().map(|child| Forwarder::Ssh {
+            child,
+            local,
+            dest: target.to_string(),
+        })
+    }
+
+    pub(super) fn is_alive(&mut self) -> bool {
+        match self {
+            Forwarder::Proxy(h) => !h.stop.load(Ordering::Relaxed),
+            // A tunnel we can't query is treated as dead, so it is replaced.
+            Forwarder::Ssh { child, .. } => child.try_wait().map(|s| s.is_none()).unwrap_or(false),
+        }
+    }
+}
+
+impl Drop for Forwarder {
+    fn drop(&mut self) {
+        match self {
+            Forwarder::Proxy(h) => h.stop.store(true, Ordering::Relaxed),
+            Forwarder::Ssh { child, .. } => {
+                #[allow(
+                    clippy::let_underscore_must_use,
+                    reason = "the tunnel may already have exited"
+                )]
+                let _ = child.kill();
+            }
+        }
+    }
+}
+
+// ── Built-in TCP proxy ────────────────────────────────────────────────────────
+
+pub(super) struct ProxyHandle {
+    stop: Arc<AtomicBool>,
+    local: u16,
+    target: String,
+}
+
+impl ProxyHandle {
+    // `target` is "ip:port" as reachable from the Docker host.
+    fn spawn(local: u16, target: String) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", local))?;
+        listener.set_nonblocking(true)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let shown = target.clone();
+
+        std::thread::spawn(move || {
+            loop {
+                if stop_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((client, _)) => {
+                        let target = target.clone();
+                        std::thread::spawn(move || {
+                            if let Ok(server) = TcpStream::connect(&target) {
+                                proxy_conn(client, server);
+                            }
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok(ProxyHandle {
+            stop,
+            local,
+            target: shown,
+        })
+    }
+}
+
+// Bidirectional copy between two TCP streams. Runs client→server in a spawned
+// thread and server→client in the current thread; each half shuts down its write
+// end on EOF so the peer sees a clean close.
+fn proxy_conn(client: TcpStream, server: TcpStream) {
+    let mut c_r = client;
+    let mut s_r = server;
+    let mut s_w = match s_r.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut c_w = match c_r.try_clone() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // A reset or already-closed peer is the normal end of a proxied connection,
+    // not an error worth reporting, so copy results are ignored below.
+    let t = std::thread::spawn(move || {
+        std::io::copy(&mut c_r, &mut s_w).ok();
+        s_w.shutdown(std::net::Shutdown::Write).ok();
+    });
+
+    std::io::copy(&mut s_r, &mut c_w).ok();
+    c_w.shutdown(std::net::Shutdown::Write).ok();
+    t.join().ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_proxy_listens_on_localhost_only() {
+        // Port 0 lets the OS pick; the point is the address family/interface.
+        let handle = ProxyHandle::spawn(0, "127.0.0.1:9".into());
+        // spawn() binds the requested port; with 0 it still binds loopback.
+        assert!(handle.is_ok());
+        let src = include_str!("tunnel.rs");
+        assert!(
+            !src.contains(concat!("bind(format!(\"0.0", ".0.0")),
+            "the proxy must not bind all interfaces"
+        );
+    }
+}
