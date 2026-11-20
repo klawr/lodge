@@ -97,6 +97,12 @@ pub fn run(rt: &dyn Runtime, target: &Target) -> Result<bool> {
         }
     }
 
+    if let Ok(cfg) = &config {
+        for decl in &cfg.secret {
+            checks.push(secret_check(decl));
+        }
+    }
+
     info!("doctor");
     let mut failed = 0;
     for c in &checks {
@@ -114,6 +120,22 @@ pub fn run(rt: &dyn Runtime, target: &Target) -> Result<bool> {
         warning!("{failed} required check(s) failed");
     }
     Ok(failed == 0)
+}
+
+/// Whether a declared secret's source resolves on this machine. The value is
+/// read to find out, then dropped; only the source's kind is shown.
+fn secret_check(decl: &crate::secret::SecretDecl) -> Check {
+    use crate::secret::From;
+    let source = match &decl.from {
+        From::Env(var) => format!("env {var}"),
+        From::File(path) => format!("file {}", path.display()),
+        From::Command(cmd) => format!("command {}", cmd.split_whitespace().next().unwrap_or("")),
+    };
+    let status = match crate::secret::resolve(decl) {
+        Ok(_) => Status::Ok(format!("resolves ({source})")),
+        Err(e) => Status::Missing(format!("{e:#}")),
+    };
+    Check::new(format!("secret {}", decl.name), status)
 }
 
 fn tool(name: &str, needed_for: &str, required: bool, hint: &str) -> Check {

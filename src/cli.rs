@@ -22,6 +22,12 @@ pub struct Cli {
     #[arg(long, short, global = true, value_name = "SSH_DEST")]
     pub remote: Option<String>,
 
+    /// Use this config file instead of ~/.config/lodge/config.toml. A relative
+    /// `bundle =` path in it is resolved against the file's folder, so a folder
+    /// holding a bundle and its config works wherever it is put.
+    #[arg(long, short, global = true, value_name = "FILE")]
+    pub config: Option<PathBuf>,
+
     /// Show what lodge is doing: print every docker/ssh command it runs and
     /// pass -v to lodge's own ssh connections (config probe, port tunnels).
     /// Repeat for more ssh verbosity (-vv, -vvv).

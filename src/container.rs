@@ -11,6 +11,7 @@ pub fn enter(
     session_name: &str,
     workdir: &str,
     remote_user: Option<&str>,
+    secret_setup: &str,
 ) -> Result<()> {
     let config = Config::load()?;
     let shell = &config.session.shell;
@@ -36,7 +37,10 @@ pub fn enter(
         crate::terminfo::session_term(container, crate::terminfo::local_term().as_deref())
             .map(|t| crate::terminfo::session_setup(&t))
             .unwrap_or_default();
-    let inner = format!("{term_setup}{set_title}; exec {} -l", shell_quote(shell));
+    let inner = format!(
+        "{secret_setup}{term_setup}{set_title}; exec {} -l",
+        shell_quote(shell)
+    );
 
     // The local command line that opens the interactive session; how it reaches
     // the container (docker exec, over ssh -tt for a remote engine) is the

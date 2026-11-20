@@ -44,10 +44,11 @@ flags, available on every subcommand.
 | `elf.rs` | Reads a binary's CPU architecture from its ELF header, to refuse an injection for the wrong one. |
 | `fingerprint.rs` | The small content hash used to notice changes (devcontainer inputs, updated libraries). |
 | `terminfo.rs` | Makes the user's terminal work in the container: passes `TERM`, copies a missing terminfo entry. |
-| `config.rs` | The user's `~/.config/lodge/config.toml`: `[[inject]]`, `[session]`, `[git]`, `[aliases]`. |
+| `config.rs` | The user's `~/.config/lodge/config.toml` (or the file chosen with the global `-c`, which must exist; a relative `bundle =` resolves against its folder): `[[inject]]`, `[session]`, `[git]`, `[aliases]`, `[[secret]]`. |
 | `devcontainer/` | Everything about running a `devcontainer.json` (see below). |
 | `bundle/` | A bundle is a portable tar of relinked binaries, their libraries and configs, with a manifest. `manifest` defines and validates it (paths derive from names, so a bundle can't point outside itself), `archive` writes, reads and verifies the tar, `pack` builds one from the config (the only step needing `ldd` and `patchelf`), and `source` readies a bundle *directory* to inject from (extracted from a file, or packed live) and caches it under `~/.cache/lodge/bundles/`, keyed by the file's hash or a fingerprint of the live inputs. Commands: `ldg pack`, `ldg bundle inspect`, `ldg bundle verify`, and `--bundle` on `up`/`exec`. |
 | `inject/` | Copies a bundle's binaries, libraries and configs into a container and wires them up, reading only from the bundle directory: `binary`, `libs` (tracked by content hash), `config_files` (and ownership), `installed` (a hash per installed piece), `shell_env` (`PATH`, aliases, git, terminal), `state` (format version, installed bundle id). |
+| `secret/` | Secrets that must not be in a bundle. `mod` is the `[[secret]]` declaration (validated; names reach shell scripts), the `Secret` value type (redacted `Debug`, no `Display`), `targets` globs, and `resolve` (env, file or command on the host, with errors that never contain the value). `place` writes values into a container under `/dev/shm/lodge-secrets-<uid>/` and builds the session lines that export them. `deliver` picks the secrets whose `targets` match, resolves and places them, and prints names only. Called on attach from `up` and `exec`; also used by `status` and `doctor`. |
 | `deps.rs` | Resolves a binary's shared libraries and dynamic linker by parsing `ldd`. Used only when packing. |
 | `features.rs` | Devcontainer *features*: fetch via `oras`, order, apply creation flags, install. |
 | `container.rs` | Opens the interactive session: `docker exec -it`, optionally inside tmux. |
@@ -151,6 +152,7 @@ things that change, such as an editor config.
 | `/opt/lodge/devcontainer.hash` | Fingerprint of the devcontainer inputs. |
 | `/opt/lodge/version` | Format version of this layout, so a future lodge can migrate it. |
 | `/opt/lodge/lib/.manifest` | Hash of every library copied, so a changed host library is refreshed (names don't change across glibc versions). |
+| `/dev/shm/lodge-secrets-<uid>/` | Placed secret values (memory only, 0700 directory, 0600 files); see `secret/`. |
 | `/opt/lodge/terminfo/` | The user's terminfo entry, when the container lacked it. |
 | `/etc/profile.d/lodge{,-env,-path,-features}.sh` | Aliases, `containerEnv`/`remoteEnv`, `PATH`, feature env. |
 

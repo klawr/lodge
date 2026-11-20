@@ -21,6 +21,7 @@ pub struct FakeEnv {
     canned: HashMap<Vec<String>, String>,
     failing: Vec<Vec<String>>,
     commands: Vec<String>,
+    modes: RefCell<HashMap<String, u32>>,
     calls: RefCell<Vec<Vec<String>>>,
     target: Target,
 }
@@ -33,6 +34,7 @@ impl FakeEnv {
             canned: HashMap::new(),
             failing: Vec::new(),
             commands: Vec::new(),
+            modes: RefCell::default(),
             calls: RefCell::default(),
             target: Target::Local,
         }
@@ -78,6 +80,11 @@ impl FakeEnv {
             .borrow()
             .get(path)
             .map(|b| String::from_utf8_lossy(b).into_owned())
+    }
+
+    /// The permission bits a file was last written with by `write_secret`.
+    pub fn mode(&self, path: &str) -> Option<u32> {
+        self.modes.borrow().get(path).copied()
     }
 
     /// True if exactly this command was run (as `exec` or `output`).
@@ -162,7 +169,7 @@ impl FakeEnv {
             // A script run for its effect (as root, say). Its effect can't be
             // emulated, so it is recorded and assumed to work; a test that cares
             // asserts on the recorded script.
-            ["sh", "-c", _] if !capture => ok(String::new()),
+            ["sh", "-c", _, ..] if !capture => ok(String::new()),
             _ => panic!(
                 "FakeEnv: unexpected command {argv:?}; declare it with \
                  with_output / with_failure / with_commands"
@@ -212,6 +219,23 @@ impl Env for FakeEnv {
         Ok(())
     }
 
+    // Records the destination and mode, never the value (as the real one keeps
+    // it out of argv).
+    fn write_secret(
+        &self,
+        dest: &str,
+        contents: &[u8],
+        mode: u32,
+        _user: Option<&str>,
+    ) -> Result<()> {
+        self.record(&["write_secret", dest, &format!("{mode:o}")]);
+        self.files
+            .borrow_mut()
+            .insert(dest.into(), contents.to_vec());
+        self.modes.borrow_mut().insert(dest.into(), mode);
+        Ok(())
+    }
+
     fn interactive_command(&self, _user: Option<&str>, workdir: &str, inner: &str) -> String {
         format!("fake-shell {workdir} {inner}")
     }
@@ -251,6 +275,17 @@ mod tests {
             .with_failure(&["infocmp", "nope"]);
         assert_eq!(env.exec_capture(&["uname", "-m"]).unwrap(), "x86_64\n");
         assert!(!env.succeeds(&["infocmp", "nope"]));
+    }
+
+    #[test]
+    fn write_secret_stores_bytes_and_mode_but_records_no_value() {
+        let env = FakeEnv::new();
+        env.write_secret("/dev/shm/s/TOKEN", b"hunter2", 0o600, None)
+            .unwrap();
+        assert_eq!(env.file("/dev/shm/s/TOKEN").as_deref(), Some("hunter2"));
+        assert_eq!(env.mode("/dev/shm/s/TOKEN"), Some(0o600));
+        assert!(env.ran(&["write_secret", "/dev/shm/s/TOKEN", "600"]));
+        assert!(!env.ran_matching(|c| c.iter().any(|a| a.contains("hunter2"))));
     }
 
     #[test]

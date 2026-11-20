@@ -597,3 +597,243 @@ fn injecting_from_a_bundle_needs_neither_ldd_nor_patchelf() {
     );
     assert_eq!(p.exec(&["/usr/local/bin/hostsh", "-c", "echo ok"]), "ok");
 }
+
+const SECRET: &str = "s3cr3t-VALUE-9f2a";
+const FILE_SECRET: &str = "f1le-VALUE-77c1";
+
+/// A config declaring an env secret (from the process environment), a file secret
+/// (from a host file, linked into the container), and one that is for another
+/// target.
+fn secrets_config(sb: &Sandbox) {
+    let host_file = sb.root().join("gh-token");
+    std::fs::write(&host_file, format!("{FILE_SECRET}\n")).unwrap();
+    sb.config(&format!(
+        r#"
+[[secret]]
+name = "API_KEY"
+from = {{ env = "LODGE_IT_API_KEY" }}
+as = "env"
+targets = ["local"]
+
+[[secret]]
+name = "GH"
+from = {{ file = "{}" }}
+as = {{ file = "/root/.cfg/gh-token", mode = "0640" }}
+
+[[secret]]
+name = "WORK_KEY"
+from = {{ command = "echo work-VALUE-31b8" }}
+as = "env"
+targets = ["no-such-host-*"]
+"#,
+        host_file.display()
+    ));
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn secrets_reach_the_session_and_never_the_image_the_trace_or_the_disk() {
+    let sb = Sandbox::new();
+    secrets_config(&sb);
+    let p = sb.project("secrets", &json(r#"{ "image": "@IMAGE@" }"#));
+    let host_env = [("LODGE_IT_API_KEY", SECRET)];
+
+    // A traced run whose session prints nothing: the value must not appear.
+    let traced = p.attach(&["-v"], &host_env, "exit\n");
+    assert!(traced.ok, "ldg up failed:\n{}", traced.tail(15));
+    for value in [SECRET, FILE_SECRET] {
+        assert!(!traced.has(value), "the -v run printed a secret value");
+    }
+    assert!(traced.has("secrets: API_KEY, GH"), "{}", traced.tail(15));
+    assert!(
+        traced.has("not for this target: WORK_KEY"),
+        "{}",
+        traced.tail(15)
+    );
+
+    // The session has the variable and the credential file.
+    let session = p.attach(
+        &[],
+        &host_env,
+        "printf 'GOT=%s\\n' \"$API_KEY\"; printf 'FILE=%s\\n' \"$(cat /root/.cfg/gh-token)\"; \
+         printf 'WORK=[%s]\\n' \"${WORK_KEY:-}\"; exit\n",
+    );
+    assert!(
+        session.has(&format!("GOT={SECRET}")),
+        "{}",
+        session.tail(15)
+    );
+    assert!(
+        session.has(&format!("FILE={FILE_SECRET}")),
+        "{}",
+        session.tail(15)
+    );
+    assert!(
+        session.has("WORK=[]"),
+        "a secret for another target arrived"
+    );
+
+    // In memory only, owner-only.
+    let c = p.container();
+    assert_eq!(p.sh("stat -f -c %T /dev/shm").trim(), "tmpfs");
+    assert_eq!(p.sh("stat -c %a /dev/shm/lodge-secrets-0").trim(), "700");
+    assert_eq!(
+        p.sh("stat -c %a /dev/shm/lodge-secrets-0/API_KEY").trim(),
+        "600"
+    );
+    assert_eq!(p.sh("stat -c %a /dev/shm/lodge-secrets-0/GH").trim(), "640");
+    assert_eq!(p.sh("ls /dev/shm/lodge-secrets-0").lines().count(), 2);
+
+    // Not in the container's configuration, nor in any layer or file on disk.
+    let inspect = docker(&["inspect", &c]);
+    let diff = docker(&["diff", &c]);
+    assert!(
+        !diff.contains("lodge-secrets"),
+        "a secret reached the filesystem layer:\n{diff}"
+    );
+    let export = std::process::Command::new("sh")
+        .args([
+            "-c",
+            &format!("docker export {c} | grep -a -c -e {SECRET} -e {FILE_SECRET} -e work-VALUE"),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&export.stdout).trim(),
+        "0",
+        "a secret value was found in the container's filesystem"
+    );
+    for value in [SECRET, FILE_SECRET, "work-VALUE"] {
+        assert!(!inspect.contains(value), "{value} is in docker inspect");
+    }
+
+    // status and doctor show names and states, never values.
+    let status = p.ldg("status", &[]);
+    assert!(
+        status.has("API_KEY (placed)") && status.has("GH (placed)"),
+        "{}",
+        status.tail(8)
+    );
+    assert!(status.has("WORK_KEY (not placed)"), "{}", status.tail(8));
+    let doctor = {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ldg"));
+        cmd.arg("doctor")
+            .env("XDG_CONFIG_HOME", sb.root().join("config"))
+            .env("LODGE_IT_API_KEY", SECRET);
+        let o = cmd.output().unwrap();
+        String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)
+    };
+    assert!(
+        doctor.contains("secret API_KEY") && doctor.contains("resolves"),
+        "{doctor}"
+    );
+    for value in [SECRET, FILE_SECRET, "work-VALUE"] {
+        assert!(!doctor.contains(value), "doctor printed a secret value");
+    }
+
+    // Dropping a declaration removes its value on the next attach.
+    sb.config("");
+    let again = p.attach(&[], &host_env, "exit\n");
+    assert!(again.ok, "{}", again.tail(10));
+    // (no secrets declared at all: nothing runs, the old files stay until stop)
+    secrets_config(&sb);
+    let one = std::fs::read_to_string(sb.root().join("config/lodge/config.toml"))
+        .unwrap()
+        .replace("name = \"GH\"", "name = \"GH_RENAMED\"");
+    std::fs::write(sb.root().join("config/lodge/config.toml"), one).unwrap();
+    p.attach(&[], &host_env, "exit\n");
+    let left = p.sh("ls /dev/shm/lodge-secrets-0");
+    assert!(
+        left.contains("GH_RENAMED") && !left.lines().any(|l| l == "GH"),
+        "{left}"
+    );
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn a_secret_that_cannot_be_resolved_warns_and_the_session_still_opens() {
+    let sb = Sandbox::new();
+    sb.config(
+        r#"
+[[secret]]
+name = "MISSING"
+from = { env = "LODGE_IT_SURELY_UNSET" }
+as = "env"
+
+[[secret]]
+name = "PRESENT"
+from = { command = "echo here" }
+as = "env"
+"#,
+    );
+    let p = sb.project("secret-warn", &json(r#"{ "image": "@IMAGE@" }"#));
+    let out = p.attach(
+        &[],
+        &[],
+        "printf 'P=%s M=[%s]\\n' \"$PRESENT\" \"${MISSING:-}\"; exit\n",
+    );
+    assert!(out.ok, "{}", out.tail(15));
+    assert!(
+        out.has("secret not delivered") && out.has("MISSING"),
+        "{}",
+        out.tail(15)
+    );
+    assert!(out.has("P=here M=[]"), "{}", out.tail(15));
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn secrets_are_added_on_the_machine_that_uses_a_tarred_bundle() {
+    let sb = Sandbox::new();
+    // The packing machine declares a secret too; it must stay out of the bundle.
+    let script = script_tool_config(&sb, "hello", "#!/bin/sh\necho tool-ran-from-bundle\n");
+    sb.config(&format!(
+        "[[inject]]\nname = \"hello\"\nbinary = \"{}\"\ncopy_deps = false\n\n[[secret]]\nname = \"API_KEY\"\nfrom = {{ env = \"LODGE_IT_API_KEY\" }}\nas = \"env\"\n",
+        script.display()
+    ));
+    let bundle = sb.root().join("b.tar");
+    assert!(sb.run(&["pack", "-o", &bundle.to_string_lossy()]).ok);
+    let tar = std::process::Command::new("tar")
+        .args(["-xOf", &bundle.to_string_lossy()])
+        .output()
+        .unwrap();
+    let contents = String::from_utf8_lossy(&tar.stdout);
+    assert!(
+        !contents.contains("API_KEY") && !contents.contains("LODGE_IT_API_KEY"),
+        "the bundle carries a secret declaration"
+    );
+
+    // The consuming machine: a folder with the tar and a config that refers to it
+    // by a relative path, used through `-c`. The default config is empty.
+    let deploy = sb.root().join("deploy");
+    std::fs::create_dir_all(&deploy).unwrap();
+    std::fs::copy(&bundle, deploy.join("bundle.tar")).unwrap();
+    let deploy_config = deploy.join("config.toml");
+    std::fs::write(
+        &deploy_config,
+        "bundle = \"bundle.tar\"\n\n[session]\nmultiplexer = \"none\"\n\n\
+         [[secret]]\nname = \"API_KEY\"\nfrom = { env = \"LODGE_IT_API_KEY\" }\nas = \"env\"\n",
+    )
+    .unwrap();
+    sb.config("");
+    let config_arg = deploy_config.to_string_lossy().into_owned();
+    let missing = sb.run(&["-c", "/no/such/config.toml", "doctor"]);
+    assert!(
+        !missing.ok && missing.has("does not exist"),
+        "{}",
+        missing.tail(5)
+    );
+    let p = sb.project("bundle-secret", &json(r#"{ "image": "@IMAGE@" }"#));
+    let out = p.attach(
+        &["-c", &config_arg],
+        &[("LODGE_IT_API_KEY", SECRET)],
+        "printf 'GOT=%s\\n' \"$API_KEY\"; /usr/local/bin/hello; exit\n",
+    );
+    assert!(out.ok, "{}", out.tail(15));
+    assert!(out.has(&format!("GOT={SECRET}")), "{}", out.tail(15));
+    assert!(
+        out.has("tool-ran-from-bundle"),
+        "the bundle's tool was not injected:\n{}",
+        out.tail(15)
+    );
+}

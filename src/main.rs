@@ -22,6 +22,7 @@ mod forward;
 mod inject;
 mod output;
 mod runtime;
+mod secret;
 mod shell;
 mod ssh;
 mod target;
@@ -45,6 +46,9 @@ fn project_dir(path: Option<PathBuf>) -> Result<PathBuf> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     output::set_verbosity(cli.verbose);
+    if let Some(path) = cli.config {
+        config::use_config_file(path)?;
+    }
     let target = Target::new(cli.remote);
 
     let rt = runtime::connect(&target);
@@ -67,11 +71,17 @@ fn main() -> Result<()> {
             inject::lodge(container, remote_user, &prepared)?;
             if !no_attach {
                 started.run_post_attach()?;
+                let secret_setup = secret::deliver::deliver(
+                    container,
+                    remote_user,
+                    &config::Config::load()?.secret,
+                )?;
                 container::enter(
                     container,
                     &started.session_name,
                     &started.workdir,
                     remote_user,
+                    &secret_setup,
                 )?;
             }
         }
@@ -97,7 +107,12 @@ fn main() -> Result<()> {
             inject::lodge(handle.as_ref(), None, &prepared)?;
             if !no_attach {
                 let session_name = format!("lodge-{container}");
-                container::enter(handle.as_ref(), &session_name, "/", None)?;
+                let secret_setup = secret::deliver::deliver(
+                    handle.as_ref(),
+                    None,
+                    &config::Config::load()?.secret,
+                )?;
+                container::enter(handle.as_ref(), &session_name, "/", None, &secret_setup)?;
             }
         }
         Command::Pack { output } => {

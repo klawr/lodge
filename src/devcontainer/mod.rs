@@ -260,6 +260,23 @@ pub fn status(project_path: &Path, rt: &dyn Runtime) -> Result<()> {
     if let Some(id) = crate::inject::installed_bundle(container.as_ref()) {
         info!("bundle     {id}");
     }
+    let declared = crate::config::Config::load()?.secret;
+    if !declared.is_empty() && container.is_running() {
+        let present =
+            crate::secret::place::present_names(container.as_ref(), spec.remote_user.as_deref());
+        let shown: Vec<String> = declared
+            .iter()
+            .map(|d| {
+                let state = if present.contains(&d.name) {
+                    "placed"
+                } else {
+                    "not placed"
+                };
+                format!("{} ({state})", d.name)
+            })
+            .collect();
+        info!("secrets    {}", shown.join(", "));
+    }
     Ok(())
 }
 

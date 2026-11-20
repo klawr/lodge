@@ -319,6 +319,54 @@ impl Project<'_> {
         out
     }
 
+    /// `ldg [flags…] up <project>` *with* a session, on a pseudo-terminal made by
+    /// `script`, feeding `input` to the shell it opens. `host_env` is added to
+    /// ldg's environment (where a secret's source can live). The shell should
+    /// end with `exit`; the whole run is cut off after 90 s. Output includes
+    /// what the session printed, with `\r\n` line ends.
+    pub fn attach(&self, flags: &[&str], host_env: &[(&str, &str)], input: &str) -> Out {
+        use std::io::Write as _;
+        fn quote(s: &str) -> String {
+            format!("'{}'", s.replace('\'', "'\\''"))
+        }
+        let ldg = self.sb.command();
+        let mut line = format!(
+            "exec timeout 90 {}",
+            quote(&ldg.get_program().to_string_lossy())
+        );
+        for f in flags {
+            line.push(' ');
+            line.push_str(&quote(f));
+        }
+        line.push_str(&format!(" up {}", quote(&self.dir.to_string_lossy())));
+        let mut cmd = Command::new("script");
+        cmd.args(["-qec", &line, "/dev/null"]);
+        for (k, v) in ldg.get_envs() {
+            if let Some(v) = v {
+                cmd.env(k, v);
+            }
+        }
+        cmd.envs(host_env.iter().copied());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawning script");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(input.as_bytes())
+            .expect("feeding the session");
+        let out = child.wait_with_output().expect("waiting for script");
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        *self.last.borrow_mut() = text.lines().rev().take(15).collect::<Vec<_>>().join("\n");
+        Out {
+            ok: out.status.success(),
+            text,
+        }
+    }
+
     /// The name of this project's container (the first, for compose).
     pub fn container(&self) -> String {
         let filter = format!("name=^lodge-{}-", self.base);

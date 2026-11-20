@@ -28,6 +28,12 @@ use crate::tmpfile::TempFile;
 /// Where lodge keeps one-shot task markers inside an environment.
 const STATE_DIR: &str = "/opt/lodge/state";
 
+/// The `sh -c` script behind [`Env::write_secret`]: `$0` is the destination, the
+/// value arrives on stdin and `%MODE%` is replaced by an octal mode. Written to a
+/// sibling temp file under `umask 077`, then moved into place.
+pub const WRITE_SECRET_SCRIPT: &str = "umask 077; t=\"$0.tmp.$$\"; \
+     { cat > \"$t\" && chmod %MODE% \"$t\" && mv -f \"$t\" \"$0\"; } || { rm -f \"$t\"; exit 1; }";
+
 /// Who a command runs as.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum User<'a> {
@@ -83,6 +89,20 @@ pub trait Env {
 
     /// Copies `src` from the environment to the local path `local_dst`.
     fn cp_out(&self, src: &str, local_dst: &str) -> Result<()>;
+
+    /// Writes `contents` to `dest` inside the environment with permission bits
+    /// `mode`, as `user` (`None` = the default user). The bytes travel on the command's **stdin**,
+    /// never in argv, so they show up in neither `ps` nor the `-v` trace (use this,
+    /// not `exec` with `-e K=V`, for anything secret). The file is created
+    /// owner-only, so it is never readable at a looser mode, and replaced
+    /// atomically. The parent directory must already exist.
+    fn write_secret(
+        &self,
+        dest: &str,
+        contents: &[u8],
+        mode: u32,
+        user: Option<&str>,
+    ) -> Result<()>;
 
     /// A local shell command line that opens an interactive session in the
     /// environment, running `inner` (a `sh -c` script) as `user` from `workdir`.
@@ -303,5 +323,51 @@ mod tests {
     fn a_marker_from_an_earlier_run_is_respected() {
         let env = FakeEnv::new().with_file("/opt/lodge/state/onCreate", "");
         assert!(env.task_done("onCreate"));
+    }
+}
+
+#[cfg(test)]
+mod write_secret_script_tests {
+    use super::WRITE_SECRET_SCRIPT;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+
+    fn run(dest: &str, mode: u32, input: &[u8]) -> bool {
+        let script = WRITE_SECRET_SCRIPT.replace("%MODE%", &format!("{mode:o}"));
+        let mut child = Command::new("sh")
+            .args(["-c", &script, dest])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait().unwrap().success()
+    }
+
+    #[test]
+    fn writes_bytes_with_the_mode_and_replaces_read_only_files() {
+        let dir = std::env::temp_dir().join(format!("lodge-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("it's a 'token'");
+        let dest = dest.to_str().unwrap();
+        assert!(run(dest, 0o600, b"one\0two"));
+        assert_eq!(std::fs::read(dest).unwrap(), b"one\0two");
+        assert_eq!(
+            std::fs::metadata(dest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // A more restrictive mode, over an existing file, still works.
+        assert!(run(dest, 0o400, b"new"));
+        assert!(run(dest, 0o400, b"newer"));
+        assert_eq!(std::fs::read(dest).unwrap(), b"newer");
+        assert_eq!(
+            std::fs::metadata(dest).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        // No leftovers; a missing directory fails cleanly.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        assert!(!run(dir.join("nope/x").to_str().unwrap(), 0o600, b"x"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

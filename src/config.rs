@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use crate::secret::{self, SecretDecl};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
@@ -16,6 +19,9 @@ pub struct Config {
     pub git: GitConfig,
     #[serde(default)]
     pub aliases: HashMap<String, String>,
+    /// Secrets to deliver at attach time. Local config only, never in a bundle.
+    #[serde(default)]
+    pub secret: Vec<SecretDecl>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -105,6 +111,33 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
     path
 }
 
+/// The config file chosen with `-c`, for the whole run.
+static CONFIG_FILE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Makes `path` the config file for this run. Unlike the default location, a file
+/// asked for by name must exist.
+pub fn use_config_file(path: PathBuf) -> Result<()> {
+    let path = expand_tilde(path);
+    if !path.is_file() {
+        anyhow::bail!("config file {} does not exist", path.display());
+    }
+    // Absolute, so a relative `bundle =` resolves the same wherever we run from.
+    let path = std::path::absolute(&path).unwrap_or(path);
+    CONFIG_FILE.set(path).ok();
+    Ok(())
+}
+
+/// A relative path in the config is relative to the config file's folder.
+fn resolve_against(config_file: &Path, path: PathBuf) -> PathBuf {
+    let path = expand_tilde(path);
+    if path.is_absolute() {
+        return path;
+    }
+    config_file
+        .parent()
+        .map_or(path.clone(), |dir| dir.join(&path))
+}
+
 impl Config {
     /// An empty config, for tests elsewhere in the crate.
     #[cfg(test)]
@@ -120,11 +153,12 @@ impl Config {
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("reading config at {}", path.display()))?;
         let mut cfg: Config = toml::from_str(&raw).context("parsing lodge config")?;
-        cfg.bundle = cfg.bundle.take().map(expand_tilde);
+        cfg.bundle = cfg.bundle.take().map(|b| resolve_against(&path, b));
         for item in &mut cfg.inject {
             item.binary = item.binary.take().map(expand_tilde);
             item.config = item.config.take().map(expand_tilde);
         }
+        secret::validate_all(&cfg.secret)?;
         Ok(cfg)
     }
 
@@ -135,11 +169,15 @@ impl Config {
             session: SessionConfig::default(),
             git: GitConfig::default(),
             aliases: HashMap::new(),
+            secret: vec![],
         }
     }
 }
 
 pub fn config_path() -> PathBuf {
+    if let Some(path) = CONFIG_FILE.get() {
+        return path.clone();
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("~/.config"))
         .join("lodge")
@@ -187,5 +225,32 @@ mod tests {
         assert_eq!(c.session.multiplexer, "none");
         assert_eq!(c.git.safe_directories, vec!["/work".to_string()]);
         assert_eq!(c.aliases.get("ll").map(String::as_str), Some("ls -la"));
+    }
+
+    #[test]
+    fn a_relative_path_is_relative_to_the_config_file() {
+        let cfg = Path::new("/srv/deploy/config.toml");
+        assert_eq!(
+            resolve_against(cfg, "bundle.tar".into()),
+            Path::new("/srv/deploy/bundle.tar")
+        );
+        assert_eq!(
+            resolve_against(cfg, "../b/x.tar".into()),
+            Path::new("/srv/deploy/../b/x.tar")
+        );
+        assert_eq!(
+            resolve_against(cfg, "/abs/x.tar".into()),
+            Path::new("/abs/x.tar")
+        );
+    }
+
+    #[test]
+    fn parses_secret_declarations() {
+        let c: Config = toml::from_str(
+            "[[secret]]\nname = \"GH_TOKEN\"\nfrom = { command = \"gh auth token\" }\nas = \"env\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.secret.len(), 1);
+        assert!(Config::default().secret.is_empty());
     }
 }

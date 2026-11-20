@@ -144,6 +144,39 @@ impl Env for DockerContainer {
         self.copy_out(src, local_dst)
     }
 
+    fn write_secret(
+        &self,
+        dest: &str,
+        contents: &[u8],
+        mode: u32,
+        user: Option<&str>,
+    ) -> Result<()> {
+        use std::io::Write as _;
+        let script = crate::runtime::WRITE_SECRET_SCRIPT.replace("%MODE%", &format!("{mode:o}"));
+        // The value goes on stdin; argv carries only the script and the path.
+        let opts = ExecOpts {
+            user: user.map_or(User::Default, User::Named),
+            ..ExecOpts::default()
+        };
+        let mut args = self.exec_args(&["sh", "-c", &script, dest], &opts);
+        args.insert(1, "-i".into());
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        // `command` closes stdin for ssh; this one streams, so override it.
+        let mut cmd = self.cli.command(&refs);
+        cmd.stdin(std::process::Stdio::piped());
+        let mut child = cmd.spawn().context("spawning docker exec")?;
+        let written = child
+            .stdin
+            .take()
+            .context("docker exec stdin was not piped")?
+            .write_all(contents);
+        let status = child.wait().context("waiting for docker exec")?;
+        if !status.success() {
+            bail!("writing secret file {dest} failed ({status})");
+        }
+        written.context("sending secret to docker exec")
+    }
+
     fn interactive_command(&self, user: Option<&str>, workdir: &str, inner: &str) -> String {
         let mut exec = String::from("docker exec -it");
         if let Some(u) = user {
