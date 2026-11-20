@@ -51,6 +51,9 @@ pub enum Command {
         /// Force-rebuild images and recreate the container from scratch
         #[arg(long)]
         build: bool,
+        /// Set everything up, but don't open a shell (for scripts and CI)
+        #[arg(long)]
+        no_attach: bool,
     },
     /// Stop a project's devcontainer
     #[command(
@@ -64,6 +67,23 @@ pub enum Command {
         /// (defaults to current directory)
         path: Option<PathBuf>,
     },
+    /// Show a project's container and whether its config changed
+    Status {
+        /// Project path containing the devcontainer config
+        /// (defaults to current directory)
+        path: Option<PathBuf>,
+    },
+    /// Remove a project's container
+    #[command(
+        long_about = "Remove the project's container, discarding everything installed in it. \
+            The next `ldg up` creates a fresh one. To rebuild and recreate in one step, \
+            use `ldg up --build`."
+    )]
+    Rm {
+        /// Project path containing the devcontainer config
+        /// (defaults to current directory)
+        path: Option<PathBuf>,
+    },
     /// Inject your environment into an already-running container
     #[command(
         long_about = "Inject your environment into a container that is already running, \
@@ -73,7 +93,18 @@ pub enum Command {
     Exec {
         /// Container name or ID
         container: String,
+        /// Inject, but don't open a shell (for scripts and CI)
+        #[arg(long)]
+        no_attach: bool,
     },
+    /// Check that everything lodge needs is available
+    #[command(
+        long_about = "Check the host: that the container engine is reachable, which helper \
+            tools are installed and what each is needed for, and that your config and the \
+            binaries it lists are usable. With --remote, checks the remote engine. Exits \
+            non-zero if a required tool is missing."
+    )]
+    Doctor,
     /// Internal: port-forwarding daemon spawned by `ldg up`
     #[command(name = "_forward", hide = true)]
     Forward {

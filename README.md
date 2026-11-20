@@ -17,6 +17,9 @@ ldg up                        # find the devcontainer config, start it, inject y
 ldg up ./some/project         # same, for a specific project path
 ldg up --build                # force-rebuild images and recreate the container
 ldg down                      # stop the project's container (resume later with `ldg up`)
+ldg status                    # show the project's container and whether its config changed
+ldg rm                        # remove the project's container (next `ldg up` creates a fresh one)
+ldg doctor                    # check the host: engine, helper tools, config, listed binaries
 ldg exec my-container         # inject into an already-running container by name/id
 ldg up -r user@host           # operate against a remote Docker daemon over SSH
 ldg up -r myhost ./project    # remote via a Host alias from ~/.ssh/config
@@ -64,11 +67,14 @@ On the host:
 
 - `docker` (and `docker compose` for `ldg up`) — for local use. With
   `--remote`, docker runs on the *remote* host instead; locally you only need
-  `ssh` and `tar` (see [Remote containers](#remote-containers)).
-- `tmux` (for the interactive session; or set `multiplexer = "none"`)
+  `ssh` (see [Remote containers](#remote-containers)).
 - `ldd` and `patchelf` (to resolve and re-link injected binaries)
 - `oras` (only if your devcontainer uses `features`)
-- `ssh` and `tar` (only for `--remote`)
+- `ssh` (only for `--remote`)
+- `tmux` is optional: without it the session opens directly (or set
+  `multiplexer = "none"` to say so explicitly)
+
+`ldg doctor` checks all of this and says what each missing piece would break.
 
 ## Configuration
 
@@ -278,11 +284,18 @@ container's normal user, so your environment and `$HOME` are the user's own.
 
 ```sh
 cargo test                                  # unit tests (no Docker needed)
+make integration                            # the real binary against docker (needs docker + patchelf; ~15 s)
 cargo clippy --all-targets -- -D warnings   # lints
 cargo fmt --check                           # formatting
 cargo build --release
 ```
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, and a release build on
-every push/PR. Tagging `vX.Y.Z` triggers `release.yml`, which builds the static
-musl binary and publishes it to a GitHub release for `install.sh` to fetch.
+`make check` runs the same fmt, clippy and test gate as CI.
+
+CI (`.github/workflows/ci.yml`) runs that gate plus a release build on every
+push/PR. On `master`, a release job derives the next version from conventional
+commits and `v*` tags with `git-cliff`, tags it, and attaches static musl
+binaries (`ldg-<target>.tar.gz`) to a GitHub release for `install.sh` to fetch.
+
+For a tour of the code (modules, the `ldg up` flow, what gets written where in a
+container, how `--remote` works) see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

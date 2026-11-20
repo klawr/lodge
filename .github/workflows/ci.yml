@@ -31,14 +31,29 @@ jobs:
       - name: Build
         run: cargo build --release
 
-  # Cut a release only after `check` passes, and only for pushes to master.
-  # `needs: check` is the dependency, so a red tree (fmt/clippy/test/build) can
-  # never be tagged. On pull requests this job is skipped by the `if`.
+  # The real binary against a real container engine (docker and its compose
+  # plugin come with the runner). Runs in parallel with `check`. Locally:
+  # `make integration`.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Host tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq patchelf
+      - name: Integration tests
+        run: make integration
+
+  # Cut a release only after `check` and `integration` pass, and only for pushes
+  # to master.
+  # `needs` is the dependency, so a red tree (fmt/clippy/test/build/integration)
+  # can never be tagged. On pull requests this job is skipped by the `if`.
   #
   # Versioning is derived entirely from conventional commits and `v*` git tags
   # via git-cliff
   release:
-    needs: check
+    needs: [check, integration]
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:

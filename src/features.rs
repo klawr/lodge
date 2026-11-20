@@ -1,4 +1,5 @@
-use crate::docker::Docker;
+use crate::output::{info, warning};
+use crate::runtime::{Env, ExecOpts, User};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -197,7 +198,7 @@ pub struct Plan {
 impl Drop for Plan {
     fn drop(&mut self) {
         if let Some(w) = &self.work {
-            let _ = std::fs::remove_dir_all(w);
+            crate::tmpfile::discard_dir(w);
         }
     }
 }
@@ -219,32 +220,35 @@ impl Plan {
 
     /// Runs each feature's `install.sh` (as root, options as env), records a
     /// success marker, and persists merged `containerEnv` for login shells.
-    pub fn install(&self, docker: &Docker, container: &str) -> Result<()> {
+    pub fn install(&self, env: &dyn Env) -> Result<()> {
         if self.resolved.is_empty() {
             return Ok(());
         }
-        if docker.mkdir_p(container, &[FEATURES_DIR]).is_err() {
+        if env.mkdir_p(&[FEATURES_DIR]).is_err() {
             return Ok(());
         }
         let mut container_env: BTreeMap<String, String> = BTreeMap::new();
         for r in &self.resolved {
             warn_unsupported(r);
             validate_options(r);
-            match install_one(docker, container, r) {
+            match install_one(env, r) {
                 Ok(()) => {
                     for (k, v) in &r.meta.container_env {
                         container_env.insert(k.clone(), v.clone());
                     }
-                    let _ = docker.mark_task_done(container, &marker_key(&r.reference));
+                    if let Err(e) = env.mark_task_done(&marker_key(&r.reference)) {
+                        // Not fatal, but the feature will be installed again next run.
+                        warning!(
+                            "could not record that feature {} is installed: {e:#}",
+                            r.reference
+                        );
+                    }
                 }
-                Err(e) => eprintln!(
-                    "[lodge] feature {} install failed (continuing): {e}",
-                    r.reference
-                ),
+                Err(e) => warning!("feature {} install failed (continuing): {e}", r.reference),
             }
         }
         if !container_env.is_empty() {
-            write_profile(docker, container, &container_env)?;
+            write_profile(env, &container_env)?;
         }
         Ok(())
     }
@@ -262,8 +266,8 @@ pub fn resolve(
         return Ok(Plan::default());
     }
     if features.iter().any(|f| !is_local_ref(&f.reference)) && !oras_available() {
-        eprintln!(
-            "[lodge] warning: devcontainer features need `oras` (https://oras.land); \
+        warning!(
+            "devcontainer features need `oras` (https://oras.land); \
              skipping {} feature(s)",
             features.len()
         );
@@ -271,11 +275,11 @@ pub fn resolve(
     }
 
     let work = std::env::temp_dir().join(format!("lodge-features-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    crate::tmpfile::discard_dir(&work);
 
     let mut resolved = Vec::with_capacity(features.len());
     for (i, req) in features.iter().enumerate() {
-        println!("[lodge] fetching feature {}", req.reference);
+        info!("fetching feature {}", req.reference);
         let fetched = if is_local_ref(&req.reference) {
             fetch_local(&req.reference, base_dir)
         } else {
@@ -288,8 +292,8 @@ pub fn resolve(
                 meta,
                 dir,
             }),
-            Err(e) => eprintln!(
-                "[lodge] feature {} could not be fetched (skipping): {e}",
+            Err(e) => warning!(
+                "feature {} could not be fetched (skipping): {e}",
                 req.reference
             ),
         }
@@ -306,21 +310,20 @@ pub fn resolve(
 /// retries failures). Create-flags can't be applied here (the container already
 /// exists) — use `resolve` + `Plan::create_flags` before `up` for those.
 pub fn install(
-    docker: &Docker,
-    container: &str,
+    env: &dyn Env,
     base_dir: &Path,
     features: &[FeatureRequest],
     override_order: &[String],
 ) -> Result<()> {
     let todo: Vec<FeatureRequest> = features
         .iter()
-        .filter(|f| !docker.task_done(container, &marker_key(&f.reference)))
+        .filter(|f| !env.task_done(&marker_key(&f.reference)))
         .cloned()
         .collect();
     if todo.is_empty() {
         return Ok(());
     }
-    resolve(base_dir, &todo, override_order)?.install(docker, container)
+    resolve(base_dir, &todo, override_order)?.install(env)
 }
 
 fn marker_key(reference: &str) -> String {
@@ -360,28 +363,30 @@ fn validate_options(r: &Resolved) {
             && let Some(allowed) = &spec.enum_values
             && !allowed.contains(value)
         {
-            eprintln!(
-                "[lodge] warning: feature {} option {id}={} is not one of its declared values",
-                r.reference, value
+            warning!(
+                "feature {} option {id}={} is not one of its declared values",
+                r.reference,
+                value
             );
         }
     }
 }
 
 // Copies a feature into the container and runs its install.sh as root.
-fn install_one(docker: &Docker, container: &str, r: &Resolved) -> Result<()> {
+fn install_one(env: &dyn Env, r: &Resolved) -> Result<()> {
     let dest = format!("{FEATURES_DIR}/{}", r.meta.id);
-    docker.exec_root(container, &["rm", "-rf", &dest])?;
-    docker.cp(&r.dir.to_string_lossy(), container, &dest)?;
+    env.exec_root(&["rm", "-rf", &dest])?;
+    env.cp_in(&r.dir.to_string_lossy(), &dest)?;
 
-    println!("[lodge] installing feature {}", r.reference);
-    let env = build_env(r);
-    docker.exec_in(
-        container,
-        Some(&dest),
-        &env,
+    info!("installing feature {}", r.reference);
+    let vars = build_env(r);
+    env.exec(
         &["sh", "-c", "chmod +x ./install.sh && ./install.sh"],
-        true,
+        &ExecOpts {
+            user: User::Root,
+            workdir: Some(&dest),
+            env: &vars,
+        },
     )
 }
 
@@ -401,7 +406,7 @@ fn pull_and_extract(reference: &str, work: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(work)?;
     let mut cmd = Command::new("oras");
     cmd.args(["pull", reference]).current_dir(work);
-    crate::verbose::trace(&cmd);
+    crate::output::trace(&cmd);
     let status = cmd.status().context("running oras pull")?;
     if !status.success() {
         bail!("oras pull failed for feature {reference}");
@@ -416,7 +421,7 @@ fn pull_and_extract(reference: &str, work: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(&content)?;
     let mut cmd = Command::new("tar");
     cmd.arg("xf").arg(&layer).arg("-C").arg(&content);
-    crate::verbose::trace(&cmd);
+    crate::output::trace(&cmd);
     let status = cmd.status().context("extracting feature tarball")?;
     if !status.success() {
         bail!("failed to extract feature {reference}");
@@ -426,8 +431,8 @@ fn pull_and_extract(reference: &str, work: &Path) -> Result<PathBuf> {
 
 fn warn_unsupported(r: &Resolved) {
     if r.meta.entrypoint.is_some() {
-        eprintln!(
-            "[lodge] warning: feature {} declares an entrypoint, which lodge can't apply \
+        warning!(
+            "feature {} declares an entrypoint, which lodge can't apply \
              (the container runs `sleep infinity`); ignoring it",
             r.reference
         );
@@ -479,16 +484,12 @@ fn stringify(v: &Value) -> String {
 // Persists feature containerEnv so login shells (lodge enters with `-l`) see it.
 // Values may reference other vars (e.g. PATH=".../bin:${PATH}"), so they're left
 // unquoted for the shell to expand.
-fn write_profile(docker: &Docker, container: &str, env: &BTreeMap<String, String>) -> Result<()> {
+fn write_profile(env: &dyn Env, vars: &BTreeMap<String, String>) -> Result<()> {
     let mut script = String::from("# generated by lodge from devcontainer feature containerEnv\n");
-    for (k, v) in env {
+    for (k, v) in vars {
         script.push_str(&format!("export {k}={v}\n"));
     }
-    let tmp = std::env::temp_dir().join(format!("lodge-profile-{}", std::process::id()));
-    std::fs::write(&tmp, script)?;
-    let res = docker.cp(&tmp.to_string_lossy(), container, PROFILE_PATH);
-    let _ = std::fs::remove_file(&tmp);
-    res
+    env.write_file(PROFILE_PATH, script.as_bytes())
 }
 
 // Orders features so that any `installsAfter` dependency that is *also* in this
@@ -540,7 +541,10 @@ fn order(resolved: Vec<Resolved>, override_order: &[String]) -> Vec<Resolved> {
     }
 
     let mut slots: Vec<Option<Resolved>> = resolved.into_iter().map(Some).collect();
-    out.into_iter().map(|i| slots[i].take().unwrap()).collect()
+    // `out` holds each index exactly once, so every slot is taken exactly once.
+    out.into_iter()
+        .filter_map(|i| slots.get_mut(i).and_then(Option::take))
+        .collect()
 }
 
 // Matches an installsAfter / override entry against a resolved feature, by full

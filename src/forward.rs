@@ -1,4 +1,8 @@
+use crate::output::{info, scoped, warning};
 use std::collections::{HashMap, HashSet};
+
+use crate::runtime::{self, Container, ExecOpts};
+use crate::target::Target;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -58,36 +62,32 @@ impl PortForward {
 /// Spawns a detached `ldg _forward` daemon that manages port forwarding for
 /// `container`. Returns immediately; the daemon outlives the calling process.
 /// Daemon stderr goes to a log file; the path is printed so the user can tail it.
-pub fn spawn_daemon(container: &str, remote: &Option<String>, static_ports: &[PortForward]) {
+pub fn spawn_daemon(container: &str, target: &Target, static_ports: &[PortForward]) {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
-        Err(_) => return,
-    };
-
-    let log = log_path(container);
-    if let Some(dir) = log.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let log_file = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)
-    {
-        Ok(f) => f,
         Err(e) => {
-            eprintln!("[lodge] could not open forward log {}: {e}", log.display());
+            warning!("cannot start port forwarding: {e}");
             return;
         }
     };
 
-    println!("[lodge] port forwarding log: {}", log.display());
+    let log = log_path(container);
+    let log_file = match open_log(&log) {
+        Ok(f) => f,
+        Err(e) => {
+            warning!("could not open forward log {}: {e}", log.display());
+            return;
+        }
+    };
+
+    info!("port forwarding log: {}", log.display());
 
     let mut cmd = Command::new(exe);
-    if let Some(r) = remote {
-        cmd.args(["--remote", r]);
+    if let Some(host) = target.ssh_host() {
+        cmd.args(["--remote", host]);
     }
     // Forward verbosity to the daemon so its ssh tunnels log into the log file.
-    for _ in 0..crate::verbose::level() {
+    for _ in 0..crate::output::verbosity() {
         cmd.arg("-v");
     }
     cmd.arg("_forward").arg(container);
@@ -101,11 +101,14 @@ pub fn spawn_daemon(container: &str, remote: &Option<String>, static_ports: &[Po
         cmd.process_group(0);
     }
 
-    let _ = cmd
+    if let Err(e) = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log_file)
-        .spawn();
+        .spawn()
+    {
+        warning!("could not start the port-forwarding daemon: {e}");
+    }
 }
 
 /// Port-forwarding daemon. Forwards declared in `forwardPorts`
@@ -116,17 +119,40 @@ pub fn spawn_daemon(container: &str, remote: &Option<String>, static_ports: &[Po
 /// polls `/proc/net/tcp` and `/proc/net/tcp6` every 2 s and maintains one
 /// forwarder per listening port. For local Docker, a built-in Rust TCP proxy
 /// is used; for `--remote`, an `ssh -L` tunnel. Exits when the container stops.
-pub fn run_daemon(container: &str, remote: &Option<String>, static_ports: &[PortForward]) {
-    let container_ip = match get_container_ip(container, remote) {
+pub fn run_daemon(container_id: &str, target: &Target, static_ports: &[PortForward]) {
+    // Every `ldg up` starts a daemon; only one per container may run, or they
+    // fight over the same local ports. The lock lives as long as this process.
+    let _lock = match acquire_lock(&lock_path(container_id)) {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
+            scoped!(
+                "lodge forward",
+                "already running for this container; exiting"
+            );
+            return;
+        }
+        Err(e) => {
+            scoped!(
+                "lodge forward",
+                "could not take the forwarder lock ({e}); continuing without it"
+            );
+            None
+        }
+    };
+    let rt = runtime::connect(target);
+    let container = rt.container(container_id);
+    let container = container.as_ref();
+    let container_ip = match container.ip_address() {
         Some(ip) => ip,
         None => {
-            eprintln!(
-                "[lodge forward] could not determine container IP — port forwarding disabled"
+            scoped!(
+                "lodge forward",
+                "could not determine container IP — port forwarding disabled"
             );
             return;
         }
     };
-    eprintln!("[lodge forward] container IP: {container_ip}");
+    scoped!("lodge forward", "container IP: {container_ip}");
 
     let mut active: HashMap<u16, Forwarder> = HashMap::new();
     // Local ports whose forwarder failed to start, so the retry every 2 s
@@ -139,8 +165,8 @@ pub fn run_daemon(container: &str, remote: &Option<String>, static_ports: &[Port
     let mut resolved: HashMap<String, String> = HashMap::new();
 
     loop {
-        if !is_container_running(container, remote) {
-            eprintln!("[lodge forward] container stopped, exiting");
+        if !container.is_running() {
+            scoped!("lodge forward", "container stopped, exiting");
             break;
         }
 
@@ -149,7 +175,7 @@ pub fn run_daemon(container: &str, remote: &Option<String>, static_ports: &[Port
         // and win a local-port collision. A forwarder that died (e.g. dropped
         // ssh tunnel) is retired below and recreated, since its local port
         // stays in the wanted set.
-        let mut wanted: HashMap<u16, PortForward> = poll_listening_ports(container, remote)
+        let mut wanted: HashMap<u16, PortForward> = poll_listening_ports(container)
             .into_iter()
             .map(|p| (p, PortForward::same(p)))
             .collect();
@@ -161,7 +187,7 @@ pub fn run_daemon(container: &str, remote: &Option<String>, static_ports: &[Port
         active.retain(|&local, fwd| {
             let alive = wanted.contains_key(&local) && fwd.is_alive();
             if !alive {
-                eprintln!("[lodge forward] stopped forwarding port {local}");
+                scoped!("lodge forward", "stopped forwarding port {local}");
             }
             alive
         });
@@ -175,17 +201,18 @@ pub fn run_daemon(container: &str, remote: &Option<String>, static_ports: &[Port
                 None => container_ip.clone(),
                 Some(h) => match resolved.get(h) {
                     Some(ip) => ip.clone(),
-                    None => match resolve_target_ip(container, remote, h) {
+                    None => match container.resolve_peer(h) {
                         Some(ip) => {
-                            eprintln!("[lodge forward] resolved {h} → {ip}");
+                            scoped!("lodge forward", "resolved {h} → {ip}");
                             resolved.insert(h.clone(), ip.clone());
                             unresolved.remove(h);
                             ip
                         }
                         None => {
                             if unresolved.insert(h.clone()) {
-                                eprintln!(
-                                    "[lodge forward] cannot resolve '{h}' on the container \
+                                scoped!(
+                                    "lodge forward",
+                                    "cannot resolve '{h}' on the container \
                                      network (service not up yet?) — will keep trying"
                                 );
                             }
@@ -194,23 +221,26 @@ pub fn run_daemon(container: &str, remote: &Option<String>, static_ports: &[Port
                     },
                 },
             };
-            let target = format!("{target_ip}:{}", f.port);
-            let fwd = if let Some(r) = remote {
-                eprintln!("[lodge forward] port {local} — ssh -L {local}:{target} {r}");
-                Forwarder::ssh_tunnel(local, &target, r)
+            let dest = format!("{target_ip}:{}", f.port);
+            let fwd = if let Some(r) = target.ssh_host() {
+                scoped!("lodge forward", "port {local} — ssh -L {local}:{dest} {r}");
+                Forwarder::ssh_tunnel(local, &dest, r)
             } else {
-                eprintln!("[lodge forward] port {local} — proxy 0.0.0.0:{local} → {target}");
-                Forwarder::proxy(local, target)
+                scoped!(
+                    "lodge forward",
+                    "port {local} — proxy 127.0.0.1:{local} → {dest}"
+                );
+                Forwarder::proxy(local, dest)
             };
             match fwd {
-                Some(fw) => {
-                    eprintln!("[lodge forward] forwarding port {local}");
+                Ok(fw) => {
+                    scoped!("lodge forward", "forwarding port {local}");
                     active.insert(local, fw);
                     failed.remove(&local);
                 }
-                None => {
+                Err(e) => {
                     if failed.insert(local) {
-                        eprintln!("[lodge forward] could not forward port {local}");
+                        scoped!("lodge forward", "could not forward port {local}: {e}");
                     }
                 }
             }
@@ -229,37 +259,28 @@ enum Forwarder {
 
 impl Forwarder {
     // `target` is "ip:port" as reachable from the Docker host.
-    fn proxy(local: u16, target: String) -> Option<Self> {
+    fn proxy(local: u16, target: String) -> std::io::Result<Self> {
         ProxyHandle::spawn(local, target).map(Forwarder::Proxy)
     }
 
-    fn ssh_tunnel(local: u16, target: &str, remote: &str) -> Option<Self> {
-        let (mut cmd, dest) = crate::ssh::base_command(remote);
-        cmd.args([
-            "-N",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-L",
-            &format!("{local}:{target}"),
-            &dest,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        // With --verbose, let ssh's own chatter land in the daemon log.
-        .stderr(if crate::verbose::enabled() {
-            Stdio::inherit()
-        } else {
-            Stdio::null()
-        });
-        crate::verbose::trace(&cmd);
-        cmd.spawn().ok().map(Forwarder::Ssh)
+    fn ssh_tunnel(local: u16, target: &str, remote: &str) -> std::io::Result<Self> {
+        let mut cmd = crate::ssh::tunnel(remote, local, target);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            // With --verbose, let ssh's own chatter land in the daemon log.
+            .stderr(if crate::output::is_verbose() {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            });
+        crate::output::trace(&cmd);
+        cmd.spawn().map(Forwarder::Ssh)
     }
 
     fn is_alive(&mut self) -> bool {
         match self {
             Forwarder::Proxy(h) => !h.stop.load(Ordering::Relaxed),
+            // A tunnel we can't query is treated as dead, so it is replaced.
             Forwarder::Ssh(child) => child.try_wait().map(|s| s.is_none()).unwrap_or(false),
         }
     }
@@ -270,6 +291,10 @@ impl Drop for Forwarder {
         match self {
             Forwarder::Proxy(h) => h.stop.store(true, Ordering::Relaxed),
             Forwarder::Ssh(child) => {
+                #[allow(
+                    clippy::let_underscore_must_use,
+                    reason = "the tunnel may already have exited"
+                )]
                 let _ = child.kill();
             }
         }
@@ -284,9 +309,9 @@ struct ProxyHandle {
 
 impl ProxyHandle {
     // `target` is "ip:port" as reachable from the Docker host.
-    fn spawn(local: u16, target: String) -> Option<Self> {
-        let listener = TcpListener::bind(format!("0.0.0.0:{local}")).ok()?;
-        listener.set_nonblocking(true).ok()?;
+    fn spawn(local: u16, target: String) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", local))?;
+        listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
 
@@ -312,7 +337,7 @@ impl ProxyHandle {
             }
         });
 
-        Some(ProxyHandle { stop })
+        Ok(ProxyHandle { stop })
     }
 }
 
@@ -331,6 +356,8 @@ fn proxy_conn(client: TcpStream, server: TcpStream) {
         Err(_) => return,
     };
 
+    // A reset or already-closed peer is the normal end of a proxied connection,
+    // not an error worth reporting, so copy results are ignored below.
     let t = std::thread::spawn(move || {
         std::io::copy(&mut c_r, &mut s_w).ok();
         s_w.shutdown(std::net::Shutdown::Write).ok();
@@ -343,29 +370,61 @@ fn proxy_conn(client: TcpStream, server: TcpStream) {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn log_path(container: &str) -> PathBuf {
+fn state_path(container: &str, extension: &str) -> PathBuf {
     let short = container.get(..12).unwrap_or(container);
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from(".local/share"))
         .join("lodge")
-        .join(format!("forward-{short}.log"))
+        .join(format!("forward-{short}.{extension}"))
 }
 
-fn poll_listening_ports(container: &str, remote: &Option<String>) -> HashSet<u16> {
-    let mut cmd = crate::docker::command(
-        remote,
-        &[
-            "exec",
-            container,
-            "sh",
-            "-c",
-            "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null",
-        ],
-    );
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-    cmd.output()
-        .ok()
-        .map(|o| parse_proc_net_tcp(&String::from_utf8_lossy(&o.stdout)))
+fn log_path(container: &str) -> PathBuf {
+    state_path(container, "log")
+}
+
+fn lock_path(container: &str) -> PathBuf {
+    state_path(container, "lock")
+}
+
+/// Takes an exclusive lock on `path`: `Ok(Some(_))` if taken, `Ok(None)` if
+/// another process holds it, `Err` if the lock file can't be used. The lock is released when the returned file is dropped or the process
+/// exits, however it exits, so a crashed daemon never leaves a stale lock.
+fn acquire_lock(path: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// Opens the daemon's log file for appending, creating its directory.
+fn open_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+fn poll_listening_ports(container: &dyn Container) -> HashSet<u16> {
+    // The exit status is ignored on purpose: `cat` fails when there is no
+    // /proc/net/tcp6 (IPv6 disabled) but has still printed the IPv4 listeners.
+    container
+        .output(
+            &["sh", "-c", "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null"],
+            &ExecOpts::default(),
+        )
+        .map(|out| parse_proc_net_tcp(&out.stdout))
         .unwrap_or_default()
 }
 
@@ -421,131 +480,6 @@ fn is_loopback_hex(addr: &str) -> bool {
         32 => addr.eq_ignore_ascii_case("00000000000000000000000001000000"),
         _ => false,
     }
-}
-
-fn get_container_ip(container: &str, remote: &Option<String>) -> Option<String> {
-    let mut cmd = crate::docker::command(
-        remote,
-        &[
-            "inspect",
-            "--format",
-            "{{range .NetworkSettings.Networks}}{{.IPAddress}}\n{{end}}",
-            container,
-        ],
-    );
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-    cmd.output().ok().and_then(|o| {
-        String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .map(str::trim)
-            .find(|s| !s.is_empty())
-            .map(String::from)
-    })
-}
-
-// Resolves a named forward target ("db" in forwardPorts: ["db:5432"]) to an IP
-// reachable from the Docker host. Two strategies:
-//   1. DNS inside the primary container — Docker's embedded DNS resolves
-//      compose service names, container names, and network aliases on
-//      user-defined networks; this is exactly what the devcontainer's own
-//      processes see.
-//   2. Containers on the primary's networks, matched by container name or
-//      compose naming convention — covers the default bridge network (no
-//      embedded DNS) and primary containers without a shell/getent.
-fn resolve_target_ip(container: &str, remote: &Option<String>, host: &str) -> Option<String> {
-    resolve_via_container_dns(container, remote, host)
-        .or_else(|| resolve_via_networks(container, remote, host))
-}
-
-fn resolve_via_container_dns(
-    container: &str,
-    remote: &Option<String>,
-    host: &str,
-) -> Option<String> {
-    let out = docker_stdout(remote, &["exec", container, "getent", "hosts", host])?;
-    // getent output: "<addr>  <name> ..." per line; prefer an IPv4 address.
-    let addrs: Vec<std::net::IpAddr> = out
-        .lines()
-        .filter_map(|l| l.split_whitespace().next())
-        .filter_map(|a| a.parse().ok())
-        .collect();
-    addrs
-        .iter()
-        .find(|a| a.is_ipv4())
-        .or(addrs.first())
-        .map(|a| a.to_string())
-}
-
-fn resolve_via_networks(container: &str, remote: &Option<String>, host: &str) -> Option<String> {
-    let nets = docker_stdout(
-        remote,
-        &[
-            "inspect",
-            "--format",
-            "{{range $k, $v := .NetworkSettings.Networks}}{{$k}}\n{{end}}",
-            container,
-        ],
-    )?;
-    for net in nets.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let containers = docker_stdout(
-            remote,
-            &[
-                "network",
-                "inspect",
-                "--format",
-                "{{range .Containers}}{{.Name}} {{.IPv4Address}}\n{{end}}",
-                net,
-            ],
-        )?;
-        for line in containers.lines() {
-            let mut cols = line.split_whitespace();
-            let (Some(name), Some(addr)) = (cols.next(), cols.next()) else {
-                continue;
-            };
-            if name == host || compose_service_matches(name, host) {
-                // IPv4Address is CIDR-form ("172.18.0.5/16").
-                return addr.split('/').next().map(String::from);
-            }
-        }
-    }
-    None
-}
-
-// True if `name` follows the compose container naming convention
-// <project>-<service>-<index> (or the legacy underscore form) for `service`.
-fn compose_service_matches(name: &str, service: &str) -> bool {
-    ['-', '_'].iter().any(|&sep| {
-        name.rsplit_once(sep).is_some_and(|(stem, index)| {
-            !index.is_empty()
-                && index.chars().all(|c| c.is_ascii_digit())
-                && stem
-                    .strip_suffix(service)
-                    .is_some_and(|project| project.ends_with(sep))
-        })
-    })
-}
-
-// Runs a docker command and returns stdout, or None on spawn/exit failure.
-fn docker_stdout(remote: &Option<String>, args: &[&str]) -> Option<String> {
-    let mut cmd = crate::docker::command(remote, args);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-fn is_container_running(container: &str, remote: &Option<String>) -> bool {
-    let mut cmd = crate::docker::command(
-        remote,
-        &["inspect", "--format", "{{.State.Running}}", container],
-    );
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-    cmd.output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -620,12 +554,33 @@ mod tests {
     }
 
     #[test]
-    fn compose_naming_matches_service() {
-        assert!(compose_service_matches("myproj-db-1", "db"));
-        assert!(compose_service_matches("myproj_db_1", "db"));
-        assert!(compose_service_matches("my-proj-db-12", "db"));
-        assert!(!compose_service_matches("myproj-database-1", "db"));
-        assert!(!compose_service_matches("myproj-db", "db"));
-        assert!(!compose_service_matches("db", "db"));
+    fn only_one_holder_of_the_lock_at_a_time() {
+        let dir = crate::tmpfile::TempDir::new("locktest");
+        let path = dir.path().join("forward.lock");
+        let first = acquire_lock(&path)
+            .unwrap()
+            .expect("first acquisition succeeds");
+        assert!(
+            acquire_lock(&path).unwrap().is_none(),
+            "second is refused while held"
+        );
+        drop(first);
+        assert!(
+            acquire_lock(&path).unwrap().is_some(),
+            "free again once released"
+        );
+    }
+
+    #[test]
+    fn the_proxy_listens_on_localhost_only() {
+        // Port 0 lets the OS pick; the point is the address family/interface.
+        let handle = ProxyHandle::spawn(0, "127.0.0.1:9".into());
+        // spawn() binds the requested port; with 0 it still binds loopback.
+        assert!(handle.is_ok());
+        let src = include_str!("forward.rs");
+        assert!(
+            !src.contains(concat!("bind(format!(\"0.0", ".0.0")),
+            "the proxy must not bind all interfaces"
+        );
     }
 }

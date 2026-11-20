@@ -1,3 +1,4 @@
+use crate::output::warning;
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -17,7 +18,7 @@ impl Deps {
 pub fn resolve(binary: &str) -> Result<Deps> {
     let mut cmd = Command::new("ldd");
     cmd.arg(binary);
-    crate::verbose::trace(&cmd);
+    crate::output::trace(&cmd);
     let output = cmd
         .output()
         .with_context(|| format!("running ldd on {binary}"))?;
@@ -39,8 +40,8 @@ pub fn resolve(binary: &str) -> Result<Deps> {
 
     let parsed = parse_ldd(&stdout);
     if !parsed.unresolved.is_empty() {
-        eprintln!(
-            "[lodge] warning: {} could not be resolved on the host and won't be injected: {}",
+        warning!(
+            "{} could not be resolved on the host and won't be injected: {}",
             if parsed.unresolved.len() == 1 {
                 "a dependency"
             } else {
