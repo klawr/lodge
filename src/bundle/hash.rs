@@ -10,53 +10,36 @@ use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use crate::fingerprint::{FNV_OFFSET, fnv1a};
+use crate::fingerprint::Fingerprint;
+use crate::tree::{self, Denied, Links};
 
 pub fn hash_path(path: &Path) -> Result<String> {
-    let mut h = FNV_OFFSET;
-    feed_entry(path, "", &mut h)?;
-    Ok(format!("{h:016x}"))
-}
-
-fn feed_entry(path: &Path, label: &str, h: &mut u64) -> Result<()> {
-    let meta =
-        std::fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
-    if meta.is_symlink() {
-        let target = std::fs::read_link(path)?;
-        feed(h, b"L\0");
-        feed(h, label.as_bytes());
-        feed(h, b"\0");
-        feed(h, target.to_string_lossy().as_bytes());
-        feed(h, b"\0");
-    } else if meta.is_dir() {
-        feed(h, b"D\0");
-        feed(h, label.as_bytes());
-        feed(h, b"\0");
-        let mut names: Vec<_> = std::fs::read_dir(path)
-            .with_context(|| format!("reading {}", path.display()))?
-            .map(|e| e.map(|e| e.file_name()))
-            .collect::<std::io::Result<_>>()?;
-        names.sort();
-        for name in names {
-            let child = format!("{label}/{}", name.to_string_lossy());
-            feed_entry(&path.join(&name), &child, h)?;
+    let mut h = Fingerprint::new();
+    tree::walk(path, Links::Keep, Denied::Fail, &mut |e| {
+        // The root is "", its children "/name", theirs "/name/child".
+        let label = if e.relative.is_empty() {
+            String::new()
+        } else {
+            format!("/{}", e.relative)
+        };
+        if e.meta.is_symlink() {
+            let target = std::fs::read_link(e.path)?;
+            h.field(b"L").field(label.as_bytes());
+            h.field(target.to_string_lossy().as_bytes());
+        } else if e.meta.is_dir() {
+            h.field(b"D").field(label.as_bytes());
+        } else {
+            h.field(b"F").field(label.as_bytes());
+            h.put(&[u8::from(e.meta.permissions().mode() & 0o111 != 0)]);
+            feed_file(e.path, &mut h)?;
         }
-    } else {
-        feed(h, b"F\0");
-        feed(h, label.as_bytes());
-        feed(h, b"\0");
-        feed(h, &[u8::from(meta.permissions().mode() & 0o111 != 0)]);
-        feed_file(path, h)?;
-    }
-    Ok(())
-}
-
-fn feed(h: &mut u64, data: &[u8]) {
-    *h = fnv1a(data, *h);
+        Ok(())
+    })?;
+    Ok(h.hex())
 }
 
 /// Streams a file through the hash, so a large binary is never held in memory.
-fn feed_file(path: &Path, h: &mut u64) -> Result<()> {
+fn feed_file(path: &Path, h: &mut Fingerprint) -> Result<()> {
     let mut file =
         std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut buf = [0u8; 64 * 1024];
@@ -65,7 +48,7 @@ fn feed_file(path: &Path, h: &mut u64) -> Result<()> {
         if n == 0 {
             return Ok(());
         }
-        feed(h, &buf[..n]);
+        h.put(&buf[..n]);
     }
 }
 
@@ -82,6 +65,21 @@ mod tests {
             std::fs::write(p, contents).unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn the_hash_of_a_tree_is_stable_across_releases() {
+        // Bundle manifests record these hashes: a change here would make every
+        // existing bundle fail verification.
+        let t = TempDir::new("golden").unwrap();
+        let p = t.path();
+        std::fs::create_dir_all(p.join("d/e")).unwrap();
+        std::fs::write(p.join("a"), "1").unwrap();
+        std::fs::write(p.join("d/e/x"), "2").unwrap();
+        std::fs::write(p.join("d/run"), "3").unwrap();
+        std::fs::set_permissions(p.join("d/run"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("a", p.join("l")).unwrap();
+        assert_eq!(hash_path(p).unwrap(), "715bc939815d54cd");
     }
 
     #[test]

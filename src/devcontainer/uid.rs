@@ -10,7 +10,7 @@
 //! so it can be tested; the container only runs a small script to apply it.
 
 use crate::output::{info, warning};
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::runtime::{ContainerUser, Env};
 use crate::shell::shell_quote;
@@ -173,8 +173,12 @@ pub(super) fn sync_user_uid(
         return Ok(());
     }
 
-    let passwd = env.exec_capture(&["cat", "/etc/passwd"])?;
-    let group = env.exec_capture(&["cat", "/etc/group"]).unwrap_or_default();
+    // A failed read is an error: an empty /etc/group would make every gid look
+    // free. A missing /etc/group really has no groups in it.
+    let passwd = env
+        .read_file("/etc/passwd")?
+        .context("the container has no /etc/passwd")?;
+    let group = env.read_file("/etc/group")?.unwrap_or_default();
     match plan(&passwd, &group, &user, host_uid, host_gid) {
         Plan::Nothing => Ok(()),
         Plan::Skip(why) => {
@@ -289,27 +293,51 @@ mod tests {
         assert_eq!(sed_escape("plain-name_1"), "plain-name_1");
     }
 
+    /// The commands that applied a change: `sh -c <script>` editing /etc/passwd.
+    fn change_scripts(env: &FakeEnv) -> Vec<crate::runtime::fake::Who> {
+        env.calls()
+            .into_iter()
+            .filter(|(argv, _)| argv.len() == 3 && argv[0] == "sh" && argv[2].contains("sed -i"))
+            .map(|(_, who)| who)
+            .collect()
+    }
+
+    fn probe(answer: &str) -> FakeEnv {
+        FakeEnv::new()
+            .with_output(&["sh", "-c", crate::runtime::PROBE_SCRIPT], answer)
+            .with_commands(&["sed", "find"])
+            .with_file("/etc/passwd", PASSWD)
+            .with_file("/etc/group", GROUP)
+    }
+
     #[test]
     fn root_is_never_changed() {
+        // Named root: nothing is even asked.
         let env = FakeEnv::new();
         sync_user_uid(&env, Some("root"), 1000, 1000).unwrap();
-        assert!(!env.ran(&["cat", "/etc/passwd"]));
+        assert!(env.calls().is_empty());
+        // A default user that turns out to be root: asked, then left alone.
+        let env = probe("0\n0\nroot\n/root\n");
+        sync_user_uid(&env, None, 1000, 1000).unwrap();
+        assert!(change_scripts(&env).is_empty());
     }
 
     #[test]
     fn a_change_runs_one_script_as_root() {
-        let env = FakeEnv::new()
-            .with_output(
-                &["sh", "-c", crate::runtime::PROBE_SCRIPT],
-                "1500\n1500\ndev\n/home/dev\n",
-            )
-            .with_commands(&["sed", "find"])
-            .with_file("/etc/passwd", PASSWD)
-            .with_file("/etc/group", GROUP);
+        let env = probe("1500\n1500\ndev\n/home/dev\n");
         sync_user_uid(&env, Some("dev"), 1000, 1000).unwrap();
-        assert!(
-            env.ran_matching(|argv| argv.first().map(String::as_str) == Some("sh")
-                && argv.get(2).is_some_and(|s| s.contains("/etc/passwd")))
-        );
+        assert_eq!(change_scripts(&env), [crate::runtime::fake::Who::Root]);
+    }
+
+    #[test]
+    fn an_unreadable_group_file_stops_the_change() {
+        let env = probe("1500\n1500\ndev\n/home/dev\n").with_failure(&[
+            "sh",
+            "-c",
+            crate::runtime::READ_FILE_SCRIPT,
+            "/etc/group",
+        ]);
+        assert!(sync_user_uid(&env, Some("dev"), 1000, 1000).is_err());
+        assert!(change_scripts(&env).is_empty());
     }
 }

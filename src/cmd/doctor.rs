@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use super::{Ctx, print_json};
 use crate::config::{Config, Multiplexer};
-use crate::host_tools::{self, Tool};
-use crate::output::{info, line, warning};
+use crate::host_tools::{self, Need, Tool};
+use crate::output::{info, line, plural, warning};
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -65,7 +65,7 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
     let needs_compose = needs.as_ref().is_ok_and(|n| n.compose);
     let needs_oras = needs.as_ref().is_ok_and(|n| n.registry_features);
     if engine.is_ok() {
-        checks.push(match ctx.rt.compose_version() {
+        checks.push(match ctx.rt.compose().and_then(|c| c.version()) {
             Ok(v) => Check::new("compose", Level::Ok, v),
             Err(e) if needs_compose => Check::new("compose", Level::Missing, format!("{e:#}")),
             Err(_) => Check::new(
@@ -88,17 +88,16 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
         .as_ref()
         .is_ok_and(|c| c.session.multiplexer == Multiplexer::Tmux);
     for tool in host_tools::ALL {
-        let required = match tool.name {
-            "ssh" => remote.is_some(),
-            "ldd" | "patchelf" => packs_live,
-            "oras" => needs_oras,
-            _ => false,
+        // (shown at all, required) for what this host and config ask of it.
+        let (shown, required) = match tool.need {
+            Need::Remote => (remote.is_some(), remote.is_some()),
+            Need::Pack => (true, packs_live),
+            Need::RegistryFeatures => (true, needs_oras),
+            Need::Multiplexer => (tmux_wanted, false),
         };
-        // tmux only matters if the config asks for it, and ssh only for --remote.
-        if (tool.name == "tmux" && !tmux_wanted) || (tool.name == "ssh" && remote.is_none()) {
-            continue;
+        if shown {
+            checks.push(tool_check(tool, required));
         }
-        checks.push(tool_check(tool, required));
     }
 
     if let Ok(cfg) = &config {
@@ -133,7 +132,10 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
         line!("  {tag}  {:<18} {}", c.name, c.detail);
     }
     if failed > 0 {
-        warning!("{failed} required check(s) failed");
+        warning!(
+            "{} failed",
+            plural(failed, "required check", "required checks")
+        );
     }
     Ok(failed == 0)
 }
@@ -175,34 +177,20 @@ fn config_check(path: &Path, config: &Result<Config>) -> Check {
             "config",
             Level::Ok,
             format!(
-                "{} ({} tool{} to inject)",
+                "{} ({} to inject)",
                 path.display(),
-                c.inject.len(),
-                if c.inject.len() == 1 { "" } else { "s" }
+                plural(c.inject.len(), "tool", "tools")
             ),
         ),
         Ok(_) => Check::new(
             "config",
             Level::Optional,
             format!(
-                "no config at {}; nothing will be injected (`ldg init` writes one){}",
-                path.display(),
-                old_config_hint()
+                "no config at {}; nothing will be injected (`ldg init` writes one)",
+                path.display()
             ),
         ),
         Err(e) => Check::new("config", Level::Missing, format!("{e:#}")),
-    }
-}
-
-/// Notes a config left at the pre-rename location (`~/.config/graft`).
-fn old_config_hint() -> String {
-    let old = dirs::config_dir().map(|d| d.join("graft").join("config.toml"));
-    match old {
-        Some(p) if p.exists() => format!(
-            " (found {}: move the directory to ~/.config/lodge)",
-            p.display()
-        ),
-        _ => String::new(),
     }
 }
 
@@ -212,10 +200,10 @@ fn bundle_check(file: &Path) -> Check {
             "bundle",
             Level::Ok,
             format!(
-                "{} ({}, {} tool(s), id {})",
+                "{} ({}, {}, id {})",
                 file.display(),
                 m.arch,
-                m.tools.len(),
+                plural(m.tools.len(), "tool", "tools"),
                 m.id()
             ),
         ),
@@ -249,6 +237,7 @@ mod tests {
 
     const NOWHERE: Tool = Tool {
         name: "definitely-not-a-real-tool",
+        need: Need::Pack,
         needed_for: "x",
         hint: "install it",
     };

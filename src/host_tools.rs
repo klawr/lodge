@@ -9,8 +9,23 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// What lodge needs a tool for, which decides when `ldg doctor` requires it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Need {
+    /// `--remote`.
+    Remote,
+    /// Packing a bundle from the config.
+    Pack,
+    /// Devcontainer features from a registry.
+    RegistryFeatures,
+    /// Opening sessions in a multiplexer. Never required: sessions open
+    /// directly without it.
+    Multiplexer,
+}
+
 pub struct Tool {
     pub name: &'static str,
+    pub need: Need,
     /// What lodge needs it for, as a phrase ("needed to pack").
     pub needed_for: &'static str,
     /// How to get it.
@@ -31,30 +46,35 @@ impl Tool {
 
 pub const SSH: Tool = Tool {
     name: "ssh",
+    need: Need::Remote,
     needed_for: "needed for --remote",
     hint: "install an OpenSSH client",
 };
 
 pub const LDD: Tool = Tool {
     name: "ldd",
+    need: Need::Pack,
     needed_for: "needed to pack (not when injecting from a bundle)",
     hint: "it ships with glibc (install your distribution's libc tools)",
 };
 
 pub const PATCHELF: Tool = Tool {
     name: "patchelf",
+    need: Need::Pack,
     needed_for: "needed to pack (not when injecting from a bundle)",
     hint: "install patchelf (pacman -S patchelf / apt install patchelf)",
 };
 
 pub const ORAS: Tool = Tool {
     name: "oras",
+    need: Need::RegistryFeatures,
     needed_for: "needed for devcontainer features from a registry",
     hint: "install oras from https://oras.land",
 };
 
 pub const TMUX: Tool = Tool {
     name: "tmux",
+    need: Need::Multiplexer,
     needed_for: "optional: sessions open directly without it",
     hint: "install tmux, or set `multiplexer = \"none\"`",
 };

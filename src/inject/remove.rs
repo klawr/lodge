@@ -59,7 +59,7 @@ fn remove_wrappers(dirs: &str) -> String {
 pub fn remove(env: &dyn Env) -> Result<Removed> {
     let mut wrappers = Vec::new();
     let mut configs_kept = Vec::new();
-    for (key, path) in installed::placed(env) {
+    for (key, path) in installed::placed(env)? {
         if key.ends_with(".bin") {
             wrappers.push(path);
         } else if key.ends_with(".config") {

@@ -17,7 +17,7 @@ impl Prompt for Terminal {
             );
             return false;
         }
-        prompt!("[lodge] {question} [y/N] ");
+        prompt!("{question} [y/N] ");
         let mut line = String::new();
         if io::stdin().read_line(&mut line).is_err() {
             return false;
@@ -42,7 +42,7 @@ impl Prompt for Terminal {
         }
 
         loop {
-            prompt!("[lodge] > ");
+            prompt!("> ");
             let mut line = String::new();
             if io::stdin().read_line(&mut line).is_err() || line.trim().is_empty() {
                 return "/".to_string();

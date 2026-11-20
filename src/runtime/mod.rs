@@ -7,8 +7,9 @@
 //!   they work the same for a container, and later for a plain host.
 //! - [`Container`]: an `Env` that can also be inspected (name, mounts, address).
 //!   Port forwarding and workdir selection need this.
-//! - [`Runtime`]: the engine itself: find, build, run, start, stop, compose.
-//!   Devcontainer backends need this.
+//! - [`Runtime`]: the engine itself: find, build, run, start, stop. Devcontainer
+//!   backends need this; the compose backend also needs the engine's
+//!   [`Compose`].
 //!
 //! [`docker`] implements all three over the `docker` CLI (locally or over SSH);
 //! [`fake`] is an in-memory `Env` for tests.
@@ -59,7 +60,8 @@ impl ExecOpts<'_> {
     }
 }
 
-/// A finished command: whether it exited zero, and what it printed.
+/// A finished command: whether it exited zero, and what it printed (decoded as
+/// UTF-8, an invalid sequence replaced, so odd output is never an error).
 #[derive(Debug, Clone)]
 pub struct Output {
     pub success: bool,
@@ -69,9 +71,6 @@ pub struct Output {
 
 /// A place commands can run and files can be copied into.
 pub trait Env {
-    /// Where the environment lives: this machine or a remote host.
-    fn target(&self) -> &Target;
-
     /// Runs `argv` with inherited stdio. Errors if it exits non-zero.
     fn exec(&self, argv: &[&str], opts: &ExecOpts) -> Result<()>;
 
@@ -79,7 +78,11 @@ pub trait Env {
     /// non-zero exit is reported in [`Output::success`].
     fn output(&self, argv: &[&str], opts: &ExecOpts) -> Result<Output>;
 
-    /// Copies the local file or directory `src` to `dest` inside the environment.
+    /// Copies the local file or directory `src` to `dest` inside the
+    /// environment, as root, keeping file modes. A file becomes `dest`; a
+    /// directory's *contents* are merged into `dest`, which is created if
+    /// missing (its parent must exist). Files already in `dest` that `src` lacks
+    /// are kept, so remove `dest` first for an exact copy.
     fn cp_in(&self, src: &str, dest: &str) -> Result<()>;
 
     /// Writes `contents` to `dest` inside the environment with permission bits
@@ -192,7 +195,9 @@ pub trait Container: Env {
     /// Mount destination paths inside the container.
     fn mounts(&self) -> Vec<String>;
 
-    fn is_running(&self) -> bool;
+    /// Whether the container is running: `false` when it is stopped or gone,
+    /// an error when the engine could not be asked (which is not "stopped").
+    fn is_running(&self) -> Result<bool>;
 
     /// The container's address on its first network, reachable from the host
     /// that runs the engine.
@@ -210,6 +215,15 @@ pub struct BuildSpec {
     pub target: Option<String>,
     pub args: BTreeMap<String, String>,
     pub tag: String,
+}
+
+/// Which containers a lookup considers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Containers {
+    /// Running ones only.
+    Running,
+    /// Stopped ones too.
+    All,
 }
 
 /// A container found by [`Runtime::list_labeled`].
@@ -233,8 +247,9 @@ pub trait Runtime {
     /// The engine's server version; errors if the engine can't be reached.
     fn version(&self) -> Result<String>;
 
-    /// The compose provider's version; errors if compose isn't available.
-    fn compose_version(&self) -> Result<String>;
+    /// The engine's compose support, for devcontainers with
+    /// `dockerComposeFile`; errors if the engine has none.
+    fn compose(&self) -> Result<&dyn Compose>;
 
     /// Every container (running or stopped) that carries `label`.
     fn list_labeled(&self, label: &str) -> Result<Vec<Listed>>;
@@ -258,23 +273,29 @@ pub trait Runtime {
     fn start(&self, id: &str) -> Result<()>;
     fn stop(&self, id: &str) -> Result<()>;
     fn remove(&self, id: &str) -> Result<()>;
+}
 
-    /// `compose up -d` for a project whose files live in `dir` on the engine host.
-    fn compose_up(&self, dir: &Path, project: &str, files: &[String], extra: &[&str])
-    -> Result<()>;
+/// Multi-container projects described by compose files, which live in `dir` on
+/// the engine's host. Separate from [`Runtime`] because not every engine has it,
+/// and only the compose backend needs it.
+pub trait Compose {
+    /// The compose provider's version; errors if it isn't usable.
+    fn version(&self) -> Result<String>;
+
+    /// `compose up -d` for the project, with `extra` arguments.
+    fn up(&self, dir: &Path, project: &str, files: &[String], extra: &[&str]) -> Result<()>;
 
     /// `compose down` for the project: removes its containers and network.
-    fn compose_down(&self, dir: &Path, project: &str, files: &[String]) -> Result<()>;
+    fn down(&self, dir: &Path, project: &str, files: &[String]) -> Result<()>;
 
-    /// The first container id for `service`, if there is one. With `all`,
-    /// includes stopped containers.
-    fn compose_ps(
+    /// The first container id for `service` among `which`, if there is one.
+    fn ps(
         &self,
         dir: &Path,
         project: &str,
         files: &[String],
         service: &str,
-        all: bool,
+        which: Containers,
     ) -> Result<Option<String>>;
 }
 

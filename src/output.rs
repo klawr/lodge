@@ -2,7 +2,7 @@
 //!
 //! Messages come in four kinds, each with a macro:
 //!
-//! - `info!`: progress, on stdout.
+//! - `info!`: progress, on stderr.
 //! - `warning!`: something went wrong but lodge carries on,
 //!   on stderr, prefixed `warning:`.
 //! - `error!`: why a command failed, on stderr, prefixed `error:`.
@@ -10,7 +10,8 @@
 //!   stderr.
 //!
 //! Reports and lists (`status`, `ls`, `--json`) are program output and use
-//! `line!`, without the prefix.
+//! `line!`, without the prefix, on stdout. Everything else goes to stderr, so
+//! stdout carries only what a script would want to read.
 //!
 //! Every line carries the `[lodge]` prefix, including the continuation lines of
 //! a multi-line message, so call sites write plain text. Verbosity is set once
@@ -42,13 +43,6 @@ pub fn is_verbose() -> bool {
     verbosity() > 0
 }
 
-/// Which stream a message goes to.
-#[derive(Clone, Copy)]
-enum Stream {
-    Out,
-    Err,
-}
-
 /// Renders `text` with the scope prefix on every line, and `tag` (such as
 /// `warning: `) on the first.
 fn render(scope: &str, tag: &str, text: &str) -> String {
@@ -62,41 +56,36 @@ fn render(scope: &str, tag: &str, text: &str) -> String {
         .join("\n")
 }
 
-fn emit(stream: Stream, scope: &str, tag: &str, args: fmt::Arguments) {
+/// Writes a prefixed message to stderr, where everything but program output
+/// goes.
+fn emit(scope: &str, tag: &str, args: fmt::Arguments) {
     let rendered = render(scope, tag, &args.to_string());
-    // A failed write to a closed stdout/stderr (a broken pipe) is not worth
-    // aborting over; there is nobody left to tell.
-    match stream {
-        Stream::Out => {
-            let _ = writeln!(std::io::stdout(), "{rendered}");
-        }
-        Stream::Err => {
-            let _ = writeln!(std::io::stderr(), "{rendered}");
-        }
-    }
+    // A failed write to a closed stderr (a broken pipe) is not worth aborting
+    // over; there is nobody left to tell.
+    let _ = writeln!(std::io::stderr(), "{rendered}");
 }
 
 pub fn print_info(args: fmt::Arguments) {
-    emit(Stream::Out, "lodge", "", args);
+    emit("lodge", "", args);
 }
 
 pub fn print_warn(args: fmt::Arguments) {
-    emit(Stream::Err, "lodge", "warning: ", args);
+    emit("lodge", "warning: ", args);
 }
 
 /// Why lodge stopped: the error a command failed with.
 pub fn print_error(args: fmt::Arguments) {
-    emit(Stream::Err, "lodge", "error: ", args);
+    emit("lodge", "error: ", args);
 }
 
 pub fn print_note(args: fmt::Arguments) {
-    emit(Stream::Err, "lodge", "", args);
+    emit("lodge", "", args);
 }
 
 /// A message from a named part of lodge, such as the port-forward daemon, whose
 /// stderr is a log file.
 pub fn print_scoped(scope: &str, args: fmt::Arguments) {
-    emit(Stream::Err, scope, "", args);
+    emit(scope, "", args);
 }
 
 /// A line of program output (a report, a list), without the `[lodge]` prefix.
@@ -122,12 +111,18 @@ pub fn raw_stderr(text: &str) {
     let _ = write!(std::io::stderr(), "{text}");
 }
 
-/// Prints a prompt without a trailing newline and flushes it so it is visible
+/// Prints a prompt on stderr (beside the context `note!` gave it), with the
+/// prefix and without a trailing newline, and flushes it so it is visible
 /// before input is read.
 pub fn print_prompt(args: fmt::Arguments) {
-    let mut out = std::io::stdout();
-    let _ = write!(out, "{args}");
-    let _ = out.flush();
+    let mut err = std::io::stderr();
+    let _ = write!(err, "{}", render("lodge", "", &args.to_string()));
+    let _ = err.flush();
+}
+
+/// "1 library", "3 libraries": a count with the right form of its noun.
+pub fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 /// Prints the command (with any explicitly-set env vars) to stderr in
@@ -151,7 +146,7 @@ pub fn trace(cmd: &Command) {
         line.push(' ');
         line.push_str(&quote(&a.to_string_lossy()));
     }
-    emit(Stream::Err, "lodge", "$ ", format_args!("{line}"));
+    emit("lodge", "$ ", format_args!("{line}"));
 }
 
 // Quote only when needed, so typical traces stay readable.
@@ -212,6 +207,12 @@ mod tests {
             render("lodge forward", "", "ready"),
             "[lodge forward] ready"
         );
+    }
+
+    #[test]
+    fn counts_take_the_right_noun() {
+        assert_eq!(super::plural(1, "library", "libraries"), "1 library");
+        assert_eq!(super::plural(0, "alias", "aliases"), "0 aliases");
     }
 
     #[test]

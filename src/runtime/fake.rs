@@ -1,5 +1,9 @@
-//! An in-memory [`Env`] for tests: a virtual filesystem plus a record of every
-//! command that was run. Lets injection logic be tested without a container.
+//! In-memory fakes for tests. [`FakeEnv`] is an [`Env`]: a virtual filesystem
+//! plus a record of every command that was run, which lets injection logic be
+//! tested without a container. [`FakeRuntime`] is a [`Runtime`] (and
+//! [`Compose`]) whose containers each run in a `FakeEnv`, which lets
+//! `devcontainer::start`'s decisions (create, reuse, recreate) be tested
+//! without an engine.
 //!
 //! It is deliberately strict. It emulates a small set of commands (`cat`, `cp`,
 //! `test`, `printenv`, `command -v`, [`Env::read_file`], and the no-output file
@@ -17,9 +21,13 @@
 
 use anyhow::{Context, Result};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+use std::rc::Rc;
 
-use super::{Env, ExecOpts, Output, User};
+use super::{
+    BuildSpec, Compose, Container, Containers, Env, ExecOpts, Listed, Output, Runtime, User,
+};
 use crate::target::Target;
 
 /// Who a recorded command ran as ([`User`] without the borrow).
@@ -49,7 +57,6 @@ pub struct FakeEnv {
     modes: RefCell<HashMap<String, u32>>,
     /// Every command run, with whom it ran as.
     calls: RefCell<Vec<(Vec<String>, Who)>>,
-    target: Target,
 }
 
 impl FakeEnv {
@@ -62,7 +69,6 @@ impl FakeEnv {
             commands: Vec::new(),
             modes: RefCell::default(),
             calls: RefCell::default(),
-            target: Target::Local,
         }
     }
 
@@ -128,6 +134,11 @@ impl FakeEnv {
             .iter()
             .find(|(c, _)| c.iter().map(String::as_str).eq(argv.iter().copied()))
             .map(|(_, who)| who.clone())
+    }
+
+    /// Every command run so far, with whom it ran as.
+    pub fn calls(&self) -> Vec<(Vec<String>, Who)> {
+        self.calls.borrow().clone()
     }
 
     /// True if any command run so far satisfies `pred`.
@@ -226,10 +237,6 @@ impl FakeEnv {
 }
 
 impl Env for FakeEnv {
-    fn target(&self) -> &Target {
-        &self.target
-    }
-
     fn exec(&self, argv: &[&str], opts: &ExecOpts) -> Result<()> {
         let out = self.handle(argv, opts.user, false);
         if out.success {
@@ -262,6 +269,235 @@ impl Env for FakeEnv {
 
     fn interactive_command(&self, _user: User, workdir: &str, inner: &str) -> String {
         format!("fake-shell {workdir} {inner}")
+    }
+}
+
+/// A [`Runtime`] that keeps containers by name (a container's id is its name),
+/// each running in its own [`FakeEnv`]. A container it creates gets a fresh
+/// environment from the factory it was made with, so a recreated container
+/// starts empty, as a real one does. Records every engine operation as a line
+/// (`run <name>`, `start <id>`, `remove <id>`, …). Like the engine, it refuses
+/// to act on a container that doesn't exist, or to create one that does.
+pub struct FakeRuntime {
+    new_env: Box<dyn Fn() -> FakeEnv>,
+    containers: RefCell<BTreeMap<String, Rc<FakeEnv>>>,
+    /// Compose projects that are up.
+    projects: RefCell<Vec<String>>,
+    ops: RefCell<Vec<String>>,
+    target: Target,
+}
+
+impl FakeRuntime {
+    /// An engine with no containers; each one it creates runs in `new_env()`.
+    pub fn new(new_env: impl Fn() -> FakeEnv + 'static) -> Self {
+        Self {
+            new_env: Box::new(new_env),
+            containers: RefCell::default(),
+            projects: RefCell::default(),
+            ops: RefCell::default(),
+            target: Target::Local,
+        }
+    }
+
+    /// Adds an existing container `name`, running in `env`.
+    pub fn with_container(self, name: &str, env: FakeEnv) -> Self {
+        self.containers
+            .borrow_mut()
+            .insert(name.to_string(), Rc::new(env));
+        self
+    }
+
+    /// The engine operations so far.
+    pub fn ops(&self) -> Vec<String> {
+        self.ops.borrow().clone()
+    }
+
+    fn op(&self, line: String) {
+        self.ops.borrow_mut().push(line);
+    }
+
+    fn exists(&self, id: &str) -> Result<()> {
+        if self.containers.borrow().contains_key(id) {
+            Ok(())
+        } else {
+            anyhow::bail!("no such container: {id}")
+        }
+    }
+}
+
+impl Runtime for FakeRuntime {
+    fn target(&self) -> &Target {
+        &self.target
+    }
+
+    /// Panics for a container that doesn't exist: lodge only asks for handles
+    /// to containers it found.
+    fn container(&self, id: &str) -> Box<dyn Container> {
+        let env = self
+            .containers
+            .borrow()
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| panic!("FakeRuntime: no container {id}"));
+        Box::new(FakeContainer {
+            id: id.to_string(),
+            env,
+        })
+    }
+
+    fn version(&self) -> Result<String> {
+        Ok("fake".into())
+    }
+
+    fn compose(&self) -> Result<&dyn Compose> {
+        Ok(self)
+    }
+
+    fn list_labeled(&self, _label: &str) -> Result<Vec<Listed>> {
+        Ok(Vec::new())
+    }
+
+    fn find_by_name(&self, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .containers
+            .borrow()
+            .contains_key(name)
+            .then(|| name.to_string()))
+    }
+
+    fn build_image(&self, spec: &BuildSpec) -> Result<()> {
+        self.op(format!("build {}", spec.tag));
+        Ok(())
+    }
+
+    fn run_detached(&self, name: &str, _: &[String], _: &str, _: &[&str]) -> Result<()> {
+        if self.exists(name).is_ok() {
+            anyhow::bail!("the container name {name} is already in use");
+        }
+        self.op(format!("run {name}"));
+        self.containers
+            .borrow_mut()
+            .insert(name.to_string(), Rc::new((self.new_env)()));
+        Ok(())
+    }
+
+    fn start(&self, id: &str) -> Result<()> {
+        self.exists(id)?;
+        self.op(format!("start {id}"));
+        Ok(())
+    }
+
+    fn stop(&self, id: &str) -> Result<()> {
+        self.exists(id)?;
+        self.op(format!("stop {id}"));
+        Ok(())
+    }
+
+    fn remove(&self, id: &str) -> Result<()> {
+        self.exists(id)?;
+        self.op(format!("remove {id}"));
+        self.containers.borrow_mut().remove(id);
+        Ok(())
+    }
+}
+
+/// Compose with one container per service, named `<project>-<service>-1` as
+/// compose names them, created when a project that is up is first asked about.
+impl Compose for FakeRuntime {
+    fn version(&self) -> Result<String> {
+        Ok("fake".into())
+    }
+
+    fn up(&self, _: &Path, project: &str, _: &[String], _: &[&str]) -> Result<()> {
+        self.op(format!("compose up {project}"));
+        let mut projects = self.projects.borrow_mut();
+        if !projects.iter().any(|p| p == project) {
+            projects.push(project.to_string());
+        }
+        Ok(())
+    }
+
+    fn down(&self, _: &Path, project: &str, _: &[String]) -> Result<()> {
+        self.op(format!("compose down {project}"));
+        self.projects.borrow_mut().retain(|p| p != project);
+        let prefix = format!("{project}-");
+        self.containers
+            .borrow_mut()
+            .retain(|name, _| !name.starts_with(&prefix));
+        Ok(())
+    }
+
+    fn ps(
+        &self,
+        _: &Path,
+        project: &str,
+        _: &[String],
+        service: &str,
+        _: Containers,
+    ) -> Result<Option<String>> {
+        let name = format!("{project}-{service}-1");
+        if self.projects.borrow().iter().any(|p| p == project) {
+            self.containers
+                .borrow_mut()
+                .entry(name.clone())
+                .or_insert_with(|| Rc::new((self.new_env)()));
+        }
+        self.find_by_name(&name)
+    }
+}
+
+/// The handle [`FakeRuntime::container`] returns: its commands go to the
+/// runtime's shared [`FakeEnv`].
+struct FakeContainer {
+    id: String,
+    env: Rc<FakeEnv>,
+}
+
+impl Env for FakeContainer {
+    fn exec(&self, argv: &[&str], opts: &ExecOpts) -> Result<()> {
+        self.env.exec(argv, opts)
+    }
+
+    fn output(&self, argv: &[&str], opts: &ExecOpts) -> Result<Output> {
+        self.env.output(argv, opts)
+    }
+
+    fn cp_in(&self, src: &str, dest: &str) -> Result<()> {
+        self.env.cp_in(src, dest)
+    }
+
+    fn write_secret(&self, dest: &str, contents: &[u8], mode: u32, user: User) -> Result<()> {
+        self.env.write_secret(dest, contents, mode, user)
+    }
+
+    fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> String {
+        self.env.interactive_command(user, workdir, inner)
+    }
+}
+
+impl Container for FakeContainer {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn name(&self) -> Option<String> {
+        Some(self.id.clone())
+    }
+
+    fn mounts(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn is_running(&self) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        None
+    }
+
+    fn resolve_peer(&self, _host: &str) -> Option<String> {
+        None
     }
 }
 

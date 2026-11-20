@@ -11,6 +11,7 @@ use std::time::SystemTime;
 
 use super::manifest::{MANIFEST_FILE, Manifest};
 use crate::tmpfile::{TempDir, discard_dir};
+use crate::tree::{self, Denied, Links};
 
 /// How many cached bundles to keep (the most recently used).
 pub const KEEP: usize = 4;
@@ -68,21 +69,18 @@ pub fn clear(root: &Path) -> (usize, u64) {
     (all.len(), size)
 }
 
+/// Bytes on disk under `path`. Best effort: it is only shown, so whatever
+/// could be measured before a failure is the answer.
 fn dir_size(path: &Path) -> u64 {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return 0;
-    };
-    if !meta.is_dir() {
-        return meta.len();
-    }
-    std::fs::read_dir(path)
-        .map(|entries| {
-            entries
-                .filter_map(std::result::Result::ok)
-                .map(|e| dir_size(&e.path()))
-                .sum()
-        })
-        .unwrap_or(0)
+    let mut size = 0;
+    tree::walk(path, Links::Keep, Denied::Skip, &mut |e| {
+        if !e.meta.is_dir() {
+            size += e.meta.len();
+        }
+        Ok(())
+    })
+    .ok();
+    size
 }
 
 /// The manifest of the entry in `dir`, marking it as recently used; `None` if

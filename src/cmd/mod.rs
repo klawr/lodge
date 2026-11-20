@@ -40,9 +40,10 @@ impl Ctx {
         Config::load(&self.config_path)
     }
 
-    /// The project folder: `path` or the current directory. Locally it is made
-    /// absolute and canonical, so `ldg up`, `ldg up .` and `ldg up $PWD` all
-    /// name the same container. A remote path is used as given.
+    /// The project folder: `path` or the current directory, made absolute and
+    /// canonical on the project's host, so `ldg up`, `ldg up .` and
+    /// `ldg up $PWD` (or `/p` and `/p/` with `--remote`) all name the same
+    /// container.
     pub fn project(&self, path: Option<PathBuf>) -> Result<PathBuf> {
         let path = match path {
             Some(p) => p,
@@ -51,11 +52,7 @@ impl Ctx {
             }
             None => std::env::current_dir().context("finding the current directory")?,
         };
-        if self.target.ssh_host().is_some() {
-            return Ok(path);
-        }
-        std::fs::canonicalize(&path)
-            .with_context(|| format!("project folder {} does not exist", path.display()))
+        self.target.canonical_dir(&path)
     }
 }
 
@@ -132,16 +129,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
                 .context("writing the man page")?;
         }
         Command::Forward { container, port } => {
-            let mut ports = Vec::new();
-            for spec in &port {
-                match crate::forward::PortForward::decode(spec) {
-                    Some(p) => ports.push(p),
-                    None => {
-                        crate::output::scoped!("lodge forward", "ignoring malformed port {spec:?}")
-                    }
-                }
-            }
-            crate::forward::run_daemon(&container, &ctx.target, &ports);
+            crate::forward::run_daemon(&container, &ctx.target, &port);
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -162,11 +150,6 @@ fn ago(time: std::time::SystemTime) -> String {
         3600..86400 => format!("{} h", secs / 3600),
         _ => format!("{} d", secs / 86400),
     }
-}
-
-/// "1 library", "3 libraries".
-fn plural(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 /// "812 B", "4.2 MB": a size for people.

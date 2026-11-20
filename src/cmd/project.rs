@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use super::{Ctx, print_json};
 use crate::devcontainer::{self, ConfigState, Found};
-use crate::output::{info, line, note};
+use crate::output::{info, line, note, warning};
 use crate::runtime::{Container, ContainerUser};
 
 /// The project's container, or an error saying there is none.
@@ -53,24 +53,28 @@ pub fn status(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<()> {
         return Ok(());
     };
     let c = found.container.as_ref();
-    let running = c.is_running();
+    let running = c.is_running()?;
     let name = c.name().unwrap_or_else(|| c.id().to_string());
-    let bundle = crate::inject::installed_bundle(c);
-    // Which declared secrets are in place; only a running container can say.
-    let user = running
-        .then(|| ContainerUser::resolve(c, found.remote_user.as_deref()).ok())
-        .flatten();
-    let secrets: Vec<(String, bool)> =
-        if let Some(user) = user.filter(|_| !config.secret.is_empty()) {
-            let present = crate::secret::place::present_names(c, &user);
+    // `None` when the container could not say.
+    let bundle = crate::inject::installed_bundle(c)
+        .map_err(|e| warning!("could not tell which bundle is installed: {e:#}"))
+        .ok();
+    // Which declared secrets are in place. They live in memory, so a stopped
+    // container has none; `None` when a running one could not say.
+    let secrets: Option<Vec<(String, bool)>> = if !running || config.secret.is_empty() {
+        Some(
             config
                 .secret
                 .iter()
-                .map(|d| (d.name.clone(), present.contains(&d.name)))
-                .collect()
-        } else {
-            Vec::new()
-        };
+                .map(|d| (d.name.clone(), false))
+                .collect(),
+        )
+    } else {
+        ContainerUser::resolve(c, found.remote_user.as_deref())
+            .and_then(|user| crate::secret::place::status(c, &user, &config.secret))
+            .map_err(|e| warning!("could not tell which secrets are placed: {e:#}"))
+            .ok()
+    };
 
     if as_json {
         return print_json(&json!({
@@ -80,8 +84,8 @@ pub fn status(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<()> {
                 "name": name,
                 "running": running,
                 "config": state,
-                "bundle": bundle,
-                "secrets": secrets.iter().map(|(n, p)| json!({"name": n, "placed": p})).collect::<Vec<_>>(),
+                "bundle": bundle.clone().flatten(),
+                "secrets": secrets.as_ref().map(|s| s.iter().map(|(n, p)| json!({"name": n, "placed": p})).collect::<Vec<_>>()),
             },
         }));
     }
@@ -96,18 +100,26 @@ pub fn status(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<()> {
             ConfigState::UpToDate => "up to date",
             ConfigState::Changed =>
                 "changed since the container was created (`ldg up` offers to recreate it)",
-            ConfigState::Unknown => "unknown (the container has no recorded config)",
+            ConfigState::Unknown => "unknown (no recorded config, or it could not be read)",
         }
     );
-    if let Some(id) = bundle {
-        line!("bundle     {id}");
+    match bundle {
+        Some(Some(id)) => line!("bundle     {id}"),
+        Some(None) => {}
+        None => line!("bundle     unknown"),
     }
-    if !secrets.is_empty() {
-        let shown: Vec<String> = secrets
-            .iter()
-            .map(|(n, placed)| format!("{n} ({})", if *placed { "placed" } else { "not placed" }))
-            .collect();
-        line!("secrets    {}", shown.join(", "));
+    match secrets {
+        None => line!("secrets    unknown"),
+        Some(s) if s.is_empty() => {}
+        Some(s) => {
+            let shown: Vec<String> = s
+                .iter()
+                .map(|(n, placed)| {
+                    format!("{n} ({})", if *placed { "placed" } else { "not placed" })
+                })
+                .collect();
+            line!("secrets    {}", shown.join(", "));
+        }
     }
     Ok(())
 }
@@ -196,7 +208,7 @@ pub fn clean(ctx: &Ctx, path: Option<PathBuf>, name: Option<&str>) -> Result<()>
         Some(n) => ctx.rt.container(n),
         None => require(ctx, path)?.container,
     };
-    if !container.is_running() {
+    if !container.is_running()? {
         bail!(
             "the container is not running; start it first (`ldg up --no-attach`, or `docker start`)"
         );
@@ -209,7 +221,7 @@ pub fn clean(ctx: &Ctx, path: Option<PathBuf>, name: Option<&str>) -> Result<()>
             .unwrap_or_else(|| container.id().to_string())
     );
     for w in &removed.wrappers {
-        info!("  wrapper {w}");
+        line!("wrapper  {w}");
     }
     if !removed.configs_kept.is_empty() {
         note!(

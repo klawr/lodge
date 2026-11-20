@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::Stdio;
 
 use super::container::DockerContainer;
@@ -16,15 +17,24 @@ use crate::shell::shell_quote;
 use crate::target::Target;
 
 impl DockerContainer {
-    /// `docker cp <src> <id>:<dest>`. With a remote target, `src` is a *local*
-    /// path that the remote docker can't see, so the bytes are streamed over SSH.
+    /// `docker cp <src> <id>:<dest>`, with the semantics [`Env::cp_in`]
+    /// promises. With a remote target, `src` is a *local* path that the remote
+    /// docker can't see, so the bytes are streamed over SSH.
     pub(super) fn copy_in(&self, src: &str, dest: &str) -> Result<()> {
         match &self.cli.target {
             Target::Local => {
                 let to = format!("{}:{dest}", self.id);
+                // `dir/.` copies the directory's contents into `dest` whether or
+                // not it exists; plain `dir` onto an existing `dest` would nest
+                // it as `dest/dir`. The remote path mirrors contents the same way.
+                let from = if Path::new(src).is_dir() {
+                    format!("{}/.", src.trim_end_matches('/'))
+                } else {
+                    src.to_string()
+                };
                 let status = self
                     .cli
-                    .command(&["cp", src, &to])
+                    .command(&["cp", &from, &to])
                     .status()
                     .context("spawning docker cp")?;
                 if !status.success() {

@@ -21,6 +21,7 @@ mod host_tools;
 mod inject;
 mod layout;
 mod output;
+mod port;
 mod runtime;
 mod secret;
 mod session;
@@ -28,6 +29,7 @@ mod shell;
 mod ssh;
 mod target;
 mod tmpfile;
+mod tree;
 
 use clap::Parser;
 use std::process::ExitCode;

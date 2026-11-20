@@ -8,13 +8,15 @@
 //! - [`binary`]: a binary, already relinked, behind a wrapper
 //! - [`libs`]: its shared libraries and the dynamic linker, tracked by content
 //! - [`installed`]: a hash per installed piece, so unchanged means a cheap no-op
-//! - [`config_files`]: config files and directories, and their ownership
-//! - [`shell_env`]: `PATH`, aliases, git's `safe.directory`, the terminal
+//! - [`config_files`]: config files and directories
+//! - [`home`]: the user's home directory: writable, and owning what is put there
+//! - [`shell_env`]: `PATH`, aliases, git's `safe.directory`
 //! - [`state`]: the format version of what is kept under `/opt/lodge`
 //! - [`remove`]: taking it all back out (`ldg clean`)
 
 mod binary;
 mod config_files;
+mod home;
 mod installed;
 mod libs;
 mod remove;
@@ -27,10 +29,11 @@ use crate::bundle::source::Prepared;
 use crate::layout;
 use crate::runtime::{ContainerUser, Env};
 use binary::{check_architecture, inject_binary};
-use config_files::{ensure_home_writable, inject_config};
+use config_files::inject_config;
+use home::ensure_home_writable;
 use libs::inject_libs;
 pub use remove::remove;
-use shell_env::{configure_git_safe, inject_aliases, inject_docker_path, inject_terminfo};
+use shell_env::{configure_git_safe, inject_aliases, preserve_path};
 pub use state::installed_bundle;
 use state::{ensure_state_version, record_bundle};
 
@@ -53,10 +56,9 @@ pub fn run(env: &dyn Env, user: &ContainerUser, bundle: &Prepared) -> Result<()>
     }
     record_bundle(env, &bundle.manifest.id())?;
 
-    inject_docker_path(env)?;
+    preserve_path(env)?;
     configure_git_safe(env, &bundle.manifest.git_safe_directories, user.exec_as())?;
     inject_aliases(env, &bundle.manifest.aliases)?;
-    inject_terminfo(env);
 
     Ok(())
 }

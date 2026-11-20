@@ -32,6 +32,7 @@ pub fn up(
     }
     started.run_post_attach();
     attach(
+        ctx,
         container,
         &config,
         &user,
@@ -51,7 +52,7 @@ pub fn exec(
     let config = ctx.config()?;
     let prepared = bundle::source::prepare(&config, bundle_file)?;
     let container = ctx.rt.container(name);
-    if !container.is_running() {
+    if !container.is_running()? {
         bail!("container {name} is not running (check the name with `docker ps`)");
     }
     let user = ContainerUser::resolve(container.as_ref(), user)?;
@@ -60,6 +61,7 @@ pub fn exec(
         return Ok(());
     }
     attach(
+        ctx,
         container.as_ref(),
         &config,
         &user,
@@ -70,15 +72,17 @@ pub fn exec(
 
 /// The part `up` and `exec` share: deliver secrets, then open the session.
 fn attach(
+    ctx: &Ctx,
     container: &dyn Container,
     config: &Config,
     user: &ContainerUser,
     name: &str,
     workdir: &str,
 ) -> Result<()> {
-    let setup = secret::deliver::deliver(container, user, &config.secret)?;
+    let setup = secret::deliver::deliver(container, &ctx.target, user, &config.secret)?;
     session::enter(
         container,
+        &ctx.target,
         &config.session,
         &Session {
             name,

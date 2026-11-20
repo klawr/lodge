@@ -16,6 +16,8 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::shell::{container_path_problem, is_var_name};
+
 /// A resolved secret value. It cannot be printed: `Debug` redacts it and there is
 /// no `Display`. The only way to the bytes is the explicit `expose`.
 pub struct Secret(Vec<u8>);
@@ -170,13 +172,8 @@ impl TryFrom<RawSecret> for SecretDecl {
 }
 
 /// Names reach shell scripts (as variable names), so keep them to the portable set.
-pub fn validate_name(name: &str) -> Result<()> {
-    let mut chars = name.chars();
-    let ok = chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if !ok {
+fn validate_name(name: &str) -> Result<()> {
+    if !is_var_name(name) {
         bail!(
             "invalid name {name:?}: use letters, digits and underscores, not starting with a digit"
         );
@@ -184,18 +181,12 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Container-side destination: absolute or `~/…`, no control characters.
+/// Container-side destination: absolute or `~/…`, no `..`, no control characters.
 fn validate_container_path(path: &str) -> Result<()> {
-    if !(path.starts_with('/') || path.starts_with("~/")) {
-        bail!("{path:?} must be absolute or start with ~/");
+    match container_path_problem(path) {
+        Some(why) => bail!("{path:?} {why}"),
+        None => Ok(()),
     }
-    if path.chars().any(char::is_control) {
-        bail!("{path:?} contains control characters");
-    }
-    if path.split('/').any(|c| c == "..") {
-        bail!("{path:?} must not contain ..");
-    }
-    Ok(())
 }
 
 fn parse_mode(s: &str) -> Result<u32> {

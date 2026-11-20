@@ -15,52 +15,7 @@ use crate::target::Target;
 
 pub use daemon::run_daemon;
 
-/// One port forward: local port `local` on the host tunnels to port `port` of
-/// a target on the container network — the primary container itself when
-/// `host` is None, or a named host (compose service, container name, network
-/// alias) otherwise.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PortForward {
-    pub local: u16,
-    pub host: Option<String>,
-    pub port: u16,
-}
-
-impl PortForward {
-    /// Local port == target port on the primary container (the common case).
-    pub fn same(port: u16) -> Self {
-        Self {
-            local: port,
-            host: None,
-            port,
-        }
-    }
-
-    /// Serialized form for the internal `ldg _forward --port` flag.
-    pub fn encode(&self) -> String {
-        match &self.host {
-            Some(h) => format!("{}:{}:{}", self.local, h, self.port),
-            None => format!("{}:{}", self.local, self.port),
-        }
-    }
-
-    pub fn decode(s: &str) -> Option<Self> {
-        let parts: Vec<&str> = s.split(':').collect();
-        match parts.as_slice() {
-            [l, p] => Some(Self {
-                local: l.parse().ok()?,
-                host: None,
-                port: p.parse().ok()?,
-            }),
-            [l, h, p] => Some(Self {
-                local: l.parse().ok()?,
-                host: Some(h.to_string()),
-                port: p.parse().ok()?,
-            }),
-            _ => None,
-        }
-    }
-}
+use crate::port::PortForward;
 
 /// Spawns a detached `ldg _forward` daemon that manages port forwarding for
 /// `container`. Returns immediately; the daemon outlives the calling process.
@@ -115,14 +70,27 @@ pub fn spawn_daemon(container: &str, target: &Target, static_ports: &[PortForwar
 }
 
 /// Writes the ports file: the daemon's pid, then one `local<TAB>dest` per
-/// active forward.
+/// active forward. Written beside it and renamed into place, so `ldg ports`
+/// never reads half a file.
 fn write_ports(path: &Path, lines: &[String]) -> std::io::Result<()> {
     let mut text = format!("pid {}\n", std::process::id());
     for l in lines {
         text.push_str(l);
         text.push('\n');
     }
-    std::fs::write(path, text)
+    let partial = path.with_extension("ports.partial");
+    std::fs::write(&partial, text)?;
+    std::fs::rename(&partial, path)
+}
+
+/// Empties the log of the daemon for `container`. Called by the daemon once it
+/// holds the lock, so a new daemon starts a new log and a daemon that finds
+/// one already running leaves that one's log alone.
+fn truncate_log(container: &str) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(log_path(container))?
+        .set_len(0)
 }
 
 /// One forward the daemon reports as active.
@@ -228,27 +196,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn port_forward_encode_decode_roundtrip() {
-        for f in [
-            PortForward::same(8080),
-            PortForward {
-                local: 3000,
-                host: None,
-                port: 8080,
-            },
-            PortForward {
-                local: 5432,
-                host: Some("db".into()),
-                port: 5432,
-            },
-        ] {
-            assert_eq!(PortForward::decode(&f.encode()), Some(f));
-        }
-        assert_eq!(PortForward::decode("garbage"), None);
-        assert_eq!(PortForward::decode("1:2:3:4"), None);
-    }
-
-    #[test]
     fn the_ports_file_counts_only_while_its_daemon_lives() {
         let text = "pid 42\n8080\t172.17.0.2:8080\n";
         let ports = parse_ports(text, |pid| pid == 42).unwrap();
@@ -262,6 +209,21 @@ mod tests {
         assert!(parse_ports(text, |_| false).is_none());
         assert!(parse_ports("8080\tx\n", |_| true).is_none());
         assert_eq!(parse_ports("pid 1\n", |_| true), Some(vec![]));
+    }
+
+    #[test]
+    fn the_ports_file_is_replaced_whole() {
+        let dir = crate::tmpfile::TempDir::new("ports").unwrap();
+        let path = dir.path().join("forward-x.ports");
+        write_ports(&path, &["8080\t1.2.3.4:80".into()]).unwrap();
+        write_ports(&path, &[]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, format!("pid {}\n", std::process::id()));
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no leftovers"
+        );
     }
 
     #[test]

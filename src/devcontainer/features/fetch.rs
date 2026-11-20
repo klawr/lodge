@@ -27,11 +27,23 @@ pub(super) fn fetch(ctx: &Context, reference: &str, work: &Path) -> Result<(Feat
     read_meta(&dir).map(|meta| (meta, dir))
 }
 
+/// Reads and checks the feature's metadata. It comes from a registry or
+/// someone else's repository, and its `id` names a folder lodge replaces as
+/// root, so the id must be a plain name.
 fn read_meta(dir: &Path) -> Result<FeatureMeta> {
     let path = dir.join("devcontainer-feature.json");
     let raw =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+    let meta: FeatureMeta =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    if !crate::shell::is_plain_name(&meta.id) {
+        bail!(
+            "{} has an unusable id {:?} (letters, digits and -_.+ only)",
+            path.display(),
+            meta.id
+        );
+    }
+    Ok(meta)
 }
 
 /// `oras pull` drops the feature's layer (a plain tar, per the features spec)
@@ -76,6 +88,24 @@ mod tests {
         assert!(is_local_ref("../shared/feat"));
         assert!(is_local_ref("/abs/feat"));
         assert!(!is_local_ref("ghcr.io/devcontainers/features/node:1"));
+    }
+
+    #[test]
+    fn a_feature_id_that_could_leave_its_folder_is_refused() {
+        let dir = crate::tmpfile::TempDir::new("meta-test").unwrap();
+        let write = |id: &str| {
+            std::fs::write(
+                dir.path().join("devcontainer-feature.json"),
+                format!(r#"{{"id": {id:?}}}"#),
+            )
+            .unwrap()
+        };
+        write("node");
+        assert_eq!(read_meta(dir.path()).unwrap().id, "node");
+        for bad in ["../../usr", "a/b", "..", ""] {
+            write(bad);
+            assert!(read_meta(dir.path()).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

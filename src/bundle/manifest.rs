@@ -10,9 +10,9 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
-use crate::bundle::elf::Arch;
+use crate::bundle::arch::Arch;
 use crate::fingerprint::content_hash;
-use crate::shell::{is_alias_name, is_plain_name};
+use crate::shell::{container_path_problem, is_alias_name, is_plain_name};
 
 /// The bundle format this ldg writes and reads.
 pub const FORMAT: u32 = 1;
@@ -179,13 +179,10 @@ fn check_hash(what: &str, hash: &str) -> Result<()> {
     Ok(())
 }
 
-/// A container path: absolute or under `~/`, without `..` or NUL.
+/// A container path: absolute or under `~/`, without `..` or control characters.
 fn check_target(tool: &str, target: &str) -> Result<()> {
-    let ok = (target.starts_with('/') || target.starts_with("~/"))
-        && !target.contains('\0')
-        && !target.split('/').any(|part| part == "..");
-    if !ok {
-        bail!("tool '{tool}' has an unusable target path '{target}'");
+    if let Some(why) = container_path_problem(target) {
+        bail!("tool '{tool}' has an unusable target path {target:?}: it {why}");
     }
     Ok(())
 }

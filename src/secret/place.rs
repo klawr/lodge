@@ -134,17 +134,41 @@ pub fn clear(env: &dyn Env, user: &ContainerUser) -> Result<()> {
         .context("removing placed secrets")
 }
 
-/// Names of the secrets currently placed for `user`: what `ldg status` reports.
-/// Reads the directory listing only, never a value.
-pub fn present_names(env: &dyn Env, user: &ContainerUser) -> Vec<String> {
-    let script = format!("ls -1 {} 2>/dev/null", shell_quote(&secrets_dir(user)));
+/// Each declared secret's name and whether it is placed for `user`: what
+/// `ldg status` reports. Reads the directory listing only, never a value. An
+/// error when the container can't be asked, which is not "none placed".
+pub fn status(
+    env: &dyn Env,
+    user: &ContainerUser,
+    decls: &[SecretDecl],
+) -> Result<Vec<(String, bool)>> {
+    if decls.is_empty() {
+        return Ok(Vec::new());
+    }
+    let present = present_names(env, user)?;
+    Ok(decls
+        .iter()
+        .map(|d| (d.name.clone(), present.contains(&d.name)))
+        .collect())
+}
+
+/// The script behind [`present_names`]: lists the directory `$0`, and nothing
+/// (successfully) when there is none.
+const LIST_SCRIPT: &str = "[ -d \"$0\" ] || exit 0; ls -1 \"$0\"";
+
+/// Names of the secrets currently placed for `user`.
+fn present_names(env: &dyn Env, user: &ContainerUser) -> Result<Vec<String>> {
     let out = env
-        .exec_capture_as(user.exec_as(), &["sh", "-c", &script])
-        .unwrap_or_default();
-    out.lines()
+        .exec_capture_as(
+            user.exec_as(),
+            &["sh", "-c", LIST_SCRIPT, &secrets_dir(user)],
+        )
+        .context("listing placed secrets")?;
+    Ok(out
+        .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -224,10 +248,37 @@ mod tests {
     }
 
     #[test]
-    fn present_names_lists_the_directory() {
-        let script = "ls -1 '/dev/shm/lodge-secrets-1000' 2>/dev/null";
-        let env = FakeEnv::new().with_output(&["sh", "-c", script], "A\nB\n");
-        assert_eq!(present_names(&env, &dev()), ["A", "B"]);
+    fn status_says_which_declared_secrets_are_placed() {
+        let list = ["sh", "-c", LIST_SCRIPT, "/dev/shm/lodge-secrets-1000"];
+        let env = FakeEnv::new().with_output(&list, "A\nOLD\n");
+        let decls = [decl("A", As::Env), decl("B", As::Env)];
+        assert_eq!(
+            status(&env, &dev(), &decls).unwrap(),
+            [("A".to_string(), true), ("B".to_string(), false)]
+        );
+        // Nothing declared: nothing to ask.
+        assert!(status(&FakeEnv::new(), &dev(), &[]).unwrap().is_empty());
+        // Not being able to ask is not "none placed".
+        let env = FakeEnv::new().with_failure(&list);
+        assert!(status(&env, &dev(), &decls).is_err());
+    }
+
+    #[test]
+    fn the_list_script_lists_and_a_missing_directory_is_empty() {
+        let tmp = crate::tmpfile::TempDir::new("list").unwrap();
+        std::fs::write(tmp.path().join("A"), "").unwrap();
+        let run = |dir: &std::path::Path| {
+            let out = Command::new("sh")
+                .args(["-c", LIST_SCRIPT, &dir.to_string_lossy()])
+                .output()
+                .unwrap();
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+            )
+        };
+        assert_eq!(run(tmp.path()), (true, "A\n".to_string()));
+        assert_eq!(run(&tmp.path().join("none")), (true, String::new()));
     }
 
     #[test]

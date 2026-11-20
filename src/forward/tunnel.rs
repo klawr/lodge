@@ -29,6 +29,14 @@ impl Forwarder {
         }
     }
 
+    /// Where it forwards to: `ip:port` as reachable from the engine's host.
+    pub(super) fn dest(&self) -> &str {
+        match self {
+            Forwarder::Proxy(h) => &h.target,
+            Forwarder::Ssh { dest, .. } => dest,
+        }
+    }
+
     // `target` is "ip:port" as reachable from the Docker host.
     pub(super) fn proxy(local: u16, target: String) -> std::io::Result<Self> {
         ProxyHandle::spawn(local, target).map(Forwarder::Proxy)

@@ -22,10 +22,11 @@ use std::path::{Path, PathBuf};
 use super::hash::hash_path;
 use super::manifest::{BIN_DIR, CONFIG_DIR, FORMAT, LIB_DIR, Manifest};
 use super::{archive, cache, deps, pack};
-use crate::bundle::elf::Arch;
+use crate::bundle::arch::Arch;
 use crate::config::Config;
-use crate::fingerprint::{FNV_OFFSET, fnv1a};
+use crate::fingerprint::Fingerprint;
 use crate::output::{info, warning};
+use crate::tree::{self, Denied, Links};
 
 /// A bundle directory ready to inject from.
 pub struct Prepared {
@@ -127,14 +128,14 @@ fn live(root: &Path, config: &Config) -> Result<Prepared> {
 /// A fingerprint of everything a live pack depends on. Packing is skipped when it
 /// is unchanged.
 fn inputs_fingerprint(config: &Config) -> Result<String> {
-    let mut h = FNV_OFFSET;
-    let mut put = |data: &str| {
-        h = fnv1a(data.as_bytes(), h);
-        h = fnv1a(&[0], h);
-    };
-    put(env!("CARGO_PKG_VERSION"));
-    put(&FORMAT.to_string());
-    put(&Arch::from_uname(std::env::consts::ARCH).map_or_else(String::new, |a| a.to_string()));
+    let mut h = Fingerprint::new();
+    h.field(env!("CARGO_PKG_VERSION").as_bytes())
+        .field(FORMAT.to_string().as_bytes())
+        .field(
+            Arch::from_uname(std::env::consts::ARCH)
+                .map_or_else(String::new, |a| a.to_string())
+                .as_bytes(),
+        );
 
     let mut parts = Vec::new();
     for item in &config.inject {
@@ -163,9 +164,9 @@ fn inputs_fingerprint(config: &Config) -> Result<String> {
     parts.push(format!("git {:?}", config.git.safe_directories));
 
     for part in &parts {
-        put(part);
+        h.field(part.as_bytes());
     }
-    Ok(format!("{h:016x}"))
+    Ok(h.hex())
 }
 
 /// `path size mtime mode`, following symlinks to the file that is really used.
@@ -190,40 +191,23 @@ fn stat_tree(root: &Path, out: &mut Vec<String>) -> Result<()> {
     use anyhow::Context as _;
     let real = std::fs::canonicalize(root)
         .with_context(|| format!("config path {} does not exist", root.display()))?;
-    walk(&real, &real, out)
-}
-
-fn walk(root: &Path, path: &Path, out: &mut Vec<String>) -> Result<()> {
-    use anyhow::Context as _;
-    let meta =
-        std::fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
-    let relative = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string();
-    if meta.is_symlink() {
-        out.push(format!(
-            "L {relative} -> {}",
-            std::fs::read_link(path)?.display()
-        ));
-    } else if meta.is_dir() {
-        out.push(format!("D {relative} {:o}", meta.mode()));
-        let mut entries: Vec<_> = std::fs::read_dir(path)?.collect::<std::io::Result<_>>()?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            walk(root, &entry.path(), out)?;
-        }
-    } else {
-        out.push(format!(
-            "F {relative} {} {}.{} {:o}",
-            meta.len(),
-            meta.mtime(),
-            meta.mtime_nsec(),
-            meta.mode()
-        ));
-    }
-    Ok(())
+    tree::walk(&real, Links::Keep, Denied::Fail, &mut |e| {
+        let (relative, meta) = (e.relative, e.meta);
+        out.push(if meta.is_symlink() {
+            format!("L {relative} -> {}", std::fs::read_link(e.path)?.display())
+        } else if meta.is_dir() {
+            format!("D {relative} {:o}", meta.mode())
+        } else {
+            format!(
+                "F {relative} {} {}.{} {:o}",
+                meta.len(),
+                meta.mtime(),
+                meta.mtime_nsec(),
+                meta.mode()
+            )
+        });
+        Ok(())
+    })
 }
 
 #[cfg(test)]

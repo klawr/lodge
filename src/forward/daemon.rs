@@ -1,167 +1,266 @@
 //! The `ldg _forward` daemon: one per container, forwarding declared ports
 //! from the start and any port that starts listening later.
 
-use crate::output::scoped;
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use super::tunnel::Forwarder;
-use super::{PortForward, acquire_lock, lock_path, ports_path, write_ports};
+use super::{acquire_lock, lock_path, ports_path, truncate_log, write_ports};
+use crate::port::PortForward;
 use crate::runtime::{self, Container, ExecOpts};
 use crate::target::Target;
 
-/// Port-forwarding daemon. Forwards declared in `forwardPorts`
-/// (`static_ports`) are set up eagerly, from startup — connections just fail
-/// until the service listens. This also covers containers whose listeners
-/// can't be inspected (no shell for `cat /proc/net/tcp`) and targets other
-/// than the primary container (compose services). On top of that, the daemon
-/// polls `/proc/net/tcp` and `/proc/net/tcp6` every 2 s and maintains one
-/// forwarder per listening port. For local Docker, a built-in Rust TCP proxy
-/// is used; for `--remote`, an `ssh -L` tunnel. Exits when the container stops.
-pub fn run_daemon(container_id: &str, target: &Target, static_ports: &[PortForward]) {
+/// A line in the daemon's log (its stderr).
+macro_rules! log {
+    ($($arg:tt)*) => { $crate::output::scoped!("lodge forward", $($arg)*) };
+}
+
+/// How often the daemon looks at the container.
+const POLL: Duration = Duration::from_secs(2);
+/// How long a resolved address is trusted before it is looked up again, so a
+/// restarted service (with a new address) is followed.
+const REFRESH: Duration = Duration::from_secs(30);
+/// How many polls in a row may fail to reach the engine before the daemon
+/// gives up (about five minutes): a dropped connection is retried, a host that
+/// is gone for good is not.
+const UNREACHABLE_POLLS: u32 = 150;
+
+/// Port-forwarding daemon. Forwards declared in `forwardPorts` are set up
+/// eagerly, from startup — connections just fail until the service listens.
+/// This also covers containers whose listeners can't be inspected (no shell for
+/// `cat /proc/net/tcp`) and targets other than the primary container (compose
+/// services). On top of that, the daemon polls `/proc/net/tcp` and
+/// `/proc/net/tcp6` every 2 s and keeps one forwarder per listening port. For
+/// local Docker, a built-in Rust TCP proxy is used; for `--remote`, an `ssh -L`
+/// tunnel. Exits when the container stops, and keeps trying while the engine
+/// can't be reached.
+///
+/// `ports` are the declared forwards as `spawn_daemon` encoded them on the
+/// command line.
+pub fn run_daemon(container_id: &str, target: &Target, ports: &[String]) {
+    let declared = decode_ports(ports);
     // Every `ldg up` starts a daemon; only one per container may run, or they
     // fight over the same local ports. The lock lives as long as this process.
     let _lock = match acquire_lock(&lock_path(container_id)) {
         Ok(Some(lock)) => Some(lock),
         Ok(None) => {
-            scoped!(
-                "lodge forward",
-                "already running for this container; exiting"
-            );
+            log!("already running for this container; exiting");
             return;
         }
         Err(e) => {
-            scoped!(
-                "lodge forward",
-                "could not take the forwarder lock ({e}); continuing without it"
-            );
+            log!("could not take the forwarder lock ({e}); continuing without it");
             None
         }
     };
+    if let Err(e) = truncate_log(container_id) {
+        log!("could not start a new log ({e}); appending");
+    }
     let rt = runtime::connect(target);
     let container = rt.container(container_id);
-    let container = container.as_ref();
-    let container_ip = match container.ip_address() {
-        Some(ip) => ip,
-        None => {
-            scoped!(
-                "lodge forward",
-                "could not determine container IP — port forwarding disabled"
-            );
-            return;
-        }
-    };
-    scoped!("lodge forward", "container IP: {container_ip}");
-
-    let mut active: HashMap<u16, Forwarder> = HashMap::new();
-    // Local ports whose forwarder failed to start, so the retry every 2 s
-    // (likely failing the same way, e.g. host port occupied) doesn't spam the
-    // log. Same warn-once treatment for named hosts that don't resolve (the
-    // target service may simply not be up yet — keep trying quietly).
-    let mut failed: HashSet<u16> = HashSet::new();
-    let mut unresolved: HashSet<String> = HashSet::new();
-    // Successful name → IP resolutions, so steady state needs no docker calls.
-    let mut resolved: HashMap<String, String> = HashMap::new();
-    // What `ldg ports` reads: one line per active forward, rewritten on change.
-    let ports_file = ports_path(container_id);
-    // `None` until the first write, so the file exists (with the pid) at once.
-    let mut published: Option<Vec<String>> = None;
+    let mut forwards = Forwards::new(container.as_ref(), target, ports_path(container_id));
+    let mut unreachable = 0;
 
     loop {
-        if !container.is_running() {
-            scoped!("lodge forward", "container stopped, exiting");
-            crate::tmpfile::discard_file(&ports_file);
-            break;
-        }
-
-        // Wanted forwards, keyed by local port: every listening port maps to
-        // itself on the primary container; declared forwards are always wanted
-        // and win a local-port collision. A forwarder that died (e.g. dropped
-        // ssh tunnel) is retired below and recreated, since its local port
-        // stays in the wanted set.
-        let mut wanted: HashMap<u16, PortForward> = poll_listening_ports(container)
-            .into_iter()
-            .map(|p| (p, PortForward::same(p)))
-            .collect();
-        for f in static_ports {
-            wanted.insert(f.local, f.clone());
-        }
-
-        // Drop forwarders for ports that stopped listening or whose process died.
-        active.retain(|&local, fwd| {
-            let alive = wanted.contains_key(&local) && fwd.is_alive();
-            if !alive {
-                scoped!("lodge forward", "stopped forwarding port {local}");
+        match container.is_running() {
+            Ok(true) => unreachable = 0,
+            Ok(false) => {
+                log!("container stopped, exiting");
+                break;
             }
-            alive
-        });
-
-        // Start forwarders for wanted ports that don't have one yet.
-        for (&local, f) in &wanted {
-            if active.contains_key(&local) {
+            Err(e) => {
+                unreachable += 1;
+                if unreachable == 1 {
+                    log!("cannot reach the container engine ({e:#}); retrying");
+                }
+                if unreachable >= UNREACHABLE_POLLS {
+                    log!("the container engine has been unreachable for too long, exiting");
+                    break;
+                }
+                std::thread::sleep(POLL);
                 continue;
             }
-            let target_ip = match &f.host {
-                None => container_ip.clone(),
-                Some(h) => match resolved.get(h) {
-                    Some(ip) => ip.clone(),
-                    None => match container.resolve_peer(h) {
-                        Some(ip) => {
-                            scoped!("lodge forward", "resolved {h} → {ip}");
-                            resolved.insert(h.clone(), ip.clone());
-                            unresolved.remove(h);
-                            ip
-                        }
-                        None => {
-                            if unresolved.insert(h.clone()) {
-                                scoped!(
-                                    "lodge forward",
-                                    "cannot resolve '{h}' on the container \
-                                     network (service not up yet?) — will keep trying"
-                                );
-                            }
-                            continue;
-                        }
-                    },
-                },
-            };
-            let dest = format!("{target_ip}:{}", f.port);
-            let fwd = if let Some(r) = target.ssh_host() {
-                scoped!("lodge forward", "port {local} — ssh -L {local}:{dest} {r}");
-                Forwarder::ssh_tunnel(local, &dest, r)
-            } else {
-                scoped!(
-                    "lodge forward",
-                    "port {local} — proxy 127.0.0.1:{local} → {dest}"
-                );
-                Forwarder::proxy(local, dest)
-            };
-            match fwd {
-                Ok(fw) => {
-                    scoped!("lodge forward", "forwarding port {local}");
-                    active.insert(local, fw);
-                    failed.remove(&local);
-                }
-                Err(e) => {
-                    if failed.insert(local) {
-                        scoped!("lodge forward", "could not forward port {local}: {e}");
-                    }
+        }
+        forwards.update(wanted(poll_listening_ports(container.as_ref()), &declared));
+        std::thread::sleep(POLL);
+    }
+    forwards.shut_down();
+}
+
+fn decode_ports(ports: &[String]) -> Vec<PortForward> {
+    ports
+        .iter()
+        .filter_map(|spec| {
+            let decoded = PortForward::decode(spec);
+            if decoded.is_none() {
+                log!("ignoring malformed port {spec:?}");
+            }
+            decoded
+        })
+        .collect()
+}
+
+/// The forwards wanted now, keyed by local port: every listening port maps to
+/// itself on the primary container; declared forwards are always wanted and
+/// win a local-port collision.
+fn wanted(listening: HashSet<u16>, declared: &[PortForward]) -> HashMap<u16, PortForward> {
+    let mut wanted: HashMap<u16, PortForward> = listening
+        .into_iter()
+        .map(|p| (p, PortForward::same(p)))
+        .collect();
+    for f in declared {
+        wanted.insert(f.local, f.clone());
+    }
+    wanted
+}
+
+/// The forwarders kept for one container, and the ports file that reports them.
+struct Forwards<'a> {
+    target: &'a Target,
+    addresses: Addresses<'a>,
+    active: HashMap<u16, Forwarder>,
+    /// Local ports whose forwarder failed to start, so the retry every 2 s
+    /// (likely failing the same way, e.g. host port occupied) doesn't spam the
+    /// log.
+    failed: HashSet<u16>,
+    ports_file: PathBuf,
+    /// What the ports file says; `None` until the first write, so the file
+    /// exists (with the pid) at once.
+    published: Option<Vec<String>>,
+}
+
+impl<'a> Forwards<'a> {
+    fn new(container: &'a dyn Container, target: &'a Target, ports_file: PathBuf) -> Self {
+        Self {
+            target,
+            addresses: Addresses::new(container, REFRESH),
+            active: HashMap::new(),
+            failed: HashSet::new(),
+            ports_file,
+            published: None,
+        }
+    }
+
+    /// Brings the forwarders in line with `wanted`: drops the ones no longer
+    /// wanted or whose process died, re-points the ones whose destination moved,
+    /// and starts the missing ones.
+    fn update(&mut self, wanted: HashMap<u16, PortForward>) {
+        let mut dests = HashMap::new();
+        for (&local, f) in &wanted {
+            if let Some(ip) = self.addresses.get(f.host.as_deref()) {
+                dests.insert(local, format!("{ip}:{}", f.port));
+            }
+        }
+        self.active.retain(|&local, fwd| {
+            let keep = fwd.is_alive() && dests.get(&local).is_some_and(|d| d == fwd.dest());
+            if !keep {
+                log!("stopped forwarding port {local}");
+            }
+            keep
+        });
+        for (local, dest) in dests {
+            if !self.active.contains_key(&local) {
+                self.start(local, dest);
+            }
+        }
+        self.publish();
+    }
+
+    fn start(&mut self, local: u16, dest: String) {
+        let fwd = if let Some(r) = self.target.ssh_host() {
+            log!("port {local} — ssh -L {local}:{dest} {r}");
+            Forwarder::ssh_tunnel(local, &dest, r)
+        } else {
+            log!("port {local} — proxy 127.0.0.1:{local} → {dest}");
+            Forwarder::proxy(local, dest)
+        };
+        match fwd {
+            Ok(fw) => {
+                log!("forwarding port {local}");
+                self.active.insert(local, fw);
+                self.failed.remove(&local);
+            }
+            Err(e) => {
+                if self.failed.insert(local) {
+                    log!("could not forward port {local}: {e}");
                 }
             }
         }
+    }
 
-        let mut now: Vec<String> = active.values().map(Forwarder::describe).collect();
+    /// Rewrites the ports file when what is forwarded changed.
+    fn publish(&mut self) {
+        let mut now: Vec<String> = self.active.values().map(Forwarder::describe).collect();
         now.sort();
-        if published.as_ref() != Some(&now) {
-            if let Err(e) = write_ports(&ports_file, &now) {
-                scoped!("lodge forward", "could not record active ports: {e}");
+        if self.published.as_ref() != Some(&now) {
+            if let Err(e) = write_ports(&self.ports_file, &now) {
+                log!("could not record active ports: {e}");
             }
-            published = Some(now);
+            self.published = Some(now);
         }
+    }
 
-        std::thread::sleep(Duration::from_secs(2));
+    /// Stops every forwarder and removes the ports file.
+    fn shut_down(self) {
+        crate::tmpfile::discard_file(&self.ports_file);
     }
 }
+
+/// Addresses on the container network, as reachable from the engine's host:
+/// the primary container's (`None`) and its peers' by name. Each is looked up
+/// again after `refresh`, so a restarted container or service is followed; a
+/// failed lookup keeps the last known address.
+struct Addresses<'a> {
+    container: &'a dyn Container,
+    refresh: Duration,
+    known: HashMap<Option<String>, (String, Instant)>,
+    /// Names already reported as unresolvable (reported once).
+    unresolved: HashSet<Option<String>>,
+}
+
+impl<'a> Addresses<'a> {
+    fn new(container: &'a dyn Container, refresh: Duration) -> Self {
+        Self {
+            container,
+            refresh,
+            known: HashMap::new(),
+            unresolved: HashSet::new(),
+        }
+    }
+
+    fn get(&mut self, host: Option<&str>) -> Option<String> {
+        let key = host.map(str::to_string);
+        if let Some((ip, at)) = self.known.get(&key)
+            && at.elapsed() < self.refresh
+        {
+            return Some(ip.clone());
+        }
+        let found = match host {
+            None => self.container.ip_address(),
+            Some(h) => self.container.resolve_peer(h),
+        };
+        let name = host.unwrap_or("the container");
+        match found {
+            Some(ip) => {
+                let previous = self.known.insert(key.clone(), (ip.clone(), Instant::now()));
+                if previous.is_none_or(|(old, _)| old != ip) {
+                    log!("{name} is at {ip}");
+                }
+                self.unresolved.remove(&key);
+                Some(ip)
+            }
+            None => {
+                if self.unresolved.insert(key.clone()) {
+                    log!(
+                        "cannot find {name} on the container network (not up yet?); will keep trying"
+                    );
+                }
+                self.known.get(&key).map(|(ip, _)| ip.clone())
+            }
+        }
+    }
+}
+
 fn poll_listening_ports(container: &dyn Container) -> HashSet<u16> {
     // The exit status is ignored on purpose: `cat` fails when there is no
     // /proc/net/tcp6 (IPv6 disabled) but has still printed the IPv4 listeners.
@@ -231,6 +330,99 @@ fn is_loopback_hex(addr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A container whose address (and its peer `db`'s) the test sets.
+    struct Moving {
+        ip: std::cell::RefCell<Option<String>>,
+    }
+
+    impl crate::runtime::Env for Moving {
+        fn exec(&self, _: &[&str], _: &ExecOpts) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn output(&self, _: &[&str], _: &ExecOpts) -> anyhow::Result<crate::runtime::Output> {
+            unreachable!()
+        }
+        fn cp_in(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn write_secret(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: u32,
+            _: crate::runtime::User,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn interactive_command(&self, _: crate::runtime::User, _: &str, _: &str) -> String {
+            unreachable!()
+        }
+    }
+
+    impl Container for Moving {
+        fn id(&self) -> &str {
+            "c"
+        }
+        fn name(&self) -> Option<String> {
+            None
+        }
+        fn mounts(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn is_running(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        fn ip_address(&self) -> Option<String> {
+            self.ip.borrow().clone()
+        }
+        fn resolve_peer(&self, host: &str) -> Option<String> {
+            (host == "db").then(|| self.ip.borrow().clone()).flatten()
+        }
+    }
+
+    #[test]
+    fn addresses_follow_a_move_and_survive_a_failed_lookup() {
+        let c = Moving {
+            ip: std::cell::RefCell::new(Some("10.0.0.2".into())),
+        };
+        let mut fresh = Addresses::new(&c, Duration::ZERO);
+        let mut cached = Addresses::new(&c, Duration::from_secs(3600));
+        assert_eq!(fresh.get(None).as_deref(), Some("10.0.0.2"));
+        assert_eq!(cached.get(Some("db")).as_deref(), Some("10.0.0.2"));
+
+        *c.ip.borrow_mut() = Some("10.0.0.9".into());
+        assert_eq!(fresh.get(None).as_deref(), Some("10.0.0.9"), "moved");
+        assert_eq!(
+            cached.get(Some("db")).as_deref(),
+            Some("10.0.0.2"),
+            "not yet due"
+        );
+
+        *c.ip.borrow_mut() = None;
+        assert_eq!(
+            fresh.get(None).as_deref(),
+            Some("10.0.0.9"),
+            "last known kept"
+        );
+        assert_eq!(fresh.get(Some("nowhere")), None);
+    }
+
+    #[test]
+    fn declared_forwards_win_a_local_port_collision() {
+        let declared = [PortForward {
+            local: 8080,
+            host: Some("db".into()),
+            port: 5432,
+        }];
+        let w = wanted(HashSet::from([8080, 3000]), &declared);
+        assert_eq!(w[&3000], PortForward::same(3000));
+        assert_eq!(w[&8080], declared[0]);
+        assert_eq!(
+            decode_ports(&["8080:80".into(), "nonsense".into()]).len(),
+            1
+        );
+    }
 
     #[test]
     fn parses_ipv4_listen_ports() {

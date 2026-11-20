@@ -7,7 +7,8 @@ it finds on your `PATH` filled in.
 
 The config is checked as a whole before anything starts: an unknown key (with a
 suggestion for a likely typo), a duplicate tool name, an entry with nothing to
-inject, and a malformed secret are all reported together. `ldg doctor` shows the
+inject, a target path that is neither absolute nor under `~/`, and a malformed
+secret are all reported together. `ldg doctor` shows the
 same report.
 
 **Editor completion.** A JSON schema describes the file:
@@ -70,8 +71,8 @@ or both.
 | `name`           | yes      | —                       | identifier, unique; used for default paths |
 | `binary`         | no       | —                       | host path to a binary to inject |
 | `config`         | no       | —                       | host path to a config file/dir to inject |
-| `target_binary`  | no       | `/usr/local/bin/<name>` | wrapper location in the container |
-| `target_config`  | no       | `~/.config/<name>`      | config location in the container (`~` is the container user's home) |
+| `target_binary`  | no       | `/usr/local/bin/<name>` | wrapper location in the container (absolute or `~/…`, no `..`) |
+| `target_config`  | no       | `~/.config/<name>`      | config location in the container (`~` is the container user's home; absolute or `~/…`, no `..`) |
 | `skip_if_exists` | no       | `false`                 | `true`: never replace it once present, even if the bundle changed (for a tree you update in the container yourself). `false`: replaced when the bundle changed, left alone when it did not |
 | `copy_deps`      | no       | `true`                  | copy shared-library dependencies via `ldd` when packing |
 

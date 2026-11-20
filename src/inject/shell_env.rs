@@ -1,11 +1,11 @@
 //! Shell-level setup: git's `safe.directory`, the container's `PATH` for login
-//! shells, aliases, and the user's terminal.
+//! shells, and aliases.
 
 use anyhow::Result;
 use std::collections::BTreeMap;
 
 use crate::layout;
-use crate::output::{info, warning};
+use crate::output::{info, plural, warning};
 use crate::runtime::{Env, ExecOpts, User};
 use crate::shell::shell_quote;
 
@@ -25,9 +25,8 @@ pub(super) fn configure_git_safe(env: &dyn Env, dirs: &[String], user: User) -> 
     }
 
     info!(
-        "marking {} git safe.director{}",
-        dirs.len(),
-        if dirs.len() == 1 { "y" } else { "ies" }
+        "marking {}",
+        plural(dirs.len(), "git safe.directory", "git safe.directories")
     );
     for dir in dirs {
         let q = crate::shell::shell_quote(dir);
@@ -49,7 +48,7 @@ pub(super) fn configure_git_safe(env: &dyn Env, dirs: &[String], user: User) -> 
 // Login shells source /etc/profile, which on many distros resets PATH to a
 // minimal system default — dropping anything added via Docker ENV. Read the
 // container's current PATH and write it into /etc/profile.d/ so it survives.
-pub(super) fn inject_docker_path(env: &dyn Env) -> Result<()> {
+pub(super) fn preserve_path(env: &dyn Env) -> Result<()> {
     let path = match env.exec_capture(&["printenv", "PATH"]) {
         Ok(p) => p.trim().to_string(),
         Err(_) => return Ok(()),
@@ -73,23 +72,9 @@ pub(super) fn inject_aliases(env: &dyn Env, aliases: &BTreeMap<String, String>) 
     }
 
     env.write_file(layout::PROFILE_ALIASES, content.as_bytes())?;
-    info!(
-        "installed {} alias{}",
-        aliases.len(),
-        if aliases.len() == 1 { "" } else { "es" }
-    );
+    info!("installed {}", plural(aliases.len(), "alias", "aliases"));
 
     Ok(())
-}
-
-// Makes the user's terminal known inside the container. Best effort: a missing
-// terminfo entry only costs some colours, so it never fails the injection.
-pub(super) fn inject_terminfo(env: &dyn Env) {
-    if let Some(term) = crate::session::terminfo::local_term()
-        && let Err(e) = crate::session::terminfo::ensure(env, &term)
-    {
-        warning!("could not copy the terminfo entry for {term}: {e:#}");
-    }
 }
 
 #[cfg(test)]
@@ -121,7 +106,7 @@ mod tests {
     #[test]
     fn container_path_survives_login_shells() {
         let env = FakeEnv::new().with_var("PATH", "/opt/tool/bin:/usr/bin");
-        inject_docker_path(&env).unwrap();
+        preserve_path(&env).unwrap();
         assert_eq!(
             env.file("/etc/profile.d/lodge-path.sh").unwrap(),
             "export PATH='/opt/tool/bin:/usr/bin'\n"
@@ -143,7 +128,7 @@ mod tests {
     #[test]
     fn missing_path_is_not_an_error() {
         let env = FakeEnv::new(); // no PATH variable
-        inject_docker_path(&env).unwrap();
+        preserve_path(&env).unwrap();
         assert!(env.file("/etc/profile.d/lodge-path.sh").is_none());
     }
 }

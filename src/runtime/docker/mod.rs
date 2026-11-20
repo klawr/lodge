@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use super::{BuildSpec, Container, Listed, Runtime};
+use super::{BuildSpec, Compose, Container, Containers, Listed, Runtime};
 use crate::shell::shell_quote;
 use crate::target::Target;
 
@@ -195,11 +195,8 @@ impl Runtime for DockerCli {
         }
     }
 
-    fn compose_version(&self) -> Result<String> {
-        match self.capture_ok(&["compose", "version", "--short"]) {
-            Some(v) if !v.trim().is_empty() => Ok(format!("docker compose {}", v.trim())),
-            _ => bail!("`docker compose` is not available (install the compose plugin)"),
-        }
+    fn compose(&self) -> Result<&dyn Compose> {
+        Ok(self)
     }
 
     fn list_labeled(&self, label: &str) -> Result<Vec<Listed>> {
@@ -262,36 +259,40 @@ impl Runtime for DockerCli {
     fn remove(&self, id: &str) -> Result<()> {
         self.run(&["rm", "-f", id])
     }
+}
 
-    fn compose_up(
-        &self,
-        dir: &Path,
-        project: &str,
-        files: &[String],
-        extra: &[&str],
-    ) -> Result<()> {
+/// `docker compose`, which every current docker CLI has (as a plugin).
+impl Compose for DockerCli {
+    fn version(&self) -> Result<String> {
+        match self.capture_ok(&["compose", "version", "--short"]) {
+            Some(v) if !v.trim().is_empty() => Ok(format!("docker compose {}", v.trim())),
+            _ => bail!("`docker compose` is not available (install the compose plugin)"),
+        }
+    }
+
+    fn up(&self, dir: &Path, project: &str, files: &[String], extra: &[&str]) -> Result<()> {
         let mut tail = vec!["up", "-d"];
         tail.extend_from_slice(extra);
         status_ok(self.compose(dir, project, files, &tail), &["compose", "up"])
     }
 
-    fn compose_down(&self, dir: &Path, project: &str, files: &[String]) -> Result<()> {
+    fn down(&self, dir: &Path, project: &str, files: &[String]) -> Result<()> {
         status_ok(
             self.compose(dir, project, files, &["down"]),
             &["compose", "down"],
         )
     }
 
-    fn compose_ps(
+    fn ps(
         &self,
         dir: &Path,
         project: &str,
         files: &[String],
         service: &str,
-        all: bool,
+        which: Containers,
     ) -> Result<Option<String>> {
         let mut tail = vec!["ps"];
-        if all {
+        if which == Containers::All {
             tail.push("-a");
         }
         tail.extend(["-q", service]);

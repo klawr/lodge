@@ -353,6 +353,21 @@ fn forwarded_ports_are_local_only_and_served_by_one_daemon() {
         1,
         "expected exactly one forward daemon"
     );
+
+    // A removed container is gone, not an engine that can't be reached: the
+    // daemon exits within a poll or two instead of retrying.
+    let id = container_id(&container);
+    docker(&["rm", "-f", &container]);
+    let mut waited = 0;
+    while forward_daemons(&id) > 0 && waited < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        waited += 1;
+    }
+    assert_eq!(
+        forward_daemons(&id),
+        0,
+        "the forward daemon outlived its container"
+    );
 }
 
 #[test]

@@ -6,9 +6,10 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use super::arch::Arch;
 use super::archive;
 use super::deps;
-use super::elf::{self, Arch};
+use super::elf;
 use super::hash::hash_path;
 use super::manifest::{
     BIN_DIR, Binary, CONFIG_DIR, ConfigTree, FORMAT, LIB_DIR, Lib, MANIFEST_FILE, Manifest, Tool,
@@ -18,6 +19,7 @@ use crate::layout;
 use crate::output::warning;
 use crate::shell::is_plain_name;
 use crate::tmpfile::{TempDir, TempFile, discard_file};
+use crate::tree::{self, Denied, Links};
 
 /// Packs `config` into a bundle file at `output`. The file appears only when it is
 /// complete: it is written beside the destination and renamed into place.
@@ -247,23 +249,24 @@ pub(crate) fn check_arch(tool: &str, binary: &Path, host: Arch) -> Result<()> {
 /// Copies a file or directory tree, keeping symlinks as symlinks and modes as they
 /// are.
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
-    let meta =
-        std::fs::symlink_metadata(src).with_context(|| format!("reading {}", src.display()))?;
-    if meta.is_symlink() {
-        std::os::unix::fs::symlink(std::fs::read_link(src)?, dst)
-            .with_context(|| format!("copying the link {}", src.display()))?;
-    } else if meta.is_dir() {
-        std::fs::create_dir_all(dst)?;
-        let mut entries: Vec<_> = std::fs::read_dir(src)
-            .with_context(|| format!("reading {}", src.display()))?
-            .collect::<std::io::Result<_>>()?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+    // A directory's own mode is applied once everything is in it, so a
+    // read-only directory can still be filled.
+    let mut dir_modes = Vec::new();
+    tree::walk(src, Links::Keep, Denied::Fail, &mut |e| {
+        let to = dst.join(e.relative);
+        if e.meta.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(e.path)?, &to)
+                .with_context(|| format!("copying the link {}", e.path.display()))?;
+        } else if e.meta.is_dir() {
+            std::fs::create_dir_all(&to)?;
+            dir_modes.push((to, e.meta.permissions()));
+        } else {
+            std::fs::copy(e.path, &to).with_context(|| format!("copying {}", e.path.display()))?;
         }
-        std::fs::set_permissions(dst, meta.permissions())?;
-    } else {
-        std::fs::copy(src, dst).with_context(|| format!("copying {}", src.display()))?;
+        Ok(())
+    })?;
+    for (dir, mode) in dir_modes.into_iter().rev() {
+        std::fs::set_permissions(dir, mode)?;
     }
     Ok(())
 }
@@ -316,10 +319,12 @@ pub(crate) fn patch_binary(binary: &str, linker_name: &str) -> Result<TempFile> 
         .arg(layout::LIB)
         .arg(tmp.path());
     crate::output::trace(&cmd);
-    let status = cmd.status().context(
-        "running patchelf — it is required to relink dynamically linked binaries \
-         (install it, e.g. `pacman -S patchelf` / `apt install patchelf`)",
-    )?;
+    let status = cmd.status().with_context(|| {
+        format!(
+            "running patchelf, which relinks dynamically linked binaries: {}",
+            crate::host_tools::PATCHELF.hint
+        )
+    })?;
     if !status.success() {
         bail!("patchelf failed to patch {binary}");
     }

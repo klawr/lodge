@@ -10,10 +10,12 @@
 //! - [`archive`]: writing, reading and verifying the tar
 //! - [`pack`]: building a bundle from the user's config (`deps` parses `ldd`,
 //!   `elf` reads a binary's architecture)
+//! - [`arch`]: CPU architectures, as bundles, binaries and machines name them
 //! - [`source`]: readying a bundle directory to inject from
 //! - [`cache`]: where readied bundle directories are kept
 //! - `hash`: the content hash of a file or tree, used throughout
 
+pub mod arch;
 pub mod archive;
 pub mod cache;
 pub mod deps;

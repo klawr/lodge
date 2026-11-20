@@ -22,6 +22,47 @@ pub fn is_alias_name(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
 
+/// A shell variable name: letters, digits and `_`, not starting with a digit.
+/// Secret names and the variables they become.
+pub fn is_var_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Why `path` is not usable as a destination inside a container, or `None` if
+/// it is: it must be absolute or start with `~/`, and contain neither `..` nor
+/// control characters. Used for anything a config or a bundle places there.
+pub fn container_path_problem(path: &str) -> Option<&'static str> {
+    if !(path.starts_with('/') || path.starts_with("~/")) {
+        Some("must be absolute or start with ~/")
+    } else if path.chars().any(char::is_control) {
+        Some("contains control characters")
+    } else if path.split('/').any(|part| part == "..") {
+        Some("must not contain ..")
+    } else {
+        None
+    }
+}
+
+/// `s` with every character but ASCII letters and digits turned into `-`: a
+/// name for tmux sessions and containers.
+pub fn slug(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// A command in one of the two forms devcontainer.json allows.
+pub enum CmdLine<'a> {
+    /// A script for `sh -c`.
+    Shell(&'a str),
+    /// A program and its arguments, run directly.
+    Argv(&'a [String]),
+}
+
 /// POSIX single-quote escaping: wrap in single quotes, and turn any embedded
 /// single quote into `'\''`. Safe for interpolation into an `sh -c`/SSH string.
 pub fn shell_quote(s: &str) -> String {
@@ -51,7 +92,38 @@ fn which_in(name: &str, path_var: &std::ffi::OsStr) -> Option<std::path::PathBuf
 
 #[cfg(test)]
 mod tests {
-    use super::{is_alias_name, is_plain_name, shell_quote, which_in};
+    use super::{
+        container_path_problem, is_alias_name, is_plain_name, is_var_name, shell_quote, slug,
+        which_in,
+    };
+
+    #[test]
+    fn var_names_are_portable_identifiers() {
+        assert!(is_var_name("GH_TOKEN") && is_var_name("_x1"));
+        for bad in ["", "1X", "A-B", "A B", "A;rm", "a\nb"] {
+            assert!(!is_var_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn container_paths_are_absolute_or_home_relative_and_cannot_climb() {
+        assert_eq!(container_path_problem("/usr/local/bin/x"), None);
+        assert_eq!(container_path_problem("~/.config/x"), None);
+        assert!(
+            container_path_problem("bin/x")
+                .unwrap()
+                .contains("absolute")
+        );
+        assert!(container_path_problem("/etc/../x").unwrap().contains(".."));
+        assert!(container_path_problem("/a\0b").unwrap().contains("control"));
+        assert!(container_path_problem("/a\nb").unwrap().contains("control"));
+    }
+
+    #[test]
+    fn slugs_keep_letters_and_digits_only() {
+        assert_eq!(slug("abc123DEF"), "abc123DEF");
+        assert_eq!(slug("svc.dev_1:tag/x"), "svc-dev-1-tag-x");
+    }
 
     #[test]
     fn plain_names_cannot_climb_or_inject() {

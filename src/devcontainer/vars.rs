@@ -6,7 +6,17 @@
 
 use std::path::Path;
 
-use super::config::path_tag;
+use crate::fingerprint::Fingerprint;
+
+/// Short, stable tag derived from a project's path: `${devcontainerId}`, and
+/// appended to container and session names so two projects that share a
+/// basename never collide.
+pub(super) fn path_tag(path: &Path) -> String {
+    let h = Fingerprint::new()
+        .put(path.to_string_lossy().as_bytes())
+        .value();
+    format!("{:06x}", h & 0xff_ffff)
+}
 
 pub(super) struct Vars<'a> {
     project: &'a Path,

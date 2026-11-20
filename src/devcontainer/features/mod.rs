@@ -12,7 +12,7 @@ mod fetch;
 
 use super::backend::{CreateSettings, Mount};
 use super::markers;
-use crate::output::{info, warning};
+use crate::output::{info, plural, warning};
 use crate::runtime::{ContainerUser, Env, ExecOpts, User};
 use crate::target::Target;
 use crate::tmpfile::TempDir;
@@ -161,7 +161,7 @@ impl Plan {
         }
         // Persisted so login shells (lodge enters with `-l`) see it.
         if !container_env.is_empty() {
-            super::lifecycle::write_profile(env, PROFILE_PATH, &container_env)?;
+            super::profile::write_profile(env, PROFILE_PATH, &container_env)?;
         }
         Ok(())
     }
@@ -182,9 +182,8 @@ pub fn resolve(
         && crate::host_tools::ORAS.find().is_none()
     {
         warning!(
-            "devcontainer features need `oras` (https://oras.land); \
-             skipping {} feature(s)",
-            features.len()
+            "devcontainer features need `oras` (https://oras.land); skipping {}",
+            plural(features.len(), "feature", "features")
         );
         return Ok(Plan::default());
     }

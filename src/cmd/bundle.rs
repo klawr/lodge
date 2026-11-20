@@ -3,18 +3,18 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use super::{Ctx, ago, human_size, plural};
+use super::{Ctx, ago, human_size};
 use crate::bundle;
 use crate::cli::{BundleCommand, CacheCommand};
-use crate::output::{info, line, note};
+use crate::output::{info, line, note, plural};
 
 pub fn pack(ctx: &Ctx, output: Option<PathBuf>) -> Result<()> {
     let config = ctx.config()?;
     let output = output.unwrap_or_else(|| PathBuf::from(bundle::default_file_name()));
     let manifest = bundle::pack::pack_to_file(&config, &output)?;
     info!(
-        "packed {} tool(s) and {} for {} into {} (id {})",
-        manifest.tools.len(),
+        "packed {} and {} for {} into {} (id {})",
+        plural(manifest.tools.len(), "tool", "tools"),
         plural(manifest.libs.len(), "library", "libraries"),
         manifest.arch,
         output.display(),
@@ -29,8 +29,8 @@ pub fn bundle(command: BundleCommand) -> Result<()> {
         BundleCommand::Verify { file } => {
             let manifest = bundle::verify_file(&file)?;
             line!(
-                "ok  {} tool(s), {}, id {}",
-                manifest.tools.len(),
+                "ok  {}, {}, id {}",
+                plural(manifest.tools.len(), "tool", "tools"),
                 plural(manifest.libs.len(), "library", "libraries"),
                 manifest.id()
             );
@@ -69,8 +69,8 @@ fn inspect(file: &Path) -> Result<()> {
     let linker = manifest.linker.as_deref().unwrap_or("none");
     line!("libs      {} (linker {linker})", manifest.libs.len());
     line!(
-        "settings  {} alias(es) · git safe.directory: {}",
-        manifest.aliases.len(),
+        "settings  {} · git safe.directory: {}",
+        plural(manifest.aliases.len(), "alias", "aliases"),
         manifest.git_safe_directories.join(", ")
     );
     Ok(())
@@ -116,7 +116,8 @@ pub fn cache(command: Option<CacheCommand>) -> Result<()> {
         CacheCommand::Clear => {
             let (n, size) = bundle::cache::clear(&root);
             info!(
-                "removed {n} cached bundle(s), {}; the next `ldg up` packs again",
+                "removed {}, {}; the next `ldg up` packs again",
+                plural(n, "cached bundle", "cached bundles"),
                 human_size(size)
             );
         }

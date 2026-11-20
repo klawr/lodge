@@ -7,6 +7,7 @@ use crate::config::{Multiplexer, SessionConfig};
 use crate::output::{info, note, warning};
 use crate::runtime::{Container, User};
 use crate::shell::shell_quote;
+use crate::target::Target;
 use anyhow::{Result, bail};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -22,8 +23,14 @@ pub struct Session<'a> {
     pub setup: &'a str,
 }
 
-/// Opens an interactive login shell in `container`, wrapped as `config` says.
-pub fn enter(container: &dyn Container, config: &SessionConfig, s: &Session) -> Result<()> {
+/// Opens an interactive login shell in `container` (on the engine at `target`),
+/// wrapped as `config` says.
+pub fn enter(
+    container: &dyn Container,
+    target: &Target,
+    config: &SessionConfig,
+    s: &Session,
+) -> Result<()> {
     let shell = &config.shell;
 
     // `container` may be a raw hex id for compose-based devcontainers, which
@@ -41,9 +48,10 @@ pub fn enter(container: &dyn Container, config: &SessionConfig, s: &Session) -> 
     // foreground process, right before dropping into the interactive shell.
     let set_title = format!("printf '\\033]2;%s\\007' {}", shell_quote(&title));
     // `docker exec -it` doesn't pass the client's TERM on (the container would see
-    // plain xterm), so the session sets it, and points ncurses at any terminfo
-    // entry copied in.
-    let term_setup = terminfo::session_term(container, terminfo::local_term().as_deref())
+    // plain xterm), so the session sets it, after copying in the entry for the
+    // terminal this session is opened from when the container lacks it. Best
+    // effort: a missing entry only costs some colours.
+    let term_setup = terminfo::prepare(container, terminfo::local_term().as_deref())
         .map(|t| terminfo::session_setup(&t))
         .unwrap_or_default();
     let inner = format!(
@@ -57,7 +65,6 @@ pub fn enter(container: &dyn Container, config: &SessionConfig, s: &Session) -> 
     // environment's business.
     let run_cmd = container.interactive_command(s.user, s.workdir, &inner);
     let container_id = container.id();
-    let target = container.target();
 
     info!("entering {container_id}");
     if crate::output::is_verbose() {
@@ -104,7 +111,7 @@ pub fn enter(container: &dyn Container, config: &SessionConfig, s: &Session) -> 
 // `switch-client` the current client to the lodge session instead. Outside
 // tmux we attach normally.
 fn enter_tmux(session_name: &str, run_cmd: &str) -> Result<()> {
-    let session = sanitize(session_name);
+    let session = crate::shell::slug(session_name);
 
     // Create the session detached if it doesn't already exist (idempotent): a
     // failure just means the session is already there.
@@ -153,27 +160,4 @@ fn enter_direct(run_cmd: &str) -> Result<()> {
         bail!("session exited with failure");
     }
     Ok(())
-}
-
-/// Replaces characters tmux dislikes in session names with '-'.
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::sanitize;
-
-    #[test]
-    fn keeps_alphanumeric() {
-        assert_eq!(sanitize("abc123DEF"), "abc123DEF");
-    }
-
-    #[test]
-    fn replaces_punctuation() {
-        // container ids/names with '.'/':' would be rejected by tmux as-is.
-        assert_eq!(sanitize("svc.dev_1:tag/x"), "svc-dev-1-tag-x");
-    }
 }

@@ -19,7 +19,10 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The non-test source of every file that spawns `program`.
+/// The non-test source of every file that spawns `program`, found by the literal
+/// text `Command::new("<program>")`. A program name built at run time (a
+/// variable, a `host_tools` entry) is not seen here; that is what the registry
+/// and the single private `ssh::base` are for.
 fn spawners(program: &str) -> Vec<String> {
     // Read at run time: `env!` would bake in the path at build time, and cargo
     // doesn't rebuild when the checkout moves, so a renamed folder broke this.

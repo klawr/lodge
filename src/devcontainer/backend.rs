@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::vars::Vars;
-use crate::runtime::{BuildSpec, Runtime};
+use crate::runtime::{BuildSpec, Containers, Runtime};
 
 /// Label on every container lodge creates for a devcontainer: the project's
 /// path on its host. `ldg ls` lists containers by it.
@@ -24,10 +24,17 @@ pub(super) trait Backend {
     /// Id of an existing container for this devcontainer (running or stopped),
     /// or None if it hasn't been created yet.
     fn existing(&self, rt: &dyn Runtime) -> Result<Option<String>>;
-    /// Brings the container up, recreating it from scratch when `recreate` is
-    /// set and applying `extra` (what features ask for) when it is created, and
-    /// returns its id.
-    fn up(&self, rt: &dyn Runtime, recreate: bool, extra: &CreateSettings) -> Result<String>;
+    /// Brings the container up and returns its id. `existing` is what
+    /// [`existing`](Self::existing) found; it is recreated from scratch when
+    /// `recreate` is set. `extra` (what features ask for) applies when it is
+    /// created.
+    fn up(
+        &self,
+        rt: &dyn Runtime,
+        existing: Option<&str>,
+        recreate: bool,
+        extra: &CreateSettings,
+    ) -> Result<String>;
     /// Removes the container (and, for compose, the project's network).
     fn remove(&self, rt: &dyn Runtime) -> Result<()>;
 }
@@ -50,14 +57,27 @@ pub(super) struct ComposeBackend {
 
 impl Backend for ComposeBackend {
     fn remove(&self, rt: &dyn Runtime) -> Result<()> {
-        rt.compose_down(&self.dir, &self.project, &self.files)
+        rt.compose()?.down(&self.dir, &self.project, &self.files)
     }
 
     fn existing(&self, rt: &dyn Runtime) -> Result<Option<String>> {
-        rt.compose_ps(&self.dir, &self.project, &self.files, &self.service, true)
+        rt.compose()?.ps(
+            &self.dir,
+            &self.project,
+            &self.files,
+            &self.service,
+            Containers::All,
+        )
     }
 
-    fn up(&self, rt: &dyn Runtime, recreate: bool, extra: &CreateSettings) -> Result<String> {
+    // Compose finds its own container; `existing` isn't needed.
+    fn up(
+        &self,
+        rt: &dyn Runtime,
+        _existing: Option<&str>,
+        recreate: bool,
+        extra: &CreateSettings,
+    ) -> Result<String> {
         // On recreate, rebuild and force a fresh container; otherwise keep the
         // existing one (and stop compose recreating it on its own config-hash).
         let mode: &[&str] = if recreate {
@@ -74,19 +94,28 @@ impl Backend for ComposeBackend {
         let mut files = self.files.clone();
         let project_path = self.project_path.to_string_lossy();
         let content = extra.compose_override(&self.service, &[(LABEL_PROJECT, &project_path)]);
-        let override_file = rt.target().scratch_path("compose-override.yml");
-        rt.target()
-            .write_file(&override_file, &content)
+        let override_file = rt
+            .target()
+            .write_scratch("compose-override.yml", &content)
             .context("writing compose override")?;
-        files.push(override_file.clone());
+        files.push(override_file.path().to_string());
 
         let mut up_args: Vec<&str> = mode.to_vec();
         up_args.extend(self.run_services.iter().map(String::as_str));
-        let result = rt.compose_up(&self.dir, &self.project, &files, &up_args);
-        rt.target().remove_file(&override_file);
+        let result = rt
+            .compose()
+            .and_then(|c| c.up(&self.dir, &self.project, &files, &up_args));
+        drop(override_file);
         result?;
 
-        rt.compose_ps(&self.dir, &self.project, &self.files, &self.service, false)?
+        rt.compose()?
+            .ps(
+                &self.dir,
+                &self.project,
+                &self.files,
+                &self.service,
+                Containers::Running,
+            )?
             .with_context(|| {
                 format!(
                     "could not find running container for service '{}'",
@@ -128,8 +157,14 @@ impl Backend for ContainerBackend {
         rt.find_by_name(&self.name)
     }
 
-    fn up(&self, rt: &dyn Runtime, recreate: bool, extra: &CreateSettings) -> Result<String> {
-        let exists = self.existing(rt)?.is_some();
+    fn up(
+        &self,
+        rt: &dyn Runtime,
+        existing: Option<&str>,
+        recreate: bool,
+        extra: &CreateSettings,
+    ) -> Result<String> {
+        let exists = existing.is_some();
         if exists && !recreate {
             info!("starting {}", self.name);
             rt.start(&self.name)

@@ -16,9 +16,9 @@ use super::backend::{
     parse_app_ports,
 };
 use super::lifecycle::{Cmd, Lifecycle};
-use super::remote;
-use super::vars::Vars;
-use crate::forward::PortForward;
+use super::vars::{Vars, path_tag};
+use crate::port::PortForward;
+use crate::shell::slug;
 use crate::target::Target;
 
 /// A parsed devcontainer.json, grouped by what the fields are for.
@@ -149,25 +149,8 @@ pub(super) struct Spec {
 }
 
 pub(super) fn load_spec(project_path: &Path, target: &Target) -> Result<Spec> {
-    let (config_path, raw) = read_config(project_path, target)?;
+    let (config_path, raw) = find_config(project_path, target)?;
     build_spec(parse_config(&raw)?, config_path, project_path)
-}
-
-/// Finds and reads devcontainer.json on the project's host.
-fn read_config(project_path: &Path, target: &Target) -> Result<(PathBuf, String)> {
-    match target {
-        Target::Ssh(host) => {
-            let (path, bytes) = remote::find_and_read_config(host, project_path)?;
-            let text = String::from_utf8(bytes).context("devcontainer.json is not valid UTF-8")?;
-            Ok((path, text))
-        }
-        Target::Local => {
-            let path = find_config(project_path)?;
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            Ok((path, text))
-        }
-    }
 }
 
 fn parse_config(raw: &str) -> Result<DevcontainerConfig> {
@@ -402,25 +385,11 @@ fn image_source(source: SourceConfig, container_name: &str, base_dir: &Path) -> 
     }
 }
 
-/// Short, stable tag derived from a project's path. Appended to container and
-/// session names (and `${devcontainerId}`) so two projects that share a
-/// basename never collide.
-pub(super) fn path_tag(path: &Path) -> String {
-    let h = crate::fingerprint::fnv1a(
-        path.to_string_lossy().as_bytes(),
-        crate::fingerprint::FNV_OFFSET,
-    );
-    format!("{:06x}", h & 0xff_ffff)
-}
-
 // A stable container name for a non-compose devcontainer: project basename plus
 // a short hash of its path, so distinct projects with the same basename don't
 // collide.
-fn container_name(project_path: &Path) -> String {
-    let base: String = project_basename(project_path)
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
+pub(super) fn container_name(project_path: &Path) -> String {
+    let base = slug(&project_basename(project_path));
     format!("lodge-{base}-{}", path_tag(project_path))
 }
 
@@ -430,11 +399,7 @@ fn container_name(project_path: &Path) -> String {
 // from the human label rather than the container id, whose compose form is an
 // opaque hash that makes "lodge-<hash>" sessions impossible to tell apart.
 fn session_name(name: Option<&str>, basename: &str, project_path: &Path) -> String {
-    let label: String = name
-        .unwrap_or(basename)
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
+    let label = slug(name.unwrap_or(basename));
     let label = label.trim_matches('-');
     let label = if label.is_empty() { "workspace" } else { label };
     format!("lodge-{label}-{}", path_tag(project_path))
@@ -490,42 +455,74 @@ fn normalize_env_value(v: &str, vars: &Vars) -> String {
 // Devcontainer config lookup, per spec precedence: .devcontainer/devcontainer.json,
 // .devcontainer.json, then .devcontainer/<folder>/devcontainer.json (one level
 // deep). With several subfolder configs the first (alphabetically) wins, with a
-// warning — lodge has no UI to pick one.
-fn find_config(project_path: &Path) -> Result<PathBuf> {
-    let candidates = [
+// warning — lodge has no UI to pick one. The files are looked for on the
+// project's host, local or remote alike.
+fn find_config(project_path: &Path, target: &Target) -> Result<(PathBuf, String)> {
+    let fixed = [
         project_path.join(".devcontainer").join("devcontainer.json"),
         project_path.join(".devcontainer.json"),
     ];
-    if let Some(p) = candidates.into_iter().find(|p| p.exists()) {
-        return Ok(p);
-    }
-
-    let mut subs: Vec<PathBuf> = std::fs::read_dir(project_path.join(".devcontainer"))
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path().join("devcontainer.json"))
-        .filter(|p| p.is_file())
-        .collect();
-    subs.sort();
-    if subs.len() > 1 {
+    let subfolders = project_path
+        .join(".devcontainer")
+        .join("*")
+        .join("devcontainer.json");
+    let patterns = [fixed[0].clone(), fixed[1].clone(), subfolders];
+    let found = target.read_first(&patterns)?;
+    let (Some(first), Some(bytes)) = (found.paths.first(), found.contents) else {
+        let place = target
+            .ssh_host()
+            .map(|h| format!(" on {h}"))
+            .unwrap_or_default();
+        bail!(
+            "no devcontainer config found in {}{place} (looked for \
+             .devcontainer/devcontainer.json, .devcontainer.json, and \
+             .devcontainer/*/devcontainer.json)",
+            project_path.display()
+        );
+    };
+    if !fixed.contains(first) && found.paths.len() > 1 {
         warning!(
             "multiple devcontainer configs found, using {}",
-            subs[0].display()
+            first.display()
         );
     }
-    subs.into_iter().next().with_context(|| {
-        format!(
-            "no devcontainer config found in {} (looked for .devcontainer/devcontainer.json, \
-             .devcontainer.json, and .devcontainer/*/devcontainer.json)",
-            project_path.display()
-        )
-    })
+    let text = String::from_utf8(bytes)
+        .with_context(|| format!("{} is not valid UTF-8", first.display()))?;
+    Ok((first.clone(), text))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_config_is_found_in_spec_order() {
+        let tmp = crate::tmpfile::TempDir::new("find-config").unwrap();
+        let p = tmp.path();
+        assert!(find_config(p, &Target::Local).is_err());
+        for f in [
+            ".devcontainer/b/devcontainer.json",
+            ".devcontainer/a/devcontainer.json",
+        ] {
+            std::fs::create_dir_all(p.join(f).parent().unwrap()).unwrap();
+            std::fs::write(p.join(f), "{}").unwrap();
+        }
+        // Subfolders: the first alphabetically.
+        assert_eq!(
+            find_config(p, &Target::Local).unwrap().0,
+            p.join(".devcontainer/a/devcontainer.json")
+        );
+        std::fs::write(p.join(".devcontainer.json"), "{}").unwrap();
+        assert_eq!(
+            find_config(p, &Target::Local).unwrap().0,
+            p.join(".devcontainer.json")
+        );
+        std::fs::write(p.join(".devcontainer/devcontainer.json"), "{}").unwrap();
+        assert_eq!(
+            find_config(p, &Target::Local).unwrap().0,
+            p.join(".devcontainer/devcontainer.json")
+        );
+    }
 
     #[test]
     fn container_name_is_stable_and_path_scoped() {

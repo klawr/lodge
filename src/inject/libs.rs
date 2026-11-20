@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use crate::bundle::manifest::Lib;
 use crate::bundle::source::Prepared;
 use crate::layout::{LIB, LIB_MANIFEST, LINKER_DIR};
-use crate::output::info;
+use crate::output::{info, plural};
 use crate::runtime::Env;
 
 /// Copies the bundle's libraries (and the dynamic linker) into `/opt/lodge/lib`
@@ -32,9 +32,8 @@ pub(super) fn inject_libs(env: &dyn Env, bundle: &Prepared) -> Result<()> {
     let changed = changed_libs(libs, &installed);
     if !changed.is_empty() {
         info!(
-            "copying {} changed librar{}",
-            changed.len(),
-            if changed.len() == 1 { "y" } else { "ies" }
+            "copying {}",
+            plural(changed.len(), "changed library", "changed libraries")
         );
         for lib in &changed {
             env.cp_in(

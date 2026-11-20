@@ -4,7 +4,7 @@
 use anyhow::{Result, bail};
 
 use super::installed::{Decision, decide, record};
-use crate::bundle::elf::Arch;
+use crate::bundle::arch::Arch;
 use crate::bundle::manifest::{Binary, Manifest, Tool};
 use crate::bundle::source::Prepared;
 use crate::layout;

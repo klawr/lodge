@@ -10,9 +10,11 @@ use json_comments::StripComments;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use crate::fingerprint::{FNV_OFFSET, fnv1a};
+use crate::fingerprint::Fingerprint;
+use crate::output::warning;
 use crate::runtime::Env;
 use crate::target::Target;
+use crate::tree::{self, Denied, Links};
 
 use crate::layout::DEVCONTAINER_HASH as HASH_PATH;
 
@@ -27,6 +29,32 @@ pub(super) fn read_hash(env: &dyn Env) -> Result<Option<String>> {
 
 pub(super) fn write_hash(env: &dyn Env, hash: &str) -> Result<()> {
     env.write_file(HASH_PATH, hash.as_bytes())
+}
+
+/// Whether the config changed since the container was created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigState {
+    UpToDate,
+    Changed,
+    /// The container has no recorded config hash, or it could not be read.
+    /// Not knowing is no reason to throw a container away, so this is not drift.
+    Unknown,
+}
+
+/// Compares the hash recorded in the container with `current`, the hash of
+/// the config as it is now. The one place drift is decided, for `ldg up` and
+/// `ldg status` alike.
+pub(super) fn config_state(env: &dyn Env, current: &str) -> ConfigState {
+    match read_hash(env) {
+        Ok(Some(stored)) if stored == current => ConfigState::UpToDate,
+        Ok(Some(_)) => ConfigState::Changed,
+        Ok(None) => ConfigState::Unknown,
+        Err(e) => {
+            warning!("could not read the config recorded in the container: {e:#}");
+            ConfigState::Unknown
+        }
+    }
 }
 
 // ── change detection ───────────────────────────────────────────────────────────
@@ -52,7 +80,7 @@ pub(super) fn hash_inputs(
     let scratch = crate::tmpfile::TempDir::new("dchash").context("creating a scratch folder")?;
     if let Some(root) = devcontainer_dir {
         let local = target.fetch_dir(root, &scratch.path().join("dir"))?;
-        collect_dir(&local, &local, &mut entries)?;
+        collect_dir(&local, &mut entries)?;
     } else {
         files.push(config_path.to_path_buf());
     }
@@ -76,14 +104,11 @@ pub(super) fn hash_inputs(
 
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut h = FNV_OFFSET;
+    let mut h = Fingerprint::new();
     for (name, bytes) in &entries {
-        h = fnv1a(name.as_bytes(), h);
-        h = fnv1a(&[0x00], h);
-        h = fnv1a(bytes, h);
-        h = fnv1a(&[0xff], h);
+        h.field(name.as_bytes()).put(bytes).put(&[0xff]);
     }
-    Ok(format!("{h:016x}"))
+    Ok(h.hex())
 }
 
 // devcontainer.json is JSONC; canonicalize it before hashing so comment-only
@@ -107,27 +132,18 @@ fn normalize_for_hash(path: &Path, bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
-fn collect_dir(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
-    let read = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
-    };
-    let mut items: Vec<PathBuf> = read.filter_map(|e| e.ok().map(|e| e.path())).collect();
-    items.sort();
-    for path in items {
-        if path.is_dir() {
-            collect_dir(root, &path, out)?;
-        } else if let Ok(bytes) = std::fs::read(&path) {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
-            out.push((rel, normalize_for_hash(&path, bytes)));
+/// Every file under `root` as (relative path, normalized bytes), as a program
+/// reading the folder sees it: symlinks are followed, and a folder or file
+/// lodge may not read is left out (it can't be what the container is built from).
+fn collect_dir(root: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
+    tree::walk(root, Links::Follow, Denied::Skip, &mut |e| {
+        if !e.meta.is_dir()
+            && let Ok(bytes) = std::fs::read(e.path)
+        {
+            out.push((e.relative.to_string(), normalize_for_hash(e.path, bytes)));
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// `path` with `.` and `dir/..` folded away, without touching the filesystem
@@ -151,6 +167,23 @@ fn lexical(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::runtime::fake::FakeEnv;
+
+    #[test]
+    fn the_hash_is_stable_across_releases() {
+        // Recorded in every container: a change here would make every existing
+        // container look changed.
+        let t = crate::tmpfile::TempDir::new("dc-golden").unwrap();
+        let dc = t.path().join("proj/.devcontainer");
+        std::fs::create_dir_all(dc.join("sub")).unwrap();
+        std::fs::write(dc.join("devcontainer.json"), "{\"image\": \"x\" /* c */}").unwrap();
+        std::fs::write(dc.join("Dockerfile"), "FROM x\n").unwrap();
+        std::fs::write(dc.join("sub/s.sh"), "echo\n").unwrap();
+        std::os::unix::fs::symlink("Dockerfile", dc.join("link")).unwrap();
+        assert_eq!(
+            hash_inputs(&dc.join("devcontainer.json"), &[], &Target::Local).unwrap(),
+            "2b104ffc92d7fc62"
+        );
+    }
 
     #[test]
     fn paths_fold_lexically() {
@@ -231,5 +264,19 @@ mod tests {
         let env =
             FakeEnv::new().with_failure(&["sh", "-c", crate::runtime::READ_FILE_SCRIPT, HASH_PATH]);
         assert!(read_hash(&env).is_err());
+        assert_eq!(config_state(&env, "aa"), ConfigState::Unknown);
+    }
+
+    #[test]
+    fn only_a_different_recorded_hash_is_drift() {
+        let env = FakeEnv::new();
+        assert_eq!(
+            config_state(&env, "aa"),
+            ConfigState::Unknown,
+            "none recorded"
+        );
+        write_hash(&env, "aa").unwrap();
+        assert_eq!(config_state(&env, "aa"), ConfigState::UpToDate);
+        assert_eq!(config_state(&env, "bb"), ConfigState::Changed);
     }
 }

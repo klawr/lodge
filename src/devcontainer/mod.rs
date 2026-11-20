@@ -9,10 +9,10 @@
 //! - [`hash`]: detect that the config drifted since the container was created
 //! - [`lifecycle`]: `initializeCommand`, `onCreateCommand`, … and container env
 //! - [`markers`]: remember which one-shot hooks and installs succeeded
+//! - [`profile`]: the env written for login shells
 //! - [`uid`]: line the container user's uid up with the host user's
 //! - [`vars`]: `${…}` substitution in config values
 //! - [`workdir`]: choose a fallback working directory
-//! - [`remote`]: the `--remote` version of finding the config
 //!
 //! Anything that needs a person to decide goes through [`Prompt`], which the
 //! command layer implements.
@@ -23,7 +23,7 @@ mod features;
 mod hash;
 mod lifecycle;
 mod markers;
-mod remote;
+mod profile;
 mod uid;
 mod vars;
 mod workdir;
@@ -32,15 +32,17 @@ use crate::output::{note, warning};
 use anyhow::Result;
 use std::path::Path;
 
-use crate::forward::PortForward;
+use crate::port::PortForward;
 use crate::runtime::{Container, Env, Runtime};
 use crate::target::Target;
 use config::{Spec, load_spec};
-use hash::{hash_inputs, read_hash, write_hash};
-use lifecycle::{Cmd, HookCtx, exec_env, run_in_container, run_on_host, write_env_profile};
+use hash::{config_state, hash_inputs, write_hash};
+use lifecycle::{Cmd, HookCtx, exec_env, run_in_container, run_on_host};
+use profile::write_env_profile;
 use workdir::select_workdir;
 
 pub use backend::LABEL_PROJECT;
+pub use hash::ConfigState;
 
 /// What to do when the config changed since the container was created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,19 +115,9 @@ pub fn start(
 
     // Has the config drifted since the existing container was created?
     let drifted = !opts.build
-        && match &existing {
-            Some(id) => match read_hash(rt.container(id).as_ref()) {
-                Ok(stored) => stored.as_deref() != Some(current_hash.as_str()),
-                // Not knowing is no reason to throw the container away.
-                Err(e) => {
-                    warning!(
-                        "could not check whether the config changed (keeping the container): {e:#}"
-                    );
-                    false
-                }
-            },
-            None => false,
-        };
+        && existing.as_deref().is_some_and(|id| {
+            config_state(rt.container(id).as_ref(), &current_hash) == ConfigState::Changed
+        });
     let recreate = drifted && should_recreate(opts.recreate, prompt);
     let created = opts.build || existing.is_none() || recreate;
 
@@ -149,9 +141,12 @@ pub fn start(
         features::Plan::default()
     };
 
-    let id = spec
-        .backend
-        .up(rt, opts.build || recreate, &plan.create_settings())?;
+    let id = spec.backend.up(
+        rt,
+        existing.as_deref(),
+        opts.build || recreate,
+        &plan.create_settings(),
+    )?;
     let container = rt.container(&id);
     let env: &dyn Env = container.as_ref();
 
@@ -281,16 +276,6 @@ pub fn remove(project_path: &Path, rt: &dyn Runtime) -> Result<Option<String>> {
     Ok(existing)
 }
 
-/// Whether the config changed since the container was created.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConfigState {
-    UpToDate,
-    Changed,
-    /// The container has no recorded config hash, or it could not be read.
-    Unknown,
-}
-
 /// The project's container, if it has one, and whether its config drifted.
 pub fn status(project_path: &Path, rt: &dyn Runtime) -> Result<Option<(Found, ConfigState)>> {
     let (spec, existing) = locate(project_path, rt)?;
@@ -299,15 +284,7 @@ pub fn status(project_path: &Path, rt: &dyn Runtime) -> Result<Option<(Found, Co
     };
     let container = rt.container(&id);
     let current = hash_inputs(&spec.config_path, &spec.hash_extra, rt.target())?;
-    let state = match read_hash(container.as_ref()) {
-        Ok(Some(stored)) if stored == current => ConfigState::UpToDate,
-        Ok(Some(_)) => ConfigState::Changed,
-        Ok(None) => ConfigState::Unknown,
-        Err(e) => {
-            warning!("could not read the recorded config: {e:#}");
-            ConfigState::Unknown
-        }
-    };
+    let state = config_state(container.as_ref(), &current);
     let found = Found {
         container,
         remote_user: spec.remote_user,
@@ -349,5 +326,188 @@ fn should_recreate(policy: Recreate, prompt: &dyn Prompt) -> bool {
             false
         }
         Recreate::Ask => prompt.confirm_recreate(question),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::fake::{FakeEnv, FakeRuntime};
+    use crate::tmpfile::TempDir;
+    use std::cell::Cell;
+
+    /// Answers the recreate question with `recreate` and counts how often it
+    /// was asked.
+    struct Answer {
+        recreate: bool,
+        asked: Cell<usize>,
+    }
+
+    impl Answer {
+        fn new(recreate: bool) -> Self {
+            Self {
+                recreate,
+                asked: Cell::new(0),
+            }
+        }
+    }
+
+    impl Prompt for Answer {
+        fn confirm_recreate(&self, _question: &str) -> bool {
+            self.asked.set(self.asked.get() + 1);
+            self.recreate
+        }
+
+        fn choose_workdir(&self, configured: &str, _: &[String]) -> String {
+            panic!("{configured} exists, nothing to choose")
+        }
+    }
+
+    const ASK: StartOpts = StartOpts {
+        build: false,
+        recreate: Recreate::Ask,
+    };
+
+    /// A project whose devcontainer.json is `json`, plus an image-based
+    /// devcontainer that needs nothing but the engine.
+    fn project(json: &str) -> TempDir {
+        let dir = TempDir::new("start").unwrap();
+        write_config(&dir, json);
+        dir
+    }
+
+    fn write_config(dir: &TempDir, json: &str) {
+        let dc = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc).unwrap();
+        std::fs::write(dc.join("devcontainer.json"), json).unwrap();
+    }
+
+    const PLAIN: &str =
+        r#"{"image": "debian", "workspaceFolder": "/w", "updateRemoteUserUID": false}"#;
+    const EDITED: &str = r#"{"image": "debian", "workspaceFolder": "/w", "updateRemoteUserUID": false, "name": "x"}"#;
+
+    /// A container whose workspace folder exists.
+    fn container() -> FakeEnv {
+        FakeEnv::new().with_file("/w", "")
+    }
+
+    /// The engine, with the project's container already there when `existing`.
+    fn engine(dir: &TempDir, existing: bool) -> FakeRuntime {
+        let rt = FakeRuntime::new(container);
+        if existing {
+            rt.with_container(&config::container_name(dir.path()), container())
+        } else {
+            rt
+        }
+    }
+
+    fn state(dir: &TempDir, rt: &FakeRuntime) -> ConfigState {
+        status(dir.path(), rt).unwrap().unwrap().1
+    }
+
+    #[test]
+    fn a_new_container_is_created_and_records_its_config() {
+        let dir = project(PLAIN);
+        let rt = engine(&dir, false);
+        let started = start(dir.path(), ASK, &rt, &Answer::new(false)).unwrap();
+        assert_eq!(started.workdir, "/w");
+        assert!(
+            rt.ops().iter().any(|o| o.starts_with("run lodge-")),
+            "{:?}",
+            rt.ops()
+        );
+        assert_eq!(state(&dir, &rt), ConfigState::UpToDate);
+    }
+
+    #[test]
+    fn an_unchanged_container_is_started_without_asking() {
+        let dir = project(PLAIN);
+        let rt = engine(&dir, false);
+        start(dir.path(), ASK, &rt, &Answer::new(true)).unwrap();
+        let prompt = Answer::new(true);
+        start(dir.path(), ASK, &rt, &prompt).unwrap();
+        assert_eq!(prompt.asked.get(), 0);
+        let ops = rt.ops();
+        assert_eq!(
+            ops.iter().filter(|o| o.starts_with("run ")).count(),
+            1,
+            "{ops:?}"
+        );
+        assert!(ops.last().unwrap().starts_with("start "), "{ops:?}");
+    }
+
+    #[test]
+    fn a_changed_config_asks_and_the_answer_decides() {
+        let dir = project(PLAIN);
+        let rt = engine(&dir, false);
+        start(dir.path(), ASK, &rt, &Answer::new(false)).unwrap();
+        write_config(&dir, EDITED);
+        assert_eq!(state(&dir, &rt), ConfigState::Changed);
+
+        let keep = Answer::new(false);
+        start(dir.path(), ASK, &rt, &keep).unwrap();
+        assert_eq!(keep.asked.get(), 1);
+        assert!(!rt.ops().iter().any(|o| o.starts_with("remove")));
+        assert_eq!(state(&dir, &rt), ConfigState::Changed, "kept as it was");
+
+        let recreate = Answer::new(true);
+        start(dir.path(), ASK, &rt, &recreate).unwrap();
+        assert_eq!(recreate.asked.get(), 1);
+        let ops = rt.ops();
+        assert!(ops.iter().any(|o| o.starts_with("remove")), "{ops:?}");
+        assert_eq!(
+            ops.iter().filter(|o| o.starts_with("run ")).count(),
+            2,
+            "{ops:?}"
+        );
+        assert_eq!(state(&dir, &rt), ConfigState::UpToDate);
+    }
+
+    #[test]
+    fn a_container_without_a_recorded_config_is_kept_and_reported_unknown() {
+        let dir = project(PLAIN);
+        let rt = engine(&dir, true);
+        let prompt = Answer::new(true);
+        start(dir.path(), ASK, &rt, &prompt).unwrap();
+        assert_eq!(prompt.asked.get(), 0, "not knowing is not drift");
+        let ops = rt.ops();
+        assert!(ops.len() == 1 && ops[0].starts_with("start "), "{ops:?}");
+        assert_eq!(state(&dir, &rt), ConfigState::Unknown);
+    }
+
+    #[test]
+    fn build_recreates_without_asking() {
+        let dir = project(PLAIN);
+        let rt = engine(&dir, true);
+        let prompt = Answer::new(false);
+        let opts = StartOpts {
+            build: true,
+            recreate: Recreate::Ask,
+        };
+        start(dir.path(), opts, &rt, &prompt).unwrap();
+        assert_eq!(prompt.asked.get(), 0);
+        let ops = rt.ops();
+        assert!(
+            ops[0].starts_with("remove ") && ops[1].starts_with("run "),
+            "{ops:?}"
+        );
+    }
+
+    #[test]
+    fn a_compose_devcontainer_is_brought_up_and_then_reused() {
+        let dir =
+            project(r#"{"dockerComposeFile": "c.yml", "service": "app", "workspaceFolder": "/w"}"#);
+        let rt = FakeRuntime::new(container);
+        let first = start(dir.path(), ASK, &rt, &Answer::new(false)).unwrap();
+        assert!(
+            first.container.id().ends_with("-app-1"),
+            "{}",
+            first.container.id()
+        );
+        let prompt = Answer::new(true);
+        let again = start(dir.path(), ASK, &rt, &prompt).unwrap();
+        assert_eq!(again.container.id(), first.container.id());
+        assert_eq!(prompt.asked.get(), 0);
+        assert_eq!(state(&dir, &rt), ConfigState::UpToDate);
     }
 }

@@ -114,9 +114,13 @@ pub fn container_id(container: &str) -> String {
 }
 
 /// How many `ldg _forward` daemons are running for `container` (by name or
-/// by any prefix of its id, as the daemon may be given either).
+/// by any prefix of its id, as the daemon may be given either). For a removed
+/// container, pass its full id.
 pub fn forward_daemons(container: &str) -> usize {
-    let id = container_id(container);
+    let id = match container_id(container) {
+        id if id.is_empty() => container.to_string(),
+        id => id,
+    };
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return 0;
     };

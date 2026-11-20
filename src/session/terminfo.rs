@@ -9,6 +9,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
+use crate::output::warning;
 use crate::runtime::Env;
 
 // Where copied entries live inside the container.
@@ -65,11 +66,24 @@ fn container_knows(env: &dyn Env, term: &str) -> bool {
     env.path_exists(&format!("{CONTAINER_DIR}/{first}/{term}")) || env.succeeds(&["infocmp", term])
 }
 
-/// Copies the host's terminfo entry for `term` into the container, if the
-/// container lacks it and the host has it. Returns whether the container can
-/// now resolve `term`.
-pub fn ensure(env: &dyn Env, term: &str) -> Result<bool> {
-    ensure_from(env, term, &host_dirs())
+/// The `TERM` a session should use, or `None` to leave the container's default
+/// (when `local`, this machine's terminal, says nothing useful). Copies the
+/// host's entry for it into the container first when the container lacks it;
+/// if that isn't possible, a widely known fallback. Best effort: a missing entry
+/// only costs some colours.
+pub fn prepare(env: &dyn Env, local: Option<&str>) -> Option<String> {
+    prepare_from(env, local?, &host_dirs())
+}
+
+fn prepare_from(env: &dyn Env, term: &str, dirs: &[PathBuf]) -> Option<String> {
+    match ensure_from(env, term, dirs) {
+        Ok(true) => Some(term.to_string()),
+        Ok(false) => Some(FALLBACK.to_string()),
+        Err(e) => {
+            warning!("could not copy the terminfo entry for {term}: {e:#}");
+            Some(FALLBACK.to_string())
+        }
+    }
 }
 
 fn ensure_from(env: &dyn Env, term: &str, dirs: &[PathBuf]) -> Result<bool> {
@@ -82,18 +96,6 @@ fn ensure_from(env: &dyn Env, term: &str, dirs: &[PathBuf]) -> Result<bool> {
     let bytes = std::fs::read(&file)?;
     env.write_file(&format!("{CONTAINER_DIR}/{relative}"), &bytes)?;
     Ok(true)
-}
-
-/// The `TERM` a session should use, or `None` to leave the container's default.
-/// The user's own terminal when the container can resolve it, otherwise a
-/// widely known fallback.
-pub fn session_term(env: &dyn Env, local: Option<&str>) -> Option<String> {
-    let term = local?;
-    if container_knows(env, term) {
-        Some(term.to_string())
-    } else {
-        Some(FALLBACK.to_string())
-    }
 }
 
 /// Shell lines for the start of a session: set `TERM`, and let ncurses find
@@ -156,9 +158,8 @@ mod tests {
     #[test]
     fn an_unknown_terminal_with_no_host_entry_falls_back() {
         let env = FakeEnv::new().with_failure(&["infocmp", "weird-term"]);
-        assert!(!ensure_from(&env, "weird-term", &[]).unwrap());
         assert_eq!(
-            session_term(&env, Some("weird-term")).as_deref(),
+            prepare_from(&env, "weird-term", &[]).as_deref(),
             Some("xterm-256color")
         );
     }
@@ -167,10 +168,28 @@ mod tests {
     fn the_users_terminal_is_used_when_the_container_resolves_it() {
         let env = FakeEnv::new().with_output(&["infocmp", "tmux-256color"], "");
         assert_eq!(
-            session_term(&env, Some("tmux-256color")).as_deref(),
+            prepare_from(&env, "tmux-256color", &[]).as_deref(),
             Some("tmux-256color")
         );
-        assert_eq!(session_term(&env, None), None);
+        assert_eq!(prepare(&env, None), None);
+    }
+
+    #[test]
+    fn a_copied_entry_makes_the_users_terminal_usable() {
+        let (dir, _) = host_with("xterm-prepared");
+        let env = FakeEnv::new().with_failure(&["infocmp", "xterm-prepared"]);
+        assert_eq!(
+            prepare_from(&env, "xterm-prepared", &[dir.path().to_path_buf()]).as_deref(),
+            Some("xterm-prepared")
+        );
+        // Asked once: the copy and the choice share the answer.
+        assert_eq!(
+            env.calls()
+                .iter()
+                .filter(|(c, _)| c.first().is_some_and(|p| p == "infocmp"))
+                .count(),
+            1
+        );
     }
 
     #[test]

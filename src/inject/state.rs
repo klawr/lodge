@@ -15,13 +15,13 @@ pub(super) fn record_bundle(env: &dyn Env, id: &str) -> Result<()> {
     env.write_file(BUNDLE_FILE, format!("{id}\n").as_bytes())
 }
 
-/// The id of the bundle last injected into this environment.
-pub fn installed_bundle(env: &dyn Env) -> Option<String> {
-    env.read_file(BUNDLE_FILE)
-        .ok()
-        .flatten()
+/// The id of the bundle last injected into this environment, `None` if none
+/// was; an error if that can't be read.
+pub fn installed_bundle(env: &dyn Env) -> Result<Option<String>> {
+    Ok(env
+        .read_file(BUNDLE_FILE)?
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty()))
 }
 
 /// Stamps the format version of the injected state, warning when a newer lodge

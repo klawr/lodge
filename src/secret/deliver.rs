@@ -4,12 +4,13 @@
 use super::{SecretDecl, place, resolve};
 use crate::output::{info, note, warning};
 use crate::runtime::{Container, ContainerUser};
+use crate::target::Target;
 use anyhow::Result;
 
-/// The names this container's host answers to, for matching `targets`: `local`
+/// The names the engine's host answers to, for matching `targets`: `local`
 /// for the local engine, otherwise the `--remote` value and its host part.
-pub fn host_names(ssh_host: Option<&str>) -> Vec<String> {
-    let Some(remote) = ssh_host else {
+fn host_names(target: &Target) -> Vec<String> {
+    let Some(remote) = target.ssh_host() else {
         return vec!["local".into()];
     };
     let mut names = vec![remote.to_string()];
@@ -32,6 +33,7 @@ pub fn host_names(ssh_host: Option<&str>) -> Vec<String> {
 /// blocking the session; the tool that needed it will say it is not logged in.
 pub fn deliver(
     container: &dyn Container,
+    target: &Target,
     user: &ContainerUser,
     decls: &[SecretDecl],
 ) -> Result<String> {
@@ -40,7 +42,7 @@ pub fn deliver(
         place::clear(container, user)?;
         return Ok(String::new());
     }
-    let hosts = host_names(container.target().ssh_host());
+    let hosts = host_names(target);
     let name = container
         .name()
         .unwrap_or_else(|| container.id().to_string());
@@ -75,11 +77,11 @@ mod tests {
 
     #[test]
     fn local_and_remote_host_names() {
-        assert_eq!(host_names(None), ["local"]);
+        assert_eq!(host_names(&Target::Local), ["local"]);
         assert_eq!(
-            host_names(Some("me@build.example:2222")),
+            host_names(&Target::Ssh("me@build.example:2222".into())),
             ["me@build.example:2222", "me@build.example", "build.example"]
         );
-        assert_eq!(host_names(Some("build")), ["build"]);
+        assert_eq!(host_names(&Target::Ssh("build".into())), ["build"]);
     }
 }

@@ -1,27 +1,61 @@
 //! A small, stable, non-cryptographic content hash (FNV-1a, 64 bit).
 //!
 //! Used to notice that something *changed* (a devcontainer's inputs, a library
-//! that was updated on the host), never to defend against an adversary.
+//! that was updated on the host), never to defend against an adversary. The
+//! values are stored (in containers, in bundle manifests), so the algorithm and
+//! the bytes each caller feeds it must not change.
 
-pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-/// Folds `data` into the running hash `h`. Start from [`FNV_OFFSET`].
-pub fn fnv1a(data: &[u8], mut h: u64) -> u64 {
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+/// A running hash: feed it bytes, then read it out.
+#[derive(Debug, Clone, Copy)]
+pub struct Fingerprint(u64);
+
+impl Default for Fingerprint {
+    fn default() -> Self {
+        Self::new()
     }
-    h
+}
+
+impl Fingerprint {
+    pub fn new() -> Self {
+        Self(FNV_OFFSET)
+    }
+
+    /// Folds `data` in as is.
+    pub fn put(&mut self, data: &[u8]) -> &mut Self {
+        for &b in data {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(FNV_PRIME);
+        }
+        self
+    }
+
+    /// Folds `data` in followed by a NUL, so consecutive fields can't run into
+    /// each other (`"ab","c"` differs from `"a","bc"`).
+    pub fn field(&mut self, data: &[u8]) -> &mut Self {
+        self.put(data).put(&[0])
+    }
+
+    pub fn value(&self) -> u64 {
+        self.0
+    }
+
+    /// The hash as 16 lowercase hex digits.
+    pub fn hex(&self) -> String {
+        format!("{:016x}", self.0)
+    }
 }
 
 /// The hash of `data` as 16 lowercase hex digits.
 pub fn content_hash(data: &[u8]) -> String {
-    format!("{:016x}", fnv1a(data, FNV_OFFSET))
+    Fingerprint::new().put(data).hex()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::content_hash;
+    use super::{Fingerprint, content_hash};
 
     #[test]
     fn equal_bytes_hash_equal_and_different_bytes_differ() {
@@ -34,5 +68,15 @@ mod tests {
         let h = content_hash(b"");
         assert_eq!(h.len(), 16);
         assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn values_are_stable_across_releases() {
+        // Stored in containers and manifests: a change here would make every
+        // existing container look changed and every bundle look damaged.
+        assert_eq!(content_hash(b"libc 2.40"), "3f366fef88e3edcf");
+        let mut f = Fingerprint::new();
+        f.field(b"name").put(b"bytes").put(&[0xff]);
+        assert_eq!(f.hex(), "ee4f46835c57eeca");
     }
 }

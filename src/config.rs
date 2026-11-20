@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::secret::{self, SecretDecl};
-use crate::shell::{is_alias_name, is_plain_name};
+use crate::shell::{container_path_problem, is_alias_name, is_plain_name};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -219,6 +219,14 @@ impl Config {
                     item.name
                 ));
             }
+            for (key, target) in [
+                ("target_binary", &item.target_binary),
+                ("target_config", &item.target_config),
+            ] {
+                if let Some(why) = target.as_deref().and_then(container_path_problem) {
+                    problems.push(format!("[[inject]] `{}`: `{key}` {why}", item.name));
+                }
+            }
             if item.binary.is_none() && item.config.is_none() {
                 problems.push(format!(
                     "[[inject]] `{}` sets neither `binary` nor `config`, so there is nothing to inject",
@@ -411,6 +419,7 @@ mod tests {
                  [[inject]]\nname = \"a\"\nbinary = \"/b\"\n\
                  [[inject]]\nname = \"c\"\n\
                  [[inject]]\nname = \"../up\"\nbinary = \"/u\"\n\
+                 [[inject]]\nname = \"t\"\nbinary = \"/t\"\ntarget_config = \"rel/x\"\n\
                  [aliases]\n\"rm -rf\" = \"x\"\n"
             )
             .unwrap_err()
@@ -418,6 +427,10 @@ mod tests {
         assert!(err.contains("`a` is listed more than once"), "{err}");
         assert!(err.contains("`../up` is not usable as a name"), "{err}");
         assert!(err.contains("`c` sets neither"), "{err}");
+        assert!(
+            err.contains("`t`: `target_config` must be absolute"),
+            "{err}"
+        );
         assert!(err.contains("`rm -rf` is not a valid alias name"), "{err}");
     }
 

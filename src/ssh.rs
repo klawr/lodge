@@ -109,11 +109,22 @@ pub fn sh_output(host: &str, script: &str) -> anyhow::Result<std::process::Outpu
     Ok(out)
 }
 
-/// Writes `content` to `path` on the remote host.
-pub fn write_file(host: &str, path: &str, content: &str) -> anyhow::Result<()> {
+/// The remote script behind [`write_scratch`]: a new owner-only file from
+/// `mktemp`, filled from stdin, its path printed. Removed again if filling it
+/// fails.
+pub(crate) const WRITE_SCRATCH_SCRIPT: &str = "f=$(mktemp \"${TMPDIR:-/tmp}/lodge-XXXXXXXXXX\") \
+     && { cat > \"$f\" || { rm -f \"$f\"; exit 1; }; } && printf '%s' \"$f\"";
+
+/// Writes `content` to a new scratch file on the remote host, made with
+/// `mktemp` (unique and owner-only, whatever else is in the remote `/tmp`), and
+/// returns its path.
+pub fn write_scratch(host: &str, content: &str) -> anyhow::Result<String> {
     use std::io::Write as _;
-    let mut cmd = command(host, &format!("cat > {}", crate::shell::shell_quote(path)));
-    cmd.stdin(Stdio::piped()).stdout(Stdio::null());
+    let mut cmd = command(
+        host,
+        &format!("sh -c {}", crate::shell::shell_quote(WRITE_SCRATCH_SCRIPT)),
+    );
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
     crate::output::trace(&cmd);
     let mut child = cmd.spawn().context("spawning ssh")?;
     child
@@ -122,11 +133,12 @@ pub fn write_file(host: &str, path: &str, content: &str) -> anyhow::Result<()> {
         .context("ssh stdin was not piped")?
         .write_all(content.as_bytes())
         .context("writing to ssh stdin")?;
-    let status = child.wait().context("waiting for ssh")?;
-    if !status.success() {
-        anyhow::bail!("writing {path} on {host} failed");
+    let out = child.wait_with_output().context("waiting for ssh")?;
+    let path = String::from_utf8_lossy(&out.stdout).into_owned();
+    if !out.status.success() || path.is_empty() {
+        anyhow::bail!("writing a scratch file on {host} failed");
     }
-    Ok(())
+    Ok(path)
 }
 
 /// A tunnel from local port `local` to `target` ("ip:port", as reachable from
