@@ -31,6 +31,47 @@ jobs:
       - name: Build
         run: cargo build --release
 
+  # The oldest Rust this crate promises to build with (`rust-version` in
+  # Cargo.toml).
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --all-targets
+
+  # Licenses, security advisories and dependency sources (.github/deny.toml).
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command-arguments: --config .github/deny.toml
+
+  # The static release binaries, built on every push and PR so a musl or
+  # aarch64 break shows up before anything is tagged.
+  musl:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
   # The real binary against a real container engine (docker and its compose
   # plugin come with the runner). Runs in parallel with `check`. Locally:
   # `make integration`.
@@ -41,77 +82,41 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Host tools
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq patchelf
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq patchelf tmux
       - name: Integration tests
         run: make integration
 
-  # Cut a release only after `check` and `integration` pass, and only for pushes
-  # to master.
-  # `needs` is the dependency, so a red tree (fmt/clippy/test/build/integration)
-  # can never be tagged. On pull requests this job is skipped by the `if`.
-  #
-  # Versioning is derived entirely from conventional commits and `v*` git tags
-  # via git-cliff
+  # Releases come from conventional commits, via release-please
+  # (.github/release-please/: config.json, and manifest.json, which holds the
+  # current version and is updated by the release PR). On every push
+  # to master that passes the gates, it keeps a "release PR" open that bumps the
+  # version in Cargo.toml: `feat` the minor version, `fix` the patch, a breaking
+  # change the minor before 1.0. Merging that PR tags the version and creates a
+  # *draft* GitHub release; `upload` attaches the binaries and `publish` makes
+  # it public, so `releases/latest` (what install.sh downloads) never points at
+  # a release without assets. No changelog file is kept; the release notes are
+  # generated from the commits.
   release:
-    needs: [check, integration]
+    needs: [check, msrv, deny, musl, integration]
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
+      issues: write
     outputs:
-      # Empty unless a new version was actually released this run.
-      tag: ${{ steps.release.outputs.tag }}
+      # Empty unless a new version was released by this run.
+      tag: ${{ steps.release.outputs.release_created && steps.release.outputs.tag_name || '' }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: git-cliff
-      - name: Release
+      - uses: googleapis/release-please-action@v4
         id: release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # Next version from conventional commits since the last `v*` tag.
-          # `--bumped-version` returns the current version unchanged when no
-          # commit warrants a release, so an equal value means "nothing to do".
-          latest="$(git tag --sort=-v:refname | head -n1 || true)"
-          next="v$(git cliff --bumped-version | sed 's/^v//')"
-          if [ "$next" = "$latest" ]; then
-            echo "No releasable changes since ${latest:-the beginning}; nothing to do."
-            exit 0
-          fi
-          echo "Releasing $next (previous: ${latest:-none})"
-
-          # Bump the version in Cargo.toml + Cargo.lock in place — no Rust
-          # toolchain needed, which keeps this job lean.
-          ver="${next#v}"
-          ver="$ver" perl -0pi -e 's/(\[package\][^\[]*?\nversion = ")[^"]+(")/$1$ENV{ver}$2/' Cargo.toml
-          ver="$ver" perl -0pi -e 's/(name = "lodge-cli"\nversion = ")[^"]+(")/$1$ENV{ver}$2/' Cargo.lock
-
-          # Regenerate the changelog including the new version.
-          git cliff --bump -o CHANGELOG.md
-
-          # Commit + tag straight to master ([skip ci] avoids re-triggering).
-          git add -A
-          git commit -m "chore: release $next [skip ci]"
-          git tag "$next"
-          git push origin HEAD:master
-          git push origin "$next"
-
-          # GitHub release with notes for just this version.
-          git cliff --latest --strip header > RELEASE_NOTES.md
-          gh release create "$next" --title "$next" --notes-file RELEASE_NOTES.md --verify-tag
-
-          echo "tag=$next" >> "$GITHUB_OUTPUT"
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: .github/release-please/config.json
+          manifest-file: .github/release-please/manifest.json
 
   # Build static musl binaries for x86_64 and aarch64 and attach them as
-  # .tar.gz assets to the release that was just published.
+  # .tar.gz assets to the draft release.
   upload:
     needs: release
     if: needs.release.outputs.tag != ''
@@ -134,3 +139,15 @@ jobs:
           archive: ldg-$target
           ref: refs/tags/${{ needs.release.outputs.tag }}
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Publish the draft once every asset is attached.
+  publish:
+    needs: [release, upload]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ needs.release.outputs.tag }}" --repo "$GITHUB_REPOSITORY" --draft=false --latest

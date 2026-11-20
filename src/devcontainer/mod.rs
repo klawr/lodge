@@ -5,33 +5,71 @@
 //!
 //! - [`config`]: parse `devcontainer.json` into a [`Spec`](config::Spec)
 //! - [`backend`]: create/start the container (compose, or image/build)
+//! - [`features`]: fetch, order and install devcontainer features
 //! - [`hash`]: detect that the config drifted since the container was created
 //! - [`lifecycle`]: `initializeCommand`, `onCreateCommand`, … and container env
+//! - [`markers`]: remember which one-shot hooks and installs succeeded
 //! - [`uid`]: line the container user's uid up with the host user's
 //! - [`vars`]: `${…}` substitution in config values
 //! - [`workdir`]: choose a fallback working directory
-//! - [`remote`]: the `--remote` equivalents of the file reads above
+//! - [`remote`]: the `--remote` version of finding the config
+//!
+//! Anything that needs a person to decide goes through [`Prompt`], which the
+//! command layer implements.
 
 mod backend;
 mod config;
+mod features;
 mod hash;
 mod lifecycle;
+mod markers;
 mod remote;
 mod uid;
 mod vars;
 mod workdir;
 
-use crate::output::{info, note, prompt, warning};
+use crate::output::{note, warning};
 use anyhow::Result;
-use std::io::{self, IsTerminal};
 use std::path::Path;
 
 use crate::forward::PortForward;
 use crate::runtime::{Container, Env, Runtime};
-use config::load_spec;
+use crate::target::Target;
+use config::{Spec, load_spec};
 use hash::{hash_inputs, read_hash, write_hash};
-use lifecycle::{Cmd, exec_env, run_in_container, run_on_host, write_env_profile};
+use lifecycle::{Cmd, HookCtx, exec_env, run_in_container, run_on_host, write_env_profile};
 use workdir::select_workdir;
+
+pub use backend::LABEL_PROJECT;
+
+/// What to do when the config changed since the container was created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recreate {
+    /// Ask through the [`Prompt`].
+    Ask,
+    /// Recreate without asking (`--yes`).
+    Yes,
+    /// Keep the container without asking (`--no-recreate`).
+    No,
+}
+
+/// How `ldg up` should treat an existing container.
+#[derive(Debug, Clone, Copy)]
+pub struct StartOpts {
+    /// Rebuild images and recreate the container unconditionally (`--build`).
+    pub build: bool,
+    pub recreate: Recreate,
+}
+
+/// The questions [`start`] may need a person to answer.
+pub trait Prompt {
+    /// Whether to recreate a container whose config changed (`Recreate::Ask`).
+    fn confirm_recreate(&self, question: &str) -> bool;
+
+    /// The directory to work in when the configured `workspaceFolder` doesn't
+    /// exist in the container, offered `candidates` that do.
+    fn choose_workdir(&self, configured: &str, candidates: &[String]) -> String;
+}
 
 /// The result of bringing a devcontainer up: the resolved container, the
 /// workspace folder to drop the user into, and the (deferred) postAttach hook.
@@ -49,61 +87,71 @@ pub struct Started {
 
 impl Started {
     /// Runs `postAttachCommand`, if any. Called after lodge has injected the
-    /// environment and right before attaching the interactive session.
-    pub fn run_post_attach(&self) -> Result<()> {
+    /// environment and right before attaching the interactive session. A
+    /// failure is reported, never fatal.
+    pub fn run_post_attach(&self) {
         if let Some(cmd) = &self.post_attach {
-            run_in_container(
-                self.container.as_ref(),
-                &self.workdir,
-                &self.env,
-                "postAttachCommand",
-                cmd,
-            );
+            let ctx = HookCtx {
+                workdir: &self.workdir,
+                user: self.remote_user.as_deref(),
+                vars: &self.env,
+            };
+            run_in_container(self.container.as_ref(), &ctx, "postAttachCommand", cmd);
         }
-        Ok(())
     }
 }
 
-pub fn start(project_path: &Path, force_build: bool, rt: &dyn Runtime) -> Result<Started> {
+pub fn start(
+    project_path: &Path,
+    opts: StartOpts,
+    rt: &dyn Runtime,
+    prompt: &dyn Prompt,
+) -> Result<Started> {
     let target = rt.target();
-    let spec = load_spec(project_path, target)?;
+    let (spec, existing) = locate(project_path, rt)?;
     let current_hash = hash_inputs(&spec.config_path, &spec.hash_extra, target)?;
 
-    // Is there already a container for this devcontainer, and has its config
-    // drifted since it was created?
-    let existing = spec.backend.existing(rt)?;
-    let drifted = !force_build
+    // Has the config drifted since the existing container was created?
+    let drifted = !opts.build
         && match &existing {
-            Some(id) => {
-                read_hash(rt.container(id).as_ref()).as_deref() != Some(current_hash.as_str())
-            }
+            Some(id) => match read_hash(rt.container(id).as_ref()) {
+                Ok(stored) => stored.as_deref() != Some(current_hash.as_str()),
+                // Not knowing is no reason to throw the container away.
+                Err(e) => {
+                    warning!(
+                        "could not check whether the config changed (keeping the container): {e:#}"
+                    );
+                    false
+                }
+            },
             None => false,
         };
-    let recreate = drifted
-        && confirm(
-            ".devcontainer changed since this container was created — recreate it? \
-             (anything installed in it since will be lost)",
-        )?;
-    let created = force_build || existing.is_none() || recreate;
+    let recreate = drifted && should_recreate(opts.recreate, prompt);
+    let created = opts.build || existing.is_none() || recreate;
 
     // initializeCommand runs on the host before the container is created/started.
     if let Some(cmd) = &spec.lifecycle.initialize {
         run_on_host(&spec.base_dir, "initializeCommand", cmd, target)?;
     }
 
-    // When (re)creating, resolve features up front so their container-creation
-    // flags (mounts/privileged/…) can be applied at `up`. On a reused container
-    // those flags are already baked in, so we skip the fetch and just retry any
-    // not-yet-installed features afterwards (marker-gated).
-    let create_plan = if created {
-        crate::features::resolve(&spec.base_dir, &spec.features, &spec.override_feature_order)?
+    let features_ctx = features::Context {
+        base_dir: &spec.base_dir,
+        target,
+    };
+
+    // A new container needs every feature, resolved up front so their
+    // container-creation settings (mounts, privileged, …) apply when it is
+    // created. A reused one has those baked in; it only retries the features
+    // that haven't succeeded yet, resolved once it is up.
+    let mut plan = if created {
+        features::resolve(&features_ctx, &spec.features, &spec.override_feature_order)?
     } else {
-        crate::features::Plan::default()
+        features::Plan::default()
     };
 
     let id = spec
         .backend
-        .up(rt, force_build || recreate, &create_plan.create_flags())?;
+        .up(rt, opts.build || recreate, &plan.create_settings())?;
     let container = rt.container(&id);
     let env: &dyn Env = container.as_ref();
 
@@ -114,16 +162,13 @@ pub fn start(project_path: &Path, force_build: bool, rt: &dyn Runtime) -> Result
 
     // Line the container user's uid up with the host user's so the bind-mounted
     // workspace is writable. Only when the container was just created.
-    if created && spec.sync_uid {
-        match target
+    if created
+        && spec.sync_uid
+        && let Err(e) = target
             .uid_gid()
             .and_then(|(uid, gid)| uid::sync_user_uid(env, spec.remote_user.as_deref(), uid, gid))
-        {
-            Ok(()) => {}
-            Err(e) => {
-                warning!("could not align the container user with the host (continuing): {e:#}")
-            }
-        }
+    {
+        warning!("could not align the container user with the host (continuing): {e:#}");
     }
 
     // Persist containerEnv/remoteEnv so login shells inside the container see it.
@@ -131,19 +176,18 @@ pub fn start(project_path: &Path, force_build: bool, rt: &dyn Runtime) -> Result
     let hook_env = exec_env(&spec.env);
 
     // Features install before the create hooks (the spec bakes them into the
-    // image first). On a fresh container we install the resolved plan; on a
-    // reused one, install() is marker-gated — a cheap no-op once everything
-    // succeeded, retrying anything that previously failed.
-    if created {
-        create_plan.install(env)?;
-    } else {
-        crate::features::install(
-            env,
-            &spec.base_dir,
-            &spec.features,
-            &spec.override_feature_order,
-        )?;
+    // image first).
+    if !created {
+        let pending = features::pending(env, &spec.features);
+        plan = features::resolve(&features_ctx, &pending, &spec.override_feature_order)?;
     }
+    plan.install(env, spec.remote_user.as_deref())?;
+
+    let hooks = HookCtx {
+        workdir: &spec.workspace_folder,
+        user: spec.remote_user.as_deref(),
+        vars: &hook_env,
+    };
 
     // Create-time hooks run once *successfully*: each is skipped if its success
     // marker exists, and the marker is written only when it succeeds — so a
@@ -163,30 +207,24 @@ pub fn start(project_path: &Path, force_build: bool, rt: &dyn Runtime) -> Result
         ),
     ] {
         if let Some(c) = cmd {
-            if env.task_done(key) {
+            if markers::done(env, key) {
                 continue;
             }
-            if run_in_container(env, &spec.workspace_folder, &hook_env, label, c) {
-                env.mark_task_done(key)?;
+            if run_in_container(env, &hooks, label, c) {
+                markers::mark_done(env, key)?;
             }
         }
     }
 
     // postStartCommand runs on every start; a failure is a warning, not fatal.
     if let Some(c) = &spec.lifecycle.post_start {
-        run_in_container(
-            env,
-            &spec.workspace_folder,
-            &hook_env,
-            "postStartCommand",
-            c,
-        );
+        run_in_container(env, &hooks, "postStartCommand", c);
     }
 
     let workdir = if env.path_exists(&spec.workspace_folder) {
         spec.workspace_folder
     } else {
-        select_workdir(container.as_ref(), &spec.workspace_folder)
+        select_workdir(container.as_ref(), &spec.workspace_folder, prompt)
     };
 
     Ok(Started {
@@ -200,97 +238,116 @@ pub fn start(project_path: &Path, force_build: bool, rt: &dyn Runtime) -> Result
     })
 }
 
-/// Stops the container `ldg up` manages for this project, if one exists.
-/// The container is kept so `ldg up` can resume it with everything intact.
-pub fn stop(project_path: &Path, rt: &dyn Runtime) -> Result<()> {
+/// The project's spec and the id of its existing container, if there is one.
+fn locate(project_path: &Path, rt: &dyn Runtime) -> Result<(Spec, Option<String>)> {
     let spec = load_spec(project_path, rt.target())?;
-    match spec.backend.existing(rt)? {
-        Some(id) => {
-            info!("stopping {id}");
-            rt.stop(&id)
-        }
-        None => {
-            info!("no container exists for this devcontainer");
-            Ok(())
-        }
-    }
+    let existing = spec.backend.existing(rt)?;
+    Ok((spec, existing))
 }
 
-/// Removes the project's container, throwing away everything installed in it.
-/// The next `ldg up` creates a fresh one.
-pub fn remove(project_path: &Path, rt: &dyn Runtime) -> Result<()> {
-    let spec = load_spec(project_path, rt.target())?;
-    match spec.backend.existing(rt)? {
-        Some(id) => {
-            info!("removing {id}");
-            spec.backend.remove(rt)
-        }
-        None => {
-            info!("no container exists for this devcontainer");
-            Ok(())
-        }
-    }
+/// The project's container, if it has one.
+pub struct Found {
+    pub container: Box<dyn Container>,
+    /// `remoteUser`, the user sessions and hooks run as.
+    pub remote_user: Option<String>,
 }
 
-/// Prints the state of the project's container and whether its config has
-/// changed since it was created.
-pub fn status(project_path: &Path, rt: &dyn Runtime) -> Result<()> {
-    let spec = load_spec(project_path, rt.target())?;
-    info!("project    {}", project_path.display());
-    let Some(id) = spec.backend.existing(rt)? else {
-        info!("container  none (run `ldg up` to create it)");
-        return Ok(());
+/// Finds the container `ldg up` manages for this project.
+pub fn find(project_path: &Path, rt: &dyn Runtime) -> Result<Option<Found>> {
+    let (spec, existing) = locate(project_path, rt)?;
+    Ok(existing.map(|id| Found {
+        container: rt.container(&id),
+        remote_user: spec.remote_user,
+    }))
+}
+
+/// Stops the container `ldg up` manages for this project, if one exists, and
+/// returns its id. The container is kept so `ldg up` can resume it.
+pub fn stop(project_path: &Path, rt: &dyn Runtime) -> Result<Option<String>> {
+    let (_, existing) = locate(project_path, rt)?;
+    if let Some(id) = &existing {
+        rt.stop(id)?;
+    }
+    Ok(existing)
+}
+
+/// Removes the project's container (and compose project), throwing away
+/// everything installed in it, and returns its id.
+pub fn remove(project_path: &Path, rt: &dyn Runtime) -> Result<Option<String>> {
+    let (spec, existing) = locate(project_path, rt)?;
+    if existing.is_some() {
+        spec.backend.remove(rt)?;
+    }
+    Ok(existing)
+}
+
+/// Whether the config changed since the container was created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigState {
+    UpToDate,
+    Changed,
+    /// The container has no recorded config hash, or it could not be read.
+    Unknown,
+}
+
+/// The project's container, if it has one, and whether its config drifted.
+pub fn status(project_path: &Path, rt: &dyn Runtime) -> Result<Option<(Found, ConfigState)>> {
+    let (spec, existing) = locate(project_path, rt)?;
+    let Some(id) = existing else {
+        return Ok(None);
     };
     let container = rt.container(&id);
-    let name = container.name().unwrap_or_else(|| id.clone());
-    let state = if container.is_running() {
-        "running"
-    } else {
-        "stopped"
-    };
-    info!("container  {name} ({state})");
-
     let current = hash_inputs(&spec.config_path, &spec.hash_extra, rt.target())?;
-    let config = match read_hash(container.as_ref()) {
-        Some(stored) if stored == current => "up to date",
-        Some(_) => "changed since the container was created (`ldg up --build` recreates it)",
-        None => "unknown (the container has no recorded config)",
+    let state = match read_hash(container.as_ref()) {
+        Ok(Some(stored)) if stored == current => ConfigState::UpToDate,
+        Ok(Some(_)) => ConfigState::Changed,
+        Ok(None) => ConfigState::Unknown,
+        Err(e) => {
+            warning!("could not read the recorded config: {e:#}");
+            ConfigState::Unknown
+        }
     };
-    info!("config     {config}");
-    if let Some(id) = crate::inject::installed_bundle(container.as_ref()) {
-        info!("bundle     {id}");
-    }
-    let declared = crate::config::Config::load()?.secret;
-    if !declared.is_empty() && container.is_running() {
-        let present =
-            crate::secret::place::present_names(container.as_ref(), spec.remote_user.as_deref());
-        let shown: Vec<String> = declared
-            .iter()
-            .map(|d| {
-                let state = if present.contains(&d.name) {
-                    "placed"
-                } else {
-                    "not placed"
-                };
-                format!("{} ({state})", d.name)
-            })
-            .collect();
-        info!("secrets    {}", shown.join(", "));
-    }
-    Ok(())
+    let found = Found {
+        container,
+        remote_user: spec.remote_user,
+    };
+    Ok(Some((found, state)))
 }
 
-fn confirm(question: &str) -> Result<bool> {
-    if !io::stdin().is_terminal() {
-        note!(
-            "{question}\n(no TTY — keeping the existing container; \
-             re-run with `ldg up --build` to recreate)"
-        );
-        return Ok(false);
+/// Which optional host tools a project's devcontainer needs.
+pub struct Needs {
+    /// The config that was read.
+    pub config_path: std::path::PathBuf,
+    /// It uses `dockerComposeFile`.
+    pub compose: bool,
+    /// It uses features from a registry (so `oras`).
+    pub registry_features: bool,
+}
+
+/// What the devcontainer in `project_path` needs. An error when there is no
+/// config there, or it can't be read.
+pub fn needs(project_path: &Path, target: &Target) -> Result<Needs> {
+    let spec = load_spec(project_path, target)?;
+    Ok(Needs {
+        compose: spec.is_compose,
+        registry_features: spec
+            .features
+            .iter()
+            .any(|f| !features::is_local_ref(&f.reference)),
+        config_path: spec.config_path,
+    })
+}
+
+fn should_recreate(policy: Recreate, prompt: &dyn Prompt) -> bool {
+    let question = ".devcontainer changed since this container was created — recreate it? \
+                    (anything installed in it since will be lost)";
+    match policy {
+        Recreate::Yes => true,
+        Recreate::No => {
+            note!("{question}\n(keeping it: --no-recreate)");
+            false
+        }
+        Recreate::Ask => prompt.confirm_recreate(question),
     }
-    prompt!("[lodge] {question} [y/N] ");
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
-    let answer = line.trim().to_ascii_lowercase();
-    Ok(answer == "y" || answer == "yes")
 }

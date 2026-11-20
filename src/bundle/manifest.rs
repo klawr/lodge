@@ -10,8 +10,9 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
-use crate::elf::Arch;
+use crate::bundle::elf::Arch;
 use crate::fingerprint::content_hash;
+use crate::shell::{is_alias_name, is_plain_name};
 
 /// The bundle format this ldg writes and reads.
 pub const FORMAT: u32 = 1;
@@ -162,23 +163,6 @@ impl Manifest {
         }
         Ok(())
     }
-}
-
-/// A file name that is safe as one path component and in a script: letters,
-/// digits and `-_.+`, not `.` or `..`, not empty.
-pub fn is_plain_name(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 255
-        && s != "."
-        && s != ".."
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
-}
-
-fn is_alias_name(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 fn check_name(kind: &str, name: &str) -> Result<()> {

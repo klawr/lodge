@@ -16,6 +16,11 @@
 pub mod docker;
 #[cfg(test)]
 pub mod fake;
+mod user;
+
+#[cfg(test)]
+pub(crate) use user::PROBE_SCRIPT;
+pub use user::{ContainerUser, User};
 
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
@@ -25,26 +30,16 @@ use crate::shell::shell_quote;
 use crate::target::Target;
 use crate::tmpfile::TempFile;
 
-/// Where lodge keeps one-shot task markers inside an environment.
-const STATE_DIR: &str = "/opt/lodge/state";
-
 /// The `sh -c` script behind [`Env::write_secret`]: `$0` is the destination, the
 /// value arrives on stdin and `%MODE%` is replaced by an octal mode. Written to a
 /// sibling temp file under `umask 077`, then moved into place.
 pub const WRITE_SECRET_SCRIPT: &str = "umask 077; t=\"$0.tmp.$$\"; \
      { cat > \"$t\" && chmod %MODE% \"$t\" && mv -f \"$t\" \"$0\"; } || { rm -f \"$t\"; exit 1; }";
 
-/// Who a command runs as.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum User<'a> {
-    /// The environment's default user (a container's `USER`).
-    #[default]
-    Default,
-    /// uid 0, regardless of the default. lodge needs this for setup that writes
-    /// to root-owned locations (`/opt/lodge`, `/lodge`, `/etc/profile.d`).
-    Root,
-    Named(&'a str),
-}
+/// The `sh -c` script behind [`Env::read_file`]: `$0` is the path. Prints `y`
+/// and the contents, or `n` when there is no such file, and exits 0 either way,
+/// so a non-zero exit means the read itself failed.
+pub const READ_FILE_SCRIPT: &str = "if [ -f \"$0\" ]; then printf y; cat \"$0\"; else printf n; fi";
 
 /// How a command is run: as whom, from where, with what extra environment.
 #[derive(Debug, Default, Clone, Copy)]
@@ -87,26 +82,17 @@ pub trait Env {
     /// Copies the local file or directory `src` to `dest` inside the environment.
     fn cp_in(&self, src: &str, dest: &str) -> Result<()>;
 
-    /// Copies `src` from the environment to the local path `local_dst`.
-    fn cp_out(&self, src: &str, local_dst: &str) -> Result<()>;
-
     /// Writes `contents` to `dest` inside the environment with permission bits
-    /// `mode`, as `user` (`None` = the default user). The bytes travel on the command's **stdin**,
-    /// never in argv, so they show up in neither `ps` nor the `-v` trace (use this,
-    /// not `exec` with `-e K=V`, for anything secret). The file is created
+    /// `mode`, as `user`. The bytes travel on the command's **stdin**, never in
+    /// argv, so they show up in neither `ps` nor the `-v` trace (use this, not
+    /// `exec` with `-e K=V`, for anything secret). The file is created
     /// owner-only, so it is never readable at a looser mode, and replaced
     /// atomically. The parent directory must already exist.
-    fn write_secret(
-        &self,
-        dest: &str,
-        contents: &[u8],
-        mode: u32,
-        user: Option<&str>,
-    ) -> Result<()>;
+    fn write_secret(&self, dest: &str, contents: &[u8], mode: u32, user: User) -> Result<()>;
 
     /// A local shell command line that opens an interactive session in the
     /// environment, running `inner` (a `sh -c` script) as `user` from `workdir`.
-    fn interactive_command(&self, user: Option<&str>, workdir: &str, inner: &str) -> String;
+    fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> String;
 
     // ── provided, built on the above ───────────────────────────────────────
 
@@ -117,13 +103,13 @@ pub trait Env {
 
     /// Runs `argv` as the default user and returns stdout; errors on non-zero exit.
     fn exec_capture(&self, argv: &[&str]) -> Result<String> {
-        self.exec_capture_as(None, argv)
+        self.exec_capture_as(User::Default, argv)
     }
 
-    /// Like [`exec_capture`](Self::exec_capture) as `user` (`None` = default).
-    fn exec_capture_as(&self, user: Option<&str>, argv: &[&str]) -> Result<String> {
+    /// Like [`exec_capture`](Self::exec_capture) as `user`.
+    fn exec_capture_as(&self, user: User, argv: &[&str]) -> Result<String> {
         let opts = ExecOpts {
-            user: user.map_or(User::Default, User::Named),
+            user,
             ..ExecOpts::default()
         };
         let out = self.output(argv, &opts)?;
@@ -180,30 +166,20 @@ pub trait Env {
         self.cp_in(&tmp.path().to_string_lossy(), dest)
     }
 
-    /// True if the one-shot task `key` already completed here. Lets create-time
-    /// hooks and feature installs retry on a later run until they succeed.
-    fn task_done(&self, key: &str) -> bool {
-        self.path_exists(&task_marker(key))
+    /// The text of the file `path` (read as root), `None` if there is no such
+    /// file. An error means it could not be found out, which callers must not
+    /// mistake for "missing".
+    fn read_file(&self, path: &str) -> Result<Option<String>> {
+        let out = self.output(&["sh", "-c", READ_FILE_SCRIPT, path], &ExecOpts::root())?;
+        if !out.success {
+            bail!("reading {path} failed: {}", out.stderr.trim());
+        }
+        match out.stdout.split_at_checked(1) {
+            Some(("y", text)) => Ok(Some(text.to_string())),
+            Some(("n", _)) => Ok(None),
+            _ => bail!("reading {path} failed: unexpected output"),
+        }
     }
-
-    /// Records that the one-shot task `key` completed.
-    fn mark_task_done(&self, key: &str) -> Result<()> {
-        self.write_file(&task_marker(key), b"")
-    }
-}
-
-fn task_marker(key: &str) -> String {
-    let safe: String = key
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("{STATE_DIR}/{safe}")
 }
 
 /// An [`Env`] that can be inspected.
@@ -236,6 +212,16 @@ pub struct BuildSpec {
     pub tag: String,
 }
 
+/// A container found by [`Runtime::list_labeled`].
+#[derive(Debug, Clone)]
+pub struct Listed {
+    pub id: String,
+    pub name: String,
+    pub running: bool,
+    /// The value of the label that was asked for.
+    pub label: String,
+}
+
 /// A container engine.
 pub trait Runtime {
     /// Where the engine runs (and so where project files must be read).
@@ -246,6 +232,12 @@ pub trait Runtime {
 
     /// The engine's server version; errors if the engine can't be reached.
     fn version(&self) -> Result<String>;
+
+    /// The compose provider's version; errors if compose isn't available.
+    fn compose_version(&self) -> Result<String>;
+
+    /// Every container (running or stopped) that carries `label`.
+    fn list_labeled(&self, label: &str) -> Result<Vec<Listed>>;
 
     /// The id of the container (running or stopped) with exactly this name.
     fn find_by_name(&self, name: &str) -> Result<Option<String>>;
@@ -274,7 +266,7 @@ pub trait Runtime {
     /// `compose down` for the project: removes its containers and network.
     fn compose_down(&self, dir: &Path, project: &str, files: &[String]) -> Result<()>;
 
-    /// The first container id for `service`, or "" if there is none. With `all`,
+    /// The first container id for `service`, if there is one. With `all`,
     /// includes stopped containers.
     fn compose_ps(
         &self,
@@ -283,7 +275,7 @@ pub trait Runtime {
         files: &[String],
         service: &str,
         all: bool,
-    ) -> Result<String>;
+    ) -> Result<Option<String>>;
 }
 
 /// Connects to the container engine at `target`.
@@ -297,32 +289,14 @@ mod tests {
     use super::fake::FakeEnv;
 
     #[test]
-    fn task_markers_make_hooks_run_once() {
-        let env = FakeEnv::new();
-        assert!(!env.task_done("postCreate"));
-        env.mark_task_done("postCreate").unwrap();
-        assert!(env.task_done("postCreate"));
-        assert!(!env.task_done("onCreate"));
-    }
-
-    #[test]
-    fn task_keys_are_made_path_safe() {
-        let env = FakeEnv::new();
-        env.mark_task_done("ghcr.io/x/feat:1").unwrap();
-        assert!(env.file_exists("/opt/lodge/state/ghcr.io_x_feat_1"));
-    }
-
-    #[test]
-    fn write_file_stores_the_contents() {
+    fn write_file_makes_the_parent_as_root_and_copies_the_contents_in() {
         let env = FakeEnv::new();
         env.write_file("/a/b/c.txt", b"hi").unwrap();
         assert_eq!(env.file("/a/b/c.txt").unwrap(), "hi");
-    }
-
-    #[test]
-    fn a_marker_from_an_earlier_run_is_respected() {
-        let env = FakeEnv::new().with_file("/opt/lodge/state/onCreate", "");
-        assert!(env.task_done("onCreate"));
+        assert_eq!(
+            env.ran_as(&["mkdir", "-p", "/a/b"]),
+            Some(super::fake::Who::Root)
+        );
     }
 }
 
@@ -347,8 +321,8 @@ mod write_secret_script_tests {
 
     #[test]
     fn writes_bytes_with_the_mode_and_replaces_read_only_files() {
-        let dir = std::env::temp_dir().join(format!("lodge-ws-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = crate::tmpfile::TempDir::new("write-secret").unwrap();
+        let dir = tmp.path();
         let dest = dir.join("it's a 'token'");
         let dest = dest.to_str().unwrap();
         assert!(run(dest, 0o600, b"one\0two"));
@@ -366,8 +340,7 @@ mod write_secret_script_tests {
             0o400
         );
         // No leftovers; a missing directory fails cleanly.
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1);
         assert!(!run(dir.join("nope/x").to_str().unwrap(), 0o600, b"x"));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

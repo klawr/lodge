@@ -1,7 +1,7 @@
 //! Where a project lives: on this machine, or on a remote host reached over SSH.
 //!
 //! This is the single place that answers "local or remote?". Everything else
-//! takes a [`Target`] (or a [`Docker`](crate::docker::Docker), which holds one)
+//! takes a [`Target`] (or a [`Runtime`](crate::runtime::Runtime), which holds one)
 //! rather than a bare `--remote` string, so adding a new operation means
 //! handling the two cases once, here, instead of in every caller.
 
@@ -9,51 +9,7 @@ use anyhow::{Context, Result};
 
 use crate::output::warning;
 use std::path::Path;
-use std::process::{Command, ExitStatus, Output, Stdio};
-use std::time::{Duration, Instant};
-
-/// Runs `sh -c <script>` on *this* machine with no stdin, capturing stdout and
-/// letting stderr through to the terminal, and kills it after `timeout`.
-///
-/// For things that must come from the machine running lodge whatever the target
-/// is (secret sources such as `pass show x`); `Target::sh_output` runs on the
-/// project's host instead. The returned `Output` has an empty `stderr`.
-pub fn local_sh_capture(script: &str, timeout: Duration) -> Result<Output> {
-    use std::io::Read;
-    let mut cmd = Command::new("sh");
-    cmd.args(["-c", script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    crate::output::trace(&cmd);
-    let mut child = cmd.spawn().context("running sh")?;
-    let mut pipe = child.stdout.take().context("capturing stdout")?;
-    // Drain on a thread so a chatty child can't block on a full pipe.
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        pipe.read_to_end(&mut buf).ok();
-        buf
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait().context("waiting for command")? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            child.kill().ok();
-            child.wait().ok();
-            reader.join().ok();
-            anyhow::bail!("timed out after {}s", timeout.as_secs());
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let stdout = reader.join().unwrap_or_default();
-    Ok(Output {
-        status,
-        stdout,
-        stderr: Vec::new(),
-    })
-}
+use std::process::{Command, ExitStatus};
 
 /// A command to run on the project's host.
 pub enum HostCmd<'a> {
@@ -95,6 +51,7 @@ impl Target {
             Self::Local => {
                 let mut cmd = Command::new("sh");
                 cmd.args(["-c", script]);
+                crate::output::trace(&cmd);
                 cmd.output().context("running sh")
             }
             Self::Ssh(host) => crate::ssh::sh_output(host, script),
@@ -164,6 +121,60 @@ impl Target {
                 if let Err(e) = self.sh_output(&script) {
                     warning!("could not remove {path} on the remote host: {e:#}");
                 }
+            }
+        }
+    }
+
+    /// The contents of the file `path` on the project's host, or `None` if
+    /// there is no such file.
+    pub fn read_file(&self, path: &Path) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::Local => match std::fs::read(path) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+            },
+            Self::Ssh(host) => {
+                let q = crate::shell::shell_quote(&path.to_string_lossy());
+                // Exit 3 means "no such file", told apart from ssh's own failures.
+                let out = crate::ssh::sh_output(host, &format!("[ -f {q} ] || exit 3; cat {q}"))?;
+                match out.status.code() {
+                    Some(0) => Ok(Some(out.stdout)),
+                    Some(3) => Ok(None),
+                    _ => anyhow::bail!(
+                        "reading {} on {host} failed: {}",
+                        path.display(),
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Makes the directory `dir` on the project's host readable here. Locally
+    /// that is `dir` itself; remotely its contents are copied into `dest` (one
+    /// `tar` stream over ssh, unpacked in-process) and `dest` is returned.
+    pub fn fetch_dir(&self, dir: &Path, dest: &Path) -> Result<std::path::PathBuf> {
+        match self {
+            Self::Local => Ok(dir.to_path_buf()),
+            Self::Ssh(host) => {
+                let script = format!(
+                    "tar -C {} -cf - .",
+                    crate::shell::shell_quote(&dir.to_string_lossy())
+                );
+                let out = crate::ssh::sh_output(host, &script)?;
+                if !out.status.success() {
+                    anyhow::bail!(
+                        "reading {} on {host} failed: {}",
+                        dir.display(),
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                }
+                std::fs::create_dir_all(dest)?;
+                tar::Archive::new(out.stdout.as_slice())
+                    .unpack(dest)
+                    .with_context(|| format!("unpacking {} from {host}", dir.display()))?;
+                Ok(dest.to_path_buf())
             }
         }
     }

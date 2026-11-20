@@ -8,8 +8,8 @@ use anyhow::{Context, Result, bail};
 use std::io::{Read, Write};
 use std::path::Path;
 
+use super::hash::hash_path;
 use super::manifest::{BIN_DIR, CONFIG_DIR, LIB_DIR, MANIFEST_FILE, Manifest};
-use super::tree::hash_path;
 
 /// Writes the bundle directory `dir` (a manifest plus `bin/`, `lib/`, `config/`)
 /// as a tar.

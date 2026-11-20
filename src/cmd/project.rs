@@ -10,7 +10,7 @@ use std::time::Duration;
 use super::{Ctx, print_json};
 use crate::devcontainer::{self, ConfigState, Found};
 use crate::output::{info, line, note};
-use crate::runtime::Container;
+use crate::runtime::{Container, ContainerUser};
 
 /// The project's container, or an error saying there is none.
 fn require(ctx: &Ctx, path: Option<PathBuf>) -> Result<Found> {
@@ -44,13 +44,12 @@ pub fn rm(ctx: &Ctx, path: Option<PathBuf>) -> Result<()> {
 pub fn status(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<()> {
     let project = ctx.project(path)?;
     let config = ctx.config()?;
-    let status = devcontainer::status(&project, ctx.rt.as_ref())?;
-    let Some((found, state)) = status.found else {
+    let Some((found, state)) = devcontainer::status(&project, ctx.rt.as_ref())? else {
         if as_json {
             return print_json(&json!({ "project": project, "container": null }));
         }
-        info!("project    {}", project.display());
-        info!("container  none (run `ldg up` to create it)");
+        line!("project    {}", project.display());
+        line!("container  none (run `ldg up` to create it)");
         return Ok(());
     };
     let c = found.container.as_ref();
@@ -58,16 +57,20 @@ pub fn status(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<()> {
     let name = c.name().unwrap_or_else(|| c.id().to_string());
     let bundle = crate::inject::installed_bundle(c);
     // Which declared secrets are in place; only a running container can say.
-    let secrets: Vec<(String, bool)> = if running && !config.secret.is_empty() {
-        let present = crate::secret::place::present_names(c, found.remote_user.as_deref());
-        config
-            .secret
-            .iter()
-            .map(|d| (d.name.clone(), present.contains(&d.name)))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let user = running
+        .then(|| ContainerUser::resolve(c, found.remote_user.as_deref()).ok())
+        .flatten();
+    let secrets: Vec<(String, bool)> =
+        if let Some(user) = user.filter(|_| !config.secret.is_empty()) {
+            let present = crate::secret::place::present_names(c, &user);
+            config
+                .secret
+                .iter()
+                .map(|d| (d.name.clone(), present.contains(&d.name)))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
     if as_json {
         return print_json(&json!({
@@ -82,12 +85,12 @@ pub fn status(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<()> {
             },
         }));
     }
-    info!("project    {}", project.display());
-    info!(
+    line!("project    {}", project.display());
+    line!(
         "container  {name} ({})",
         if running { "running" } else { "stopped" }
     );
-    info!(
+    line!(
         "config     {}",
         match state {
             ConfigState::UpToDate => "up to date",
@@ -97,14 +100,14 @@ pub fn status(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<()> {
         }
     );
     if let Some(id) = bundle {
-        info!("bundle     {id}");
+        line!("bundle     {id}");
     }
     if !secrets.is_empty() {
         let shown: Vec<String> = secrets
             .iter()
             .map(|(n, placed)| format!("{n} ({})", if *placed { "placed" } else { "not placed" }))
             .collect();
-        info!("secrets    {}", shown.join(", "));
+        line!("secrets    {}", shown.join(", "));
     }
     Ok(())
 }

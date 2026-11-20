@@ -3,7 +3,7 @@
 
 use super::{SecretDecl, place, resolve};
 use crate::output::{info, note, warning};
-use crate::runtime::Container;
+use crate::runtime::{Container, ContainerUser};
 use anyhow::Result;
 
 /// The names this container's host answers to, for matching `targets`: `local`
@@ -32,10 +32,12 @@ pub fn host_names(ssh_host: Option<&str>) -> Vec<String> {
 /// blocking the session; the tool that needed it will say it is not logged in.
 pub fn deliver(
     container: &dyn Container,
-    user: Option<&str>,
+    user: &ContainerUser,
     decls: &[SecretDecl],
 ) -> Result<String> {
     if decls.is_empty() {
+        // Nothing declared (any more): take away whatever an earlier run placed.
+        place::clear(container, user)?;
         return Ok(String::new());
     }
     let hosts = host_names(container.target().ssh_host());

@@ -1,5 +1,26 @@
 //! POSIX shell quoting, shared by everything that builds a command line for
-//! `sh -c` or for ssh to hand to a remote login shell.
+//! `sh -c` or for ssh to hand to a remote login shell, and the rules for names
+//! that are written into scripts and paths unquoted.
+
+/// A name that is safe as one path component and in a script: letters, digits
+/// and `-_.+`, not `.` or `..`, not empty. Tool, library and terminal names.
+pub fn is_plain_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 255
+        && s != "."
+        && s != ".."
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+}
+
+/// A shell alias name (`alias <name>=…` is written unquoted): letters, digits,
+/// `_`, `-` and `.`, not starting with `-`.
+pub fn is_alias_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
 
 /// POSIX single-quote escaping: wrap in single quotes, and turn any embedded
 /// single quote into `'\''`. Safe for interpolation into an `sh -c`/SSH string.
@@ -30,7 +51,23 @@ fn which_in(name: &str, path_var: &std::ffi::OsStr) -> Option<std::path::PathBuf
 
 #[cfg(test)]
 mod tests {
-    use super::{shell_quote, which_in};
+    use super::{is_alias_name, is_plain_name, shell_quote, which_in};
+
+    #[test]
+    fn plain_names_cannot_climb_or_inject() {
+        assert!(is_plain_name("nvim") && is_plain_name("g++") && is_plain_name("libc.so.6"));
+        for bad in ["", ".", "..", "a/b", "../x", "a b", "x;y"] {
+            assert!(!is_plain_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn alias_names_cannot_look_like_options_or_syntax() {
+        assert!(is_alias_name("ll") && is_alias_name("g.st"));
+        for bad in ["", "-x", "rm -rf", "a;b", "a=b"] {
+            assert!(!is_alias_name(bad), "{bad:?}");
+        }
+    }
 
     #[test]
     fn finds_a_tool_that_is_on_the_path() {

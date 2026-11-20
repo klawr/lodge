@@ -10,27 +10,19 @@ use json_comments::StripComments;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use super::remote;
 use crate::fingerprint::{FNV_OFFSET, fnv1a};
 use crate::runtime::Env;
 use crate::target::Target;
 
-// Where the hash of the .devcontainer inputs is stored *inside* the container,
-// so we can tell on the next `ldg up` whether the config drifted since this
-// container instance was created. Living in the container means it survives
-// reboots and is discarded automatically when the container is recreated.
-const HASH_PATH: &str = "/opt/lodge/devcontainer.hash";
+use crate::layout::DEVCONTAINER_HASH as HASH_PATH;
 
-pub(super) fn read_hash(env: &dyn Env) -> Option<String> {
-    let tmp = std::env::temp_dir().join(format!("lodge-{}-dchash", std::process::id()));
-    let hash = env
-        .cp_out(HASH_PATH, &tmp.to_string_lossy())
-        .ok()
-        .and_then(|_| std::fs::read_to_string(&tmp).ok())
+/// The hash recorded in the container: `None` if it has none, an error if it
+/// could not be read (which must not be mistaken for drift).
+pub(super) fn read_hash(env: &dyn Env) -> Result<Option<String>> {
+    Ok(env
+        .read_file(HASH_PATH)?
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    crate::tmpfile::discard_file(&tmp);
-    hash
+        .filter(|s| !s.is_empty()))
 }
 
 pub(super) fn write_hash(env: &dyn Env, hash: &str) -> Result<()> {
@@ -39,38 +31,46 @@ pub(super) fn write_hash(env: &dyn Env, hash: &str) -> Result<()> {
 
 // ── change detection ───────────────────────────────────────────────────────────
 
-// Hashes the inputs that define the container. When the config lives in a
-// `.devcontainer/` directory we hash the whole directory (Dockerfile, compose
-// file, scripts, …); otherwise we hash the standalone config plus any `extra`
-// files the backend declares (e.g. compose files referenced from elsewhere).
+// Hashes the inputs that define the container: the whole `.devcontainer/`
+// directory when the config lives in one (Dockerfile, compose file, scripts, …),
+// otherwise the standalone config, plus any `extra` files the backend declares
+// (compose files kept elsewhere). The files are read from the project's host
+// (copied over ssh with `--remote`) and hashed here, so local and remote
+// projects get the same answer for the same files.
 pub(super) fn hash_inputs(
     config_path: &Path,
     extra: &[PathBuf],
     target: &Target,
 ) -> Result<String> {
-    if let Target::Ssh(host) = target {
-        return remote::hash_inputs(host, config_path, extra);
-    }
-
     let mut entries: Vec<(String, Vec<u8>)> = vec![];
     let devcontainer_dir = config_path
         .parent()
         .filter(|p| p.file_name() == Some(OsStr::new(".devcontainer")));
 
+    let mut files: Vec<PathBuf> = Vec::new();
+    // Kept alive until hashing is done: a remote directory is copied into it.
+    let scratch = crate::tmpfile::TempDir::new("dchash").context("creating a scratch folder")?;
     if let Some(root) = devcontainer_dir {
-        collect_dir(root, root, &mut entries)?;
+        let local = target.fetch_dir(root, &scratch.path().join("dir"))?;
+        collect_dir(&local, &local, &mut entries)?;
     } else {
-        let mut files = vec![config_path.to_path_buf()];
-        files.extend_from_slice(extra);
-        for f in files {
-            if let Ok(bytes) = std::fs::read(&f) {
-                let name = f
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned();
-                entries.push((name, normalize_for_hash(&f, bytes)));
-            }
+        files.push(config_path.to_path_buf());
+    }
+    // Extra files outside the hashed directory (inside it, they already count).
+    files.extend(
+        extra
+            .iter()
+            .map(|f| lexical(f))
+            .filter(|f| devcontainer_dir.is_none_or(|root| !f.starts_with(lexical(root)))),
+    );
+    for f in files {
+        if let Some(bytes) = target.read_file(&f)? {
+            let name = f
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            entries.push((name, normalize_for_hash(&f, bytes)));
         }
     }
 
@@ -130,17 +130,58 @@ fn collect_dir(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Res
     Ok(())
 }
 
-/// Short, stable tag derived from a project's path. Appended to container and
-/// session names so two projects that share a basename never collide.
-pub(super) fn path_tag(path: &Path) -> String {
-    let h = fnv1a(path.to_string_lossy().as_bytes(), FNV_OFFSET);
-    format!("{:06x}", h & 0xff_ffff)
+/// `path` with `.` and `dir/..` folded away, without touching the filesystem
+/// (it may be on another host): `/p/.devcontainer/../c.yml` is `/p/c.yml`.
+fn lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir if out.file_name().is_some() => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::fake::FakeEnv;
+
+    #[test]
+    fn paths_fold_lexically() {
+        assert_eq!(
+            lexical(Path::new("/p/.devcontainer/../c.yml")),
+            Path::new("/p/c.yml")
+        );
+        assert_eq!(lexical(Path::new("/p/./a/b")), Path::new("/p/a/b"));
+    }
+
+    #[test]
+    fn a_compose_file_outside_the_folder_counts_and_one_inside_counts_once() {
+        let tmp = crate::tmpfile::TempDir::new("hash-extra").unwrap();
+        let dc = tmp.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc).unwrap();
+        std::fs::write(dc.join("devcontainer.json"), "{}").unwrap();
+        std::fs::write(dc.join("compose.yml"), "a").unwrap();
+        std::fs::write(tmp.path().join("outside.yml"), "x").unwrap();
+        let config = dc.join("devcontainer.json");
+        let inside = [dc.join("compose.yml")];
+        let outside = [dc.join("../outside.yml")];
+        let none = hash_inputs(&config, &[], &Target::Local).unwrap();
+        assert_eq!(hash_inputs(&config, &inside, &Target::Local).unwrap(), none);
+        let with_outside = hash_inputs(&config, &outside, &Target::Local).unwrap();
+        assert_ne!(with_outside, none);
+        std::fs::write(tmp.path().join("outside.yml"), "y").unwrap();
+        assert_ne!(
+            hash_inputs(&config, &outside, &Target::Local).unwrap(),
+            with_outside
+        );
+    }
 
     #[test]
     fn hash_normalization_ignores_comments_and_formatting() {
@@ -173,8 +214,22 @@ mod tests {
     #[test]
     fn stored_hash_round_trips_through_the_environment() {
         let env = FakeEnv::new();
-        assert_eq!(read_hash(&env), None, "no hash before the first create");
+        assert_eq!(
+            read_hash(&env).unwrap(),
+            None,
+            "no hash before the first create"
+        );
         write_hash(&env, "00ff11ee22dd33cc").unwrap();
-        assert_eq!(read_hash(&env).as_deref(), Some("00ff11ee22dd33cc"));
+        assert_eq!(
+            read_hash(&env).unwrap().as_deref(),
+            Some("00ff11ee22dd33cc")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_hash_is_an_error_not_a_missing_one() {
+        let env =
+            FakeEnv::new().with_failure(&["sh", "-c", crate::runtime::READ_FILE_SCRIPT, HASH_PATH]);
+        assert!(read_hash(&env).is_err());
     }
 }

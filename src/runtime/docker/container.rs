@@ -139,23 +139,12 @@ impl Env for DockerContainer {
         self.copy_in(src, dest)
     }
 
-    /// `docker cp <id>:<src> <local_dst>`; see [`copy`](super::copy).
-    fn cp_out(&self, src: &str, local_dst: &str) -> Result<()> {
-        self.copy_out(src, local_dst)
-    }
-
-    fn write_secret(
-        &self,
-        dest: &str,
-        contents: &[u8],
-        mode: u32,
-        user: Option<&str>,
-    ) -> Result<()> {
+    fn write_secret(&self, dest: &str, contents: &[u8], mode: u32, user: User) -> Result<()> {
         use std::io::Write as _;
         let script = crate::runtime::WRITE_SECRET_SCRIPT.replace("%MODE%", &format!("{mode:o}"));
         // The value goes on stdin; argv carries only the script and the path.
         let opts = ExecOpts {
-            user: user.map_or(User::Default, User::Named),
+            user,
             ..ExecOpts::default()
         };
         let mut args = self.exec_args(&["sh", "-c", &script, dest], &opts);
@@ -177,10 +166,12 @@ impl Env for DockerContainer {
         written.context("sending secret to docker exec")
     }
 
-    fn interactive_command(&self, user: Option<&str>, workdir: &str, inner: &str) -> String {
+    fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> String {
         let mut exec = String::from("docker exec -it");
-        if let Some(u) = user {
-            exec.push_str(&format!(" -u {}", shell_quote(u)));
+        match user {
+            User::Default => {}
+            User::Root => exec.push_str(" -u 0"),
+            User::Named(u) => exec.push_str(&format!(" -u {}", shell_quote(u))),
         }
         exec.push_str(&format!(
             " --workdir {} {} sh -c {}",
@@ -232,16 +223,12 @@ impl Container for DockerContainer {
     }
 
     fn ip_address(&self) -> Option<String> {
-        // The exit status is ignored on purpose, as before the trait existed.
-        let out = self
-            .cli
-            .capture(&[
-                "inspect",
-                "--format",
-                "{{range .NetworkSettings.Networks}}{{.IPAddress}}\n{{end}}",
-                &self.id,
-            ])
-            .ok()?;
+        let out = self.cli.capture_ok(&[
+            "inspect",
+            "--format",
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}}\n{{end}}",
+            &self.id,
+        ])?;
         out.lines()
             .map(str::trim)
             .find(|s| !s.is_empty())

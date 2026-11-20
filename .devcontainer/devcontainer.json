@@ -4,5 +4,7 @@
   "service": "dev",
   "workspaceFolder": "/workspace",
   "remoteUser": "dev",
+  // The folder shared with the host engine at the same path (see compose.yaml).
+  "initializeCommand": "mkdir -p /tmp/lodge-dev",
   "postCreateCommand": "cargo fetch"
 }

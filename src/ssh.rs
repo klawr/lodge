@@ -1,3 +1,7 @@
+//! Everything about `ssh`: parsing a `--remote` destination, connection
+//! multiplexing, and the few ssh invocations lodge needs. Every ssh command is
+//! built from [`base`] here, so port, multiplexing and `-v` are applied once.
+
 use anyhow::Context as _;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -170,19 +174,13 @@ pub fn pty_denied(remote: &str) -> bool {
 /// `remote_command`, with a PTY forced (`-tt`). It is meant to be run by `sh -c`
 /// or a tmux pane, so it is a string rather than a [`Command`].
 pub fn interactive_line(remote: &str, remote_command: &str) -> String {
-    let (dest, port) = split(remote);
-    let mut line = String::from("ssh -tt");
-    if let Some(p) = port {
-        line.push_str(&format!(" -p {p}"));
+    let (mut cmd, dest) = base(remote);
+    cmd.arg("-tt").arg(dest).arg(remote_command);
+    let mut line = cmd.get_program().to_string_lossy().into_owned();
+    for a in cmd.get_args() {
+        line.push(' ');
+        line.push_str(&crate::shell::shell_quote(&a.to_string_lossy()));
     }
-    let v = crate::output::verbosity().min(3);
-    if v > 0 {
-        line.push_str(&format!(" -{}", "v".repeat(v as usize)));
-    }
-    line.push(' ');
-    line.push_str(&crate::shell::shell_quote(&dest));
-    line.push(' ');
-    line.push_str(&crate::shell::shell_quote(remote_command));
     line
 }
 
@@ -255,10 +253,13 @@ mod tests {
     }
 
     #[test]
-    fn the_interactive_line_forces_a_pty_and_quotes_the_command() {
-        assert_eq!(
-            interactive_line("user@host:2222", "docker exec -it c sh"),
-            "ssh -tt -p 2222 'user@host' 'docker exec -it c sh'"
+    fn the_interactive_line_forces_a_pty_reuses_the_connection_and_quotes_the_command() {
+        let line = interactive_line("user@host:2222", "docker exec -it c sh");
+        assert!(line.starts_with("ssh '-p' '2222' "), "{line}");
+        assert!(line.contains("'ControlMaster=auto'"), "{line}");
+        assert!(
+            line.ends_with(" '-tt' 'user@host' 'docker exec -it c sh'"),
+            "{line}"
         );
     }
 }

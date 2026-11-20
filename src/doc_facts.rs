@@ -1,4 +1,4 @@
-//! Facts the docs state that the code can check, so README and ARCHITECTURE
+//! Facts the docs state that the code can check, so the README and docs/architecture.md
 //! can't quietly drift from the code (as they did when bundles landed).
 //!
 //! Each test reads the docs from the checkout and compares them with the

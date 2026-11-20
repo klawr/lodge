@@ -30,6 +30,33 @@ pub(super) enum OneCmd {
     Exec(Vec<String>),
 }
 
+impl OneCmd {
+    /// The command to run; `None` for an empty argv, which runs nothing.
+    fn step(&self) -> Option<HostCmd<'_>> {
+        match self {
+            OneCmd::Shell(s) => Some(HostCmd::Shell(s)),
+            OneCmd::Exec(argv) if argv.is_empty() => None,
+            OneCmd::Exec(argv) => Some(HostCmd::Argv(argv)),
+        }
+    }
+}
+
+impl Cmd {
+    /// The commands this hook stands for, each with its name when the hook is
+    /// a named map. An empty argv runs nothing and is left out.
+    fn steps(&self) -> Vec<(Option<&str>, HostCmd<'_>)> {
+        match self {
+            Cmd::Shell(s) => vec![(None, HostCmd::Shell(s))],
+            Cmd::Exec(argv) if argv.is_empty() => vec![],
+            Cmd::Exec(argv) => vec![(None, HostCmd::Argv(argv))],
+            Cmd::Named(map) => map
+                .iter()
+                .filter_map(|(name, c)| Some((Some(name.as_str()), c.step()?)))
+                .collect(),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Lifecycle {
     pub(super) initialize: Option<Cmd>,
@@ -41,43 +68,71 @@ pub(super) struct Lifecycle {
 }
 
 // Writes containerEnv/remoteEnv to /etc/profile.d so login shells inherit it.
-// Lines are written verbatim (each shell-quoted for printf), so ${VAR}
-// references inside values expand when the profile is sourced.
 pub(super) fn write_env_profile(env: &dyn Env, vars: &BTreeMap<String, String>) -> Result<()> {
     if vars.is_empty() {
         return Ok(());
     }
+    write_profile(env, crate::layout::PROFILE_ENV, vars)
+}
+
+/// Writes `vars` as `export K=<value>` lines to the profile script at `path`.
+/// Values are quoted with [`quote_env_value`], so literals are safe and
+/// variable references still expand when the profile is sourced.
+pub(super) fn write_profile(
+    env: &dyn Env,
+    path: &str,
+    vars: &BTreeMap<String, String>,
+) -> Result<()> {
     let mut script = String::new();
     for (k, v) in vars {
         script.push_str(&format!("export {k}={}\n", quote_env_value(v)));
     }
-    env.write_file("/etc/profile.d/lodge-env.sh", script.as_bytes())
+    env.write_file(path, script.as_bytes())
 }
 
 // Renders an env value for a POSIX `export K=<value>` line. Literal runs are
 // shell-quoted so spaces and metacharacters (`code --wait`, `a;b`, `a'b`) are
-// safe, while `${VAR}` references are left bare so the login shell still expands
-// them — `normalize_env_value` deliberately rewrites `${containerEnv:X}` to
-// `${X}` for exactly that, so quoting the whole value would break it.
+// safe, while `${VAR}` and `$VAR` references are left bare so the login shell
+// still expands them — `normalize_env_value` deliberately rewrites
+// `${containerEnv:X}` to `${X}` for exactly that, and feature metadata writes
+// `PATH=/x/bin:$PATH`, so quoting the whole value would break both.
 fn quote_env_value(v: &str) -> String {
     let mut out = String::new();
+    let mut literal = String::new();
     let mut rest = v;
-    while let Some(start) = rest.find("${") {
-        match rest[start..].find('}') {
-            Some(end_rel) => {
-                let end = start + end_rel + 1; // include the closing '}'
-                if start > 0 {
-                    out.push_str(&crate::shell::shell_quote(&rest[..start]));
+    while let Some(start) = rest.find('$') {
+        let after = &rest[start + 1..];
+        let len = if after.starts_with('{') {
+            after.find('}').map(|end| end + 1)
+        } else {
+            let n = after
+                .char_indices()
+                .take_while(|&(i, c)| {
+                    c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
+                })
+                .count();
+            (n > 0).then_some(n)
+        };
+        match len {
+            Some(len) => {
+                literal.push_str(&rest[..start]);
+                if !literal.is_empty() {
+                    out.push_str(&crate::shell::shell_quote(&literal));
+                    literal.clear();
                 }
-                out.push_str(&rest[start..end]); // ${VAR} kept bare
-                rest = &rest[end..];
+                out.push_str(&rest[start..=start + len]); // the reference, bare
+                rest = &rest[start + 1 + len..];
             }
-            // No closing brace — treat the remainder as a literal.
-            None => break,
+            // A `$` that starts no reference is a literal.
+            None => {
+                literal.push_str(&rest[..=start]);
+                rest = after;
+            }
         }
     }
-    if !rest.is_empty() {
-        out.push_str(&crate::shell::shell_quote(rest));
+    literal.push_str(rest);
+    if !literal.is_empty() || out.is_empty() {
+        out.push_str(&crate::shell::shell_quote(&literal));
     }
     out
 }
@@ -92,47 +147,40 @@ pub(super) fn exec_env(env: &BTreeMap<String, String>) -> Vec<(String, String)> 
         .collect()
 }
 
-// Runs a lifecycle command inside the container, in the workspace folder, with
-// `env` exported. A failing command is reported but never aborts lodge. Returns
-// true only if every command succeeded (used to decide whether to mark the hook
-// done).
-pub(super) fn run_in_container(
-    env: &dyn Env,
-    workdir: &str,
-    vars: &[(String, String)],
-    label: &str,
-    cmd: &Cmd,
-) -> bool {
+/// Where and as whom container-side hooks run: the workspace folder, as
+/// `remoteUser` (the spec's user for lifecycle commands; `None` is the
+/// container's default user), with `containerEnv`/`remoteEnv` exported.
+pub(super) struct HookCtx<'a> {
+    pub workdir: &'a str,
+    pub user: Option<&'a str>,
+    pub vars: &'a [(String, String)],
+}
+
+// Runs a lifecycle command inside the container. A failing command is reported
+// but never aborts lodge. Returns true only if every command succeeded (used to
+// decide whether to mark the hook done).
+pub(super) fn run_in_container(env: &dyn Env, ctx: &HookCtx, label: &str, cmd: &Cmd) -> bool {
     info!("{label}");
     let opts = ExecOpts {
-        workdir: Some(workdir),
-        env: vars,
-        ..ExecOpts::default()
+        workdir: Some(ctx.workdir),
+        env: ctx.vars,
+        user: ctx.user.into(),
     };
-    let run = |argv: &[&str]| -> bool {
-        match env.exec(argv, &opts) {
-            Ok(()) => true,
-            Err(e) => {
-                warning!("{label} failed (continuing): {e}");
-                false
-            }
+    let mut ok = true;
+    for (name, step) in cmd.steps() {
+        if let Some(name) = name {
+            info!("  {name}");
         }
-    };
-    match cmd {
-        Cmd::Shell(s) => run(&["sh", "-c", s]),
-        Cmd::Exec(argv) => run(&argv.iter().map(String::as_str).collect::<Vec<_>>()),
-        Cmd::Named(map) => {
-            let mut ok = true;
-            for (name, one) in map {
-                info!("  {name}");
-                ok &= match one {
-                    OneCmd::Shell(s) => run(&["sh", "-c", s]),
-                    OneCmd::Exec(argv) => run(&argv.iter().map(String::as_str).collect::<Vec<_>>()),
-                };
-            }
-            ok
+        let argv: Vec<&str> = match step {
+            HostCmd::Shell(s) => vec!["sh", "-c", s],
+            HostCmd::Argv(argv) => argv.iter().map(String::as_str).collect(),
+        };
+        if let Err(e) = env.exec(&argv, &opts) {
+            warning!("{} failed (continuing): {e}", name.unwrap_or(label));
+            ok = false;
         }
     }
+    ok
 }
 
 // Runs initializeCommand on the host, with the .devcontainer dir as cwd. The
@@ -140,34 +188,15 @@ pub(super) fn run_in_container(
 // --remote — the remote host, over ssh (the dir doesn't exist locally there).
 pub(super) fn run_on_host(dir: &Path, label: &str, cmd: &Cmd, target: &Target) -> Result<()> {
     info!("{label} (host)");
-
-    let run_one = |what: &str, one: &OneCmd| -> Result<()> {
-        let host_cmd = match one {
-            OneCmd::Shell(script) => HostCmd::Shell(script),
-            OneCmd::Exec(argv) => HostCmd::Argv(argv),
-        };
-        if !target.run_in(dir, &host_cmd)?.success() {
-            bail!("{what} failed");
+    for (name, step) in cmd.steps() {
+        if let Some(name) = name {
+            info!("  {name}");
         }
-        Ok(())
-    };
-
-    match cmd {
-        Cmd::Shell(s) => run_one(label, &OneCmd::Shell(s.clone())),
-        Cmd::Exec(argv) if !argv.is_empty() => run_one(label, &OneCmd::Exec(argv.clone())),
-        Cmd::Exec(_) => Ok(()),
-        Cmd::Named(map) => {
-            for (name, one) in map {
-                info!("  {name}");
-                match one {
-                    OneCmd::Shell(_) => run_one(name, one)?,
-                    OneCmd::Exec(argv) if !argv.is_empty() => run_one(name, one)?,
-                    OneCmd::Exec(_) => {}
-                }
-            }
-            Ok(())
+        if !target.run_in(dir, &step)?.success() {
+            bail!("{} failed", name.unwrap_or(label));
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -192,6 +221,26 @@ mod tests {
     }
 
     #[test]
+    fn every_form_becomes_steps_and_empty_argv_runs_nothing() {
+        let cmd: Cmd =
+            serde_json::from_str(r#"{"a": "echo hi", "b": ["ls", "-l"], "c": []}"#).unwrap();
+        let steps = cmd.steps();
+        assert_eq!(steps.len(), 2);
+        assert!(matches!(steps[0], (Some("a"), HostCmd::Shell("echo hi"))));
+        assert!(matches!(steps[1], (Some("b"), HostCmd::Argv(a)) if a == ["ls", "-l"]));
+        assert!(Cmd::Exec(vec![]).steps().is_empty());
+
+        // In the container, too: an empty argv is not handed to the engine.
+        let env = FakeEnv::new();
+        let ctx = HookCtx {
+            workdir: "/w",
+            user: None,
+            vars: &[],
+        };
+        assert!(run_in_container(&env, &ctx, "x", &Cmd::Exec(vec![])));
+    }
+
+    #[test]
     fn quote_env_value_quotes_literals_but_expands_vars() {
         // Plain literals with spaces/metacharacters get single-quoted whole.
         assert_eq!(quote_env_value("code --wait"), "'code --wait'");
@@ -205,6 +254,12 @@ mod tests {
         assert_eq!(quote_env_value("pre ${X} post"), "'pre '${X}' post'");
         // A dangling ${ with no closing brace is treated as a literal.
         assert_eq!(quote_env_value("a${b"), "'a${b'");
+        // $VAR without braces, as feature metadata writes it.
+        assert_eq!(quote_env_value("/x/bin:$PATH"), "'/x/bin:'$PATH");
+        assert_eq!(quote_env_value("$A$B c"), "$A$B' c'");
+        // A `$` that starts no name is literal.
+        assert_eq!(quote_env_value("cost $5 or $"), "'cost $5 or $'");
+        assert_eq!(quote_env_value(""), "''");
     }
 
     #[test]

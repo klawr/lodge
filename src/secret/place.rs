@@ -14,10 +14,10 @@
 //! A file in the directory whose secret is no longer declared is removed, so
 //! dropping a `[[secret]]` takes effect without restarting the container.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use super::{As, Secret, SecretDecl};
-use crate::runtime::{Env, ExecOpts, User};
+use crate::runtime::{ContainerUser, Env, ExecOpts};
 use crate::shell::shell_quote;
 
 /// Mode of an `env` secret's file.
@@ -78,21 +78,14 @@ impl Placed {
 /// longer wanted. The caller has already decided these may go to this container.
 pub fn place(
     env: &dyn Env,
-    user: Option<&str>,
+    user: &ContainerUser,
     items: &[(&SecretDecl, &Secret)],
 ) -> Result<Placed> {
     let opts = ExecOpts {
-        user: user.map_or(User::Default, User::Named),
+        user: user.exec_as(),
         ..ExecOpts::default()
     };
-    let uid = env
-        .exec_capture_as(user, &["id", "-u"])
-        .context("finding the container user's uid")?;
-    let uid = uid.trim();
-    if uid.is_empty() || !uid.chars().all(|c| c.is_ascii_digit()) {
-        bail!("could not read the container user's uid (got {uid:?})");
-    }
-    let dir = format!("/dev/shm/lodge-secrets-{uid}");
+    let dir = secrets_dir(user);
 
     // Names are validated to [A-Za-z0-9_], so they are safe as arguments and as
     // shell variable names.
@@ -110,12 +103,12 @@ pub fn place(
         let stored = format!("{}/{}", placed.dir, decl.name);
         match &decl.as_ {
             As::Env => {
-                env.write_secret(&stored, value.expose(), ENV_MODE, user)
+                env.write_secret(&stored, value.expose(), ENV_MODE, user.exec_as())
                     .with_context(|| format!("placing secret {}", decl.name))?;
                 placed.env_names.push(decl.name.clone());
             }
             As::File { path, mode } => {
-                env.write_secret(&stored, value.expose(), *mode, user)
+                env.write_secret(&stored, value.expose(), *mode, user.exec_as())
                     .with_context(|| format!("placing secret {}", decl.name))?;
                 env.exec(&["sh", "-c", LINK_SCRIPT, "sh", path, &stored], &opts)
                     .with_context(|| format!("linking secret {} at {path}", decl.name))?;
@@ -126,12 +119,27 @@ pub fn place(
     Ok(placed)
 }
 
+fn secrets_dir(user: &ContainerUser) -> String {
+    crate::layout::secrets_dir(&user.uid.to_string())
+}
+
+/// Removes every secret placed for `user`. Cheaper than [`place`] with nothing to
+/// place, which would first create the directory.
+pub fn clear(env: &dyn Env, user: &ContainerUser) -> Result<()> {
+    let opts = ExecOpts {
+        user: user.exec_as(),
+        ..ExecOpts::default()
+    };
+    env.exec(&["rm", "-rf", &secrets_dir(user)], &opts)
+        .context("removing placed secrets")
+}
+
 /// Names of the secrets currently placed for `user`: what `ldg status` reports.
 /// Reads the directory listing only, never a value.
-pub fn present_names(env: &dyn Env, user: Option<&str>) -> Vec<String> {
-    let script = "ls -1 /dev/shm/lodge-secrets-$(id -u) 2>/dev/null";
+pub fn present_names(env: &dyn Env, user: &ContainerUser) -> Vec<String> {
+    let script = format!("ls -1 {} 2>/dev/null", shell_quote(&secrets_dir(user)));
     let out = env
-        .exec_capture_as(user, &["sh", "-c", script])
+        .exec_capture_as(user.exec_as(), &["sh", "-c", &script])
         .unwrap_or_default();
     out.lines()
         .map(|l| l.trim().to_string())
@@ -143,14 +151,24 @@ pub fn present_names(env: &dyn Env, user: Option<&str>) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::runtime::fake::FakeEnv;
-    use crate::secret::From;
+    use crate::secret::Source;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
+
+    fn dev() -> ContainerUser {
+        ContainerUser {
+            requested: Some("dev".into()),
+            name: "dev".into(),
+            uid: 1000,
+            gid: 1000,
+            home: "/home/dev".into(),
+        }
+    }
 
     fn decl(name: &str, as_: As) -> SecretDecl {
         SecretDecl {
             name: name.into(),
-            from: From::Env("UNUSED".into()),
+            from: Source::Env("UNUSED".into()),
             as_,
             targets: vec![],
         }
@@ -158,7 +176,7 @@ mod tests {
 
     #[test]
     fn env_and_file_secrets_are_placed_under_the_users_shm_directory() {
-        let env = FakeEnv::new().with_output(&["id", "-u"], "1000\n");
+        let env = FakeEnv::new();
         let (a, b) = (
             decl("API_KEY", As::Env),
             decl(
@@ -173,7 +191,7 @@ mod tests {
             Secret::new(b"k-123".to_vec()),
             Secret::new(b"g-456".to_vec()),
         );
-        let placed = place(&env, Some("dev"), &[(&a, &va), (&b, &vb)]).unwrap();
+        let placed = place(&env, &dev(), &[(&a, &va), (&b, &vb)]).unwrap();
 
         let dir = "/dev/shm/lodge-secrets-1000";
         assert_eq!(
@@ -199,23 +217,24 @@ mod tests {
 
     #[test]
     fn nothing_to_place_still_prunes_and_exports_nothing() {
-        let env = FakeEnv::new().with_output(&["id", "-u"], "0\n");
-        let placed = place(&env, None, &[]).unwrap();
+        let env = FakeEnv::new();
+        let placed = place(&env, &ContainerUser::root(), &[]).unwrap();
         assert!(placed.session_setup().is_empty());
         assert!(env.ran_matching(|c| c.get(4).is_some_and(|d| d == "/dev/shm/lodge-secrets-0")));
     }
 
     #[test]
     fn present_names_lists_the_directory() {
-        let script = "ls -1 /dev/shm/lodge-secrets-$(id -u) 2>/dev/null";
+        let script = "ls -1 '/dev/shm/lodge-secrets-1000' 2>/dev/null";
         let env = FakeEnv::new().with_output(&["sh", "-c", script], "A\nB\n");
-        assert_eq!(present_names(&env, None), ["A", "B"]);
+        assert_eq!(present_names(&env, &dev()), ["A", "B"]);
     }
 
     #[test]
-    fn a_bad_uid_is_an_error() {
-        let env = FakeEnv::new().with_output(&["id", "-u"], "root\n");
-        assert!(place(&env, None, &[]).is_err());
+    fn clearing_removes_the_users_secrets_directory() {
+        let env = FakeEnv::new();
+        clear(&env, &dev()).unwrap();
+        assert!(env.ran(&["rm", "-rf", "/dev/shm/lodge-secrets-1000"]));
     }
 
     // The scripts, run for real against a temp directory.
@@ -232,11 +251,11 @@ mod tests {
 
     #[test]
     fn the_prepare_script_makes_a_private_directory_and_prunes_old_files() {
-        let base = std::env::temp_dir().join(format!("lodge-place-{}", std::process::id()));
-        std::fs::create_dir_all(&base).unwrap();
+        let tmp = crate::tmpfile::TempDir::new("place").unwrap();
+        let base = tmp.path();
         let d = base.join("secrets");
         let d = d.to_str().unwrap();
-        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(base).unwrap();
         assert!(sh(PREPARE_SCRIPT, &[d, "KEEP"]));
         assert_eq!(
             std::fs::metadata(d).unwrap().permissions().mode() & 0o777,
@@ -249,15 +268,14 @@ mod tests {
         assert!(!std::path::Path::new(&format!("{d}/GONE")).exists());
         // A symlinked directory (planted in a shared /dev/shm) is refused.
         let link = base.join("planted");
-        std::os::unix::fs::symlink(&base, &link).unwrap();
+        std::os::unix::fs::symlink(base, &link).unwrap();
         assert!(!sh(PREPARE_SCRIPT, &[link.to_str().unwrap()]));
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
     fn the_link_script_replaces_files_but_not_directories() {
-        let base = std::env::temp_dir().join(format!("lodge-link-{}", std::process::id()));
-        std::fs::create_dir_all(&base).unwrap();
+        let tmp = crate::tmpfile::TempDir::new("link").unwrap();
+        let base = tmp.path();
         let target = base.join("stored");
         std::fs::write(&target, "v").unwrap();
         let target = target.to_str().unwrap();
@@ -289,6 +307,5 @@ mod tests {
             .unwrap()
             .success();
         assert!(ok && home.join(".tok").exists());
-        std::fs::remove_dir_all(&base).unwrap();
     }
 }

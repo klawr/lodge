@@ -1,36 +1,31 @@
 //! Getting a bundle ready to inject from.
 //!
 //! Injection reads only from a bundle *directory*: a manifest plus `bin/`, `lib/`
-//! and `config/`. This module produces one, from either source, and keeps it in a
-//! cache so work is not repeated:
+//! and `config/`. This module produces one, from either source, and keeps it in
+//! the [`cache`](super::cache) so work is not repeated:
 //!
 //! - a bundle **file** (`--bundle`, or `bundle = …` in the config) is extracted
 //!   once, keyed by the hash of the file;
 //! - otherwise the config is **packed live**, keyed by a fingerprint of everything
 //!   it depends on (the config entries, each source file's size and mtime, the
-//!   libraries `ldd` finds). If nothing changed, the cached bundle is reused and
-//!   neither `ldd` nor `patchelf` runs again.
+//!   libraries `ldd` finds). Working out that fingerprint runs `ldd`; if it is
+//!   unchanged the cached bundle is reused and nothing is copied or relinked
+//!   (`patchelf` does not run).
 //!
 //! So the live path and the bundle-file path end in the same place, and there is a
 //! single injector.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
-use super::manifest::{BIN_DIR, CONFIG_DIR, FORMAT, LIB_DIR, MANIFEST_FILE, Manifest};
-use super::tree::hash_path;
-use super::{archive, pack};
+use super::hash::hash_path;
+use super::manifest::{BIN_DIR, CONFIG_DIR, FORMAT, LIB_DIR, Manifest};
+use super::{archive, cache, deps, pack};
+use crate::bundle::elf::Arch;
 use crate::config::Config;
-use crate::deps;
-use crate::elf::Arch;
 use crate::fingerprint::{FNV_OFFSET, fnv1a};
 use crate::output::{info, warning};
-use crate::tmpfile::{TempDir, discard_dir};
-
-/// How many cached bundles to keep (the most recently used).
-const KEEP: usize = 4;
 
 /// A bundle directory ready to inject from.
 pub struct Prepared {
@@ -66,15 +61,10 @@ impl Prepared {
 /// Readies the bundle to inject from: `file` if given, else the config's
 /// `bundle`, else a live pack of the config.
 pub fn prepare(config: &Config, file: Option<&Path>) -> Result<Prepared> {
-    let root = dirs::cache_dir()
-        .context("this system has no cache directory")?
-        .join("lodge")
-        .join("bundles");
-    prepare_in(&root, config, file)
+    prepare_in(&cache::root()?, config, file)
 }
 
 pub(crate) fn prepare_in(root: &Path, config: &Config, file: Option<&Path>) -> Result<Prepared> {
-    std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
     let explicit = file
         .map(Path::to_path_buf)
         .or_else(|| config.bundle.clone());
@@ -87,7 +77,7 @@ pub(crate) fn prepare_in(root: &Path, config: &Config, file: Option<&Path>) -> R
         }
         None => live(root, config)?,
     };
-    prune(root, &prepared.dir);
+    cache::prune(root, &prepared.dir);
 
     let how = match prepared.origin {
         Origin::Cached => "cached",
@@ -99,106 +89,44 @@ pub(crate) fn prepare_in(root: &Path, config: &Config, file: Option<&Path>) -> R
 }
 
 fn from_file(root: &Path, file: &Path) -> Result<Prepared> {
-    let key = format!("f-{}", hash_path(file)?);
-    let dir = root.join(&key);
-    if let Some(manifest) = load_cached(&dir) {
+    let dir = root.join(format!("f-{}", hash_path(file)?));
+    if let Some(manifest) = cache::load(&dir) {
         return Ok(Prepared {
             dir,
             manifest,
             origin: Origin::Cached,
         });
     }
-    let staging = TempDir::new_in(root, "extract")?;
+    let staging = cache::staging(root, "extract")?;
     let manifest = archive::extract(file, staging.path())?;
-    let dir = install(staging, &dir)?;
     Ok(Prepared {
-        dir,
+        dir: cache::install(staging, &dir)?,
         manifest,
         origin: Origin::Extracted,
     })
 }
 
 fn live(root: &Path, config: &Config) -> Result<Prepared> {
-    let key = format!("p-{}", inputs_fingerprint(config)?);
-    let dir = root.join(&key);
-    if let Some(manifest) = load_cached(&dir) {
+    let dir = root.join(format!("p-{}", inputs_fingerprint(config)?));
+    if let Some(manifest) = cache::load(&dir) {
         return Ok(Prepared {
             dir,
             manifest,
             origin: Origin::Cached,
         });
     }
-    let staging = TempDir::new_in(root, "pack")?;
+    let staging = cache::staging(root, "pack")?;
     let manifest = pack::build(config, staging.path())?;
-    let dir = install(staging, &dir)?;
     Ok(Prepared {
-        dir,
+        dir: cache::install(staging, &dir)?,
         manifest,
         origin: Origin::Packed,
     })
 }
 
-/// The cached manifest in `dir`, marking the entry as recently used; `None` if
-/// there is no valid bundle there.
-fn load_cached(dir: &Path) -> Option<Manifest> {
-    let bytes = std::fs::read(dir.join(MANIFEST_FILE)).ok()?;
-    let manifest = Manifest::from_json(&bytes).ok()?;
-    touch(dir);
-    Some(manifest)
-}
-
-/// Moves a finished staging directory into place. Atomic, so a cache entry is
-/// either complete or absent. If a concurrent run got there first its copy is
-/// just as good.
-fn install(staging: TempDir, dir: &Path) -> Result<PathBuf> {
-    match std::fs::rename(staging.path(), dir) {
-        Ok(()) => Ok(dir.to_path_buf()),
-        Err(_) if dir.join(MANIFEST_FILE).exists() => Ok(dir.to_path_buf()),
-        Err(e) => Err(e).with_context(|| format!("saving the bundle to {}", dir.display())),
-    }
-}
-
-#[allow(
-    clippy::let_underscore_must_use,
-    reason = "recency is only a pruning hint"
-)]
-fn touch(dir: &Path) {
-    if let Ok(handle) = std::fs::File::open(dir) {
-        let _ = handle.set_modified(SystemTime::now());
-    }
-}
-
-/// Removes the least recently used cache entries beyond [`KEEP`], and staging
-/// directories left behind by a crashed run. `keep` is never removed.
-fn prune(root: &Path, keep: &Path) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    let mut cached = Vec::new();
-    for entry in entries.filter_map(std::result::Result::ok) {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let modified = entry.metadata().and_then(|m| m.modified()).ok();
-        if name.starts_with("f-") || name.starts_with("p-") {
-            cached.push((modified, entry.path()));
-        } else if name.starts_with("lodge-")
-            && modified
-                .and_then(|m| m.elapsed().ok())
-                .is_some_and(|age| age.as_secs() > 3600)
-        {
-            discard_dir(&entry.path());
-        }
-    }
-    cached.sort_by_key(|entry| std::cmp::Reverse(entry.0)); // newest first
-    for (_, path) in cached.into_iter().skip(KEEP) {
-        if path != keep {
-            discard_dir(&path);
-        }
-    }
-}
-
 /// A fingerprint of everything a live pack depends on. Packing is skipped when it
 /// is unchanged.
-pub(crate) fn inputs_fingerprint(config: &Config) -> Result<String> {
+fn inputs_fingerprint(config: &Config) -> Result<String> {
     let mut h = FNV_OFFSET;
     let mut put = |data: &str| {
         h = fnv1a(data.as_bytes(), h);
@@ -242,6 +170,7 @@ pub(crate) fn inputs_fingerprint(config: &Config) -> Result<String> {
 
 /// `path size mtime mode`, following symlinks to the file that is really used.
 fn stat_line(path: &Path) -> Result<String> {
+    use anyhow::Context as _;
     let real =
         std::fs::canonicalize(path).with_context(|| format!("reading {}", path.display()))?;
     let meta = std::fs::metadata(&real)?;
@@ -258,12 +187,14 @@ fn stat_line(path: &Path) -> Result<String> {
 /// Adds one line per entry of the tree at `root` (by name order): enough to notice
 /// that anything under it changed without reading file contents.
 fn stat_tree(root: &Path, out: &mut Vec<String>) -> Result<()> {
+    use anyhow::Context as _;
     let real = std::fs::canonicalize(root)
         .with_context(|| format!("config path {} does not exist", root.display()))?;
     walk(&real, &real, out)
 }
 
 fn walk(root: &Path, path: &Path, out: &mut Vec<String>) -> Result<()> {
+    use anyhow::Context as _;
     let meta =
         std::fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
     let relative = path
@@ -299,6 +230,7 @@ fn walk(root: &Path, path: &Path, out: &mut Vec<String>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::Injectable;
+    use crate::tmpfile::TempDir;
 
     fn script_tool(dir: &Path, name: &str, body: &str) -> Injectable {
         let bin = dir.join(format!("{name}-src"));
@@ -317,7 +249,7 @@ mod tests {
     fn config(inject: Vec<Injectable>) -> Config {
         Config {
             inject,
-            ..Config::for_tests()
+            ..Config::default()
         }
     }
 
@@ -434,11 +366,26 @@ mod tests {
     }
 
     #[test]
+    fn the_cache_can_be_listed_and_cleared() {
+        let tmp = TempDir::new("cache-list").unwrap();
+        let root = tmp.path().join("bundles");
+        let script = script_tool(tmp.path(), "hello", "echo hi");
+        prepare_in(&root, &config(vec![script]), None).unwrap();
+        let entries = cache::entries(&root);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].manifest.is_some());
+        assert!(entries[0].size > 0);
+        let (n, size) = cache::clear(&root);
+        assert_eq!((n, size > 0), (1, true));
+        assert!(cache::entries(&root).is_empty());
+    }
+
+    #[test]
     fn only_the_most_recently_used_bundles_are_kept() {
         let work = TempDir::new("src6").unwrap();
         let cache = TempDir::new("cache6").unwrap();
         let mut last = None;
-        for i in 0..(KEEP + 2) {
+        for i in 0..(cache::KEEP + 2) {
             let cfg = config(vec![script_tool(
                 work.path(),
                 "t",
@@ -448,7 +395,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let kept = std::fs::read_dir(cache.path()).unwrap().count();
-        assert_eq!(kept, KEEP);
+        assert_eq!(kept, cache::KEEP);
         assert!(
             last.unwrap().dir.exists(),
             "the bundle in use must survive pruning"

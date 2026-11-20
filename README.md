@@ -2,420 +2,147 @@
 
 **Inject your environment into any container.**
 
-`lodge` (command: `ldg`) copies your personal tools (editor, shell utilities, …) — together with
-the shared libraries they need — into a running Docker container and drops you
-into a shell inside it. You get your toolchain in someone else's image without
-rebuilding it, and **without** requiring your tools to be compatible with the
-container's (often much older) glibc.
+`lodge` (command: `ldg`) copies your personal tools (editor, shell utilities, AI
+CLIs, …), together with the shared libraries they need, into a running
+container and drops you into a shell inside it. You get your toolchain in
+someone else's image without rebuilding it, and **without** requiring your
+tools to be compatible with the container's (often much older) glibc.
 
 It also doubles as a lightweight [devcontainer](https://containers.dev) runner:
 `ldg up` starts a project's `.devcontainer`, honors its lifecycle hooks and
-features, then injects your environment on top.
-
-```sh
-ldg up                        # find the devcontainer config, start it, inject your environment, open a shell
-ldg up ./some/project         # same, for a specific project path
-ldg up --build                # force-rebuild images and recreate the container
-ldg down                      # stop the project's container (resume later with `ldg up`)
-ldg status                    # show the project's container and whether its config changed
-ldg rm                        # remove the project's container (next `ldg up` creates a fresh one)
-ldg doctor                    # check the host: engine, helper tools, config, listed binaries
-ldg pack                      # pack your tools and configs into a portable bundle (lodge-<arch>.tar)
-ldg up --bundle lodge.tar     # inject from a bundle file instead of packing your config
-ldg bundle inspect lodge.tar  # show what a bundle contains
-ldg bundle verify lodge.tar   # check a bundle is intact (for example after copying it)
-ldg exec my-container         # inject into an already-running container by name/id
-ldg up -r user@host           # operate against a remote Docker daemon over SSH
-ldg up -r myhost ./project    # remote via a Host alias from ~/.ssh/config
-ldg up -r user@host:2222      # remote on a non-standard SSH port
-ldg up -v                     # verbose: print every docker/ssh command lodge runs
-ldg --version                 # print the installed version
-```
-
-`-r/--remote` and `-v/--verbose` work on every subcommand. `--verbose` prints
-each `docker`/`ssh` command before it runs; repeating it (`-vv`, `-vvv`) passes
-matching `-v` flags to lodge's own ssh connections (config probe, port tunnels)
-for connection-level debugging.
+features, then injects your environment on top. No VS Code, no daemon, nothing
+added to the image.
 
 ## Install
-
-### From a release (prebuilt binary)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/klawr/lodge/master/install.sh | sh
 ```
 
-Downloads the latest static Linux binary into `~/.local/bin`. Overrides:
+Downloads the latest static Linux binary (x86_64 or aarch64) into
+`~/.local/bin`. Set `LODGE_BIN_DIR` to install elsewhere, or `LODGE_VERSION`
+(e.g. `v0.4.2`) to pin a version.
 
-| variable | default | meaning |
-| --- | --- | --- |
-| `LODGE_BIN_DIR` | `~/.local/bin` | install location |
-| `LODGE_VERSION` | latest | pin to e.g. `v0.1.0` |
+From source: `cargo install --git https://github.com/klawr/lodge`, or
+`make install` in a clone (`PREFIX=~/.local/bin` for a user install).
 
-### From source
-
-```sh
-cargo install --git https://github.com/klawr/lodge   # needs a Rust toolchain
-```
-
-Or from a clone:
+## Quickstart
 
 ```sh
-make install                    # installs to /usr/local/bin/ldg
-make install BINDIR=~/.local/bin  # install to a user-local bin directory
+ldg init          # write ~/.config/lodge/config.toml, with the tools found here filled in
+$EDITOR ~/.config/lodge/config.toml   # uncomment the tools you want
+ldg doctor        # check the host and the config
+cd my-project     # a project with a .devcontainer
+ldg up            # start it, inject your tools, open a shell
 ```
+
+Inside, your editor and tools run as if they were installed in the image. Leave
+the shell and come back with `ldg up` again; the container, and everything
+installed in it, is kept until you `ldg rm` it.
+
+No devcontainer? `ldg exec <container>` injects into any running container.
+
+Shell completions: `ldg completions bash|zsh|fish` (see `ldg completions --help`
+for where to put them). Man page: `ldg man | man -l -`.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `ldg up [PATH]` | Start the project's devcontainer, inject your environment, open a shell. `--build` rebuilds; `--yes` / `--no-recreate` answer the "config changed" question; `--no-attach` sets up without a shell. |
+| `ldg exec CONTAINER` | Inject into an already-running container and open a shell (`-u USER`, `-w DIR`). |
+| `ldg down [PATH]` | Stop the project's container (resume later with `ldg up`). |
+| `ldg rm [PATH]` | Remove the project's container (the next `ldg up` starts fresh). |
+| `ldg status [PATH]` | The container's state, whether its config changed, the injected bundle, placed secrets. |
+| `ldg ls` | Every container lodge created, across projects. |
+| `ldg ports [PATH]` | The ports forwarded to this machine for the project's container. |
+| `ldg logs [PATH]` | The port-forwarding log (`-f` to follow). |
+| `ldg clean [PATH]` | Remove what lodge injected from the container (configs are kept and listed). |
+| `ldg init` | Write a starting config (`--print` to see it first). |
+| `ldg doctor [PATH]` | Check the host, the config, and what the project's devcontainer needs. |
+| `ldg pack` | Pack your tools and configs into a portable bundle (`lodge-<arch>.tar`). |
+| `ldg bundle inspect\|verify FILE` | Show what a bundle holds; check it is intact. |
+| `ldg cache [clear]` | Show or clear the cache of prepared bundles. |
+| `ldg completions SHELL`, `ldg man` | Shell completions and the man page. |
+
+Global flags, on every command: `-r/--remote HOST` runs against a docker engine
+over SSH, `-c/--config FILE` uses another config file, and `-v/--verbose` prints
+every docker/ssh command lodge runs (`-vv`, `-vvv` add ssh's own debug output).
+`status`, `ls`, `ports` and `doctor` take `--json`.
 
 ## Requirements
 
 On the host:
 
-- `docker` (and `docker compose` for `ldg up`) — for local use. With
-  `--remote`, docker runs on the *remote* host instead; locally you only need
-  `ssh` (see [Remote containers](#remote-containers)).
-- `ldd` and `patchelf`, **only to pack** (to resolve and re-link your binaries). Injecting
-  from a bundle needs neither, so a bundle made on one Linux machine can be used from
-  any machine that can reach a container (see [Bundles](#bundles)).
-- `oras` (only if your devcontainer uses `features`)
-- `ssh` (only for `--remote`)
-- `tmux` is optional: without it the session opens directly (or set
-  `multiplexer = "none"` to say so explicitly)
+- `docker` with `docker compose` (for compose-based devcontainers). With
+  `--remote`, docker runs on the *remote* host and locally you only need `ssh`.
+- `ldd` and `patchelf`, **only to pack** your tools (that is, when your config
+  lists `[[inject]]` entries). Injecting from a bundle needs neither.
+- `oras`, only for devcontainer features from a registry.
+- `tmux` is optional: without it the session opens directly.
 
-`ldg doctor` checks all of this and says what each missing piece would break.
+`ldg doctor` checks all of this, and says what each missing piece would break.
 
-## Configuration
+## Documentation
 
-`lodge` reads `~/.config/lodge/config.toml` (or the file given with `-c`). If it doesn't exist, nothing is
-injected (you still get a shell).
+- [Configuration](docs/configuration.md): `config.toml`, every field, and the
+  JSON schema for editor completion.
+- [Devcontainers](docs/devcontainers.md): which parts of the spec lodge runs,
+  features, lifecycle hooks, change detection, port forwarding.
+- [Remote containers](docs/remote.md): `--remote` over SSH.
+- [Bundles and secrets](docs/bundles-and-secrets.md): carrying your setup to
+  other machines, and delivering API keys and logins without putting them in
+  a bundle.
+- [Troubleshooting](docs/troubleshooting.md): common problems and fixes.
+- [Architecture](docs/architecture.md): how the code is organised.
 
-```toml
-# Inject Neovim plus its runtime and plugins.
-[[inject]]
-name           = "nvim"
-binary         = "/usr/local/bin/nvim"     # host binary to copy in
-config         = "~/.config/nvim"          # host config dir/file to copy in
-target_binary  = "/usr/local/bin/nvim"     # where the wrapper goes (optional)
-target_config  = "/root/.config/nvim"      # where the config goes (optional)
-skip_if_exists = false                     # true: never replace it once it exists (default: false)
-copy_deps      = true                      # copy shared libs via ldd when packing (default: true)
+## How it works, briefly
 
-# Neovim needs its runtime at the compiled-in $VIMRUNTIME path.
-[[inject]]
-name          = "nvim-runtime"
-config        = "/usr/local/share/nvim/runtime"
-target_config = "/usr/local/share/nvim/runtime"
-
-# Ship installed plugins so the container uses your exact host versions instead
-# of re-cloning them at HEAD (which drifts into incompatible versions).
-[[inject]]
-name          = "nvim-plugins"
-config        = "/home/me/.local/share/nvim/lazy"
-target_config = "/root/.local/share/nvim/lazy"
-
-[session]
-shell       = "/bin/bash"   # shell launched inside the container (default)
-multiplexer = "tmux"        # "tmux" or "none" (default: "tmux")
-
-[git]
-# Registered as git `safe.directory` in the container, so git-backed tools
-# (lazy.nvim, gitsigns, …) don't trip over "detected dubious ownership" on the
-# host-owned workspace/plugins. Default: ["*"]; set [] to disable.
-safe_directories = ["*"]
-
-[aliases]
-# Written to /etc/profile.d/lodge.sh (login shells).
-ll = "ls -la"
-```
-
-### `[[inject]]` fields
-
-| field            | required | default                 | meaning                                                                       |
-| ---------------- | -------- | ----------------------- | ----------------------------------------------------------------------------- |
-| `name`           | yes      | —                       | identifier; used for default paths                                            |
-| `binary`         | no       | —                       | host path to a binary to inject                                               |
-| `config`         | no       | —                       | host path to a config file/dir to inject                                      |
-| `target_binary`  | no       | `/usr/local/bin/<name>` | wrapper location in the container                                             |
-| `target_config`  | no       | `/root/.config/<name>`  | config location in the container                                              |
-| `skip_if_exists` | no       | `false`                 | `true`: never replace it once present, even if the bundle changed (for a tree you update in the container yourself). `false`: replaced when the bundle changed, left alone when it did not |
-| `copy_deps`      | no       | `true`                  | copy shared-library dependencies via `ldd` when packing                       |
-
-## Devcontainer support
-
-`ldg up [PATH]` looks for the devcontainer config under the project path
-(default: current directory), in spec order:
-
-1. `PATH/.devcontainer/devcontainer.json`
-2. `PATH/.devcontainer.json`
-3. `PATH/.devcontainer/<folder>/devcontainer.json` (one level deep; with
-   several, the alphabetically first wins and a warning lists the choice)
-
-The config is JSONC and lodge supports a useful subset of the spec. All three
-project forms work:
-
-- **`dockerComposeFile`** + `service` — lodge drives `docker compose`, under a
-  project name derived from the project path (`-p lodge-<name>-<hash>`), so
-  two projects whose compose files both live in `.devcontainer/` don't collide
-  on compose's directory-derived project name.
-- **`image`** — lodge runs the image as a `sleep infinity` container with the
-  workspace bind-mounted (honoring `workspaceFolder`/`workspaceMount`, `mounts`,
-  and `runArgs`).
-- **`build`** / **`dockerFile`** — lodge builds the image (honoring `context`,
-  `dockerfile`, `target`, `args`) and runs it the same way.
-
-On top of that:
-
-- **Lifecycle hooks** — `initializeCommand` (host, before up), `onCreateCommand` /
-  `updateContentCommand` / `postCreateCommand` (in-container, once at creation),
-  `postStartCommand` (every up), and `postAttachCommand` (before the shell). All
-  three forms work: string (`sh -c`), array (argv), and object (named commands).
-  A failing hook is reported but never locks you out of the container.
-- **Features** — `features` are pulled with `oras` and their `install.sh` runs in
-  the container at create-time: options become env vars, `installsAfter` /
-  `overrideFeatureInstallOrder` ordering is honored, and `containerEnv` is written
-  to `/etc/profile.d` so login shells pick it up. lodge installs features *in the
-  container* rather than baking them into the image, so create-flag fields
-  (`mounts`, `privileged`, `capAdd`, `entrypoint`) can't be applied — they're
-  warned and skipped.
-- **Change detection** — if the container already exists, lodge compares the
-  current `.devcontainer/` contents (canonicalized JSON, so comments and
-  formatting don't count) against a hash recorded inside the container at
-  creation. If they differ it offers to recreate; otherwise it reuses the
-  container. `ldg up --build` forces a rebuild without prompting.
-- **Port forwarding** — `forwardPorts` entries are forwarded eagerly, from the
-  moment the container is up (connections just fail until the service starts
-  listening). This works even for minimal images where lodge can't inspect
-  listeners (no shell in the container). All entry forms are supported:
-  - `3000` / `"3000"` — local port 3000 → port 3000 of the primary container.
-  - `"db:5432"` — local port 5432 → port 5432 of host `db` on the container
-    network (e.g. another compose service). Resolved via DNS inside the
-    primary container, falling back to matching container names / compose
-    naming on the container's networks; if the service isn't up yet, lodge
-    keeps retrying and forwards once it appears.
-  - `"3000:8080"` — local port 3000 → port 8080 of the primary container
-    (docker `-p` style; a purely numeric prefix is read as a local port).
-
-  Beyond that, lodge watches `/proc/net/tcp` inside the running container and
-  dynamically forwards any port that starts listening to the same port on the
-  host (loopback-only listeners are skipped — they're unreachable from outside
-  the container). Forwarding uses a built-in TCP proxy locally or an `ssh -L`
-  tunnel when operating with `--remote`.
-
-## Remote containers
-
-`ldg up -r <dest>` (or `--remote`) runs the docker CLI *on the remote host*
-over SSH (`ssh <dest> docker …`), so **no local docker CLI is required** — only
-an `ssh` client (and `tar`, for copying your local environment in). The
-devcontainer config is read from the remote host, features are installed in the
-remote container, and port forwarding tunnels ports back to your local machine.
-
-The destination is anything your SSH client understands:
-
-- `user@host` — explicit user and host.
-- `myhost` — a `Host` alias from `~/.ssh/config`; its `User`, `Port`,
-  `IdentityFile`, etc. all apply.
-- `user@host:2222` — a non-standard SSH port (becomes `-p 2222`).
-
-Because docker runs remotely, `docker`/`docker compose`/`docker build` must be
-installed on the remote host (they don't need to exist locally). Your injected
-environment — binaries, their libraries, and config — lives locally and is
-streamed into the remote container over the SSH connection: directories are
-`tar`'d and unpacked by the remote daemon, individual files are piped straight
-in. That is why `tar` is needed locally for `--remote`.
-
-Connections must be non-interactive (key/agent auth); if something fails, run
-with `-v` to see each command and `-vv`/`-vvv` for ssh's own debug output.
-
-## Bundles
-
-Injection always works from a **bundle**: a plain tar holding your tools already
-relinked to a bundled glibc, their libraries, your configs, your aliases and git
-settings, and a manifest. Without any options, `ldg up` packs your config into a
-bundle itself and keeps it in `~/.cache/lodge/bundles/`. It is reused as long as
-nothing it depends on has changed (the config, each source file's size and mtime,
-the libraries `ldd` finds), so a repeated `up` neither runs `ldd` nor `patchelf`.
-
-To use your setup on a machine that isn't your Linux workstation, pack once and
-carry the file:
-
-```sh
-ldg pack -o lodge-x86_64.tar             # on the Linux/WSL machine: resolves, relinks, snapshots
-ldg bundle verify lodge-x86_64.tar       # after copying it somewhere
-ldg up --bundle lodge-x86_64.tar         # anywhere with a container runtime (or just ssh with -r)
-```
-
-or set `bundle = "~/lodge-x86_64.tar"` at the top of `config.toml`. A configured
-bundle replaces the `[[inject]]` entries on that machine; `[session]` stays local.
-
-A machine that only *uses* a bundle needs just the tar and a small config of its
-own: the `bundle =` line, `[session]`, and any `[[secret]]` (see below). Keep them
-in one folder and point lodge at it with `-c`:
-
-```toml
-# deploy/config.toml
-bundle = "bundle.tar"          # relative to this file's folder
-
-[session]
-multiplexer = "none"
-
-[[secret]]
-name = "ANTHROPIC_API_KEY"
-from = { env = "ANTHROPIC_API_KEY" }
-as   = "env"
-```
-```sh
-ldg -c deploy/config.toml --remote me@host:2222 up /devel/project
-```
-
-`-c` is global and replaces `~/.config/lodge/config.toml` for the run (the file
-must exist); `--bundle` on the command line still overrides the config's `bundle`.
-A bundle is for one CPU architecture and must match the container's. It can hold
-credentials if you list the wrong directory, so `pack` warns about `~/.ssh`,
-`~/.config/gh`, `~/.claude` and similar.
-
-## Secrets
-
-Things you want in the container but must **not** be in a bundle (an API key, a
-GitHub token, a credential file) are declared as `[[secret]]` in your local
-`config.toml`. A bundle is a shareable artifact; secrets never go into one. They
-are declared in the config of the machine you attach from, so they work the same
-with a live `ldg up` and with `--bundle lodge.tar` or `bundle = "…"`. Carry the
-tar to another machine together with a config holding its own `[[secret]]`
-entries (see [Bundles](#bundles)).
-
-```toml
-# A token from `pass`, as an environment variable in the session.
-[[secret]]
-name = "ANTHROPIC_API_KEY"
-from = { command = "pass show anthropic" }
-as   = "env"
-
-# The GitHub CLI's token, only for containers on one host.
-[[secret]]
-name    = "GH_TOKEN"
-from    = { command = "gh auth token" }
-as      = "env"
-targets = ["build-*"]
-
-# A credential file, placed where the tool looks for it.
-[[secret]]
-name = "claude_login"
-from = { file = "~/.claude/.credentials.json" }
-as   = { file = "~/.claude/.credentials.json", mode = "0600" }
-```
-
-| field     | required | meaning |
-| --------- | -------- | ------- |
-| `name`    | yes      | letters, digits and `_`; the variable name for `as = "env"`, otherwise just a label. Unique. |
-| `from`    | yes      | where the value comes from on **this** machine: exactly one of `{ env = "VAR" }`, `{ file = "path" }` or `{ command = "…" }` (stdout, trimmed; 30 s limit, stdin closed). |
-| `as`      | yes      | `"env"`, or `{ file = "/path/in/container", mode = "0600" }` (`~/` is the container user's home; `mode` defaults to `0600`). |
-| `targets` | no       | globs (`*`, `?`) matched against the container name and the host (`local`, or the `--remote` value and its host part). Omitted: any container. |
-
-How they are delivered, when you attach (`ldg up` and `ldg exec`, not with
-`--no-attach`):
-
-- The value is read on your machine and sent over the container command's
-  **stdin**, never as an argument, so it is in neither `ps` nor the `-v` trace.
-- It is stored under `/dev/shm/lodge-secrets-<uid>/`: memory only, owner-only,
-  never in an image layer, gone when the container stops.
-- An `env` secret is exported by the session start-up script, which reads it from
-  that file. A `file` secret is symlinked from the path you gave.
-- lodge prints secret *names*, never values. `ldg status` shows which declared
-  secrets are placed; `ldg doctor` checks that each source resolves.
-- A source that cannot be resolved is a warning; the session still opens.
-- Removing a `[[secret]]` removes its value on the next attach (but see below).
-
-lodge only delivers. Logging in, which credential a tool prefers, and refreshing
-tokens are the tool's business. In particular, if you declare an API key, a tool
-may use it in preference to a subscription login, so declare only what you want
-used.
-
-## How it works
-
-When packing, for each tool in your config, `lodge`:
-
-1. Resolves the binary's shared-library dependencies on the **host** with `ldd`,
-   including the dynamic linker (`ld-linux-*.so`), and puts them in the bundle.
-2. Uses `patchelf` to rewrite a copy of the binary so it runs **directly** against
-   the bundled glibc:
-   - `--set-interpreter /lodge/<ld>` — the bundled linker becomes the program interpreter.
-   - `--force-rpath --set-rpath /opt/lodge/lib` — the search path is baked in as
-     `DT_RPATH` (not `RUNPATH`), so it also resolves *transitive* deps.
-
-When injecting from a bundle, `lodge` copies the libraries into `/opt/lodge/lib/`
-(only those whose content changed) and the linker into `/lodge/`, copies each
-relinked binary to `/opt/lodge/bin/<name>`, and installs a thin wrapper at the
-target path that just `exec`s it. A hash is recorded per installed piece, so an
-unchanged tool is a no-op and a changed one is replaced.
-
-Baking the search path into the binary (rather than exporting `LD_LIBRARY_PATH`)
-gives two properties:
-
-- **Subprocesses are unaffected.** Tools the binary spawns — `git`, shells,
-  language servers — keep using the container's own glibc. An exported
-  `LD_LIBRARY_PATH` would poison them (`undefined symbol … GLIBC_PRIVATE`).
-- **`/proc/self/exe` stays correct.** Running directly (not via `ld.so <binary>`)
-  keeps `/proc/self/exe` pointing at the binary. Tools that re-exec themselves
-  need this — Neovim spawns its backend via `/proc/self/exe --embed`; under an
-  `ld.so` wrapper that path would be the linker and the TUI wouldn't start.
-
-Statically linked binaries are copied and run directly, with no patching. After
-injecting, `lodge` opens a per-container `tmux` session; run from *inside* tmux it
-`switch-client`s instead of nesting.
-
-The setup steps that write to root-owned locations (`/opt/lodge`, `/lodge`,
-`/etc/profile.d`, system wrappers) and feature install scripts run as root via
-`docker exec -u 0`, so injecting works even on images whose default `USER` is
-unprivileged. The interactive shell and devcontainer lifecycle hooks run as the
-container's normal user, so your environment and `$HOME` are the user's own.
+When packing, lodge resolves each binary's shared libraries with `ldd` and
+rewrites a copy with `patchelf` so it runs against a **bundled** glibc: the
+bundled dynamic linker becomes its interpreter and `/opt/lodge/lib` its
+`DT_RPATH`. Injecting copies that bundle into the container (`/opt/lodge`,
+`/lodge`) and puts a thin wrapper at the tool's usual path. Because the search
+path is baked into the binary rather than exported as `LD_LIBRARY_PATH`, the
+programs your tool starts (git, shells, language servers) keep using the
+container's own glibc, and `/proc/self/exe` stays correct for tools that
+re-exec themselves. Statically linked binaries are copied as they are.
 
 ## Limitations
 
-- An injected binary's libraries must all resolve on the packing machine; anything `ldd`
-  reports "not found" is skipped (with a warning) and may break the tool.
-- Host and container must share an architecture — injected binaries, glibc, and
-  compiled assets (treesitter parsers, Mason servers) are host binaries run
-  inside the container.
-- Host-built subprocesses the tool launches (e.g. a Mason language server) run
-  against the *container's* glibc. Injection fixes the tool, not everything it
-  shells out to — for LSPs, prefer letting the container provide the toolchain
-  (via a feature, or in the image itself).
-- A feature's `entrypoint` is ignored (lodge runs the container as `sleep
-  infinity`); its `mounts`/`privileged`/`capAdd`/`securityOpt`/`init` *are*
-  applied at creation.
-- Dynamic port forwarding requires the container's bridge IP to be reachable from
-  the host. This works on Linux with Docker Engine. Docker Desktop on macOS/Windows
-  doesn't expose container IPs directly, so forwarding doesn't reach the
-  container there; with `--remote` the `ssh -L` tunnel targets the IP from the
-  remote host, which works.
-
-- Secrets live in `/dev/shm`, so they last until the container stops, and a tmux
-  session outlives a detach. Removing *every* `[[secret]]` does not clear values
-  already placed (nothing runs when none are declared); removing some does. A tool
-  that refreshes a credential file may replace the symlink with a real file in the
-  home directory, which then stays on disk.
-- `/dev/shm` is 64 MB by default in Docker; enough for tokens, not for large files.
+- Host and container must share a CPU architecture: injected binaries and
+  compiled assets (treesitter parsers, Mason servers) are host binaries.
+- Programs an injected tool starts but that weren't injected themselves (say,
+  a Mason language server) run against the container's glibc. For language
+  servers, prefer letting the container provide the toolchain.
+- Libraries loaded at run time (`dlopen`, interpreters) are invisible to `ldd`;
+  list them as `[[inject]]` entries.
+- Dynamic port forwarding needs the container's bridge IP to be reachable from
+  the engine's host: Linux with Docker Engine, or any engine with `--remote`.
+  Docker Desktop on macOS/Windows doesn't expose container IPs.
 
 ## Roadmap
 
-- Full round-based feature install ordering (lodge does a simple topo sort today).
-- Support for other multiplexers.
-- Support for other container runtimes.
+- Podman as a second container runtime, then plain hosts with no runtime.
+- Devcontainer features without `oras` (a built-in OCI pull), and full
+  round-based install ordering (lodge does a simple topological sort today).
+- Change detection that ignores files generated by hooks.
+- Other multiplexers.
 
 ## Development
 
 ```sh
-cargo test                                  # unit tests (no Docker needed)
-make integration                            # the real binary against docker (needs docker + patchelf; ~15 s)
-cargo clippy --all-targets -- -D warnings   # lints
-cargo fmt --check                           # formatting
-cargo build --release
+make            # list the targets
+make check      # fmt, clippy -D warnings, unit tests (what CI gates on)
+make integration  # the real binary against docker (~30 s; needs docker, patchelf, tmux)
+make dev        # open this repo's own devcontainer with the ldg built from this tree
 ```
 
-`make check` runs the same fmt, clippy and test gate as CI.
-
-CI (`.github/workflows/ci.yml`) runs that gate plus a release build on every
-push/PR. On `master`, a release job derives the next version from conventional
-commits and `v*` tags with `git-cliff`, tags it, and attaches static musl
-binaries (`ldg-<target>.tar.gz`) to a GitHub release for `install.sh` to fetch.
-
-For a tour of the code (modules, the `ldg up` flow, what gets written where in a
-container, how `--remote` works) see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The repo's devcontainer has docker (through the host's socket) and patchelf, so
+`make integration` runs inside it too. CI (`.github/workflows/ci.yml`) runs the
+gate, the integration tests, the MSRV build, `cargo deny` and the static musl
+builds on every push and PR. Releases come from conventional
+commits through [release-please](https://github.com/googleapis/release-please):
+on `master` it keeps a release PR open with the next version, and merging it
+tags the release, attaches the binaries (`ldg-<target>.tar.gz`) to a draft and
+publishes it once they are all there.

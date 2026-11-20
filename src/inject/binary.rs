@@ -3,25 +3,24 @@
 
 use anyhow::{Result, bail};
 
-use super::LODGE_BIN;
-use super::config_files::resolve_home;
 use super::installed::{Decision, decide, record};
+use crate::bundle::elf::Arch;
 use crate::bundle::manifest::{Binary, Manifest, Tool};
 use crate::bundle::source::Prepared;
-use crate::elf::Arch;
+use crate::layout;
 use crate::output::info;
-use crate::runtime::Env;
+use crate::runtime::{ContainerUser, Env};
 
 pub(super) fn inject_binary(
     env: &dyn Env,
-    home: &str,
+    user: &ContainerUser,
     bundle: &Prepared,
     tool: &Tool,
     binary: &Binary,
 ) -> Result<()> {
     let name = &tool.name;
-    let installed = format!("{LODGE_BIN}/{name}");
-    let target = resolve_home(&binary.target, home);
+    let installed = format!("{}/{name}", layout::BIN);
+    let target = user.expand_home(&binary.target);
     let key = format!("{name}.bin");
 
     match decide(
@@ -50,7 +49,7 @@ pub(super) fn inject_binary(
     env.cp_in(&bundle.bin(name).to_string_lossy(), &installed)?;
     env.exec_root(&["chmod", "+x", &installed])?;
     install_wrapper(env, &installed, &target)?;
-    record(env, &key, &binary.hash)
+    record(env, &key, &binary.hash, &target)
 }
 
 // Refuses a bundle built for a different CPU than the container runs on: its
@@ -142,7 +141,14 @@ mod tests {
 
     fn inject(env: &FakeEnv, bundle: &Prepared) {
         let tool = &bundle.manifest.tools[0];
-        inject_binary(env, "/root", bundle, tool, tool.binary.as_ref().unwrap()).unwrap();
+        inject_binary(
+            env,
+            &ContainerUser::root(),
+            bundle,
+            tool,
+            tool.binary.as_ref().unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -172,7 +178,7 @@ mod tests {
         );
         assert_eq!(
             env.file("/opt/lodge/installed/hello.bin").unwrap().trim(),
-            "aaaaaaaaaaaaaaaa"
+            "aaaaaaaaaaaaaaaa\n/usr/local/bin/hello"
         );
     }
 

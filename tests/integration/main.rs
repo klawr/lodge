@@ -158,12 +158,14 @@ fn a_library_that_changed_on_the_host_is_refreshed() {
 
 #[test]
 #[ignore = "needs docker"]
-fn a_binary_for_another_architecture_is_refused() {
+fn packing_a_binary_for_another_architecture_than_this_machine_is_refused() {
     let sb = Sandbox::new();
     let p = sb.project("arch", &json(r#"{ "image": "@IMAGE@" }"#));
     p.up();
 
-    // An ELF header for the architecture the container is *not*.
+    // An ELF header for the architecture this machine (and so the local
+    // container) is *not*. The live pack refuses it before injecting; the
+    // container-side check is `a_bundle_for_another_architecture_is_refused`.
     let machine: [u8; 2] = if p.exec(&["uname", "-m"]) == "x86_64" {
         [0xB7, 0]
     } else {
@@ -254,14 +256,17 @@ fn container_settings_and_variables_reach_the_container() {
     p.up();
     let c = p.container();
 
-    assert_eq!(
-        docker(&[
-            "inspect",
-            &c,
-            "--format",
-            "{{.HostConfig.CapAdd}} {{.HostConfig.Init}}"
-        ]),
-        "[CAP_SYS_PTRACE] true"
+    // Newer docker CLIs normalise the capability to `CAP_SYS_PTRACE`, older
+    // ones (27) send it as written.
+    let settings = docker(&[
+        "inspect",
+        &c,
+        "--format",
+        "{{.HostConfig.CapAdd}} {{.HostConfig.Init}}",
+    ]);
+    assert!(
+        settings == "[CAP_SYS_PTRACE] true" || settings == "[SYS_PTRACE] true",
+        "{settings}"
     );
     let bindings = docker(&[
         "inspect",
@@ -835,5 +840,283 @@ fn secrets_are_added_on_the_machine_that_uses_a_tarred_bundle() {
         out.has("tool-ran-from-bundle"),
         "the bundle's tool was not injected:\n{}",
         out.tail(15)
+    );
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn hooks_and_feature_scripts_run_as_the_remote_user() {
+    let sb = Sandbox::new();
+    let p = sb.project(
+        "remoteuser",
+        &json(
+            r#"{ "image": "@IMAGE@",
+                 "remoteUser": "nobody",
+                 "updateRemoteUserUID": false,
+                 "features": { "./who": {} },
+                 "postCreateCommand": "id -un > /tmp/hook-user" }"#,
+        ),
+    );
+    p.write(
+        ".devcontainer/who/devcontainer-feature.json",
+        r#"{ "id": "who" }"#,
+    );
+    p.write(
+        ".devcontainer/who/install.sh",
+        "#!/bin/sh\necho \"$(id -un) $_REMOTE_USER $_REMOTE_USER_HOME\" > /tmp/feature-users\n",
+    );
+    p.up();
+
+    assert_eq!(
+        p.sh("cat /tmp/hook-user"),
+        "nobody",
+        "the hook ran as the wrong user"
+    );
+    // The script itself runs as root, and is told who the remote user is.
+    assert_eq!(p.sh("cat /tmp/feature-users"), "root nobody /nonexistent");
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn the_same_folder_is_the_same_container_however_it_is_spelled() {
+    let sb = Sandbox::new();
+    let p = sb.project("spelling", &json(r#"{ "image": "@IMAGE@" }"#));
+    p.up();
+    // The same folder through `..`: canonicalised, so no second container.
+    let dir = p.path();
+    let roundabout = dir.join("..").join(dir.file_name().expect("a folder name"));
+    let out = sb.run(&["up", "--no-attach", &roundabout.to_string_lossy()]);
+    assert!(out.ok, "{}", out.tail(10));
+    assert_eq!(p.containers().len(), 1, "a second container was created");
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn local_features_are_read_from_the_project_host_over_ssh() {
+    let mut sb = Sandbox::new();
+    sb.use_fake_ssh();
+    let p = sb
+        .project(
+            "remotefeature",
+            &json(r#"{ "image": "@IMAGE@", "features": { "./mine": {} } }"#),
+        )
+        .remote();
+    p.write(
+        ".devcontainer/mine/devcontainer-feature.json",
+        r#"{ "id": "mine" }"#,
+    );
+    p.write(
+        ".devcontainer/mine/install.sh",
+        "#!/bin/sh\necho installed > /tmp/feature-ran\n",
+    );
+    let out = p.ldg("-v", &["up", "--no-attach"]);
+    assert!(out.ok, "{}", out.tail(15));
+    assert_eq!(p.sh("cat /tmp/feature-ran"), "installed");
+    // Read through ssh (a tar stream from the project host), not from local disk.
+    assert!(
+        out.text
+            .lines()
+            .any(|l| l.starts_with("[lodge] $ ssh") && l.contains("tar -C")),
+        "the feature was not fetched over ssh:\n{}",
+        out.tail(30)
+    );
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn ls_status_ports_and_clean_describe_and_undo_what_up_did() {
+    require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
+    let sb = Sandbox::new();
+    sb.config(&inject_sh_config(false));
+    let port = free_port();
+    let p = sb.project(
+        "manage",
+        &json(&format!(
+            r#"{{ "image": "@IMAGE@", "forwardPorts": [{port}],
+                  "postCreateCommand": "true" }}"#
+        )),
+    );
+    p.up();
+    let path = p.path().to_string_lossy().into_owned();
+
+    // ls: labelled with the project, across projects.
+    let ls = sb.run(&["ls", "--json"]);
+    assert!(ls.ok, "{}", ls.tail(10));
+    let listed: serde_json::Value = serde_json::from_str(&ls.stdout).expect("ls --json");
+    assert!(
+        listed
+            .as_array()
+            .expect("an array")
+            .iter()
+            .any(|c| c["project"] == path.as_str() && c["running"] == true),
+        "{}",
+        ls.stdout
+    );
+
+    // status --json.
+    let status = p.ldg("status", &["--json"]);
+    let status: serde_json::Value = serde_json::from_str(&status.stdout).expect("status --json");
+    assert_eq!(status["container"]["running"], true);
+    assert_eq!(status["container"]["config"], "up_to_date");
+
+    // ports: the daemon reports the declared forward once it is up.
+    let mut shown = String::new();
+    for _ in 0..50 {
+        shown = p.ldg("ports", &[]).text;
+        if shown.contains(&format!("127.0.0.1:{port}")) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(shown.contains(&format!("127.0.0.1:{port}")), "{shown}");
+    assert!(p.ldg("logs", &[]).has("forwarding port"));
+
+    // clean: lodge's files and wrapper go, the devcontainer's state stays.
+    assert!(p.sh("test -x /usr/local/bin/hostsh && echo yes") == "yes");
+    // As an older ldg left it: the record has the hash but no path, so the
+    // wrapper must be found by looking.
+    p.sh("sed -i 2d /opt/lodge/installed/hostsh.bin");
+    let out = p.ldg("clean", &[]);
+    assert!(
+        out.ok && out.has("/usr/local/bin/hostsh"),
+        "{}",
+        out.tail(10)
+    );
+    assert_eq!(
+        p.sh("ls -d /opt/lodge/bin /lodge /usr/local/bin/hostsh 2>/dev/null | wc -l"),
+        "0"
+    );
+    assert_eq!(p.sh("ls /opt/lodge/state"), "postCreate");
+    assert!(p.ldg("status", &[]).has("up to date"));
+
+    // And the next `up` puts it back.
+    let again = p.up();
+    assert!(again.has("injecting hostsh binary"), "{}", again.tail(10));
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn a_typo_in_the_config_stops_before_anything_starts() {
+    let sb = Sandbox::new();
+    sb.config("[[inject]]\nname = \"x\"\nbinary = \"/bin/sh\"\nskip_if_exist = true\n");
+    let p = sb.project("typo", &json(r#"{ "image": "@IMAGE@" }"#));
+    let out = p.ldg("up", &["--no-attach"]);
+    assert!(!out.ok);
+    assert!(out.has("did you mean `skip_if_exists`?"), "{}", out.tail(5));
+    assert!(p.containers().is_empty(), "a container was created anyway");
+    let doctor = sb.run(&["doctor"]);
+    assert!(
+        !doctor.ok && doctor.has("MISSING   config"),
+        "{}",
+        doctor.tail(12)
+    );
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn init_writes_a_config_doctor_accepts_and_completions_and_man_render() {
+    let sb = Sandbox::new();
+    std::fs::remove_file(sb.root().join("config/lodge/config.toml")).expect("no config");
+    let out = sb.run(&["init"]);
+    assert!(out.ok, "{}", out.tail(5));
+    let written = std::fs::read_to_string(sb.root().join("config/lodge/config.toml")).unwrap();
+    assert!(written.starts_with("#:schema "));
+    assert!(!sb.run(&["init"]).ok, "init overwrote an existing config");
+    assert!(sb.run(&["init", "--force"]).ok);
+    let doctor = sb.run(&["doctor"]);
+    assert!(doctor.has("ok        config"), "{}", doctor.tail(12));
+
+    assert!(sb.run(&["completions", "bash"]).stdout.contains("_ldg"));
+    assert!(sb.run(&["man"]).stdout.contains(".TH ldg"));
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn a_tmux_session_runs_the_shell_in_the_container() {
+    require_tool("tmux", "apt install tmux / pacman -S tmux");
+    let sb = Sandbox::new();
+    sb.config_raw("[session]\nmultiplexer = \"tmux\"\n");
+    let p = sb.project("tmux", &json(r#"{ "image": "@IMAGE@" }"#));
+    let out = p.attach(&[], &[], "echo in-tmux > /tmp/tmux-proof; exit\n");
+    assert!(!out.has("tmux not found"), "the session did not use tmux");
+    assert!(out.ok, "ldg up failed:\n{}", out.tail(15));
+    assert_eq!(p.sh("cat /tmp/tmux-proof"), "in-tmux");
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn a_glibc_tool_runs_in_a_musl_container() {
+    require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
+    let sb = Sandbox::new();
+    sb.config(&inject_sh_config(false));
+    let p = sb.project(
+        "alpine",
+        r#"{ "image": "alpine:3", "remoteUser": "nobody", "updateRemoteUserUID": false,
+             "postCreateCommand": "id -un > /tmp/hook-user" }"#,
+    );
+    p.up();
+    // The host's (glibc) shell, with its bundled libraries, on busybox/musl.
+    assert_eq!(
+        p.exec(&["/usr/local/bin/hostsh", "-c", "echo glibc-on-musl"]),
+        "glibc-on-musl"
+    );
+    assert_eq!(p.sh("cat /tmp/hook-user"), "nobody");
+    assert!(p.ldg("status", &[]).has("up to date"));
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn remote_mode_works_against_a_real_ssh_server() {
+    let mut sb = Sandbox::new();
+    let host = sb.use_real_sshd();
+    let cfg = sb.root().join("cfg");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join("rc"), "hello over ssh").unwrap();
+    sb.config(&format!(
+        "[[inject]]\nname = \"cfg\"\nconfig = \"{}\"\ntarget_config = \"/root/.config/cfg\"\n",
+        cfg.display()
+    ));
+    let port = free_port();
+    let p = sb
+        .project(
+            "realssh",
+            &json(&format!(
+                r#"{{ // comments must not count as a change
+                      "image": "@IMAGE@", "forwardPorts": [{port}],
+                      "initializeCommand": "touch ../init-ran" }}"#
+            )),
+        )
+        .remote_via(host.dest());
+    p.up();
+
+    assert_eq!(p.sh("cat /root/.config/cfg/rc"), "hello over ssh");
+    assert!(
+        p.path().join("init-ran").exists(),
+        "initializeCommand did not run"
+    );
+    assert!(
+        p.ldg("status", &[]).has("up to date"),
+        "the hash differs over ssh"
+    );
+
+    // A comment-only edit is not a change, over ssh as locally.
+    let dc = p.path().join(".devcontainer/devcontainer.json");
+    let text = std::fs::read_to_string(&dc).unwrap();
+    std::fs::write(&dc, text.replace("comments must", "comments still must")).unwrap();
+    assert!(p.ldg("status", &[]).has("up to date"));
+
+    // The forward goes through an ssh -L tunnel.
+    let mut shown = String::new();
+    for _ in 0..80 {
+        shown = p.ldg("ports", &[]).text;
+        if shown.contains(&format!("127.0.0.1:{port}")) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(shown.contains(&format!("127.0.0.1:{port}")), "{shown}");
+    assert!(
+        !listeners(port).is_empty(),
+        "the tunnel isn't listening here"
     );
 }

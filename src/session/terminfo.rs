@@ -11,8 +11,8 @@ use std::path::PathBuf;
 
 use crate::runtime::Env;
 
-/// Where copied entries live inside the container.
-pub const CONTAINER_DIR: &str = "/opt/lodge/terminfo";
+// Where copied entries live inside the container.
+use crate::layout::TERMINFO as CONTAINER_DIR;
 
 /// What a session falls back to when the user's own terminal can't be used.
 const FALLBACK: &str = "xterm-256color";
@@ -21,14 +21,8 @@ const FALLBACK: &str = "xterm-256color";
 pub fn local_term() -> Option<String> {
     std::env::var("TERM")
         .ok()
-        .filter(|t| !t.is_empty() && t != "dumb" && is_plain_name(t))
-}
-
-/// Terminal names go into paths and shell scripts; accept only the characters
-/// real ones use.
-fn is_plain_name(t: &str) -> bool {
-    t.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '.'))
+        // The name goes into paths and shell scripts.
+        .filter(|t| t != "dumb" && crate::shell::is_plain_name(t))
 }
 
 /// The host's compiled terminfo file for `term`, as `(path relative to a
@@ -177,13 +171,6 @@ mod tests {
             Some("tmux-256color")
         );
         assert_eq!(session_term(&env, None), None);
-    }
-
-    #[test]
-    fn names_that_could_escape_a_path_or_script_are_refused() {
-        assert!(is_plain_name("xterm-256color"));
-        assert!(!is_plain_name("x;rm -rf /"));
-        assert!(!is_plain_name("../etc"));
     }
 
     #[test]

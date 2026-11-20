@@ -1,7 +1,7 @@
 //! One forward: the built-in TCP proxy (local engine) or an `ssh -L` tunnel
 //! (`--remote`).
 
-use std::net::{TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Stdio};
 use std::sync::{
     Arc,
@@ -24,7 +24,7 @@ impl Forwarder {
     /// `local<TAB>dest`, for the ports file.
     pub(super) fn describe(&self) -> String {
         match self {
-            Forwarder::Proxy(h) => format!("{}\t{}", h.local, h.target),
+            Forwarder::Proxy(h) => format!("{}\t{}", h.bound.port(), h.target),
             Forwarder::Ssh { local, dest, .. } => format!("{local}\t{dest}"),
         }
     }
@@ -80,14 +80,16 @@ impl Drop for Forwarder {
 
 pub(super) struct ProxyHandle {
     stop: Arc<AtomicBool>,
-    local: u16,
+    /// The address actually listened on: loopback only, never all interfaces.
+    bound: SocketAddr,
     target: String,
 }
 
 impl ProxyHandle {
     // `target` is "ip:port" as reachable from the Docker host.
     fn spawn(local: u16, target: String) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", local))?;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, local))?;
+        let bound = listener.local_addr()?;
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
@@ -110,14 +112,18 @@ impl ProxyHandle {
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(50));
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        // Report the proxy dead so the daemon replaces it.
+                        stop_thread.store(true, Ordering::Relaxed);
+                        break;
+                    }
                 }
             }
         });
 
         Ok(ProxyHandle {
             stop,
-            local,
+            bound,
             target: shown,
         })
     }
@@ -155,15 +161,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_proxy_listens_on_localhost_only() {
-        // Port 0 lets the OS pick; the point is the address family/interface.
-        let handle = ProxyHandle::spawn(0, "127.0.0.1:9".into());
-        // spawn() binds the requested port; with 0 it still binds loopback.
-        assert!(handle.is_ok());
-        let src = include_str!("tunnel.rs");
-        assert!(
-            !src.contains(concat!("bind(format!(\"0.0", ".0.0")),
-            "the proxy must not bind all interfaces"
-        );
+    fn the_proxy_listens_on_localhost_only_and_forwards() {
+        use std::io::{Read, Write};
+        // A server for the proxy to forward to.
+        let server = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let target = server.local_addr().unwrap().to_string();
+        let echo = std::thread::spawn(move || {
+            let (mut s, _) = server.accept().unwrap();
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).unwrap();
+            s.write_all(&buf).unwrap();
+        });
+
+        // Port 0 lets the OS pick; what matters is the interface.
+        let handle = ProxyHandle::spawn(0, target).unwrap();
+        assert!(handle.bound.ip().is_loopback(), "{}", handle.bound);
+
+        let mut client = TcpStream::connect(handle.bound).unwrap();
+        client.write_all(b"ping").unwrap();
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).unwrap();
+        assert_eq!(&back, b"ping");
+        echo.join().unwrap();
+        handle.stop.store(true, Ordering::Relaxed);
     }
 }

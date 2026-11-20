@@ -2,6 +2,8 @@
 name = "lodge-cli"
 version = "0.4.2"
 edition = "2024"
+# File::try_lock (forward daemon) needs 1.89. CI checks this version builds.
+rust-version = "1.89"
 description = "Inject your environment into any container; a lightweight devcontainer runner."
 license = "MIT"
 readme = "README.md"
@@ -14,6 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_mangen = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 json_comments = "0.2"
@@ -21,3 +25,6 @@ toml = "0.8"
 anyhow = "1"
 dirs = "5"
 tar = { version = "0.4", default-features = false }
+
+[dev-dependencies]
+schemars = "1"

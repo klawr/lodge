@@ -1,12 +1,16 @@
 //! Everything lodge says to the user, and the verbosity setting.
 //!
-//! Messages come in three kinds, each with a macro:
+//! Messages come in four kinds, each with a macro:
 //!
 //! - `info!`: progress, on stdout.
 //! - `warning!`: something went wrong but lodge carries on,
 //!   on stderr, prefixed `warning:`.
+//! - `error!`: why a command failed, on stderr, prefixed `error:`.
 //! - `note!`: a hint or the context of a question, on
 //!   stderr.
+//!
+//! Reports and lists (`status`, `ls`, `--json`) are program output and use
+//! `line!`, without the prefix.
 //!
 //! Every line carries the `[lodge]` prefix, including the continuation lines of
 //! a multi-line message, so call sites write plain text. Verbosity is set once
@@ -80,6 +84,11 @@ pub fn print_warn(args: fmt::Arguments) {
     emit(Stream::Err, "lodge", "warning: ", args);
 }
 
+/// Why lodge stopped: the error a command failed with.
+pub fn print_error(args: fmt::Arguments) {
+    emit(Stream::Err, "lodge", "error: ", args);
+}
+
 pub fn print_note(args: fmt::Arguments) {
     emit(Stream::Err, "lodge", "", args);
 }
@@ -98,6 +107,13 @@ pub fn print_line(args: fmt::Arguments) {
 /// A line of program output on stderr, without the prefix.
 pub fn print_line_err(args: fmt::Arguments) {
     let _ = writeln!(std::io::stderr(), "{args}");
+}
+
+/// Writes text to stdout untouched (a generated file, a log being shown).
+pub fn raw_stdout(text: &str) {
+    let mut out = std::io::stdout();
+    let _ = write!(out, "{text}");
+    let _ = out.flush();
 }
 
 /// Passes text through to stderr untouched: another program's own output, such
@@ -160,6 +176,9 @@ macro_rules! warning {
 macro_rules! note {
     ($($arg:tt)*) => { $crate::output::print_note(format_args!($($arg)*)) };
 }
+macro_rules! error {
+    ($($arg:tt)*) => { $crate::output::print_error(format_args!($($arg)*)) };
+}
 macro_rules! line {
     ($($arg:tt)*) => { $crate::output::print_line(format_args!($($arg)*)) };
 }
@@ -172,7 +191,7 @@ macro_rules! prompt {
 macro_rules! scoped {
     ($scope:expr, $($arg:tt)*) => { $crate::output::print_scoped($scope, format_args!($($arg)*)) };
 }
-pub(crate) use {info, line, line_err, note, prompt, scoped, warning};
+pub(crate) use {error, info, line, line_err, note, prompt, scoped, warning};
 
 #[cfg(test)]
 mod tests {

@@ -12,10 +12,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::backend::{
-    Backend, ComposeBackend, ContainerBackend, CreateSettings, ImageSource, build_run_args,
+    Backend, ComposeBackend, ContainerBackend, CreateSettings, ImageSource, Mount, build_run_args,
     parse_app_ports,
 };
-use super::hash::path_tag;
 use super::lifecycle::{Cmd, Lifecycle};
 use super::remote;
 use super::vars::Vars;
@@ -138,13 +137,14 @@ pub(super) struct Spec {
     pub(super) session_name: String,
     pub(super) forward_ports: Vec<PortForward>,
     pub(super) lifecycle: Lifecycle,
-    pub(super) features: Vec<crate::features::FeatureRequest>,
+    pub(super) features: Vec<super::features::FeatureRequest>,
     pub(super) override_feature_order: Vec<String>,
     // Merged containerEnv + remoteEnv (remoteEnv wins on conflict).
     pub(super) env: BTreeMap<String, String>,
     pub(super) remote_user: Option<String>,
     // Whether to line the container user's uid up with the host user's.
     pub(super) sync_uid: bool,
+    pub(super) is_compose: bool,
     pub(super) backend: Box<dyn Backend>,
 }
 
@@ -233,6 +233,7 @@ fn build_spec(
         // remoteUser defaults to containerUser.
         remote_user: remote_user.or(container_user),
         sync_uid: update_remote_user_uid.unwrap_or(true) && !built.is_compose,
+        is_compose: built.is_compose,
         backend: built.backend,
     })
 }
@@ -246,11 +247,11 @@ fn project_basename(project_path: &Path) -> String {
 
 fn feature_requests(
     features: Option<serde_json::Map<String, serde_json::Value>>,
-) -> Vec<crate::features::FeatureRequest> {
+) -> Vec<super::features::FeatureRequest> {
     features
         .unwrap_or_default()
         .into_iter()
-        .map(|(reference, opts)| crate::features::FeatureRequest {
+        .map(|(reference, opts)| super::features::FeatureRequest {
             reference,
             options: match opts {
                 serde_json::Value::Object(m) => m,
@@ -332,6 +333,7 @@ fn compose_backend(source: SourceConfig, ctx: &BackendContext) -> Result<BuiltBa
             run_services,
             // Compose project names must be lowercase.
             project: container_name(ctx.project_path).to_lowercase(),
+            project_path: ctx.project_path.to_path_buf(),
         }),
         hash_extra,
         is_compose: true,
@@ -351,13 +353,18 @@ fn container_backend(
         init: create.init.unwrap_or(false),
         cap_add: create.cap_add.unwrap_or_default(),
         security_opt: create.security_opt.unwrap_or_default(),
+        mounts: create
+            .mounts
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| Mount::parse(m, &|s| ctx.vars.apply(s)))
+            .collect(),
         container_user,
         published_ports: parse_app_ports(create.app_port),
     };
     let run_args = build_run_args(
         create.run_args,
         create.workspace_mount,
-        create.mounts,
         &settings,
         ctx.vars,
         ctx.project_path,
@@ -393,6 +400,17 @@ fn image_source(source: SourceConfig, container_name: &str, base_dir: &Path) -> 
         args: build.args,
         tag: format!("{container_name}-img"),
     }
+}
+
+/// Short, stable tag derived from a project's path. Appended to container and
+/// session names (and `${devcontainerId}`) so two projects that share a
+/// basename never collide.
+pub(super) fn path_tag(path: &Path) -> String {
+    let h = crate::fingerprint::fnv1a(
+        path.to_string_lossy().as_bytes(),
+        crate::fingerprint::FNV_OFFSET,
+    );
+    format!("{:06x}", h & 0xff_ffff)
 }
 
 // A stable container name for a non-compose devcontainer: project basename plus

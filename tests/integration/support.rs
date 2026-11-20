@@ -18,7 +18,10 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// The result of one `ldg` (or docker) invocation.
 pub struct Out {
     pub ok: bool,
+    /// stdout followed by stderr.
     pub text: String,
+    /// stdout alone (for `--json`).
+    pub stdout: String,
 }
 
 impl Out {
@@ -39,11 +42,13 @@ fn capture(mut cmd: Command) -> Out {
         .stdin(Stdio::null())
         .output()
         .expect("spawning a command");
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut text = stdout.clone();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
     Out {
         ok: out.status.success(),
         text,
+        stdout,
     }
 }
 
@@ -99,17 +104,57 @@ pub fn listeners(port: u16) -> Vec<String> {
         .collect()
 }
 
-/// How many `ldg _forward` daemons are running for `container`.
+/// The full id of `container` (a name or id).
+pub fn container_id(container: &str) -> String {
+    let out = Command::new("docker")
+        .args(["inspect", "--format", "{{.Id}}", container])
+        .output()
+        .expect("docker inspect");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// How many `ldg _forward` daemons are running for `container` (by name or
+/// by any prefix of its id, as the daemon may be given either).
 pub fn forward_daemons(container: &str) -> usize {
+    let id = container_id(container);
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return 0;
     };
     dir.filter_map(|e| std::fs::read(e.ok()?.path().join("cmdline")).ok())
         .filter(|raw| {
             let args: Vec<&[u8]> = raw.split(|&b| b == 0).collect();
-            args.contains(&&b"_forward"[..]) && args.contains(&container.as_bytes())
+            let names_it = |a: &&[u8]| {
+                *a == container.as_bytes() || (a.len() >= 12 && id.as_bytes().starts_with(a))
+            };
+            args.contains(&&b"_forward"[..]) && args.iter().any(names_it)
         })
         .count()
+}
+
+fn which(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+}
+
+/// A real sshd container; removed when dropped.
+pub struct SshHost {
+    container: String,
+}
+
+impl SshHost {
+    /// The `--remote` destination.
+    pub fn dest(&self) -> &'static str {
+        "lodge-it-sshd"
+    }
+}
+
+impl Drop for SshHost {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &self.container])
+            .output();
+    }
 }
 
 /// Private config and data directories, and an optional fake `ssh`.
@@ -150,7 +195,13 @@ impl Sandbox {
     /// Writes the user's lodge config. A session section that avoids tmux is
     /// always included.
     pub fn config(&self, extra_toml: &str) {
-        let toml = format!("{extra_toml}\n[session]\nmultiplexer = \"none\"\n");
+        self.config_raw(&format!(
+            "{extra_toml}\n[session]\nmultiplexer = \"none\"\n"
+        ));
+    }
+
+    /// Writes the user's lodge config exactly as given.
+    pub fn config_raw(&self, toml: &str) {
         std::fs::write(self.root.join("config/lodge/config.toml"), toml).expect("writing config");
     }
 
@@ -170,6 +221,121 @@ impl Sandbox {
         self.fake_ssh = true;
     }
 
+    /// Starts a real OpenSSH server (a container with the docker CLI, talking to
+    /// this engine through its socket) and puts an `ssh` on `PATH` that is the
+    /// real client plus a private config. Returns the `--remote` destination.
+    /// The sandbox is mounted at the same path in the server, so project paths
+    /// mean the same on both sides, as on a real remote host.
+    pub fn use_real_sshd(&mut self) -> SshHost {
+        let real_ssh = which("ssh").expect("these tests need an ssh client");
+        let bin = self.root.join("bin");
+        std::fs::create_dir_all(&bin).expect("creating bin");
+        let key = self.root.join("id_ed25519");
+        let keygen = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key)
+            .status()
+            .expect("running ssh-keygen");
+        assert!(keygen.success(), "ssh-keygen failed");
+
+        let image = "lodge-it-sshd";
+        let dockerfile = concat!(
+            "FROM docker:27-cli\n",
+            "RUN apk add --no-cache --upgrade openssh-server openssh-client && ssh-keygen -A",
+            " && sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config",
+            // authorized_keys is bind-mounted from the sandbox, owned by the test's uid.
+            " && echo 'StrictModes no' >> /etc/ssh/sshd_config\n",
+        );
+        let mut build = Command::new("docker")
+            .args(["build", "-q", "-t", image, "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("docker build");
+        {
+            use std::io::Write as _;
+            build
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(dockerfile.as_bytes())
+                .expect("writing the Dockerfile");
+        }
+        assert!(
+            build.wait().expect("docker build").success(),
+            "building the sshd image failed"
+        );
+
+        let port = free_port();
+        let root = self.root.to_string_lossy().into_owned();
+        let pubkey = format!("{}.pub", key.display());
+        let name = format!(
+            "lodge-it-sshd-{}",
+            self.root.file_name().expect("a name").to_string_lossy()
+        );
+        docker(&[
+            "run",
+            "-d",
+            "--name",
+            &name,
+            "-p",
+            &format!("127.0.0.1:{port}:22"),
+            "-v",
+            "/var/run/docker.sock:/var/run/docker.sock",
+            "-v",
+            &format!("{root}:{root}"),
+            "-v",
+            &format!("{pubkey}:/root/.ssh/authorized_keys:ro"),
+            image,
+            "/usr/sbin/sshd",
+            "-D",
+            "-e",
+        ]);
+        // From here on the container is removed even if the test panics.
+        let host = SshHost { container: name };
+
+        let config = self.root.join("ssh_config");
+        std::fs::write(
+            &config,
+            format!(
+                "Host lodge-it-sshd\n  HostName 127.0.0.1\n  Port {port}\n  User root\n  \
+                 IdentityFile {}\n  IdentitiesOnly yes\n  StrictHostKeyChecking no\n  \
+                 UserKnownHostsFile /dev/null\n  LogLevel ERROR\n",
+                key.display()
+            ),
+        )
+        .expect("writing ssh_config");
+        let wrapper = bin.join("ssh");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nexec {} -F {} \"$@\"\n",
+                real_ssh.display(),
+                config.display()
+            ),
+        )
+        .expect("writing the ssh wrapper");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        self.fake_ssh = true;
+
+        // Wait until sshd answers.
+        for _ in 0..50 {
+            let ok = Command::new(&wrapper)
+                .args(["-o", "BatchMode=yes", "lodge-it-sshd", "true"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if ok {
+                return host;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        panic!("sshd in {} never answered", host.container);
+    }
+
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ldg"));
         cmd.env("XDG_CONFIG_HOME", self.root.join("config"))
@@ -177,7 +343,10 @@ impl Sandbox {
             .env("XDG_CACHE_HOME", self.root.join("cache"))
             // Scratch files and ssh control sockets land here, not in /tmp, and go
             // away with the sandbox.
-            .env("TMPDIR", self.root.join("tmp"));
+            .env("TMPDIR", self.root.join("tmp"))
+            // A private tmux server, and never the one the tests run inside.
+            .env("TMUX_TMPDIR", self.root.join("tmp"))
+            .env_remove("TMUX");
         if self.fake_ssh {
             let mut paths = vec![self.root.join("bin")];
             paths.extend(std::env::split_paths(
@@ -226,7 +395,7 @@ impl Sandbox {
             sb: self,
             dir,
             base: name.to_string(),
-            remote: false,
+            remote: None,
             last: RefCell::new(String::new()),
         };
         p.write(".devcontainer/devcontainer.json", devcontainer_json);
@@ -267,6 +436,12 @@ impl Drop for Sandbox {
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+        // A tmux server a test started lives in the sandbox; stop it.
+        let _ = Command::new("tmux")
+            .env("TMUX_TMPDIR", self.root.join("tmp"))
+            .env_remove("TMUX")
+            .args(["kill-server"])
+            .output();
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
@@ -276,7 +451,8 @@ pub struct Project<'a> {
     sb: &'a Sandbox,
     dir: PathBuf,
     base: String,
-    remote: bool,
+    /// The `--remote` destination, if any.
+    remote: Option<String>,
     last: RefCell<String>,
 }
 
@@ -286,8 +462,13 @@ impl Project<'_> {
     }
 
     /// Operate through the fake ssh (`--remote fakehost`) from now on.
-    pub fn remote(mut self) -> Self {
-        self.remote = true;
+    pub fn remote(self) -> Self {
+        self.remote_via("fakehost")
+    }
+
+    /// Operate with `--remote <host>` from now on.
+    pub fn remote_via(mut self, host: &str) -> Self {
+        self.remote = Some(host.to_string());
         self
     }
 
@@ -301,8 +482,8 @@ impl Project<'_> {
     pub fn ldg(&self, subcommand: &str, extra: &[&str]) -> Out {
         let path = self.dir.to_string_lossy().into_owned();
         let mut args: Vec<&str> = Vec::new();
-        if self.remote {
-            args.extend(["--remote", "fakehost"]);
+        if let Some(host) = &self.remote {
+            args.extend(["--remote", host.as_str()]);
         }
         args.push(subcommand);
         args.extend(extra);
@@ -342,9 +523,10 @@ impl Project<'_> {
         let mut cmd = Command::new("script");
         cmd.args(["-qec", &line, "/dev/null"]);
         for (k, v) in ldg.get_envs() {
-            if let Some(v) = v {
-                cmd.env(k, v);
-            }
+            match v {
+                Some(v) => cmd.env(k, v),
+                None => cmd.env_remove(k),
+            };
         }
         cmd.envs(host_env.iter().copied());
         cmd.stdin(Stdio::piped())
@@ -358,12 +540,14 @@ impl Project<'_> {
             .write_all(input.as_bytes())
             .expect("feeding the session");
         let out = child.wait_with_output().expect("waiting for script");
-        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let mut text = stdout.clone();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
         *self.last.borrow_mut() = text.lines().rev().take(15).collect::<Vec<_>>().join("\n");
         Out {
             ok: out.status.success(),
             text,
+            stdout,
         }
     }
 

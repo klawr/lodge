@@ -6,12 +6,16 @@
 //! its id.
 
 use crate::output::info;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::vars::Vars;
 use crate::runtime::{BuildSpec, Runtime};
+
+/// Label on every container lodge creates for a devcontainer: the project's
+/// path on its host. `ldg ls` lists containers by it.
+pub const LABEL_PROJECT: &str = "dev.lodge.project";
 
 // Brings a devcontainer's container up. Each backend only has to know how to
 // find an existing container and create/start one; everything after that —
@@ -21,13 +25,9 @@ pub(super) trait Backend {
     /// or None if it hasn't been created yet.
     fn existing(&self, rt: &dyn Runtime) -> Result<Option<String>>;
     /// Brings the container up, recreating it from scratch when `recreate` is
-    /// set, applying any feature `flags` at creation, and returns its id.
-    fn up(
-        &self,
-        rt: &dyn Runtime,
-        recreate: bool,
-        flags: &crate::features::CreateFlags,
-    ) -> Result<String>;
+    /// set and applying `extra` (what features ask for) when it is created, and
+    /// returns its id.
+    fn up(&self, rt: &dyn Runtime, recreate: bool, extra: &CreateSettings) -> Result<String>;
     /// Removes the container (and, for compose, the project's network).
     fn remove(&self, rt: &dyn Runtime) -> Result<()>;
 }
@@ -44,6 +44,8 @@ pub(super) struct ComposeBackend {
     // `runServices`: bring up only these (always including `service`). Empty
     // means every service in the compose file.
     pub(super) run_services: Vec<String>,
+    /// The project's path, recorded as [`LABEL_PROJECT`] on the service.
+    pub(super) project_path: PathBuf,
 }
 
 impl Backend for ComposeBackend {
@@ -52,58 +54,45 @@ impl Backend for ComposeBackend {
     }
 
     fn existing(&self, rt: &dyn Runtime) -> Result<Option<String>> {
-        let id = rt.compose_ps(&self.dir, &self.project, &self.files, &self.service, true)?;
-        Ok((!id.is_empty()).then_some(id))
+        rt.compose_ps(&self.dir, &self.project, &self.files, &self.service, true)
     }
 
-    fn up(
-        &self,
-        rt: &dyn Runtime,
-        recreate: bool,
-        flags: &crate::features::CreateFlags,
-    ) -> Result<String> {
+    fn up(&self, rt: &dyn Runtime, recreate: bool, extra: &CreateSettings) -> Result<String> {
         // On recreate, rebuild and force a fresh container; otherwise keep the
         // existing one (and stop compose recreating it on its own config-hash).
-        let extra: &[&str] = if recreate {
+        let mode: &[&str] = if recreate {
             &["--build", "--force-recreate"]
         } else {
             &["--no-recreate"]
         };
 
-        // Feature create-flags go in a temporary compose override, appended as
-        // the last `-f` so it layers over the project's files without changing
-        // the project identity (the first file still sets the project dir).
-        // Compose reads it client-side, so with a remote target it is written on
-        // the remote host (where compose runs).
+        // lodge's label and the features' settings go in a temporary compose
+        // override, appended as the last `-f` so it layers over the project's
+        // files without changing the project identity (the first file still
+        // sets the project dir). Compose reads it client-side, so with a remote
+        // target it is written on the remote host (where compose runs).
         let mut files = self.files.clone();
-        let override_file = if flags.is_empty() {
-            None
-        } else {
-            let content = flags.compose_override(&self.service);
-            let path = rt.target().scratch_path("compose-override.yml");
-            rt.target()
-                .write_file(&path, &content)
-                .context("writing compose override")?;
-            files.push(path.clone());
-            Some(path)
-        };
+        let project_path = self.project_path.to_string_lossy();
+        let content = extra.compose_override(&self.service, &[(LABEL_PROJECT, &project_path)]);
+        let override_file = rt.target().scratch_path("compose-override.yml");
+        rt.target()
+            .write_file(&override_file, &content)
+            .context("writing compose override")?;
+        files.push(override_file.clone());
 
-        let mut up_args: Vec<&str> = extra.to_vec();
+        let mut up_args: Vec<&str> = mode.to_vec();
         up_args.extend(self.run_services.iter().map(String::as_str));
         let result = rt.compose_up(&self.dir, &self.project, &files, &up_args);
-        if let Some(p) = &override_file {
-            rt.target().remove_file(p);
-        }
+        rt.target().remove_file(&override_file);
         result?;
 
-        let id = rt.compose_ps(&self.dir, &self.project, &self.files, &self.service, false)?;
-        if id.is_empty() {
-            bail!(
-                "could not find running container for service '{}'",
-                self.service
-            );
-        }
-        Ok(id)
+        rt.compose_ps(&self.dir, &self.project, &self.files, &self.service, false)?
+            .with_context(|| {
+                format!(
+                    "could not find running container for service '{}'",
+                    self.service
+                )
+            })
     }
 }
 
@@ -139,18 +128,13 @@ impl Backend for ContainerBackend {
         rt.find_by_name(&self.name)
     }
 
-    fn up(
-        &self,
-        rt: &dyn Runtime,
-        recreate: bool,
-        flags: &crate::features::CreateFlags,
-    ) -> Result<String> {
+    fn up(&self, rt: &dyn Runtime, recreate: bool, extra: &CreateSettings) -> Result<String> {
         let exists = self.existing(rt)?.is_some();
         if exists && !recreate {
             info!("starting {}", self.name);
             rt.start(&self.name)
                 .context("starting the existing container")?;
-            return Ok(self.name.clone());
+            return self.id(rt);
         }
         if exists {
             rt.remove(&self.name)
@@ -160,7 +144,7 @@ impl Backend for ContainerBackend {
         let image = self.resolve_image(rt)?;
         info!("creating container {}", self.name);
         let mut run_args = self.run_args.clone();
-        run_args.extend(flags.run_args());
+        run_args.extend(extra.to_args());
         let command: &[&str] = if self.override_command {
             &["sleep", "infinity"]
         } else {
@@ -168,11 +152,18 @@ impl Backend for ContainerBackend {
         };
         rt.run_detached(&self.name, &run_args, &image, command)
             .context("creating container")?;
-        Ok(self.name.clone())
+        self.id(rt)
     }
 }
 
 impl ContainerBackend {
+    /// The engine's id for the container, the same form `existing` returns, so
+    /// everything keyed by it (the forward daemon) agrees across commands.
+    fn id(&self, rt: &dyn Runtime) -> Result<String> {
+        rt.find_by_name(&self.name)?
+            .with_context(|| format!("container {} vanished after starting it", self.name))
+    }
+
     fn resolve_image(&self, rt: &dyn Runtime) -> Result<String> {
         match &self.source {
             ImageSource::Image(img) => Ok(img.clone()),
@@ -197,21 +188,33 @@ impl ContainerBackend {
     }
 }
 
-/// Container-creation settings that devcontainer.json states directly. They
-/// apply to the image/Dockerfile backend only; with compose the compose file is
-/// where these are configured.
+/// How a container is created: what devcontainer.json states directly (for the
+/// image/Dockerfile backend; with compose these belong in the compose file),
+/// and what features ask for (either backend).
 #[derive(Debug, Default)]
 pub(super) struct CreateSettings {
     pub(super) privileged: bool,
     pub(super) init: bool,
     pub(super) cap_add: Vec<String>,
     pub(super) security_opt: Vec<String>,
+    pub(super) mounts: Vec<Mount>,
     pub(super) container_user: Option<String>,
     /// `-p` values, from `appPort`.
     pub(super) published_ports: Vec<String>,
 }
 
 impl CreateSettings {
+    /// Adds `other`'s settings to these.
+    pub(super) fn merge(&mut self, other: CreateSettings) {
+        self.privileged |= other.privileged;
+        self.init |= other.init;
+        self.cap_add.extend(other.cap_add);
+        self.security_opt.extend(other.security_opt);
+        self.mounts.extend(other.mounts);
+        self.container_user = other.container_user.or(self.container_user.take());
+        self.published_ports.extend(other.published_ports);
+    }
+
     /// The `docker run` flags these settings stand for.
     pub(super) fn to_args(&self) -> Vec<String> {
         let mut args = Vec::new();
@@ -227,6 +230,9 @@ impl CreateSettings {
         for opt in &self.security_opt {
             args.extend(["--security-opt".into(), opt.clone()]);
         }
+        for m in &self.mounts {
+            args.extend(["--mount".into(), m.spec.clone()]);
+        }
         if let Some(user) = &self.container_user {
             args.extend(["-u".into(), user.clone()]);
         }
@@ -235,6 +241,117 @@ impl CreateSettings {
         }
         args
     }
+
+    /// A compose override adding these settings and `labels` to `service`.
+    /// Every scalar is quoted, so no value can change the document's shape.
+    /// `container_user` and `published_ports` are left out: they come from
+    /// devcontainer.json, whose compose form configures them in the compose file.
+    pub(super) fn compose_override(&self, service: &str, labels: &[(&str, &str)]) -> String {
+        let q = yaml_string;
+        let mut s = format!("services:\n  {}:\n", q(service));
+        if self.privileged {
+            s.push_str("    privileged: true\n");
+        }
+        if self.init {
+            s.push_str("    init: true\n");
+        }
+        let mut list = |key: &str, items: Vec<String>| {
+            if !items.is_empty() {
+                s.push_str(&format!("    {key}:\n"));
+                for item in items {
+                    s.push_str(&format!("      - {}\n", q(&item)));
+                }
+            }
+        };
+        list("cap_add", self.cap_add.clone());
+        list("security_opt", self.security_opt.clone());
+        list(
+            "volumes",
+            self.mounts
+                .iter()
+                .filter_map(Mount::compose_volume)
+                .collect(),
+        );
+        if !labels.is_empty() {
+            s.push_str("    labels:\n");
+            for (k, v) in labels {
+                s.push_str(&format!("      {}: {}\n", q(k), q(v)));
+            }
+        }
+        s
+    }
+}
+
+/// A mount, from devcontainer.json's `mounts` or a feature's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Mount {
+    /// The `--mount` value.
+    pub(super) spec: String,
+    source: Option<String>,
+    target: Option<String>,
+}
+
+impl Mount {
+    /// Parses a mount in either spec form: a `--mount` string
+    /// (`type=bind,source=/a,target=/b`) or a `{type, source, target}` object.
+    /// `apply` substitutes variables in the values.
+    pub(super) fn parse(value: &serde_json::Value, apply: &dyn Fn(&str) -> String) -> Option<Self> {
+        match value {
+            serde_json::Value::String(s) => {
+                let spec = apply(s);
+                let (mut source, mut target) = (None, None);
+                for kv in spec.split(',') {
+                    if let Some((k, v)) = kv.split_once('=') {
+                        match k.trim() {
+                            "source" | "src" => source = Some(v.to_string()),
+                            "target" | "dst" | "destination" => target = Some(v.to_string()),
+                            _ => {}
+                        }
+                    }
+                }
+                Some(Self {
+                    spec,
+                    source,
+                    target,
+                })
+            }
+            serde_json::Value::Object(o) => {
+                let get = |k: &str| o.get(k).and_then(|v| v.as_str());
+                let source = get("source").map(apply);
+                let target = get("target").map(apply);
+                let mut parts = Vec::new();
+                if let Some(t) = get("type") {
+                    parts.push(format!("type={t}"));
+                }
+                if let Some(s) = &source {
+                    parts.push(format!("source={s}"));
+                }
+                if let Some(t) = &target {
+                    parts.push(format!("target={t}"));
+                }
+                (!parts.is_empty()).then(|| Self {
+                    spec: parts.join(","),
+                    source,
+                    target,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The compose `volumes` entry, `source:target`, when both are known.
+    fn compose_volume(&self) -> Option<String> {
+        Some(format!(
+            "{}:{}",
+            self.source.as_ref()?,
+            self.target.as_ref()?
+        ))
+    }
+}
+
+/// A YAML double-quoted scalar (JSON string syntax is valid YAML).
+fn yaml_string(s: &str) -> String {
+    serde_json::Value::String(s.to_string()).to_string()
 }
 
 // Parses `appPort`: a port, a "host:container" string, or an array of either.
@@ -267,19 +384,21 @@ fn publish_spec(s: &str) -> String {
 }
 
 // Builds the `docker run` arguments for a ContainerBackend: the workspace mount
-// (or a default bind), the working dir, any extra `mounts`, the settings that
-// devcontainer.json states directly, and finally the user's `runArgs` (last, so
-// they can override).
+// (or a default bind), the working dir, the settings that devcontainer.json
+// states directly (its `mounts` among them), and finally the user's `runArgs`
+// (last, so they can override).
 pub(super) fn build_run_args(
     user_args: Option<Vec<String>>,
     workspace_mount: Option<String>,
-    mounts: Option<Vec<serde_json::Value>>,
     settings: &CreateSettings,
     vars: &Vars,
     project_path: &Path,
     workspace_folder: &str,
 ) -> Vec<String> {
-    let mut args = Vec::new();
+    let mut args = vec![
+        "--label".to_string(),
+        format!("{LABEL_PROJECT}={}", project_path.display()),
+    ];
     match workspace_mount {
         Some(m) => {
             args.push("--mount".into());
@@ -292,13 +411,6 @@ pub(super) fn build_run_args(
     }
     args.push("-w".into());
     args.push(workspace_folder.to_string());
-
-    for m in mounts.unwrap_or_default() {
-        if let Some(spec) = mount_to_arg(&m, vars) {
-            args.push("--mount".into());
-            args.push(spec);
-        }
-    }
     args.extend(settings.to_args());
     args.extend(
         user_args
@@ -309,57 +421,43 @@ pub(super) fn build_run_args(
     args
 }
 
-// A devcontainer `mounts` entry → a `--mount` value (string or {source,target,type}).
-fn mount_to_arg(m: &serde_json::Value, vars: &Vars) -> Option<String> {
-    match m {
-        serde_json::Value::String(s) => Some(vars.apply(s)),
-        serde_json::Value::Object(o) => {
-            let mut parts = Vec::new();
-            if let Some(t) = o.get("type").and_then(|v| v.as_str()) {
-                parts.push(format!("type={t}"));
-            }
-            if let Some(s) = o.get("source").and_then(|v| v.as_str()) {
-                parts.push(format!("source={}", vars.apply(s)));
-            }
-            if let Some(t) = o.get("target").and_then(|v| v.as_str()) {
-                parts.push(format!("target={}", vars.apply(t)));
-            }
-            (!parts.is_empty()).then(|| parts.join(","))
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn as_is(s: &str) -> String {
+        s.to_string()
+    }
 
     #[test]
-    fn mount_to_arg_handles_string_and_object() {
-        let p = Path::new("/home/me/proj");
-        let vars = Vars::new(p);
-        assert_eq!(
-            mount_to_arg(&serde_json::json!("type=bind,source=/a,target=/b"), &vars).unwrap(),
-            "type=bind,source=/a,target=/b"
-        );
-        let obj = serde_json::json!({"type": "volume", "source": "vol", "target": "/data"});
-        assert_eq!(
-            mount_to_arg(&obj, &vars).unwrap(),
-            "type=volume,source=vol,target=/data"
-        );
+    fn mounts_parse_from_string_and_object() {
+        let m = Mount::parse(&json!("type=bind,source=/a,target=/b,readonly"), &as_is).unwrap();
+        assert_eq!(m.spec, "type=bind,source=/a,target=/b,readonly");
+        assert_eq!(m.compose_volume().as_deref(), Some("/a:/b"));
+        let m = Mount::parse(
+            &json!({"type": "volume", "source": "vol", "target": "/data"}),
+            &as_is,
+        )
+        .unwrap();
+        assert_eq!(m.spec, "type=volume,source=vol,target=/data");
+        // Without a target there is no compose volume to write.
+        let m = Mount::parse(&json!("source=/a"), &as_is).unwrap();
+        assert_eq!(m.compose_volume(), None);
+        assert!(Mount::parse(&json!(3), &as_is).is_none());
     }
 
     #[test]
     fn mounts_resolve_variables_including_the_container_workspace() {
         let p = Path::new("/home/me/proj");
         let vars = Vars::new(p).with_container_workspace("/workspaces/proj");
-        let obj = serde_json::json!({
+        let obj = json!({
             "type": "bind",
             "source": "${localWorkspaceFolder}/cache",
             "target": "${containerWorkspaceFolder}/.cache"
         });
         assert_eq!(
-            mount_to_arg(&obj, &vars).unwrap(),
+            Mount::parse(&obj, &|s| vars.apply(s)).unwrap().spec,
             "type=bind,source=/home/me/proj/cache,target=/workspaces/proj/.cache"
         );
     }
@@ -371,6 +469,7 @@ mod tests {
             init: true,
             cap_add: vec!["SYS_PTRACE".into()],
             security_opt: vec!["seccomp=unconfined".into()],
+            mounts: vec![Mount::parse(&json!("type=volume,source=v,target=/d"), &as_is).unwrap()],
             container_user: Some("dev".into()),
             published_ports: vec!["127.0.0.1:3000:3000".into()],
         };
@@ -383,6 +482,8 @@ mod tests {
                 "SYS_PTRACE",
                 "--security-opt",
                 "seccomp=unconfined",
+                "--mount",
+                "type=volume,source=v,target=/d",
                 "-u",
                 "dev",
                 "-p",
@@ -393,13 +494,43 @@ mod tests {
     }
 
     #[test]
+    fn merged_settings_keep_both_sides() {
+        let mut a = CreateSettings {
+            cap_add: vec!["A".into()],
+            container_user: Some("dev".into()),
+            ..Default::default()
+        };
+        a.merge(CreateSettings {
+            privileged: true,
+            cap_add: vec!["B".into()],
+            ..Default::default()
+        });
+        assert!(a.privileged);
+        assert_eq!(a.cap_add, ["A", "B"]);
+        assert_eq!(a.container_user.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn the_compose_override_is_quoted_yaml() {
+        let s = CreateSettings {
+            privileged: true,
+            init: true,
+            cap_add: vec!["SYS_PTRACE".into()],
+            mounts: vec![Mount::parse(&json!("source=v,target=/d"), &as_is).unwrap()],
+            ..Default::default()
+        };
+        let ov = s.compose_override("dev", &[(LABEL_PROJECT, "/p/it's: here")]);
+        assert_eq!(
+            ov,
+            "services:\n  \"dev\":\n    privileged: true\n    init: true\n    \
+             cap_add:\n      - \"SYS_PTRACE\"\n    volumes:\n      - \"v:/d\"\n    \
+             labels:\n      \"dev.lodge.project\": \"/p/it's: here\"\n"
+        );
+    }
+
+    #[test]
     fn app_ports_are_published_on_loopback_only() {
-        let ports = parse_app_ports(Some(serde_json::json!([
-            3000,
-            "4000",
-            "8080:80",
-            "0.0.0.0:9:9"
-        ])));
+        let ports = parse_app_ports(Some(json!([3000, "4000", "8080:80", "0.0.0.0:9:9"])));
         assert_eq!(
             ports,
             [
@@ -409,10 +540,7 @@ mod tests {
                 "0.0.0.0:9:9" // an explicit address is the user's decision
             ]
         );
-        assert_eq!(
-            parse_app_ports(Some(serde_json::json!(5000))),
-            ["127.0.0.1:5000:5000"]
-        );
+        assert_eq!(parse_app_ports(Some(json!(5000))), ["127.0.0.1:5000:5000"]);
         assert!(parse_app_ports(None).is_empty());
     }
 
@@ -421,7 +549,6 @@ mod tests {
         let p = Path::new("/home/me/proj");
         let args = build_run_args(
             Some(vec!["--cap-drop=ALL".into()]),
-            None,
             None,
             &CreateSettings {
                 privileged: true,
@@ -434,6 +561,8 @@ mod tests {
         assert_eq!(
             args,
             [
+                "--label",
+                "dev.lodge.project=/home/me/proj",
                 "-v",
                 "/home/me/proj:/workspaces/proj",
                 "-w",

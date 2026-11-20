@@ -4,16 +4,18 @@
 use anyhow::Result;
 use std::collections::BTreeMap;
 
+use crate::layout;
 use crate::output::{info, warning};
-use crate::runtime::{Env, ExecOpts};
+use crate::runtime::{Env, ExecOpts, User};
 use crate::shell::shell_quote;
-// Registers git `safe.directory` entries inside the container. Injected plugin
-// repos and the mounted workspace are owned by the host uid, but git runs as
-// root in the container, so without this git aborts with "detected dubious
-// ownership" and anything that shells out to git (lazy.nvim, gitsigns, …) fails.
-// Idempotent: only adds an entry that isn't already present. No-op if the
-// container has no git.
-pub(super) fn configure_git_safe(env: &dyn Env, dirs: &[String]) -> Result<()> {
+
+// Registers git `safe.directory` entries for the session user (`--global` is
+// that user's ~/.gitconfig). Injected plugin repos and the mounted workspace are
+// owned by the host uid, which often isn't the session user's, so without this
+// git aborts with "detected dubious ownership" and anything that shells out to
+// git (lazy.nvim, gitsigns, …) fails. Idempotent: only adds an entry that isn't
+// already present. No-op if the container has no git.
+pub(super) fn configure_git_safe(env: &dyn Env, dirs: &[String], user: User) -> Result<()> {
     if dirs.is_empty() {
         return Ok(());
     }
@@ -33,7 +35,13 @@ pub(super) fn configure_git_safe(env: &dyn Env, dirs: &[String]) -> Result<()> {
             "git config --global --get-all safe.directory 2>/dev/null | grep -qxF {q} \
              || git config --global --add safe.directory {q}"
         );
-        env.exec(&["sh", "-c", &script], &ExecOpts::default())?;
+        env.exec(
+            &["sh", "-c", &script],
+            &ExecOpts {
+                user,
+                ..ExecOpts::default()
+            },
+        )?;
     }
     Ok(())
 }
@@ -50,7 +58,7 @@ pub(super) fn inject_docker_path(env: &dyn Env) -> Result<()> {
         return Ok(());
     }
     let script = format!("export PATH={}\n", crate::shell::shell_quote(&path));
-    env.write_file("/etc/profile.d/lodge-path.sh", script.as_bytes())
+    env.write_file(layout::PROFILE_PATH, script.as_bytes())
 }
 
 pub(super) fn inject_aliases(env: &dyn Env, aliases: &BTreeMap<String, String>) -> Result<()> {
@@ -64,7 +72,7 @@ pub(super) fn inject_aliases(env: &dyn Env, aliases: &BTreeMap<String, String>) 
         content.push_str(&format!("alias {}={}\n", name, shell_quote(cmd)));
     }
 
-    env.write_file("/etc/profile.d/lodge.sh", content.as_bytes())?;
+    env.write_file(layout::PROFILE_ALIASES, content.as_bytes())?;
     info!(
         "installed {} alias{}",
         aliases.len(),
@@ -77,8 +85,8 @@ pub(super) fn inject_aliases(env: &dyn Env, aliases: &BTreeMap<String, String>) 
 // Makes the user's terminal known inside the container. Best effort: a missing
 // terminfo entry only costs some colours, so it never fails the injection.
 pub(super) fn inject_terminfo(env: &dyn Env) {
-    if let Some(term) = crate::terminfo::local_term()
-        && let Err(e) = crate::terminfo::ensure(env, &term)
+    if let Some(term) = crate::session::terminfo::local_term()
+        && let Err(e) = crate::session::terminfo::ensure(env, &term)
     {
         warning!("could not copy the terminfo entry for {term}: {e:#}");
     }
@@ -117,6 +125,18 @@ mod tests {
         assert_eq!(
             env.file("/etc/profile.d/lodge-path.sh").unwrap(),
             "export PATH='/opt/tool/bin:/usr/bin'\n"
+        );
+    }
+
+    #[test]
+    fn safe_directories_are_set_for_the_session_user() {
+        let env = FakeEnv::new().with_commands(&["git"]);
+        configure_git_safe(&env, &["*".to_string()], User::Named("dev")).unwrap();
+        let script = "git config --global --get-all safe.directory 2>/dev/null | grep -qxF '*' \
+                      || git config --global --add safe.directory '*'";
+        assert_eq!(
+            env.ran_as(&["sh", "-c", script]),
+            Some(crate::runtime::fake::Who::Named("dev".into()))
         );
     }
 

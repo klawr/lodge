@@ -1,6 +1,28 @@
 services:
   dev:
     build: .
-    command: sleep infinity
+    # Docker-outside-of-docker, so `make integration` runs in here against the
+    # host's engine. Three things make the tests behave as on the host:
+    #
+    # - The socket, plus its group for `dev`. The container starts as root only
+    #   to add that group; sessions and lifecycle hooks run as remoteUser `dev`.
+    # - Host networking: the forwarding tests reach other containers' bridge
+    #   IPs, which a compose network is isolated from.
+    # - TMPDIR at the same path on both sides: the tests bind-mount sandbox
+    #   folders, and the engine resolves those paths on the host.
+    user: root
+    command:
+      - sh
+      - -c
+      - |
+        gid=$$(stat -c %g /var/run/docker.sock)
+        getent group "$$gid" >/dev/null || groupadd -g "$$gid" hostdocker
+        usermod -aG "$$(getent group "$$gid" | cut -d: -f1)" dev
+        exec sleep infinity
+    network_mode: host
+    environment:
+      TMPDIR: /tmp/lodge-dev
     volumes:
       - ..:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/lodge-dev:/tmp/lodge-dev

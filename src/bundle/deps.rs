@@ -2,7 +2,6 @@ use crate::output::warning;
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::process::Command;
 
 pub struct Deps {
     pub libs: Vec<PathBuf>,
@@ -16,7 +15,7 @@ impl Deps {
 }
 
 pub fn resolve(binary: &str) -> Result<Deps> {
-    let mut cmd = Command::new("ldd");
+    let mut cmd = crate::host_tools::LDD.command();
     cmd.arg(binary);
     crate::output::trace(&cmd);
     let output = cmd

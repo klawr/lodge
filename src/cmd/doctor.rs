@@ -1,120 +1,136 @@
 //! `ldg doctor`: what is available on this host, and what each missing piece
 //! would break. Reports everything up front instead of failing mid-run.
 
-use crate::output::{info, line, warning};
 use anyhow::Result;
-use std::path::Path;
+use serde_json::json;
+use std::path::{Path, PathBuf};
 
-use crate::config::{Config, config_path};
-use crate::runtime::Runtime;
-use crate::target::Target;
+use super::{Ctx, print_json};
+use crate::config::{Config, Multiplexer};
+use crate::host_tools::{self, Tool};
+use crate::output::{info, line, warning};
 
-enum Status {
-    Ok(String),
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Level {
+    Ok,
     /// Needed for something lodge was asked to do.
-    Missing(String),
+    Missing,
     /// Only needed for an optional feature.
-    Optional(String),
+    Optional,
 }
 
 struct Check {
     name: String,
-    status: Status,
+    level: Level,
+    detail: String,
 }
 
 impl Check {
-    fn new(name: impl Into<String>, status: Status) -> Self {
+    fn new(name: impl Into<String>, level: Level, detail: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            status,
+            level,
+            detail: detail.into(),
         }
     }
 }
 
 /// Runs every check, prints the report, and returns whether all required checks
 /// passed.
-pub fn run(rt: &dyn Runtime, target: &Target) -> Result<bool> {
+pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
     let mut checks = Vec::new();
+    let remote = ctx.target.ssh_host();
+    let place = remote.map_or("local".to_string(), |h| format!("on {h}"));
 
-    let place = match target.ssh_host() {
-        Some(host) => format!("on {host}"),
-        None => "local".to_string(),
-    };
-    checks.push(Check::new(
-        "container engine",
-        match rt.version() {
-            Ok(v) => Status::Ok(format!("{v} ({place})")),
-            Err(e) => Status::Missing(e.to_string()),
-        },
-    ));
+    let engine = ctx.rt.version();
+    checks.push(match &engine {
+        Ok(v) => Check::new("container engine", Level::Ok, format!("{v} ({place})")),
+        Err(e) => Check::new("container engine", Level::Missing, e.to_string()),
+    });
 
-    if target.ssh_host().is_some() {
-        checks.push(tool(
-            "ssh",
-            "needed for --remote",
-            true,
-            "install an OpenSSH client",
-        ));
+    // The devcontainer here (if any) decides whether compose and oras matter.
+    let needs = ctx
+        .project(path)
+        .and_then(|p| crate::devcontainer::needs(&p, &ctx.target));
+    checks.push(match &needs {
+        Ok(n) => Check::new(
+            "devcontainer",
+            Level::Ok,
+            n.config_path.display().to_string(),
+        ),
+        // Not every folder has one: only `up` needs it, and `up` says so.
+        Err(e) => Check::new("devcontainer", Level::Optional, format!("{e:#}")),
+    });
+    let needs_compose = needs.as_ref().is_ok_and(|n| n.compose);
+    let needs_oras = needs.as_ref().is_ok_and(|n| n.registry_features);
+    if engine.is_ok() {
+        checks.push(match ctx.rt.compose_version() {
+            Ok(v) => Check::new("compose", Level::Ok, v),
+            Err(e) if needs_compose => Check::new("compose", Level::Missing, format!("{e:#}")),
+            Err(_) => Check::new(
+                "compose",
+                Level::Optional,
+                "only needed for devcontainers with dockerComposeFile",
+            ),
+        });
     }
 
-    let config = Config::load();
-    checks.push(config_check(&config));
+    let config = Config::load(&ctx.config_path);
+    checks.push(config_check(&ctx.config_path, &config));
 
     // ldd and patchelf are needed only to *pack*: with a bundle, injection needs
     // neither. So they are required only when this config would pack live.
     let packs_live = config
         .as_ref()
         .is_ok_and(|c| c.bundle.is_none() && !c.inject.is_empty());
-    checks.push(tool(
-        "patchelf",
-        "needed to pack (not needed when injecting from a bundle)",
-        packs_live,
-        "install patchelf (pacman -S patchelf / apt install patchelf)",
-    ));
-    checks.push(tool(
-        "ldd",
-        "needed to pack (not needed when injecting from a bundle)",
-        packs_live,
-        "install your libc's developer tools (ldd ships with glibc)",
-    ));
-    if let Ok(cfg) = &config
-        && let Some(bundle) = &cfg.bundle
-    {
-        checks.push(bundle_check(bundle));
+    let tmux_wanted = config
+        .as_ref()
+        .is_ok_and(|c| c.session.multiplexer == Multiplexer::Tmux);
+    for tool in host_tools::ALL {
+        let required = match tool.name {
+            "ssh" => remote.is_some(),
+            "ldd" | "patchelf" => packs_live,
+            "oras" => needs_oras,
+            _ => false,
+        };
+        // tmux only matters if the config asks for it, and ssh only for --remote.
+        if (tool.name == "tmux" && !tmux_wanted) || (tool.name == "ssh" && remote.is_none()) {
+            continue;
+        }
+        checks.push(tool_check(tool, required));
     }
-    checks.push(tool(
-        "oras",
-        "only needed for devcontainer features",
-        false,
-        "install oras from https://oras.land",
-    ));
 
     if let Ok(cfg) = &config {
+        if let Some(bundle) = &cfg.bundle {
+            checks.push(bundle_check(bundle));
+        }
         for item in &cfg.inject {
             if let Some(binary) = &item.binary {
                 checks.push(binary_check(&item.name, binary));
             }
         }
-    }
-
-    if let Ok(cfg) = &config {
         for decl in &cfg.secret {
             checks.push(secret_check(decl));
         }
     }
 
+    let failed = checks.iter().filter(|c| c.level == Level::Missing).count();
+    if as_json {
+        print_json(&json!({
+            "ok": failed == 0,
+            "checks": checks.iter().map(|c| json!({"name": c.name, "status": c.level, "detail": c.detail})).collect::<Vec<_>>(),
+        }))?;
+        return Ok(failed == 0);
+    }
     info!("doctor");
-    let mut failed = 0;
     for c in &checks {
-        let (tag, detail) = match &c.status {
-            Status::Ok(d) => ("ok      ", d),
-            Status::Missing(d) => {
-                failed += 1;
-                ("MISSING ", d)
-            }
-            Status::Optional(d) => ("optional", d),
+        let tag = match c.level {
+            Level::Ok => "ok      ",
+            Level::Missing => "MISSING ",
+            Level::Optional => "optional",
         };
-        line!("  {tag}  {:<18} {detail}", c.name);
+        line!("  {tag}  {:<18} {}", c.name, c.detail);
     }
     if failed > 0 {
         warning!("{failed} required check(s) failed");
@@ -125,45 +141,57 @@ pub fn run(rt: &dyn Runtime, target: &Target) -> Result<bool> {
 /// Whether a declared secret's source resolves on this machine. The value is
 /// read to find out, then dropped; only the source's kind is shown.
 fn secret_check(decl: &crate::secret::SecretDecl) -> Check {
-    use crate::secret::From;
+    use crate::secret::Source;
     let source = match &decl.from {
-        From::Env(var) => format!("env {var}"),
-        From::File(path) => format!("file {}", path.display()),
-        From::Command(cmd) => format!("command {}", cmd.split_whitespace().next().unwrap_or("")),
+        Source::Env(var) => format!("env {var}"),
+        Source::File(path) => format!("file {}", path.display()),
+        Source::Command(cmd) => format!("command {}", cmd.split_whitespace().next().unwrap_or("")),
     };
-    let status = match crate::secret::resolve(decl) {
-        Ok(_) => Status::Ok(format!("resolves ({source})")),
-        Err(e) => Status::Missing(format!("{e:#}")),
-    };
-    Check::new(format!("secret {}", decl.name), status)
+    let name = format!("secret {}", decl.name);
+    match crate::secret::resolve(decl) {
+        Ok(_) => Check::new(name, Level::Ok, format!("resolves ({source})")),
+        Err(e) => Check::new(name, Level::Missing, format!("{e:#}")),
+    }
 }
 
-fn tool(name: &str, needed_for: &str, required: bool, hint: &str) -> Check {
-    let status = match crate::shell::which(name) {
-        Some(path) => Status::Ok(path.display().to_string()),
-        None if required => Status::Missing(format!("{needed_for}; {hint}")),
-        None => Status::Optional(format!("{needed_for}; {hint}")),
-    };
-    Check::new(name, status)
+fn tool_check(tool: &Tool, required: bool) -> Check {
+    match tool.find() {
+        Some(path) => Check::new(tool.name, Level::Ok, path.display().to_string()),
+        None => Check::new(
+            tool.name,
+            if required {
+                Level::Missing
+            } else {
+                Level::Optional
+            },
+            format!("{}; {}", tool.needed_for, tool.hint),
+        ),
+    }
 }
 
-fn config_check(config: &Result<Config>) -> Check {
-    let path = config_path();
-    let status = match config {
-        Ok(c) if path.exists() => Status::Ok(format!(
-            "{} ({} tool{} to inject)",
-            path.display(),
-            c.inject.len(),
-            if c.inject.len() == 1 { "" } else { "s" }
-        )),
-        Ok(_) => Status::Optional(format!(
-            "no config at {}; nothing will be injected{}",
-            path.display(),
-            old_config_hint()
-        )),
-        Err(e) => Status::Missing(format!("{e:#}")),
-    };
-    Check::new("config", status)
+fn config_check(path: &Path, config: &Result<Config>) -> Check {
+    match config {
+        Ok(c) if path.exists() => Check::new(
+            "config",
+            Level::Ok,
+            format!(
+                "{} ({} tool{} to inject)",
+                path.display(),
+                c.inject.len(),
+                if c.inject.len() == 1 { "" } else { "s" }
+            ),
+        ),
+        Ok(_) => Check::new(
+            "config",
+            Level::Optional,
+            format!(
+                "no config at {}; nothing will be injected (`ldg init` writes one){}",
+                path.display(),
+                old_config_hint()
+            ),
+        ),
+        Err(e) => Check::new("config", Level::Missing, format!("{e:#}")),
+    }
 }
 
 /// Notes a config left at the pre-rename location (`~/.config/graft`).
@@ -179,41 +207,55 @@ fn old_config_hint() -> String {
 }
 
 fn bundle_check(file: &Path) -> Check {
-    let status = match crate::bundle::archive::read_manifest(file) {
-        Ok(m) => Status::Ok(format!(
-            "{} ({}, {} tool(s), id {})",
-            file.display(),
-            m.arch,
-            m.tools.len(),
-            m.id()
-        )),
-        Err(e) => Status::Missing(format!("{e:#}")),
-    };
-    Check::new("bundle", status)
+    match crate::bundle::archive::read_manifest(file) {
+        Ok(m) => Check::new(
+            "bundle",
+            Level::Ok,
+            format!(
+                "{} ({}, {} tool(s), id {})",
+                file.display(),
+                m.arch,
+                m.tools.len(),
+                m.id()
+            ),
+        ),
+        Err(e) => Check::new("bundle", Level::Missing, format!("{e:#}")),
+    }
 }
 
 fn binary_check(name: &str, binary: &Path) -> Check {
-    let status = if !binary.exists() {
-        Status::Missing(format!("{} does not exist", binary.display()))
-    } else {
-        match crate::elf::arch_of(binary) {
-            Ok(Some(arch)) => Status::Ok(format!("{} ({arch})", binary.display())),
-            Ok(None) => Status::Ok(format!("{} (not an ELF binary)", binary.display())),
-            Err(e) => Status::Missing(format!("{e:#}")),
-        }
-    };
-    Check::new(format!("inject {name}"), status)
+    let name = format!("inject {name}");
+    if !binary.exists() {
+        return Check::new(
+            name,
+            Level::Missing,
+            format!("{} does not exist", binary.display()),
+        );
+    }
+    match crate::bundle::elf::arch_of(binary) {
+        Ok(Some(arch)) => Check::new(name, Level::Ok, format!("{} ({arch})", binary.display())),
+        Ok(None) => Check::new(
+            name,
+            Level::Ok,
+            format!("{} (not an ELF binary)", binary.display()),
+        ),
+        Err(e) => Check::new(name, Level::Missing, format!("{e:#}")),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const NOWHERE: Tool = Tool {
+        name: "definitely-not-a-real-tool",
+        needed_for: "x",
+        hint: "install it",
+    };
+
     #[test]
     fn a_missing_required_tool_is_reported_missing_and_an_optional_one_is_not() {
-        let required = tool("definitely-not-a-real-tool", "x", true, "install it");
-        assert!(matches!(required.status, Status::Missing(_)));
-        let optional = tool("definitely-not-a-real-tool", "x", false, "install it");
-        assert!(matches!(optional.status, Status::Optional(_)));
+        assert!(tool_check(&NOWHERE, true).level == Level::Missing);
+        assert!(tool_check(&NOWHERE, false).level == Level::Optional);
     }
 }

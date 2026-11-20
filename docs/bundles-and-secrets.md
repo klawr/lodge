@@ -7,8 +7,8 @@ relinked to a bundled glibc, their libraries, your configs, your aliases and git
 settings, and a manifest. Without any options, `ldg up` packs your config into a
 bundle itself and keeps it in `~/.cache/lodge/bundles/`. It is reused as long as
 nothing it depends on has changed (the config, each source file's size and
-mtime, the libraries `ldd` finds), so a repeated `up` runs neither `ldd` nor
-`patchelf`. `ldg cache` lists the cached bundles (the four most recently used are
+mtime, the libraries `ldd` finds). Checking that runs `ldd`, but a repeated `up`
+copies and relinks nothing (`patchelf` does not run). `ldg cache` lists the cached bundles (the four most recently used are
 kept) and `ldg cache clear` empties the cache.
 
 To use your setup on a machine that isn't your Linux workstation, pack once and

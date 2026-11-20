@@ -1,4 +1,4 @@
-//! Copying files into and out of a container.
+//! Copying files into a container.
 //!
 //! Locally this is `docker cp`. With a remote target the docker CLI runs on the
 //! remote host and cannot see local paths, so the bytes are streamed through the
@@ -7,7 +7,6 @@
 
 use anyhow::{Context, Result, bail};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 use std::process::Stdio;
 
 use super::container::DockerContainer;
@@ -35,64 +34,6 @@ impl DockerContainer {
             }
             Target::Ssh(host) => self.cp_in_remote(host, src, dest),
         }
-    }
-
-    /// `docker cp <id>:<src> <local_dst>` (works on stopped containers). With a
-    /// remote target, the remote docker writes a tar to stdout, which is piped
-    /// back over SSH and unpacked into `local_dst` here.
-    pub(super) fn copy_out(&self, src: &str, local_dst: &str) -> Result<()> {
-        match &self.cli.target {
-            Target::Local => {
-                let from = format!("{}:{src}", self.id);
-                let status = self
-                    .cli
-                    .command(&["cp", &from, local_dst])
-                    .status()
-                    .context("spawning docker cp")?;
-                if !status.success() {
-                    bail!("docker cp failed: {from} -> {local_dst}");
-                }
-                Ok(())
-            }
-            Target::Ssh(host) => self.cp_out_remote(host, src, local_dst),
-        }
-    }
-
-    // Streams `docker cp <id>:<src> -` from the remote and unpacks the resulting
-    // tar locally, then moves the single top-level entry (named after `src`'s
-    // basename) to `local_dst`.
-    fn cp_out_remote(&self, host: &str, src: &str, local_dst: &str) -> Result<()> {
-        let from = format!("{}:{src}", self.id);
-        let mut ssh = crate::ssh::command(host, &remote_script(&["cp", &from, "-"]));
-        ssh.stdin(Stdio::null()).stdout(Stdio::piped());
-        crate::output::trace(&ssh);
-        let mut child = ssh.spawn().context("spawning ssh docker cp")?;
-        let stdout = child.stdout.take().context("ssh stdout was not piped")?;
-
-        let staging = std::env::temp_dir().join(format!("lodge-cpout-{}", std::process::id()));
-        crate::tmpfile::discard_dir(&staging);
-        std::fs::create_dir_all(&staging).context("creating cp staging dir")?;
-
-        let unpacked = tar::Archive::new(stdout).unpack(&staging);
-        let ssh_status = child.wait().context("waiting on ssh docker cp")?;
-
-        if unpacked.is_err() || !ssh_status.success() {
-            crate::tmpfile::discard_dir(&staging);
-            bail!("docker cp failed: {} -> {}", from, local_dst);
-        }
-
-        let name = Path::new(src).file_name().unwrap_or_default();
-        let extracted = staging.join(name);
-        if let Some(parent) = Path::new(local_dst).parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        crate::tmpfile::discard_file(Path::new(local_dst));
-        let moved = std::fs::rename(&extracted, local_dst)
-            .or_else(|_| std::fs::copy(&extracted, local_dst).map(|_| ()));
-        crate::tmpfile::discard_dir(&staging);
-        moved.with_context(|| format!("placing extracted file at {local_dst}"))?;
-        Ok(())
     }
 
     // Copies a local `src` into the container without a local docker CLI:

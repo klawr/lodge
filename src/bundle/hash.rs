@@ -115,12 +115,22 @@ mod tests {
     }
 
     #[test]
-    fn a_single_file_can_be_hashed() {
-        let d = tree(&[("f", "hello")]);
+    fn a_single_file_hashes_by_content_wherever_it_lives() {
+        let a = tree(&[("f", "hello"), ("g", "hello"), ("h", "other")]);
+        let b = tree(&[("f", "hello")]);
+        let f = hash_path(&a.path().join("f")).unwrap();
         assert_eq!(
-            hash_path(&d.path().join("f")).unwrap(),
-            hash_path(&d.path().join("f")).unwrap()
+            f,
+            hash_path(&b.path().join("f")).unwrap(),
+            "same file elsewhere"
         );
-        assert!(hash_path(&d.path().join("missing")).is_err());
+        assert_eq!(
+            f,
+            hash_path(&a.path().join("g")).unwrap(),
+            "the name is not hashed"
+        );
+        assert_ne!(f, hash_path(&a.path().join("h")).unwrap(), "content is");
+        assert_ne!(f, hash_path(b.path()).unwrap(), "a file is not its folder");
+        assert!(hash_path(&a.path().join("missing")).is_err());
     }
 }

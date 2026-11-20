@@ -1,5 +1,5 @@
 //! Config probing over SSH, for `--remote`: the project's files live on the
-//! remote host, so they have to be read and hashed there.
+//! remote host, so the config has to be found there.
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -53,33 +53,4 @@ pub(super) fn find_and_read_config(host: &str, project_path: &Path) -> Result<(P
     let path = PathBuf::from(String::from_utf8_lossy(&out.stdout[..nul]).as_ref());
     let content = out.stdout[nul + 1..].to_vec();
     Ok((path, content))
-}
-
-// One SSH call: hash every file under `dir` (plus any `extra` paths) using
-// sha256sum, then hash the combined output for a stable fingerprint.
-pub(super) fn hash_inputs(host: &str, config_path: &Path, extra: &[PathBuf]) -> Result<String> {
-    let dir = config_path.parent().unwrap_or(config_path);
-    let mut targets = vec![crate::shell::shell_quote(&dir.to_string_lossy())];
-    for e in extra {
-        targets.push(crate::shell::shell_quote(&e.to_string_lossy()));
-    }
-    let script = format!(
-        "find {} -type f 2>/dev/null | sort | xargs sha256sum 2>/dev/null | sha256sum",
-        targets.join(" ")
-    );
-    let out = crate::ssh::sh_output(host, &script)?;
-    if !out.status.success() {
-        bail!(
-            "hashing devcontainer inputs on {host} failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    // sha256sum output: "<hex>  -\n" — take just the hex token.
-    let hash = String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .next()
-        .unwrap_or("0")
-        .to_string();
-    Ok(hash)
 }

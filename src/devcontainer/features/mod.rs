@@ -1,14 +1,30 @@
+//! Devcontainer *features*: fetch them, order them, apply their creation
+//! settings and run their `install.sh` in the container.
+//!
+//! - [`fetch`]: get a feature's files onto this machine (OCI or a local path)
+//!
+//! The container-creation settings features ask for (mounts, `privileged`,
+//! capabilities, `init`) are gathered into the same
+//! [`CreateSettings`](super::backend::CreateSettings) devcontainer.json's own
+//! settings use.
+
+mod fetch;
+
+use super::backend::{CreateSettings, Mount};
+use super::markers;
 use crate::output::{info, warning};
-use crate::runtime::{Env, ExecOpts, User};
-use anyhow::{Context, Result, bail};
+use crate::runtime::{ContainerUser, Env, ExecOpts, User};
+use crate::target::Target;
+use crate::tmpfile::TempDir;
+use anyhow::Result;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-const FEATURES_DIR: &str = "/tmp/lodge-features";
-const PROFILE_PATH: &str = "/etc/profile.d/lodge-features.sh";
+pub use fetch::is_local_ref;
+
+use crate::layout::{FEATURES as FEATURES_DIR, PROFILE_FEATURES as PROFILE_PATH};
 
 /// A feature as requested in devcontainer.json: an OCI reference plus the
 /// user-supplied options object.
@@ -29,7 +45,7 @@ struct FeatureMeta {
     #[serde(default, rename = "containerEnv")]
     container_env: BTreeMap<String, String>,
     // Container *creation* settings — applied to the backend at up time
-    // (see CreateFlags).
+    // (see `Plan::create_settings`).
     #[serde(default)]
     mounts: Vec<Value>,
     #[serde(default)]
@@ -58,185 +74,81 @@ struct Resolved {
     reference: String,
     options: Map<String, Value>,
     meta: FeatureMeta,
-    dir: PathBuf, // host dir with install.sh + metadata
+    dir: PathBuf, // local dir with install.sh + metadata
 }
 
-/// Container-creation settings a feature contributes, aggregated across all
-/// features. Applied to the backend at `up` time (compose override / `docker
-/// run` flags). `entrypoint` is intentionally not represented — lodge runs the
-/// container as `sleep infinity`.
-#[derive(Default)]
-pub struct CreateFlags {
-    mounts: Vec<FeatureMount>,
-    privileged: bool,
-    cap_add: Vec<String>,
-    security_opt: Vec<String>,
-    init: bool,
+/// Where features find the project.
+pub struct Context<'a> {
+    /// The devcontainer folder, on the project's host; local feature paths are
+    /// relative to it.
+    pub base_dir: &'a Path,
+    /// The project's host, where local features are read from.
+    pub target: &'a Target,
 }
 
-struct FeatureMount {
-    source: String,
-    target: String,
-    kind: Option<String>,
-}
-
-impl CreateFlags {
-    pub fn is_empty(&self) -> bool {
-        self.mounts.is_empty()
-            && !self.privileged
-            && self.cap_add.is_empty()
-            && self.security_opt.is_empty()
-            && !self.init
-    }
-
-    /// `docker run` flags (for the image/build backend).
-    pub fn run_args(&self) -> Vec<String> {
-        let mut a = Vec::new();
-        if self.privileged {
-            a.push("--privileged".into());
-        }
-        if self.init {
-            a.push("--init".into());
-        }
-        for c in &self.cap_add {
-            a.push("--cap-add".into());
-            a.push(c.clone());
-        }
-        for s in &self.security_opt {
-            a.push("--security-opt".into());
-            a.push(s.clone());
-        }
-        for m in &self.mounts {
-            a.push("--mount".into());
-            a.push(m.to_mount_arg());
-        }
-        a
-    }
-
-    /// A docker-compose override snippet adding these settings to `service`.
-    pub fn compose_override(&self, service: &str) -> String {
-        let mut s = format!("services:\n  {service}:\n");
-        if self.privileged {
-            s.push_str("    privileged: true\n");
-        }
-        if self.init {
-            s.push_str("    init: true\n");
-        }
-        if !self.cap_add.is_empty() {
-            s.push_str("    cap_add:\n");
-            for c in &self.cap_add {
-                s.push_str(&format!("      - {c}\n"));
-            }
-        }
-        if !self.security_opt.is_empty() {
-            s.push_str("    security_opt:\n");
-            for o in &self.security_opt {
-                s.push_str(&format!("      - {o}\n"));
-            }
-        }
-        if !self.mounts.is_empty() {
-            s.push_str("    volumes:\n");
-            for m in &self.mounts {
-                s.push_str(&format!("      - \"{}:{}\"\n", m.source, m.target));
-            }
-        }
-        s
-    }
-}
-
-impl FeatureMount {
-    fn to_mount_arg(&self) -> String {
-        let mut parts = Vec::new();
-        if let Some(k) = &self.kind {
-            parts.push(format!("type={k}"));
-        }
-        parts.push(format!("source={}", self.source));
-        parts.push(format!("target={}", self.target));
-        parts.join(",")
-    }
-}
-
-fn parse_mount(v: &Value) -> Option<FeatureMount> {
-    match v {
-        // "type=bind,source=/a,target=/b"
-        Value::String(s) => {
-            let (mut source, mut target, mut kind) = (None, None, None);
-            for kv in s.split(',') {
-                if let Some((k, val)) = kv.split_once('=') {
-                    match k.trim() {
-                        "source" | "src" => source = Some(val.to_string()),
-                        "target" | "dst" | "destination" => target = Some(val.to_string()),
-                        "type" => kind = Some(val.to_string()),
-                        _ => {}
-                    }
-                }
-            }
-            Some(FeatureMount {
-                source: source?,
-                target: target?,
-                kind,
-            })
-        }
-        Value::Object(o) => Some(FeatureMount {
-            source: o.get("source").and_then(|v| v.as_str())?.to_string(),
-            target: o.get("target").and_then(|v| v.as_str())?.to_string(),
-            kind: o.get("type").and_then(|v| v.as_str()).map(String::from),
-        }),
-        _ => None,
-    }
+/// A user an install script is told about. Falls back to root when the
+/// container can't say, so the script still runs.
+fn script_user(env: &dyn Env, user: Option<&str>) -> ContainerUser {
+    ContainerUser::resolve(env, user).unwrap_or_else(|e| {
+        warning!("{e:#}; telling feature scripts the user is root");
+        ContainerUser::root()
+    })
 }
 
 /// A fetched, ordered set of features ready to install. Produced by `resolve`
-/// (which does the network/disk work up front, so create-flags are known before
-/// the container is brought up) and consumed by `install`.
+/// (which does the network/disk work up front, so creation settings are known
+/// before the container is brought up) and consumed by `install`.
 #[derive(Default)]
 pub struct Plan {
     resolved: Vec<Resolved>,
-    work: Option<PathBuf>,
-}
-
-impl Drop for Plan {
-    fn drop(&mut self) {
-        if let Some(w) = &self.work {
-            crate::tmpfile::discard_dir(w);
-        }
-    }
+    /// Where the features' files were fetched to; removed with the plan.
+    _work: Option<TempDir>,
 }
 
 impl Plan {
     /// The container-creation settings these features require.
-    pub fn create_flags(&self) -> CreateFlags {
-        let mut f = CreateFlags::default();
+    pub fn create_settings(&self) -> CreateSettings {
+        let mut settings = CreateSettings::default();
         for r in &self.resolved {
             let m = &r.meta;
-            f.privileged |= m.privileged;
-            f.init |= m.init;
-            f.cap_add.extend(m.cap_add.iter().cloned());
-            f.security_opt.extend(m.security_opt.iter().cloned());
-            f.mounts.extend(m.mounts.iter().filter_map(parse_mount));
+            settings.merge(CreateSettings {
+                privileged: m.privileged,
+                init: m.init,
+                cap_add: m.cap_add.clone(),
+                security_opt: m.security_opt.clone(),
+                mounts: m
+                    .mounts
+                    .iter()
+                    .filter_map(|v| Mount::parse(v, &str::to_string))
+                    .collect(),
+                ..CreateSettings::default()
+            });
         }
-        f
+        settings
     }
 
     /// Runs each feature's `install.sh` (as root, options as env), records a
     /// success marker, and persists merged `containerEnv` for login shells.
-    pub fn install(&self, env: &dyn Env) -> Result<()> {
+    pub fn install(&self, env: &dyn Env, remote_user: Option<&str>) -> Result<()> {
         if self.resolved.is_empty() {
             return Ok(());
         }
-        if env.mkdir_p(&[FEATURES_DIR]).is_err() {
+        if let Err(e) = env.mkdir_p(&[FEATURES_DIR]) {
+            // Like a failing install script: reported, not fatal.
+            warning!("cannot install devcontainer features (continuing without them): {e:#}");
             return Ok(());
         }
+        let users = [script_user(env, remote_user), script_user(env, None)];
         let mut container_env: BTreeMap<String, String> = BTreeMap::new();
         for r in &self.resolved {
             warn_unsupported(r);
             validate_options(r);
-            match install_one(env, r) {
+            match install_one(env, r, &users) {
                 Ok(()) => {
                     for (k, v) in &r.meta.container_env {
                         container_env.insert(k.clone(), v.clone());
                     }
-                    if let Err(e) = env.mark_task_done(&marker_key(&r.reference)) {
+                    if let Err(e) = markers::mark_done(env, &marker_key(&r.reference)) {
                         // Not fatal, but the feature will be installed again next run.
                         warning!(
                             "could not record that feature {} is installed: {e:#}",
@@ -247,25 +159,28 @@ impl Plan {
                 Err(e) => warning!("feature {} install failed (continuing): {e}", r.reference),
             }
         }
+        // Persisted so login shells (lodge enters with `-l`) see it.
         if !container_env.is_empty() {
-            write_profile(env, &container_env)?;
+            super::lifecycle::write_profile(env, PROFILE_PATH, &container_env)?;
         }
         Ok(())
     }
 }
 
 /// Fetches and orders the given features (pulling OCI artifacts with `oras`,
-/// reading local-path features from disk). Returns an empty plan if there's
-/// nothing to do or `oras` is needed but missing.
+/// reading local-path features from the project's host). Returns an empty plan
+/// if there's nothing to do or `oras` is needed but missing.
 pub fn resolve(
-    base_dir: &Path,
+    ctx: &Context,
     features: &[FeatureRequest],
     override_order: &[String],
 ) -> Result<Plan> {
     if features.is_empty() {
         return Ok(Plan::default());
     }
-    if features.iter().any(|f| !is_local_ref(&f.reference)) && !oras_available() {
+    if features.iter().any(|f| !is_local_ref(&f.reference))
+        && crate::host_tools::ORAS.find().is_none()
+    {
         warning!(
             "devcontainer features need `oras` (https://oras.land); \
              skipping {} feature(s)",
@@ -274,18 +189,12 @@ pub fn resolve(
         return Ok(Plan::default());
     }
 
-    let work = std::env::temp_dir().join(format!("lodge-features-{}", std::process::id()));
-    crate::tmpfile::discard_dir(&work);
+    let work = TempDir::new("features")?;
 
     let mut resolved = Vec::with_capacity(features.len());
     for (i, req) in features.iter().enumerate() {
         info!("fetching feature {}", req.reference);
-        let fetched = if is_local_ref(&req.reference) {
-            fetch_local(&req.reference, base_dir)
-        } else {
-            fetch_oci(&req.reference, &work.join(i.to_string()))
-        };
-        match fetched {
+        match fetch::fetch(ctx, &req.reference, &work.path().join(i.to_string())) {
             Ok((meta, dir)) => resolved.push(Resolved {
                 reference: req.reference.clone(),
                 options: req.options.clone(),
@@ -293,7 +202,7 @@ pub fn resolve(
                 dir,
             }),
             Err(e) => warning!(
-                "feature {} could not be fetched (skipping): {e}",
+                "feature {} could not be fetched (skipping): {e:#}",
                 req.reference
             ),
         }
@@ -301,58 +210,22 @@ pub fn resolve(
 
     Ok(Plan {
         resolved: order(resolved, override_order),
-        work: Some(work),
+        _work: Some(work),
     })
 }
 
-/// Marker-gated install for an already-running container: resolves and installs
-/// only the features that haven't succeeded yet (cheap no-op when all are done,
-/// retries failures). Create-flags can't be applied here (the container already
-/// exists) — use `resolve` + `Plan::create_flags` before `up` for those.
-pub fn install(
-    env: &dyn Env,
-    base_dir: &Path,
-    features: &[FeatureRequest],
-    override_order: &[String],
-) -> Result<()> {
-    let todo: Vec<FeatureRequest> = features
+/// The features that haven't been installed successfully in `env` yet: all of
+/// them in a new container, the ones that failed before in a reused one.
+pub fn pending(env: &dyn Env, features: &[FeatureRequest]) -> Vec<FeatureRequest> {
+    features
         .iter()
-        .filter(|f| !env.task_done(&marker_key(&f.reference)))
+        .filter(|f| !markers::done(env, &marker_key(&f.reference)))
         .cloned()
-        .collect();
-    if todo.is_empty() {
-        return Ok(());
-    }
-    resolve(base_dir, &todo, override_order)?.install(env)
+        .collect()
 }
 
 fn marker_key(reference: &str) -> String {
     format!("feature.{reference}")
-}
-
-// Local feature: a relative or absolute path (rather than an OCI reference).
-fn is_local_ref(reference: &str) -> bool {
-    reference.starts_with("./") || reference.starts_with("../") || reference.starts_with('/')
-}
-
-// Reads a feature shipped as a directory on disk (resolved relative to the
-// devcontainer dir for relative paths).
-fn fetch_local(reference: &str, base_dir: &Path) -> Result<(FeatureMeta, PathBuf)> {
-    let dir = base_dir.join(reference);
-    read_meta(&dir).map(|meta| (meta, dir))
-}
-
-// Pulls + extracts an OCI feature artifact and parses its metadata.
-fn fetch_oci(reference: &str, work: &Path) -> Result<(FeatureMeta, PathBuf)> {
-    let dir = pull_and_extract(reference, work)?;
-    read_meta(&dir).map(|meta| (meta, dir))
-}
-
-fn read_meta(dir: &Path) -> Result<FeatureMeta> {
-    let path = dir.join("devcontainer-feature.json");
-    let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
 }
 
 // Warns (but doesn't fail) when a provided option value isn't one of the
@@ -373,13 +246,13 @@ fn validate_options(r: &Resolved) {
 }
 
 // Copies a feature into the container and runs its install.sh as root.
-fn install_one(env: &dyn Env, r: &Resolved) -> Result<()> {
+fn install_one(env: &dyn Env, r: &Resolved, users: &[ContainerUser; 2]) -> Result<()> {
     let dest = format!("{FEATURES_DIR}/{}", r.meta.id);
     env.exec_root(&["rm", "-rf", &dest])?;
     env.cp_in(&r.dir.to_string_lossy(), &dest)?;
 
     info!("installing feature {}", r.reference);
-    let vars = build_env(r);
+    let vars = build_env(r, users);
     env.exec(
         &["sh", "-c", "chmod +x ./install.sh && ./install.sh"],
         &ExecOpts {
@@ -388,45 +261,6 @@ fn install_one(env: &dyn Env, r: &Resolved) -> Result<()> {
             env: &vars,
         },
     )
-}
-
-fn oras_available() -> bool {
-    Command::new("oras")
-        .arg("version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-// `oras pull` drops the feature's tarball layer into `work`; extract it and
-// return the directory holding install.sh + devcontainer-feature.json.
-fn pull_and_extract(reference: &str, work: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(work)?;
-    let mut cmd = Command::new("oras");
-    cmd.args(["pull", reference]).current_dir(work);
-    crate::output::trace(&cmd);
-    let status = cmd.status().context("running oras pull")?;
-    if !status.success() {
-        bail!("oras pull failed for feature {reference}");
-    }
-
-    let layer = std::fs::read_dir(work)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.is_file())
-        .with_context(|| format!("oras pull produced no artifact for {reference}"))?;
-
-    let content = work.join("content");
-    std::fs::create_dir_all(&content)?;
-    let mut cmd = Command::new("tar");
-    cmd.arg("xf").arg(&layer).arg("-C").arg(&content);
-    crate::output::trace(&cmd);
-    let status = cmd.status().context("extracting feature tarball")?;
-    if !status.success() {
-        bail!("failed to extract feature {reference}");
-    }
-    Ok(content)
 }
 
 fn warn_unsupported(r: &Resolved) {
@@ -440,21 +274,21 @@ fn warn_unsupported(r: &Resolved) {
 }
 
 // Builds the env for install.sh: each declared option as an uppercased var
-// (user value or its default), plus the _REMOTE_USER/_CONTAINER_USER variables
-// scripts commonly read. lodge runs as root.
-fn build_env(r: &Resolved) -> Vec<(String, String)> {
+// (user value or its default), plus the `_REMOTE_USER` / `_CONTAINER_USER`
+// variables (and their homes) that scripts use to set up the right user.
+fn build_env(r: &Resolved, [remote, container]: &[ContainerUser; 2]) -> Vec<(String, String)> {
     let mut env = Vec::new();
     for (id, spec) in &r.meta.options {
         let value = r.options.get(id).unwrap_or(&spec.default);
         env.push((env_name(id), stringify(value)));
     }
     for (k, v) in [
-        ("_REMOTE_USER", "root"),
-        ("_REMOTE_USER_HOME", "/root"),
-        ("_CONTAINER_USER", "root"),
-        ("_CONTAINER_USER_HOME", "/root"),
+        ("_REMOTE_USER", &remote.name),
+        ("_REMOTE_USER_HOME", &remote.home),
+        ("_CONTAINER_USER", &container.name),
+        ("_CONTAINER_USER_HOME", &container.home),
     ] {
-        env.push((k.to_string(), v.to_string()));
+        env.push((k.to_string(), v.clone()));
     }
     env
 }
@@ -479,17 +313,6 @@ fn stringify(v: &Value) -> String {
         Value::Null => String::new(),
         other => other.to_string(),
     }
-}
-
-// Persists feature containerEnv so login shells (lodge enters with `-l`) see it.
-// Values may reference other vars (e.g. PATH=".../bin:${PATH}"), so they're left
-// unquoted for the shell to expand.
-fn write_profile(env: &dyn Env, vars: &BTreeMap<String, String>) -> Result<()> {
-    let mut script = String::from("# generated by lodge from devcontainer feature containerEnv\n");
-    for (k, v) in vars {
-        script.push_str(&format!("export {k}={v}\n"));
-    }
-    env.write_file(PROFILE_PATH, script.as_bytes())
 }
 
 // Orders features so that any `installsAfter` dependency that is *also* in this
@@ -592,14 +415,6 @@ mod tests {
     }
 
     #[test]
-    fn distinguishes_local_refs() {
-        assert!(is_local_ref("./my-feature"));
-        assert!(is_local_ref("../shared/feat"));
-        assert!(is_local_ref("/abs/feat"));
-        assert!(!is_local_ref("ghcr.io/devcontainers/features/node:1"));
-    }
-
-    #[test]
     fn matches_ref_by_ref_tag_and_id() {
         let r = resolved("ghcr.io/devcontainers/features/node:1", "node", &[]);
         assert!(matches_ref("ghcr.io/devcontainers/features/node:1", &r));
@@ -630,55 +445,6 @@ mod tests {
             .map(|r| r.meta.id)
             .collect();
         assert_eq!(ids, vec!["b", "a"]); // b promoted by override order
-    }
-
-    #[test]
-    fn parse_mount_string_and_object() {
-        let m = parse_mount(&json!("type=bind,source=/a,target=/b")).unwrap();
-        assert_eq!(
-            (m.source.as_str(), m.target.as_str(), m.kind.as_deref()),
-            ("/a", "/b", Some("bind"))
-        );
-        let m = parse_mount(&json!({"source": "vol", "target": "/d"})).unwrap();
-        assert_eq!(
-            (m.source.as_str(), m.target.as_str(), m.kind),
-            ("vol", "/d", None)
-        );
-        assert!(parse_mount(&json!("source=/a")).is_none()); // missing target
-    }
-
-    #[test]
-    fn create_flags_render_run_args_and_compose() {
-        let flags = CreateFlags {
-            mounts: vec![FeatureMount {
-                source: "v".into(),
-                target: "/d".into(),
-                kind: Some("volume".into()),
-            }],
-            privileged: true,
-            cap_add: vec!["SYS_PTRACE".into()],
-            security_opt: vec![],
-            init: true,
-        };
-        let args = flags.run_args();
-        assert!(args.contains(&"--privileged".to_string()));
-        assert!(args.contains(&"--init".to_string()));
-        assert!(
-            args.contains(&"--cap-add".to_string()) && args.contains(&"SYS_PTRACE".to_string())
-        );
-        assert!(args.iter().any(|a| a == "type=volume,source=v,target=/d"));
-
-        let ov = flags.compose_override("dev");
-        assert!(ov.starts_with("services:\n  dev:\n"));
-        assert!(ov.contains("privileged: true"));
-        assert!(ov.contains("init: true"));
-        assert!(ov.contains("- SYS_PTRACE"));
-        assert!(ov.contains("\"v:/d\""));
-    }
-
-    #[test]
-    fn create_flags_empty_is_empty() {
-        assert!(CreateFlags::default().is_empty());
     }
 
     #[test]

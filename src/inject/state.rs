@@ -2,10 +2,13 @@
 
 use anyhow::Result;
 
+use crate::layout::{BUNDLE_ID as BUNDLE_FILE, VERSION as STATE_VERSION_FILE};
 use crate::output::warning;
 use crate::runtime::Env;
-// Stamps the injected-state format version, warning when a newer lodge wrote it.
-const BUNDLE_FILE: &str = "/opt/lodge/bundle";
+
+// The layout under /opt/lodge is a format. Stamping it lets a future lodge
+// migrate it, and keeps an older lodge from silently altering newer state.
+const STATE_VERSION: u32 = 1;
 
 /// Records which bundle was injected, so `ldg status` can show it.
 pub(super) fn record_bundle(env: &dyn Env, id: &str) -> Result<()> {
@@ -14,16 +17,18 @@ pub(super) fn record_bundle(env: &dyn Env, id: &str) -> Result<()> {
 
 /// The id of the bundle last injected into this environment.
 pub fn installed_bundle(env: &dyn Env) -> Option<String> {
-    env.exec_capture(&["cat", BUNDLE_FILE])
+    env.read_file(BUNDLE_FILE)
         .ok()
+        .flatten()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
+/// Stamps the format version of the injected state, warning when a newer lodge
+/// wrote it.
 pub(super) fn ensure_state_version(env: &dyn Env) -> Result<()> {
     let found = env
-        .exec_capture(&["cat", STATE_VERSION_FILE])
-        .ok()
+        .read_file(STATE_VERSION_FILE)?
         .and_then(|s| s.trim().parse::<u32>().ok());
     match found {
         Some(v) if v > STATE_VERSION => {
@@ -37,12 +42,6 @@ pub(super) fn ensure_state_version(env: &dyn Env) -> Result<()> {
         None => env.write_file(STATE_VERSION_FILE, format!("{STATE_VERSION}\n").as_bytes()),
     }
 }
-
-// The layout under /opt/lodge is a format. Stamping it lets a future lodge
-// migrate it, and keeps an older lodge from silently altering newer state.
-const STATE_VERSION: u32 = 1;
-
-const STATE_VERSION_FILE: &str = "/opt/lodge/version";
 
 #[cfg(test)]
 mod tests {

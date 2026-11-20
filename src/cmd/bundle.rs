@@ -1,9 +1,9 @@
 //! Bundle commands: `pack`, `bundle inspect|verify`, `cache [list|clear]`.
 
-use anyhow::Result;
-use std::path::PathBuf;
+use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 
-use super::{Ctx, ago, human_size};
+use super::{Ctx, ago, human_size, plural};
 use crate::bundle;
 use crate::cli::{BundleCommand, CacheCommand};
 use crate::output::{info, line, note};
@@ -13,10 +13,9 @@ pub fn pack(ctx: &Ctx, output: Option<PathBuf>) -> Result<()> {
     let output = output.unwrap_or_else(|| PathBuf::from(bundle::default_file_name()));
     let manifest = bundle::pack::pack_to_file(&config, &output)?;
     info!(
-        "packed {} tool(s) and {} librar{} for {} into {} (id {})",
+        "packed {} tool(s) and {} for {} into {} (id {})",
         manifest.tools.len(),
-        manifest.libs.len(),
-        if manifest.libs.len() == 1 { "y" } else { "ies" },
+        plural(manifest.libs.len(), "library", "libraries"),
         manifest.arch,
         output.display(),
         manifest.id()
@@ -26,16 +25,62 @@ pub fn pack(ctx: &Ctx, output: Option<PathBuf>) -> Result<()> {
 
 pub fn bundle(command: BundleCommand) -> Result<()> {
     match command {
-        BundleCommand::Inspect { file } => bundle::inspect(&file),
-        BundleCommand::Verify { file } => bundle::verify_file(&file),
+        BundleCommand::Inspect { file } => inspect(&file),
+        BundleCommand::Verify { file } => {
+            let manifest = bundle::verify_file(&file)?;
+            line!(
+                "ok  {} tool(s), {}, id {}",
+                manifest.tools.len(),
+                plural(manifest.libs.len(), "library", "libraries"),
+                manifest.id()
+            );
+            Ok(())
+        }
     }
 }
 
+/// Prints what is in the bundle at `file`.
+fn inspect(file: &Path) -> Result<()> {
+    let manifest = bundle::archive::read_manifest(file)?;
+    let size = std::fs::metadata(file)
+        .with_context(|| format!("reading {}", file.display()))?
+        .len();
+
+    line!("bundle    {} ({})", file.display(), human_size(size));
+    line!("id        {}", manifest.id());
+    line!(
+        "format    {} · {} · packed by ldg {}",
+        manifest.format,
+        manifest.arch,
+        manifest.lodge_version
+    );
+    for tool in &manifest.tools {
+        let mut parts = Vec::new();
+        if let Some(b) = &tool.binary {
+            let kind = if b.dynamic { "relinked" } else { "as is" };
+            parts.push(format!("bin → {} ({kind})", b.target));
+        }
+        if let Some(c) = &tool.config {
+            let kind = if c.is_dir { "dir" } else { "file" };
+            parts.push(format!("config → {} ({kind})", c.target));
+        }
+        line!("tool      {:<12} {}", tool.name, parts.join(" · "));
+    }
+    let linker = manifest.linker.as_deref().unwrap_or("none");
+    line!("libs      {} (linker {linker})", manifest.libs.len());
+    line!(
+        "settings  {} alias(es) · git safe.directory: {}",
+        manifest.aliases.len(),
+        manifest.git_safe_directories.join(", ")
+    );
+    Ok(())
+}
+
 pub fn cache(command: Option<CacheCommand>) -> Result<()> {
-    let root = bundle::source::cache_root()?;
+    let root = bundle::cache::root()?;
     match command.unwrap_or(CacheCommand::List) {
         CacheCommand::List => {
-            let entries = bundle::source::cache_entries(&root);
+            let entries = bundle::cache::entries(&root);
             if entries.is_empty() {
                 note!("the bundle cache ({}) is empty", root.display());
                 return Ok(());
@@ -65,11 +110,11 @@ pub fn cache(command: Option<CacheCommand>) -> Result<()> {
                 "{} in {} (the {} most recently used are kept; `ldg cache clear` empties it)",
                 human_size(total),
                 root.display(),
-                bundle::source::KEEP
+                bundle::cache::KEEP
             );
         }
         CacheCommand::Clear => {
-            let (n, size) = bundle::source::clear_cache(&root);
+            let (n, size) = bundle::cache::clear(&root);
             info!(
                 "removed {n} cached bundle(s), {}; the next `ldg up` packs again",
                 human_size(size)

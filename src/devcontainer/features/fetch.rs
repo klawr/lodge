@@ -12,10 +12,6 @@ pub fn is_local_ref(reference: &str) -> bool {
     reference.starts_with("./") || reference.starts_with("../") || reference.starts_with('/')
 }
 
-pub(super) fn oras_available() -> bool {
-    host_tools::ORAS.find().is_some()
-}
-
 /// Fetches `reference` into `work` (if it has to be copied) and returns its
 /// metadata and the local directory holding `install.sh`.
 pub(super) fn fetch(ctx: &Context, reference: &str, work: &Path) -> Result<(FeatureMeta, PathBuf)> {

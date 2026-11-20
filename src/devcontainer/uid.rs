@@ -10,9 +10,9 @@
 //! so it can be tested; the container only runs a small script to apply it.
 
 use crate::output::{info, warning};
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use crate::runtime::Env;
+use crate::runtime::{ContainerUser, Env};
 use crate::shell::shell_quote;
 
 /// What to do about one user's ids.
@@ -153,25 +153,21 @@ fn script(user: &str, change: &Change) -> String {
 }
 
 /// Aligns `remote_user`'s uid/gid (or the container's default user's) with the
-/// host's. Does nothing for root, and never aborts: a problem is reported and
-/// the container is left as it was.
+/// host's. Does nothing for root.
 pub(super) fn sync_user_uid(
     env: &dyn Env,
     remote_user: Option<&str>,
     host_uid: u32,
     host_gid: u32,
 ) -> Result<()> {
-    let user = match remote_user {
-        Some(u) => u.to_string(),
-        None => env
-            .exec_capture(&["id", "-un"])
-            .context("finding the container's default user")?
-            .trim()
-            .to_string(),
-    };
-    if user == "root" || host_uid == 0 {
+    if remote_user == Some("root") || host_uid == 0 {
         return Ok(());
     }
+    let resolved = ContainerUser::resolve(env, remote_user)?;
+    if resolved.is_root() {
+        return Ok(());
+    }
+    let user = resolved.name;
     if !env.has_command("sed") || !env.has_command("find") {
         warning!("cannot align uid with the host: sed/find missing in the container");
         return Ok(());
@@ -303,6 +299,10 @@ mod tests {
     #[test]
     fn a_change_runs_one_script_as_root() {
         let env = FakeEnv::new()
+            .with_output(
+                &["sh", "-c", crate::runtime::PROBE_SCRIPT],
+                "1500\n1500\ndev\n/home/dev\n",
+            )
             .with_commands(&["sed", "find"])
             .with_file("/etc/passwd", PASSWD)
             .with_file("/etc/group", GROUP);

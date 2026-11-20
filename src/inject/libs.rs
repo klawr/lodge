@@ -9,14 +9,11 @@
 use anyhow::Result;
 use std::collections::BTreeMap;
 
-use super::{LODGE_DIR, LODGE_LIB};
 use crate::bundle::manifest::Lib;
 use crate::bundle::source::Prepared;
+use crate::layout::{LIB, LIB_MANIFEST, LINKER_DIR};
 use crate::output::info;
 use crate::runtime::Env;
-
-// What we copied into LODGE_LIB and what it looked like.
-const LIB_MANIFEST: &str = "/opt/lodge/lib/.manifest";
 
 /// Copies the bundle's libraries (and the dynamic linker) into `/opt/lodge/lib`
 /// when their content differs from what an earlier injection recorded.
@@ -31,8 +28,7 @@ pub(super) fn inject_libs(env: &dyn Env, bundle: &Prepared) -> Result<()> {
         return Ok(());
     }
 
-    let mut installed =
-        parse_manifest(&env.exec_capture(&["cat", LIB_MANIFEST]).unwrap_or_default());
+    let mut installed = parse_manifest(&env.read_file(LIB_MANIFEST)?.unwrap_or_default());
     let changed = changed_libs(libs, &installed);
     if !changed.is_empty() {
         info!(
@@ -43,7 +39,7 @@ pub(super) fn inject_libs(env: &dyn Env, bundle: &Prepared) -> Result<()> {
         for lib in &changed {
             env.cp_in(
                 &bundle.lib(&lib.name).to_string_lossy(),
-                &format!("{LODGE_LIB}/{}", lib.name),
+                &format!("{LIB}/{}", lib.name),
             )?;
             installed.insert(lib.name.clone(), lib.hash.clone());
         }
@@ -51,9 +47,9 @@ pub(super) fn inject_libs(env: &dyn Env, bundle: &Prepared) -> Result<()> {
     }
 
     if let Some(ld) = &bundle.manifest.linker {
-        let placed = format!("{LODGE_DIR}/{ld}");
+        let placed = format!("{LINKER_DIR}/{ld}");
         if changed.iter().any(|l| &l.name == ld) || !env.file_exists(&placed) {
-            env.exec_root(&["cp", &format!("{LODGE_LIB}/{ld}"), &placed])?;
+            env.exec_root(&["cp", &format!("{LIB}/{ld}"), &placed])?;
         }
     }
     Ok(())

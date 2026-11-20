@@ -1,8 +1,8 @@
-//! Secret declarations (`[[secret]]` in the local config) and the value type
-//! that carries a resolved secret.
-//!
-//! Declarations only ever live in the local config.toml, never in a bundle.
-//! Nothing here resolves or delivers a value yet; see `notes/bundles-and-secrets.md`.
+//! Secrets that must not be in a bundle: their declarations (`[[secret]]` in
+//! the local config, never in a bundle), the value type that carries a resolved
+//! secret, and resolving one on this machine. [`place`] puts values into a
+//! container and [`deliver`] does both for one container. See
+//! `docs/bundles-and-secrets.md`.
 
 pub mod deliver;
 pub mod place;
@@ -13,7 +13,8 @@ use std::ffi::OsString;
 use std::fmt;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 /// A resolved secret value. It cannot be printed: `Debug` redacts it and there is
 /// no `Display`. The only way to the bytes is the explicit `expose`.
@@ -38,7 +39,7 @@ impl fmt::Debug for Secret {
 /// Where a secret's value comes from, on the machine running ldg.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum From {
+pub enum Source {
     /// An environment variable of the ldg process.
     Env(String),
     /// A file on the host.
@@ -62,23 +63,27 @@ pub enum As {
 pub struct SecretDecl {
     pub name: String,
     #[serde(rename = "from")]
-    pub from: From,
+    pub from: Source,
     #[serde(rename = "as")]
     pub as_: As,
     /// Remote host or container-name globs this secret may go to; empty means anywhere.
     pub targets: Vec<String>,
 }
 
+/// Where the value comes from on this machine: exactly one of the three.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 struct RawFrom {
     env: Option<String>,
     file: Option<PathBuf>,
     command: Option<String>,
 }
 
+/// `"env"`, or a file in the container.
 #[derive(Deserialize)]
 #[serde(untagged)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 enum RawAs {
     Kind(String),
     File { file: String, mode: Option<String> },
@@ -86,6 +91,7 @@ enum RawAs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 struct RawSecret {
     name: String,
     from: RawFrom,
@@ -93,6 +99,18 @@ struct RawSecret {
     as_: RawAs,
     #[serde(default)]
     targets: Vec<String>,
+}
+
+// The config schema describes what is written in the file, which is RawSecret.
+#[cfg(test)]
+impl schemars::JsonSchema for SecretDecl {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Secret".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        RawSecret::json_schema(generator)
+    }
 }
 
 const DEFAULT_FILE_MODE: u32 = 0o600;
@@ -108,10 +126,11 @@ impl TryFrom<RawSecret> for SecretDecl {
         let from = match (raw.from.env, raw.from.file, raw.from.command) {
             (Some(v), None, None) => {
                 validate_name(&v).map_err(|e| ctx(format!("from.env: {e}")))?;
-                From::Env(v)
+                Source::Env(v)
             }
-            (None, Some(p), None) => From::File(expand_tilde(p)),
-            (None, None, Some(c)) if !c.trim().is_empty() => From::Command(c),
+            // `~` is expanded by `Config::parse`, like every host path.
+            (None, Some(p), None) => Source::File(p),
+            (None, None, Some(c)) if !c.trim().is_empty() => Source::Command(c),
             (None, None, Some(_)) => return Err(ctx("from.command is empty".into())),
             _ => {
                 return Err(ctx(
@@ -187,16 +206,6 @@ fn parse_mode(s: &str) -> Result<u32> {
     }
 }
 
-fn expand_tilde(path: PathBuf) -> PathBuf {
-    let s = path.to_string_lossy();
-    if (s.starts_with("~/") || s == "~")
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.join(s.get(2..).unwrap_or(""));
-    }
-    path
-}
-
 /// True if `text` matches `pattern`, where `*` is any run of characters and `?`
 /// any one. Nothing else is special.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
@@ -259,11 +268,55 @@ pub fn resolve(decl: &SecretDecl) -> Result<Secret> {
 }
 
 fn run_command(script: &str) -> Result<Vec<u8>> {
-    let out = crate::target::local_sh_capture(script, COMMAND_TIMEOUT)?;
+    let out = local_sh_capture(script, COMMAND_TIMEOUT)?;
     if !out.status.success() {
         bail!("{}", out.status);
     }
     Ok(out.stdout)
+}
+
+/// Runs `sh -c <script>` on *this* machine with no stdin, capturing stdout and
+/// letting stderr through to the terminal, and kills it after `timeout`.
+///
+/// A secret's source is on the machine running lodge whatever the target is
+/// (`pass show x`), so this is deliberately not [`Target`](crate::target::Target)
+/// — which runs on the project's host. The returned `Output` has an empty
+/// `stderr`.
+fn local_sh_capture(script: &str, timeout: Duration) -> Result<Output> {
+    use std::io::Read;
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    crate::output::trace(&cmd);
+    let mut child = cmd.spawn().context("running sh")?;
+    let mut pipe = child.stdout.take().context("capturing stdout")?;
+    // Drain on a thread so a chatty child can't block on a full pipe.
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        pipe.read_to_end(&mut buf).ok();
+        buf
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("waiting for command")? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            reader.join().ok();
+            bail!("timed out after {}s", timeout.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = reader.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    })
 }
 
 fn resolve_with(
@@ -272,14 +325,14 @@ fn resolve_with(
     command: impl Fn(&str) -> Result<Vec<u8>>,
 ) -> Result<Secret> {
     let (what, bytes) = match &decl.from {
-        From::Env(var) => {
+        Source::Env(var) => {
             let v = env(var).map(OsStringExt::into_vec);
             (
                 format!("environment variable {var}"),
                 v.context("is not set"),
             )
         }
-        From::File(path) => {
+        Source::File(path) => {
             let r = std::fs::read(path)
                 .map(|mut b| {
                     // A trailing newline is an editor artefact, not part of the value.
@@ -291,7 +344,7 @@ fn resolve_with(
                 .map_err(|e| anyhow::anyhow!("{}", e.kind()));
             (format!("file {}", path.display()), r)
         }
-        From::Command(cmd) => {
+        Source::Command(cmd) => {
             let program = cmd.split_whitespace().next().unwrap_or_default();
             let r = command(cmd).map(|b| b.trim_ascii().to_vec());
             (format!("command `{program}`"), r)
@@ -334,7 +387,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s[0].name, "ANTHROPIC_API_KEY");
-        assert_eq!(s[0].from, From::Command("pass show anthropic".into()));
+        assert_eq!(s[0].from, Source::Command("pass show anthropic".into()));
         assert_eq!(s[0].as_, As::Env);
         assert_eq!(s[0].targets, vec!["work-*".to_string()]);
     }
@@ -430,7 +483,7 @@ mod tests {
         assert_eq!(s.expose(), b"hunter2");
     }
 
-    fn decl(from: From) -> SecretDecl {
+    fn decl(from: Source) -> SecretDecl {
         SecretDecl {
             name: "TOKEN".into(),
             from,
@@ -449,7 +502,7 @@ mod tests {
 
     #[test]
     fn resolves_env_untouched() {
-        let d = decl(From::Env("X".into()));
+        let d = decl(Source::Env("X".into()));
         let s = resolve_with(&d, |_| Some("  v al \n".into()), no_cmd).unwrap();
         assert_eq!(s.expose(), b"  v al \n");
         let e = resolve_with(&d, no_env, no_cmd).unwrap_err();
@@ -460,22 +513,21 @@ mod tests {
 
     #[test]
     fn resolves_file_stripping_trailing_newline() {
-        let dir = std::env::temp_dir().join(format!("lodge-secret-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = crate::tmpfile::TempDir::new("secret").unwrap();
+        let dir = tmp.path();
         let p = dir.join("tok");
         std::fs::write(&p, "abc\r\n\n").unwrap();
-        let s = resolve_with(&decl(From::File(p.clone())), no_env, no_cmd).unwrap();
+        let s = resolve_with(&decl(Source::File(p.clone())), no_env, no_cmd).unwrap();
         assert_eq!(s.expose(), b"abc");
         std::fs::write(&p, "\n").unwrap();
-        assert!(resolve_with(&decl(From::File(p.clone())), no_env, no_cmd).is_err());
-        let e = resolve_with(&decl(From::File(dir.join("missing"))), no_env, no_cmd).unwrap_err();
+        assert!(resolve_with(&decl(Source::File(p.clone())), no_env, no_cmd).is_err());
+        let e = resolve_with(&decl(Source::File(dir.join("missing"))), no_env, no_cmd).unwrap_err();
         assert!(format!("{e:#}").contains("not found"), "{e:#}");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn command_output_is_trimmed_and_errors_hide_the_value() {
-        let d = decl(From::Command("pass show hunter2-entry --flag".into()));
+        let d = decl(Source::Command("pass show hunter2-entry --flag".into()));
         let s = resolve_with(&d, no_env, |_| Ok(b"\n tok \n".to_vec())).unwrap();
         assert_eq!(s.expose(), b"tok");
         let e = resolve_with(&d, no_env, |_| Ok(b" \n".to_vec())).unwrap_err();
@@ -491,11 +543,11 @@ mod tests {
 
     #[test]
     fn real_command_source_runs_and_times_out() {
-        let d = decl(From::Command("printf '  s3cret\\n'".into()));
+        let d = decl(Source::Command("printf '  s3cret\\n'".into()));
         assert_eq!(resolve(&d).unwrap().expose(), b"s3cret");
-        let e = resolve(&decl(From::Command("exit 3".into()))).unwrap_err();
+        let e = resolve(&decl(Source::Command("exit 3".into()))).unwrap_err();
         assert!(format!("{e:#}").contains("exit"), "{e:#}");
-        let e = crate::target::local_sh_capture("sleep 5", Duration::from_millis(100)).unwrap_err();
+        let e = local_sh_capture("sleep 5", Duration::from_millis(100)).unwrap_err();
         assert!(e.to_string().contains("timed out"));
     }
 
@@ -514,7 +566,7 @@ mod tests {
 
     #[test]
     fn targets_match_the_container_or_any_host_name() {
-        let mut d = decl(From::Env("X".into()));
+        let mut d = decl(Source::Env("X".into()));
         let hosts = vec!["me@build.example".to_string(), "build.example".to_string()];
         assert!(d.applies_to(&hosts, "anything")); // no targets: anywhere
         d.targets = vec!["build.*".into()];

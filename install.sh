@@ -50,17 +50,14 @@ tar -xzf "$tmp/ldg.tar.gz" -C "$tmp" || err "could not extract $asset"
 install -m755 "$tmp/ldg" "$BIN_DIR/ldg" 2>/dev/null || { mv "$tmp/ldg" "$BIN_DIR/ldg"; chmod +x "$BIN_DIR/ldg"; }
 info "installed ldg to $BIN_DIR/ldg"
 
-# Warn about runtime dependencies lodge shells out to.
-missing=""
-for tool in docker tmux patchelf ldd; do
-  command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
-done
-[ -n "$missing" ] && warn "missing required tools:$missing (install them via your package manager)"
-command -v oras >/dev/null 2>&1 || info "note: 'oras' is only needed if your devcontainers use features (https://oras.land)"
+# Nothing else is strictly required: what each helper tool is for is reported by
+# `ldg doctor`, which also knows whether your config needs it.
+command -v docker >/dev/null 2>&1 \
+  || info "note: no local docker; that is fine with --remote (ssh only), otherwise install docker"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) warn "$BIN_DIR is not on your PATH — add it, e.g.  export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
 
-info "done — run 'ldg up' in a project with a .devcontainer"
+info "done — run 'ldg doctor' to check the host, then 'ldg up' in a project with a .devcontainer"

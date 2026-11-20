@@ -6,13 +6,15 @@
 //! - [`project`]: `down`, `status`, `rm`, `ls`, `ports`, `logs`, `clean`
 //! - [`doctor`]: the `doctor` command
 //! - [`init`]: the `init` command
-//! - [`cache`]: `pack`, `bundle`, `cache`
+//! - [`bundle`]: `pack`, `bundle`, `cache`
+//! - [`prompt`]: the questions `up` asks on the terminal
 
 mod attach;
-mod cache;
+mod bundle;
 mod doctor;
 mod init;
 mod project;
+mod prompt;
 
 use anyhow::{Context, Result};
 use clap::CommandFactory;
@@ -112,9 +114,9 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Clean { project, container } => {
             project::clean(&ctx, project.path, container.as_deref())?
         }
-        Command::Pack { output } => cache::pack(&ctx, output)?,
-        Command::Bundle { command } => cache::bundle(command)?,
-        Command::Cache { command } => cache::cache(command)?,
+        Command::Pack { output } => bundle::pack(&ctx, output)?,
+        Command::Bundle { command } => bundle::bundle(command)?,
+        Command::Cache { command } => bundle::cache(command)?,
         Command::Init { force, print } => init::run(&ctx, force, print)?,
         Command::Doctor { project, json } => {
             if !doctor::run(&ctx, project.path, json)? {
@@ -160,6 +162,11 @@ fn ago(time: std::time::SystemTime) -> String {
         3600..86400 => format!("{} h", secs / 3600),
         _ => format!("{} d", secs / 86400),
     }
+}
+
+/// "1 library", "3 libraries".
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 /// "812 B", "4.2 MB": a size for people.

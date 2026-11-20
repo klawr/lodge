@@ -1,20 +1,30 @@
-use crate::config::Config;
+//! The interactive session: a login shell in the container, optionally inside
+//! a tmux session on this machine.
+
+pub mod terminfo;
+
+use crate::config::{Multiplexer, SessionConfig};
 use crate::output::{info, note, warning};
-use crate::runtime::Container;
+use crate::runtime::{Container, User};
 use crate::shell::shell_quote;
 use anyhow::{Result, bail};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-pub fn enter(
-    container: &dyn Container,
-    session_name: &str,
-    workdir: &str,
-    remote_user: Option<&str>,
-    secret_setup: &str,
-) -> Result<()> {
-    let config = Config::load()?;
-    let shell = &config.session.shell;
+/// Where and how to open the session.
+pub struct Session<'a> {
+    /// The tmux session name.
+    pub name: &'a str,
+    pub workdir: &'a str,
+    /// Who the shell runs as.
+    pub user: User<'a>,
+    /// Shell lines run before the login shell (secret exports).
+    pub setup: &'a str,
+}
+
+/// Opens an interactive login shell in `container`, wrapped as `config` says.
+pub fn enter(container: &dyn Container, config: &SessionConfig, s: &Session) -> Result<()> {
+    let shell = &config.shell;
 
     // `container` may be a raw hex id for compose-based devcontainers, which
     // makes an unreadable title — resolve it back to the engine-assigned name
@@ -33,19 +43,19 @@ pub fn enter(
     // `docker exec -it` doesn't pass the client's TERM on (the container would see
     // plain xterm), so the session sets it, and points ncurses at any terminfo
     // entry copied in.
-    let term_setup =
-        crate::terminfo::session_term(container, crate::terminfo::local_term().as_deref())
-            .map(|t| crate::terminfo::session_setup(&t))
-            .unwrap_or_default();
+    let term_setup = terminfo::session_term(container, terminfo::local_term().as_deref())
+        .map(|t| terminfo::session_setup(&t))
+        .unwrap_or_default();
     let inner = format!(
-        "{secret_setup}{term_setup}{set_title}; exec {} -l",
+        "{}{term_setup}{set_title}; exec {} -l",
+        s.setup,
         shell_quote(shell)
     );
 
     // The local command line that opens the interactive session; how it reaches
     // the container (docker exec, over ssh -tt for a remote engine) is the
     // environment's business.
-    let run_cmd = container.interactive_command(remote_user, workdir, &inner);
+    let run_cmd = container.interactive_command(s.user, s.workdir, &inner);
     let container_id = container.id();
     let target = container.target();
 
@@ -55,17 +65,16 @@ pub fn enter(
     }
 
     let started = Instant::now();
-    let result = match config.session.multiplexer.as_str() {
-        "tmux" if crate::shell::which("tmux").is_none() => {
+    let result = match config.multiplexer {
+        Multiplexer::Tmux if crate::host_tools::TMUX.find().is_none() => {
             warning!(
                 "tmux not found; opening the session without it \
                  (set `multiplexer = \"none\"` to silence this)"
             );
             enter_direct(&run_cmd)
         }
-        "tmux" => enter_tmux(session_name, &run_cmd),
-        "none" => enter_direct(&run_cmd),
-        other => bail!("unknown session.multiplexer {other:?} (supported: \"tmux\", \"none\")"),
+        Multiplexer::Tmux => enter_tmux(s.name, &run_cmd),
+        Multiplexer::None => enter_direct(&run_cmd),
     };
 
     // A remote session that fails almost instantly is the signature of the SSH
@@ -102,7 +111,8 @@ fn enter_tmux(session_name: &str, run_cmd: &str) -> Result<()> {
     tmux_best_effort(&["new-session", "-d", "-s", &session, run_cmd]);
 
     // New windows in this session also exec into the container.
-    Command::new("tmux")
+    crate::host_tools::TMUX
+        .command()
         .args(["set-option", "-t", &session, "default-command", run_cmd])
         .status()?;
 
@@ -120,7 +130,8 @@ fn enter_tmux(session_name: &str, run_cmd: &str) -> Result<()> {
     } else {
         "attach-session"
     };
-    let status = Command::new("tmux")
+    let status = crate::host_tools::TMUX
+        .command()
         .args([action, "-t", &session])
         .status()?;
     if !status.success() {
@@ -132,7 +143,7 @@ fn enter_tmux(session_name: &str, run_cmd: &str) -> Result<()> {
 // Runs a tmux command whose failure doesn't matter to the session.
 #[allow(clippy::let_underscore_must_use, reason = "failure is harmless here")]
 fn tmux_best_effort(args: &[&str]) {
-    let _ = Command::new("tmux").args(args).status();
+    let _ = crate::host_tools::TMUX.command().args(args).status();
 }
 
 // Execs straight into the container with no multiplexer.

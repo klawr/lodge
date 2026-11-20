@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use super::hash::path_tag;
+use super::config::path_tag;
 
 pub(super) struct Vars<'a> {
     project: &'a Path,

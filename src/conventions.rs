@@ -21,7 +21,10 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// The non-test source of every file that spawns `program`.
 fn spawners(program: &str) -> Vec<String> {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // Read at run time: `env!` would bake in the path at build time, and cargo
+    // doesn't rebuild when the checkout moves, so a renamed folder broke this.
+    let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let src = Path::new(&root).join("src");
     let mut files = Vec::new();
     rust_files(&src, &mut files);
     let needle = format!("Command::new(\"{program}\")");
@@ -30,8 +33,9 @@ fn spawners(program: &str) -> Vec<String> {
         .filter(|f| !f.ends_with("conventions.rs"))
         .filter(|f| {
             let text = std::fs::read_to_string(f).unwrap();
-            // Only code before the test module counts.
-            let code = text.split("#[cfg(test)]").next().unwrap();
+            // Only code before the test module counts. (Not before the first
+            // `#[cfg(test)]`: that may be a test-only item above real code.)
+            let code = text.split("#[cfg(test)]\nmod ").next().unwrap();
             code.contains(&needle)
         })
         .map(|f| f.strip_prefix(&src).unwrap().to_string_lossy().into_owned())
@@ -51,8 +55,32 @@ fn only_the_docker_runtime_starts_docker() {
 }
 
 #[test]
-fn local_shells_are_started_by_target_and_the_session_launcher_only() {
-    // `target.rs` runs scripts on the project's host; `container.rs` launches the
-    // user's interactive session, which is a local command line by nature.
-    assert_eq!(spawners("sh"), ["container.rs", "target.rs"]);
+fn local_shells_are_started_by_target_secrets_and_the_session_launcher_only() {
+    // `target.rs` runs scripts on the project's host; `secret/` runs a secret's
+    // `command` source, which is on this machine whatever the target;
+    // `session/` launches the user's interactive session, which is a local
+    // command line by nature.
+    assert_eq!(
+        spawners("sh"),
+        ["secret/mod.rs", "session/mod.rs", "target.rs"]
+    );
+}
+
+#[test]
+fn host_tools_are_started_through_the_registry_only() {
+    // `host_tools::Tool::command` is the one place; nobody spells them out.
+    for tool in crate::host_tools::ALL {
+        if tool.name == "ssh" {
+            continue; // ssh has its own module, checked above.
+        }
+        assert_eq!(
+            spawners(tool.name),
+            Vec::<String>::new(),
+            "start {} through host_tools",
+            tool.name
+        );
+    }
+    // lodge no longer needs a local `tar`: features and remote copies unpack
+    // in-process.
+    assert_eq!(spawners("tar"), Vec::<String>::new());
 }

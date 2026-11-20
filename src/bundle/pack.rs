@@ -5,18 +5,18 @@ use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
+use super::archive;
+use super::deps;
+use super::elf::{self, Arch};
+use super::hash::hash_path;
 use super::manifest::{
     BIN_DIR, Binary, CONFIG_DIR, ConfigTree, FORMAT, LIB_DIR, Lib, MANIFEST_FILE, Manifest, Tool,
-    is_plain_name,
 };
-use super::tree::hash_path;
-use super::{LODGE_DIR, LODGE_LIB, archive};
 use crate::config::{Config, Injectable};
-use crate::deps;
-use crate::elf::{self, Arch};
+use crate::layout;
 use crate::output::warning;
+use crate::shell::is_plain_name;
 use crate::tmpfile::{TempDir, TempFile, discard_file};
 
 /// Packs `config` into a bundle file at `output`. The file appears only when it is
@@ -75,18 +75,13 @@ struct Packer<'a> {
 
 impl Packer<'_> {
     fn add(&mut self, item: &Injectable) -> Result<()> {
+        // `Config::parse` checks this too; a `Config` built in code may not
+        // have been, and the name becomes a path in the bundle.
         if !is_plain_name(&item.name) {
             bail!(
                 "'{}' is not usable as a tool name (letters, digits and -_.+ only)",
                 item.name
             );
-        }
-        if item.binary.is_none() && item.config.is_none() {
-            warning!(
-                "{} has neither a binary nor a config; leaving it out",
-                item.name
-            );
-            return Ok(());
         }
         let binary = item
             .binary
@@ -154,7 +149,7 @@ impl Packer<'_> {
     fn add_libs(&mut self, libs: &[PathBuf], linker: &str, tool: &str) -> Result<()> {
         match &self.linker {
             Some(existing) if existing != linker => bail!(
-                "{tool} uses the dynamic linker {linker} but another tool uses {existing}; \\
+                "{tool} uses the dynamic linker {linker} but another tool uses {existing}; \
                  a bundle holds one glibc"
             ),
             _ => self.linker = Some(linker.to_string()),
@@ -169,7 +164,7 @@ impl Packer<'_> {
             match self.libs.get(&name) {
                 Some(existing) if *existing == hash => {}
                 Some(_) => bail!(
-                    "{tool} needs a different build of {name} than a tool packed earlier; \\
+                    "{tool} needs a different build of {name} than a tool packed earlier; \
                      a bundle holds one copy of each library"
                 ),
                 None => {
@@ -241,7 +236,7 @@ pub(crate) fn check_arch(tool: &str, binary: &Path, host: Arch) -> Result<()> {
         && arch != host
     {
         bail!(
-            "{tool}: {} is built for {arch}, but this machine is {host}; \\
+            "{tool}: {} is built for {arch}, but this machine is {host}; \
              pack on a {arch} machine",
             binary.display()
         );
@@ -313,12 +308,12 @@ pub(crate) fn patch_binary(binary: &str, linker_name: &str) -> Result<TempFile> 
     );
     let tmp = TempFile::write(&format!("lodge-patched-{stem}"), &data)?;
 
-    let mut cmd = Command::new("patchelf");
+    let mut cmd = crate::host_tools::PATCHELF.command();
     cmd.arg("--set-interpreter")
-        .arg(format!("{LODGE_DIR}/{linker_name}"))
+        .arg(format!("{}/{linker_name}", layout::LINKER_DIR))
         .arg("--force-rpath")
         .arg("--set-rpath")
-        .arg(LODGE_LIB)
+        .arg(layout::LIB)
         .arg(tmp.path());
     crate::output::trace(&cmd);
     let status = cmd.status().context(
@@ -355,7 +350,7 @@ mod tests {
     fn config_with(inject: Vec<Injectable>) -> Config {
         Config {
             inject,
-            ..Config::for_tests()
+            ..Config::default()
         }
     }
 

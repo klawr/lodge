@@ -1,4 +1,4 @@
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -8,10 +8,12 @@ use std::path::PathBuf;
     about = "Inject your environment into any container",
     long_about = "Inject your environment into any container.\n\n\
         lodge copies your personal tools (editor, shell config, …) together with \
-        their shared-library dependencies into a running Docker container and drops \
+        their shared-library dependencies into a running container and drops \
         you into a shell. It also drives devcontainers: `ldg up` reads \
         devcontainer.json, starts the container, installs features, runs lifecycle \
-        hooks, injects your environment on top, and forwards container ports to the host."
+        hooks, injects your environment on top, and forwards container ports to the host.\n\n\
+        New here? `ldg init` writes a starting config, `ldg doctor` checks the host.",
+    after_help = "Docs: https://github.com/klawr/lodge#readme"
 )]
 pub struct Cli {
     /// SSH remote to operate on; the docker CLI is run on the remote host over
@@ -38,6 +40,13 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// A project folder argument.
+#[derive(Args)]
+pub struct ProjectArg {
+    /// Project path containing the devcontainer config (default: current directory)
+    pub path: Option<PathBuf>,
+}
+
 #[derive(Subcommand)]
 pub enum BundleCommand {
     /// Show what a bundle contains
@@ -53,6 +62,15 @@ pub enum BundleCommand {
 }
 
 #[derive(Subcommand)]
+pub enum CacheCommand {
+    /// List the cached bundles (the default)
+    #[command(alias = "ls")]
+    List,
+    /// Remove every cached bundle
+    Clear,
+}
+
+#[derive(Subcommand)]
 pub enum Command {
     /// Start a devcontainer and inject your environment
     #[command(
@@ -62,15 +80,20 @@ pub enum Command {
             hooks and features, inject your environment, then open an interactive shell.\n\n\
             Supports dockerComposeFile, image, build, and dockerFile backends. \
             Forwards ports declared in forwardPorts and any port that starts \
-            listening at runtime. Config: ~/.config/lodge/config.toml."
+            listening at runtime."
     )]
     Up {
-        /// Project path containing the devcontainer config
-        /// (defaults to current directory)
-        path: Option<PathBuf>,
+        #[command(flatten)]
+        project: ProjectArg,
         /// Force-rebuild images and recreate the container from scratch
         #[arg(long)]
         build: bool,
+        /// Recreate the container without asking when its config changed
+        #[arg(long, short, conflicts_with = "no_recreate")]
+        yes: bool,
+        /// Keep the container without asking when its config changed
+        #[arg(long)]
+        no_recreate: bool,
         /// Set everything up, but don't open a shell (for scripts and CI)
         #[arg(long)]
         no_attach: bool,
@@ -86,15 +109,16 @@ pub enum Command {
             with `ldg up`."
     )]
     Down {
-        /// Project path containing the devcontainer config
-        /// (defaults to current directory)
-        path: Option<PathBuf>,
+        #[command(flatten)]
+        project: ProjectArg,
     },
     /// Show a project's container and whether its config changed
     Status {
-        /// Project path containing the devcontainer config
-        /// (defaults to current directory)
-        path: Option<PathBuf>,
+        #[command(flatten)]
+        project: ProjectArg,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Remove a project's container
     #[command(
@@ -103,9 +127,15 @@ pub enum Command {
             use `ldg up --build`."
     )]
     Rm {
-        /// Project path containing the devcontainer config
-        /// (defaults to current directory)
-        path: Option<PathBuf>,
+        #[command(flatten)]
+        project: ProjectArg,
+    },
+    /// List the containers lodge created, across projects
+    #[command(alias = "list")]
+    Ls {
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Inject your environment into an already-running container
     #[command(
@@ -116,12 +146,49 @@ pub enum Command {
     Exec {
         /// Container name or ID
         container: String,
+        /// Open the shell as this user (default: the container's user)
+        #[arg(long, short)]
+        user: Option<String>,
+        /// Open the shell in this directory (default: /)
+        #[arg(long, short, value_name = "DIR", default_value = "/")]
+        workdir: String,
         /// Inject, but don't open a shell (for scripts and CI)
         #[arg(long)]
         no_attach: bool,
         /// Inject from this bundle file instead of packing your config
         #[arg(long, value_name = "FILE")]
         bundle: Option<PathBuf>,
+    },
+    /// Show the ports forwarded for a project's container
+    Ports {
+        #[command(flatten)]
+        project: ProjectArg,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the port-forwarding log for a project's container
+    Logs {
+        #[command(flatten)]
+        project: ProjectArg,
+        /// Keep printing new lines as they are written
+        #[arg(long, short)]
+        follow: bool,
+    },
+    /// Remove what lodge injected from a container
+    #[command(
+        long_about = "Remove what lodge injected: binaries, libraries, the wrappers it \
+            installed, its shell setup and any placed secrets. Injected configs are left \
+            in place (you may have changed them) and listed. The devcontainer's own state \
+            (hook markers, recorded config) is kept. Acts on the project's container, or \
+            on --container."
+    )]
+    Clean {
+        #[command(flatten)]
+        project: ProjectArg,
+        /// A running container (name or ID) instead of the project's
+        #[arg(long, value_name = "NAME", conflicts_with = "path")]
+        container: Option<String>,
     },
     /// Pack your tools and configs into a portable bundle
     #[command(
@@ -142,14 +209,49 @@ pub enum Command {
         #[command(subcommand)]
         command: BundleCommand,
     },
+    /// Show or clear the cache of prepared bundles
+    Cache {
+        #[command(subcommand)]
+        command: Option<CacheCommand>,
+    },
+    /// Write a starting config, with the tools found on this machine filled in
+    #[command(
+        long_about = "Write a commented config.toml (at ~/.config/lodge/config.toml, or the \
+            file given with -c). Editors and tools found on PATH (nvim, hx, rg, fzf, …) \
+            are added as [[inject]] entries, commented out, so you pick what to bring. \
+            Refuses to overwrite an existing file unless --force."
+    )]
+    Init {
+        /// Overwrite an existing config
+        #[arg(long)]
+        force: bool,
+        /// Print the config instead of writing it
+        #[arg(long)]
+        print: bool,
+    },
     /// Check that everything lodge needs is available
     #[command(
-        long_about = "Check the host: that the container engine is reachable, which helper \
-            tools are installed and what each is needed for, and that your config and the \
-            binaries it lists are usable. With --remote, checks the remote engine. Exits \
-            non-zero if a required tool is missing."
+        long_about = "Check the host: that the container engine and compose are reachable, \
+            which helper tools are installed and what each is needed for, and that your \
+            config and the binaries it lists are usable. Looks at the devcontainer in PATH \
+            (default: current directory) to tell whether `oras` is needed. With --remote, \
+            checks the remote engine. Exits non-zero if something required is missing."
     )]
-    Doctor,
+    Doctor {
+        #[command(flatten)]
+        project: ProjectArg,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a shell completion script
+    #[command(long_about = "Print a completion script for SHELL. For example:\n\n  \
+            ldg completions bash > ~/.local/share/bash-completion/completions/ldg\n  \
+            ldg completions zsh  > ~/.zfunc/_ldg\n  \
+            ldg completions fish > ~/.config/fish/completions/ldg.fish")]
+    Completions { shell: clap_complete::Shell },
+    /// Print the man page (view it with `ldg man | man -l -`)
+    Man,
     /// Internal: port-forwarding daemon spawned by `ldg up`
     #[command(name = "_forward", hide = true)]
     Forward {
