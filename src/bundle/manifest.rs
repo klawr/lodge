@@ -59,7 +59,6 @@ pub struct Tool {
     pub name: String,
     pub binary: Option<Binary>,
     pub config: Option<ConfigTree>,
-    pub skip_if_exists: bool,
 }
 
 /// A binary, stored at `bin/<tool name>`.
@@ -216,7 +215,6 @@ mod tests {
                     is_dir: true,
                     hash: "00000000000000bb".into(),
                 }),
-                skip_if_exists: true,
             }],
             git_safe_directories: vec!["*".into()],
         }

@@ -2,48 +2,27 @@
 
 use anyhow::{Context, Result};
 
-use super::installed::{Decision, Kind, Piece, decide, record};
 use crate::bundle::manifest::{ConfigTree, Tool};
 use crate::bundle::source::Prepared;
-use crate::layout::Layout;
-use crate::output::info;
+use crate::output::{info, warning};
 use crate::runtime::{ContainerUser, Env};
 
+/// Copies the tool's config to its destination and returns that path.
+/// `placed_before` is what an earlier injection placed: anything else already
+/// at the destination is not lodge's, so replacing it is warned about.
 pub(super) fn inject_config(
     env: &dyn Env,
     user: &ContainerUser,
-    layout: &Layout,
     bundle: &Prepared,
     tool: &Tool,
     config: &ConfigTree,
-) -> Result<()> {
+    placed_before: &[String],
+) -> Result<String> {
     let name = &tool.name;
     let dest = user.expand_home(&config.dest);
-    let dir = layout.installed();
-    let piece = Piece {
-        tool: name,
-        kind: Kind::Config,
-    };
-
-    // Asked strictly: a wrong "missing" would replace a tree the user
-    // protected with `skip_if_exists`.
-    let decision = decide(
-        env,
-        &dir,
-        piece,
-        &config.hash,
-        env.exists(&dest)?,
-        tool.skip_if_exists,
-    );
-    if decision != Decision::Install {
-        if decision == Decision::UpToDate {
-            info!("{name} config is up to date");
-        } else {
-            info!("{name} config already present, skipping");
-        }
-        return Ok(());
+    if !placed_before.contains(&dest) && env.exists(&dest)? {
+        warning!("{dest} already exists and was not injected by lodge; replacing it");
     }
-
     info!("injecting {name} config → {dest}");
 
     // Replace anything at the destination before copying: a directory is merged
@@ -62,8 +41,7 @@ pub(super) fn inject_config(
             user.name
         )
     })?;
-
-    record(env, &dir, piece, &config.hash, &dest)
+    Ok(dest)
 }
 
 #[cfg(test)]
@@ -73,12 +51,6 @@ mod tests {
     use crate::bundle::source::Origin;
     use crate::runtime::fake::{FakeEnv, Who};
     use crate::tmpfile::TempDir;
-
-    const HASH: &str = "00000000000000aa";
-
-    fn layout() -> Layout {
-        Layout::new("/p")
-    }
 
     fn dev() -> ContainerUser {
         ContainerUser {
@@ -92,7 +64,7 @@ mod tests {
 
     /// A bundle whose tool `hello` has the config tree `config/hello/rc`,
     /// going to `dest`.
-    fn bundle(dest: &str, skip_if_exists: bool) -> (TempDir, Prepared) {
+    fn bundle(dest: &str) -> (TempDir, Prepared) {
         let dir = TempDir::new("cfg-bundle").unwrap();
         std::fs::create_dir_all(dir.path().join("config/hello")).unwrap();
         std::fs::write(dir.path().join("config/hello/rc"), "set x").unwrap();
@@ -102,9 +74,8 @@ mod tests {
             config: Some(ConfigTree {
                 dest: dest.into(),
                 is_dir: true,
-                hash: HASH.into(),
+                hash: "00000000000000aa".into(),
             }),
-            skip_if_exists,
         };
         let manifest = Manifest {
             lodge_version: "0".into(),
@@ -123,25 +94,30 @@ mod tests {
         (dir, prepared)
     }
 
-    fn inject(env: &FakeEnv, b: &Prepared) -> Result<()> {
+    fn inject(env: &FakeEnv, b: &Prepared) -> Result<String> {
+        inject_known(env, b, &[])
+    }
+
+    fn inject_known(env: &FakeEnv, b: &Prepared, placed_before: &[String]) -> Result<String> {
         let tool = &b.manifest.tools[0];
         let user = dev();
         inject_config(
             &crate::runtime::Acting::new(env, &user),
             &user,
-            &layout(),
             b,
             tool,
             tool.config.as_ref().unwrap(),
+            placed_before,
         )
     }
 
     #[test]
     fn a_config_lands_in_the_users_home_owned_by_them_without_any_chown() {
-        let (_dir, b) = bundle("~/.config/hello", false);
+        let (_dir, b) = bundle("~/.config/hello");
         let env = FakeEnv::new();
-        inject(&env, &b).unwrap();
+        let placed = inject(&env, &b).unwrap();
 
+        assert_eq!(placed, "/home/dev/.config/hello");
         assert_eq!(
             env.file("/home/dev/.config/hello/rc").as_deref(),
             Some("set x")
@@ -156,85 +132,50 @@ mod tests {
             "the chain down to the destination is made as the user"
         );
         assert!(!env.ran_matching(|c| c[0] == "chown"));
-        assert_eq!(
-            env.file("/p/installed/hello.config").unwrap().trim(),
-            format!("{HASH}\n/home/dev/.config/hello")
-        );
-    }
-
-    #[test]
-    fn nothing_here_runs_as_root() {
-        let (_dir, b) = bundle("~/.config/hello", false);
-        let env = FakeEnv::new();
-        let user = dev();
-        let acting = crate::runtime::Acting::new(&env, &user);
-        inject_config(
-            &acting,
-            &user,
-            &layout(),
-            &b,
-            &b.manifest.tools[0],
-            b.manifest.tools[0].config.as_ref().unwrap(),
-        )
-        .unwrap();
         for (call, who) in env.calls() {
             assert_ne!(who, Who::Root, "{call:?} ran as root");
         }
     }
 
     #[test]
-    fn an_unchanged_config_is_left_alone_and_a_changed_one_replaced() {
-        let (_dir, b) = bundle("~/.config/hello", false);
-        let env = FakeEnv::new()
-            .with_file("/home/dev/.config/hello/rc", "mine")
-            .with_file(
-                "/p/installed/hello.config",
-                &format!("{HASH}\n/home/dev/.config/hello"),
-            );
-        inject(&env, &b).unwrap();
-        assert_eq!(
-            env.file("/home/dev/.config/hello/rc").as_deref(),
-            Some("mine")
-        );
-
-        let env = FakeEnv::new()
-            .with_file("/home/dev/.config/hello/rc", "mine")
-            .with_file(
-                "/p/installed/hello.config",
-                "1111111111111111\n/home/dev/.config/hello",
-            );
+    fn whatever_was_there_is_replaced() {
+        let (_dir, b) = bundle("~/.config/hello");
+        let env = FakeEnv::new().with_file("/home/dev/.config/hello/rc", "mine");
         inject(&env, &b).unwrap();
         assert_eq!(
             env.file("/home/dev/.config/hello/rc").as_deref(),
             Some("set x")
         );
+        assert!(env.ran(&["rm", "-rf", "/home/dev/.config/hello"]));
     }
 
     #[test]
-    fn a_protected_config_is_kept_even_when_the_bundle_changed() {
-        let (_dir, b) = bundle("~/.config/hello", true);
-        let env = FakeEnv::new()
-            .with_file("/home/dev/.config/hello/rc", "mine")
-            .with_file(
-                "/p/installed/hello.config",
-                "1111111111111111\n/home/dev/.config/hello",
-            );
+    fn only_a_destination_lodge_did_not_place_is_warned_about() {
+        let (_dir, b) = bundle("~/.config/hello");
+        let present = || FakeEnv::new().with_file("/home/dev/.config/hello/rc", "mine");
+        let checked = |env: &FakeEnv| {
+            env.ran_matching(|c| {
+                c.iter().any(|a| a.contains("hello")) && c[0] != "rm" && c[0] != "mkdir"
+            })
+        };
+        // The existence check is made for a destination nobody recorded...
+        let env = present();
         inject(&env, &b).unwrap();
-        assert_eq!(
-            env.file("/home/dev/.config/hello/rc").as_deref(),
-            Some("mine")
-        );
+        assert!(checked(&env), "an unrecorded destination was not checked");
+        // ...and not for one an earlier injection placed.
+        let env = present();
+        inject_known(&env, &b, &["/home/dev/.config/hello".to_string()]).unwrap();
+        assert!(!checked(&env), "a recorded destination was checked");
     }
 
     #[test]
     fn a_target_the_user_cannot_write_is_an_error_that_says_so() {
-        let (_dir, b) = bundle("/etc/hello", false);
+        let (_dir, b) = bundle("/etc/hello");
         let env = FakeEnv::new().with_failure(&["rm", "-rf", "/etc/hello"]);
         let err = format!("{:#}", inject(&env, &b).unwrap_err());
         assert!(
             err.contains("never uses root") && err.contains("/etc/hello") && err.contains("dev"),
             "{err}"
         );
-        assert!(env.file("/p/installed/hello.config").is_none());
     }
 }

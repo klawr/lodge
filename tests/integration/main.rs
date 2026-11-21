@@ -16,10 +16,8 @@ fn json(template: &str) -> String {
     template.replace("@IMAGE@", IMAGE)
 }
 
-fn inject_sh_config(skip_if_exists: bool) -> String {
-    format!(
-        "[[inject]]\nname = \"hostsh\"\nbinary = \"/bin/sh\"\nskip_if_exists = {skip_if_exists}\n"
-    )
+fn inject_sh_config() -> String {
+    "[[inject]]\nname = \"hostsh\"\nbinary = \"/bin/sh\"\n".to_string()
 }
 
 #[test]
@@ -127,13 +125,13 @@ fn status_down_and_rm_follow_the_container_lifecycle() {
 fn an_injected_binary_runs_against_the_injected_glibc() {
     require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
     let sb = Sandbox::new();
-    sb.config(&inject_sh_config(true));
+    sb.config(&inject_sh_config());
     let p = sb.project("inject", &json(r#"{ "image": "@IMAGE@" }"#));
     p.up();
 
     assert_eq!(p.exec(&[&root_tool("hostsh"), "-c", "echo ok"]), "ok");
     assert!(
-        p.sh(&format!("wc -l < {ROOT_PREFIX}/lib/.manifest"))
+        p.sh(&format!("ls {ROOT_PREFIX}/lib | wc -l"))
             .trim()
             .parse::<u32>()
             .unwrap()
@@ -141,34 +139,30 @@ fn an_injected_binary_runs_against_the_injected_glibc() {
     );
     let again = p.up();
     assert!(
-        !again.has("injecting") && !again.has("is up to date"),
+        !again.has("injecting"),
         "a second run should only attach:\n{}",
         again.tail(8)
     );
     let again = p.ldg("up", &["--no-attach", "--reinject"]);
     assert!(
-        again.ok && again.has("is up to date"),
-        "--reinject found work to do:\n{}",
+        again.ok && again.has("injecting"),
+        "--reinject did not inject:\n{}",
         again.tail(8)
     );
 }
 
 #[test]
 #[ignore = "needs docker"]
-fn a_library_that_changed_on_the_host_is_refreshed() {
+fn a_reinject_restores_a_damaged_library() {
     require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
     let sb = Sandbox::new();
-    sb.config(&inject_sh_config(false));
+    sb.config(&inject_sh_config());
     let p = sb.project("refresh", &json(r#"{ "image": "@IMAGE@" }"#));
     p.up();
 
-    // Simulate a host upgrade: the container's libc is stale and the manifest
-    // remembers a different hash for it.
+    // The container's libc is stale.
     let libc = p.sh(&format!("ls {ROOT_PREFIX}/lib | grep '^libc.so'"));
-    p.sh(&format!(
-        "echo STALE > {ROOT_PREFIX}/lib/{libc} && \
-         sed -i 's/^[0-9a-f]* {libc}$/0000000000000000 {libc}/' {ROOT_PREFIX}/lib/.manifest"
-    ));
+    p.sh(&format!("echo STALE > {ROOT_PREFIX}/lib/{libc}"));
 
     let out = p.ldg("up", &["--no-attach", "--reinject"]);
     assert!(out.ok, "re-injecting failed:\n{}", out.tail(10));
@@ -460,7 +454,7 @@ fn doctor_reports_a_reachable_engine() {
 fn a_bundle_can_be_packed_inspected_verified_and_damage_is_caught() {
     require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
     let sb = Sandbox::new();
-    sb.config(&inject_sh_config(true));
+    sb.config(&inject_sh_config());
     let bundle = sb.root().join("b.tar");
     let bundle_arg = bundle.to_string_lossy().into_owned();
 
@@ -600,7 +594,7 @@ fn a_repeated_up_reuses_the_cached_bundle_and_a_change_updates_the_container() {
     );
     assert_eq!(p.exec(&[&root_tool("hello")]), "one");
     let updated = p.ldg("up", &["--no-attach", "--reinject"]);
-    assert!(updated.has("injecting hello"), "{}", updated.tail(8));
+    assert!(updated.has("injecting bundle"), "{}", updated.tail(8));
     assert_eq!(p.exec(&[&root_tool("hello")]), "two, and longer");
 }
 
@@ -609,7 +603,7 @@ fn a_repeated_up_reuses_the_cached_bundle_and_a_change_updates_the_container() {
 fn injecting_from_a_bundle_needs_neither_ldd_nor_patchelf() {
     require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
     let sb = Sandbox::new();
-    sb.config(&inject_sh_config(false));
+    sb.config(&inject_sh_config());
     let bundle = sb.root().join("b.tar");
     let bundle_arg = bundle.to_string_lossy().into_owned();
     assert!(
@@ -967,7 +961,7 @@ fn local_features_are_read_from_the_project_host_over_ssh() {
 fn ls_status_ports_and_clean_describe_and_undo_what_up_did() {
     require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
     let sb = Sandbox::new();
-    sb.config(&inject_sh_config(false));
+    sb.config(&inject_sh_config());
     let port = free_port();
     let p = sb.project(
         "manage",
@@ -1028,18 +1022,18 @@ fn ls_status_ports_and_clean_describe_and_undo_what_up_did() {
 
     // And the next `up` puts it back.
     let again = p.up();
-    assert!(again.has("injecting hostsh binary"), "{}", again.tail(10));
+    assert!(again.has("injecting bundle"), "{}", again.tail(10));
 }
 
 #[test]
 #[ignore = "needs docker"]
 fn a_typo_in_the_config_stops_before_anything_starts() {
     let sb = Sandbox::new();
-    sb.config("[[inject]]\nname = \"x\"\nbinary = \"/bin/sh\"\nskip_if_exist = true\n");
+    sb.config("[[inject]]\nname = \"x\"\nbinary = \"/bin/sh\"\ncopy_dep = true\n");
     let p = sb.project("typo", &json(r#"{ "image": "@IMAGE@" }"#));
     let out = p.ldg("up", &["--no-attach"]);
     assert!(!out.ok);
-    assert!(out.has("did you mean `skip_if_exists`?"), "{}", out.tail(5));
+    assert!(out.has("did you mean `copy_deps`?"), "{}", out.tail(5));
     assert!(p.containers().is_empty(), "a container was created anyway");
     let doctor = sb.run(&["doctor"]);
     assert!(
@@ -1090,7 +1084,7 @@ fn a_user_without_root_gets_everything_in_their_own_prefix_and_nothing_elsewhere
     std::fs::write(settings.join("rc"), "set x").unwrap();
     sb.config(&format!(
         "{}\n[[inject]]\nname = \"settings\"\nconfig = \"{}\"\ntarget_config = \"/tmp/lodge-test-settings\"\n",
-        inject_sh_config(false),
+        inject_sh_config(),
         settings.display()
     ));
     // `nobody` has the home /nonexistent, which doesn't exist and which lodge
@@ -1137,7 +1131,7 @@ fn a_user_without_root_gets_everything_in_their_own_prefix_and_nothing_elsewhere
 fn the_session_finds_injected_tools_even_though_the_login_profile_resets_path() {
     require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
     let sb = Sandbox::new();
-    sb.config(&inject_sh_config(false));
+    sb.config(&inject_sh_config());
     // Debian's /etc/profile sets PATH from scratch for a login shell; the image's
     // own ENV entry would be lost with it.
     let p = sb.project(
@@ -1180,7 +1174,7 @@ fn the_session_finds_injected_tools_even_though_the_login_profile_resets_path() 
 fn a_glibc_tool_runs_in_a_musl_container() {
     require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
     let sb = Sandbox::new();
-    sb.config(&inject_sh_config(false));
+    sb.config(&inject_sh_config());
     let p = sb.project(
         "alpine",
         r#"{ "image": "alpine:3", "remoteUser": "nobody", "updateRemoteUserUID": false,

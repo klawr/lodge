@@ -89,11 +89,6 @@
           "description": "Identifier; used for default paths.",
           "type": "string"
         },
-        "skip_if_exists": {
-          "description": "If true, never replace the binary/config once it exists in the container,\neven when the bundle has a newer version (for a tree you update inside the\ncontainer yourself, such as installed plugins). The default, false, keeps\nit current: replaced when the bundle changed, left alone when it did not.",
-          "type": "boolean",
-          "default": false
-        },
         "target_binary": {
           "description": "Where to put an extra wrapper script that runs the binary (default: none:\nthe binary is on the `PATH` of the sessions lodge opens).",
           "type": [

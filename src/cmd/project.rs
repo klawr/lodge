@@ -278,8 +278,7 @@ pub fn clean(ctx: &Ctx, path: Option<PathBuf>) -> Result<()> {
         info!("nothing is injected into {}", container.display_name());
         return Ok(());
     };
-    let layout = installed.layout;
-    let removed = crate::inject::remove(container.as_ref(), &user, &layout)?;
+    let removed = crate::inject::remove(container.as_ref(), &user, &installed)?;
     crate::secret::place::clear(container.as_ref(), &user)?;
     info!("removed lodge from {}", container.display_name());
 
@@ -363,8 +362,11 @@ mod tests {
                 .with_output(&list, "T\n")
         });
         let c = start(&dir, &rt);
-        c.write_file("/home/dev/.local/share/lodge/bundle", b"0123456789abcdef\n")
-            .unwrap();
+        c.write_file(
+            "/home/dev/.local/share/lodge/injected",
+            b"bundle 0123456789abcdef\n",
+        )
+        .unwrap();
 
         let r = StatusReport::gather(dir.path(), &Target::Local, &rt, &one_secret()).unwrap();
         assert_eq!(
@@ -393,8 +395,11 @@ mod tests {
                 .with_file("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n")
         });
         let c = start(&dir, &rt);
-        c.write_file("/root/.local/share/lodge/bundle", b"0123456789abcdef\n")
-            .unwrap();
+        c.write_file(
+            "/root/.local/share/lodge/injected",
+            b"bundle 0123456789abcdef\n",
+        )
+        .unwrap();
         rt.stop(c.id()).unwrap();
         // The fake refuses commands in a stopped container, so a command would
         // show up as "unknown" (and a warning).

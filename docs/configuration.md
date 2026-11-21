@@ -30,7 +30,6 @@ binary         = "/usr/local/bin/nvim"     # host binary to copy in
 config         = "~/.config/nvim"          # host config dir/file to copy in
 target_binary  = "~/.local/bin/nvim"       # also write a wrapper script here (optional)
 target_config  = "~/.config/nvim"          # where the config goes (optional, default shown)
-skip_if_exists = false                     # true: never replace it once it exists (default: false)
 copy_deps      = true                      # copy shared libs via ldd when packing (default: true)
 
 # Neovim needs its runtime at the compiled-in $VIMRUNTIME path.
@@ -69,7 +68,6 @@ or both.
 | `config`         | no       | —                       | host path to a config file/dir to inject |
 | `target_binary`  | no       | none                    | also write a wrapper script that runs the binary at this path in the container (absolute or `~/…`, no `..`). Without it the binary is on the `PATH` of the sessions lodge opens |
 | `target_config`  | no       | `~/.config/<name>`      | config location in the container (`~` is the container user's home; absolute or `~/…`, no `..`) |
-| `skip_if_exists` | no       | `false`                 | `true`: never replace it once present, even if the bundle changed (for a tree you update in the container yourself). `false`: replaced when the bundle changed, left alone when it did not |
 | `copy_deps`      | no       | `true`                  | copy shared-library dependencies via `ldd` when packing |
 
 At least one of `binary` and `config` must be set. Host paths may start with `~/`.

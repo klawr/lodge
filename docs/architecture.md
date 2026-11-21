@@ -165,24 +165,27 @@ whose target is under `~` fails with the path and the user named.
 
 For each tool in the bundle (`inject/`):
 
-- **Libraries first.** Copied to `<prefix>/lib/`, with the dynamic linker, when
-  their hash differs from `<prefix>/lib/.manifest`, so a linker and libc never come
-  from different versions.
+- **One copy for the prefix.** Libraries (with the dynamic linker, so they never
+  come from different versions) and binaries are staged in a local directory laid
+  out as the prefix (`lib/`, `bin/`) and sent as a single tar. `<prefix>/bin` and
+  `<prefix>/lib` are removed first, so a re-injection leaves nothing of the
+  previous one (a running binary can be unlinked, not overwritten), and the copy
+  costs the same few engine calls however many files it holds.
 - **Binaries.** A bundle holds no install prefix: a dynamic binary was packed with
   a placeholder interpreter filling a reserved 512 bytes and a library search path
-  relative to itself (`$ORIGIN/../lib`). Injection overwrites the placeholder in
+  relative to itself (`$ORIGIN/../lib`). Staging overwrites the placeholder in
   place with `<prefix>/lib/<ld>` (`bundle::elf::set_interpreter`: the file keeps its
-  size and layout, so `patchelf` is not needed here) and copies the result to
-  `<prefix>/bin/<name>`. It runs directly, without an `ld.so` indirection, and
-  `/proc/self/exe` stays correct for tools that re-exec themselves. A static binary
-  is simply copied. Only if the config sets `target_binary` is a two-line wrapper
-  script written there, which `exec`s the binary.
-- **Skipping.** A hash is recorded per installed piece (`<prefix>/installed/`):
-  unchanged is a no-op, changed is replaced, and `skip_if_exists = true` keeps a
-  piece that is already there even when the bundle changed.
+  size and layout, so `patchelf` is not needed here). It runs directly, without an
+  `ld.so` indirection, and `/proc/self/exe` stays correct for tools that re-exec
+  themselves. A static binary is simply copied. Only if the config sets
+  `target_binary` is a two-line wrapper script written there, which `exec`s the
+  binary.
 - **Configs** are copied to their target (default `~/.config/<name>`) with the user
   as owner of every directory down to it, so nothing needs a `chown`. A target the
-  user can't write is an error naming the path and the user.
+  user can't write is an error naming the path and the user. A target that
+  already exists and that an earlier injection did not place (it is not in
+  `<prefix>/injected`) is replaced with a warning; one lodge placed is replaced
+  silently, edits made in the container included.
 - **Git.** `safe.directory` is set (`git config --global`, as the user) so tools
   can run `git` on host-owned files.
 
@@ -195,9 +198,11 @@ The terminal's terminfo entry is not part of the injection: it belongs to the
 machine a session is opened from, not to the bundle, so `session` copies it
 when it opens one.
 
-`skip_if_exists` defaults to `false`: a piece is replaced when the bundle changed
-and left alone when it did not. Set it to `true` for a tree the user updates
-inside the container (installed plugins, for example).
+Injection always replaces what it injects; there is no comparing with what is
+already there. Whether to inject at all is `ldg up`'s decision: always into a
+container it just created, only on request (`--reinject`) into an existing one.
+The record `<prefix>/injected` is written last, so an injection that failed halfway
+reads as none.
 
 ## What lives where
 
@@ -209,9 +214,8 @@ what `ldg clean` removes:
 | Path | Contents |
 | --- | --- |
 | `<prefix>/bin/` | The injected binaries; first on the session's `PATH`. |
-| `<prefix>/lib/` | Copied libraries and the dynamic linker, one copy; `.manifest` holds the hash of every library copied, so a changed host library is refreshed (names don't change across glibc versions). |
-| `<prefix>/installed/` | A content hash and the destination path per installed binary and config, so an unchanged piece is skipped, a changed one replaced (`skip_if_exists` protects a piece from replacement), and `ldg clean` knows what to remove. |
-| `<prefix>/bundle` | The id of the bundle last injected; `ldg status` shows it, and its presence is how `ldg clean` finds the prefix. |
+| `<prefix>/lib/` | Copied libraries and the dynamic linker, one copy. |
+| `<prefix>/injected` | The id of the bundle last injected, and the wrappers and configs placed outside the prefix. `ldg status` shows the id, `ldg clean` removes the wrappers and reports the configs, and its presence is how both find the prefix. |
 | `<prefix>/terminfo/` | The user's terminfo entry, when the container lacked it. |
 
 Provisioning state, which is the devcontainer's own and written as root when the
@@ -401,8 +405,8 @@ erode.
   not run again), and `ldg clean` fails when something could not be removed. The `bool` check (`succeeds`) is only for
   answers where a wrong "no" is harmless.
 - **Docs follow the code.** `doc_facts.rs` checks what the docs can be checked
-  on: every command appears in the README and in the list above, the documented
-  `skip_if_exists` default, the README's host tools, its links, and that
+  on: every command appears in the README and in the list above, the README's host
+  tools, its links, and that
   `docs/config.schema.json` is current (`make schema` regenerates it).
 
 ## Testing

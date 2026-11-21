@@ -3,32 +3,39 @@
 //! Everything here is done *as that user* (through [`Acting`]) into a prefix they
 //! own (see [`crate::layout`]), so it behaves the same whether the user is root, an
 //! ordinary user, or rootless: it never asks for more than the user has.
+//!
+//! An injection always replaces what is there: the libraries and binaries are
+//! staged in a local directory, sent to the prefix as one tar, and the configs are
+//! copied over their destinations. Whether to inject at all is the caller's
+//! decision (see `ldg up`), not something this module second-guesses.
 
 mod binary;
 mod config_files;
 mod git;
-mod installed;
 mod libs;
 mod prefix;
 mod remove;
 mod state;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::bundle::source::Prepared;
 use crate::layout::Layout;
-use crate::runtime::{Acting, ContainerUser, Env};
-use binary::{check_architecture, inject_binary};
+use crate::output::{info, plural};
+use crate::runtime::{Acting, ContainerUser, Env, ExecOpts};
+use crate::tmpfile::TempDir;
+use binary::{check_architecture, place_wrapper, stage_binary};
 use config_files::inject_config;
 use git::configure_git_safe;
-use libs::inject_libs;
+use libs::stage_libs;
 pub use prefix::resolve as resolve_layout;
 pub use remove::remove;
-pub use state::installed;
-use state::record_bundle;
+pub use state::{Installed, installed};
 
 /// Injects `bundle` for `user` into the prefix `layout` (see [`resolve_layout`]):
-/// libraries first, then each tool's binary and config, then git's settings.
+/// libraries and binaries in one copy, then each tool's wrapper and config, then
+/// git's settings. The record that says what was injected is written last, so an
+/// injection that failed halfway reads as none.
 pub fn run(
     container: &dyn Env,
     user: &ContainerUser,
@@ -38,18 +45,81 @@ pub fn run(
     let env = Acting::new(container, user);
     check_architecture(&env, &bundle.manifest)?;
 
-    inject_libs(&env, layout, bundle)?;
+    let stage = TempDir::new("inject").context("making a staging directory")?;
+    stage_libs(bundle, stage.path())?;
     for tool in &bundle.manifest.tools {
         if let Some(binary) = &tool.binary {
-            inject_binary(&env, user, layout, bundle, tool, binary)?;
-        }
-        if let Some(config) = &tool.config {
-            inject_config(&env, user, layout, bundle, tool, config)?;
+            stage_binary(bundle, layout, tool, binary, stage.path())?;
         }
     }
-    record_bundle(&env, layout, &bundle.manifest.id())?;
+    let binaries = bundle
+        .manifest
+        .tools
+        .iter()
+        .filter(|t| t.binary.is_some())
+        .count();
+    let libs = bundle.manifest.libs.len();
+    let contents: Vec<String> = [
+        (binaries, "binary", "binaries"),
+        (libs, "library", "libraries"),
+    ]
+    .into_iter()
+    .filter(|(n, ..)| *n > 0)
+    .map(|(n, one, many)| plural(n, one, many))
+    .collect();
+    if contents.is_empty() {
+        info!("injecting bundle {}", bundle.manifest.id());
+    } else {
+        info!(
+            "injecting bundle {} ({})",
+            bundle.manifest.id(),
+            contents.join(", ")
+        );
+    }
+    // What an earlier injection placed outside the prefix, to tell it from what
+    // was already there.
+    let placed_before = state::previous(&env, layout)?
+        .map(|p| p.configs)
+        .unwrap_or_default();
+    // `bin/` and `lib/` are replaced as a whole, so nothing of an earlier
+    // injection is left behind. (A running binary can be unlinked, but not
+    // overwritten.)
+    env.exec(
+        &["rm", "-rf", &layout.bin(), &layout.lib()],
+        &ExecOpts::default(),
+    )?;
+    env.cp_in(&stage.path().to_string_lossy(), layout.prefix())?;
 
-    configure_git_safe(&env, &bundle.manifest.git_safe_directories)
+    let mut wrappers = Vec::new();
+    let mut configs = Vec::new();
+    for tool in &bundle.manifest.tools {
+        if let Some(binary) = &tool.binary
+            && let Some(wrapper) = place_wrapper(&env, user, layout, tool, binary)?
+        {
+            wrappers.push(wrapper);
+        }
+        if let Some(config) = &tool.config {
+            configs.push(inject_config(
+                &env,
+                user,
+                bundle,
+                tool,
+                config,
+                &placed_before,
+            )?);
+        }
+    }
+    configure_git_safe(&env, &bundle.manifest.git_safe_directories)?;
+
+    state::record(
+        &env,
+        &Installed {
+            layout: layout.clone(),
+            bundle: bundle.manifest.id(),
+            wrappers,
+            configs,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -95,7 +165,6 @@ mod tests {
                     is_dir: false,
                     hash: "00000000000000bb".into(),
                 }),
-                skip_if_exists: false,
             }],
             git_safe_directories: vec!["*".into()],
         };
@@ -118,7 +187,16 @@ mod tests {
             env.file("/home/dev/.hellorc").as_deref(),
             Some("greeting=hi")
         );
-        assert_eq!(env.file(&format!("{p}/bundle")), Some(format!("{id}\n")));
+        assert_eq!(
+            env.file(&format!("{p}/injected")),
+            Some(format!("bundle {id}\nconfig /home/dev/.hellorc\n")),
+            "the record names the bundle and what was placed outside the prefix"
+        );
+        // `bin/` and `lib/` are replaced and refilled by the one copy into the
+        // prefix, not file by file.
+        assert!(env.ran(&["rm", "-rf", &layout.bin(), &layout.lib()]));
+        assert!(env.ran(&["mkdir", "-p", p]));
+        assert!(!env.ran(&["mkdir", "-p", &layout.bin()]));
         for (call, who) in env.calls() {
             assert_ne!(who, Who::Root, "{call:?} ran as root");
         }
@@ -147,7 +225,6 @@ mod tests {
                     is_dir: false,
                     hash: "00000000000000bb".into(),
                 }),
-                skip_if_exists: false,
             }],
             git_safe_directories: vec![],
         };
@@ -160,6 +237,6 @@ mod tests {
         let root = ContainerUser::root();
         run(&env, &root, &Layout::preferred(&root), &bundle).unwrap();
         assert_eq!(env.file("/root/.c").as_deref(), Some("x"));
-        assert!(env.file("/root/.local/share/lodge/bundle").is_some());
+        assert!(env.file("/root/.local/share/lodge/injected").is_some());
     }
 }

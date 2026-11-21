@@ -7,7 +7,7 @@ with `-v` to see every docker/ssh command lodge runs.
 ## The config is rejected
 
 ```
-[lodge] error: invalid config ~/.config/lodge/config.toml: unknown field `skip_if_exist`, … (line 4); did you mean `skip_if_exists`?
+[lodge] error: invalid config ~/.config/lodge/config.toml: unknown field `copy_dep`, … (line 4); did you mean `copy_deps`?
 ```
 
 lodge rejects keys it doesn't know rather than ignoring them, so a typo can't

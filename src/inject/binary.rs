@@ -1,95 +1,40 @@
 use anyhow::{Context, Result, bail};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::Path;
 
-use super::installed::{Decision, Kind, Piece, decide, record};
 use crate::bundle::arch::Arch;
 use crate::bundle::elf;
-use crate::bundle::manifest::{Binary, Manifest, Tool};
+use crate::bundle::manifest::{BIN_DIR, Binary, Manifest, Tool};
 use crate::bundle::source::Prepared;
 use crate::layout::Layout;
-use crate::output::info;
 use crate::runtime::{ContainerUser, Env};
-use crate::tmpfile::TempFile;
 
-pub(super) fn inject_binary(
-    env: &dyn Env,
-    user: &ContainerUser,
-    layout: &Layout,
+/// Puts the tool's binary into `stage/bin/`, which is sent as a whole to the
+/// prefix.
+///
+/// The bundle's copy was relinked when it was packed, so it runs *directly*
+/// against the injected glibc (no ld.so wrapper). Running directly keeps
+/// /proc/self/exe pointing at the binary, which tools like Neovim need when
+/// they re-exec themselves (`--embed`). A dynamic one is staged as a copy whose
+/// interpreter names the dynamic linker in `layout`; a static one as it is.
+pub(super) fn stage_binary(
     bundle: &Prepared,
+    layout: &Layout,
     tool: &Tool,
     binary: &Binary,
+    stage: &Path,
 ) -> Result<()> {
     let name = &tool.name;
-    let installed = layout.bin_of(name);
-    let dir = layout.installed();
-    let piece = Piece {
-        tool: name,
-        kind: Kind::Binary,
-    };
-
-    match decide(
-        env,
-        &dir,
-        piece,
-        &binary.hash,
-        env.exists(&installed)?,
-        tool.skip_if_exists,
-    ) {
-        Decision::UpToDate => {
-            info!("{name} is up to date");
-            return Ok(());
-        }
-        Decision::KeepExisting => {
-            info!("{name} already exists, skipping");
-            return Ok(());
-        }
-        Decision::Install => {}
-    }
-
-    info!("injecting {name} binary");
-    // The bundle's copy was relinked when it was packed, so it runs *directly*
-    // against the injected glibc (no ld.so wrapper). Running directly keeps
-    // /proc/self/exe pointing at the binary, which tools like Neovim need when
-    // they re-exec themselves (`--embed`).
-    let staged = stage(bundle, layout, name, binary)?;
-    env.cp_in(&staged.path().to_string_lossy(), &installed)?;
-    // Where the user asked for an extra wrapper: a script, so any program that
-    // looks for the tool at that path finds it.
-    let wrapper = binary.dest.as_deref().map(|d| user.expand_home(d));
-    if let Some(dest) = &wrapper {
-        install_wrapper(env, &installed, dest)
-            .with_context(|| format!("{name}: writing the wrapper {dest}"))?;
-    }
-    record(
-        env,
-        &dir,
-        piece,
-        &binary.hash,
-        wrapper.as_deref().unwrap_or(&installed),
-    )
-}
-
-/// A binary ready to copy: the bundle's own file, or (for a dynamic one) a copy
-/// of it whose interpreter now names the dynamic linker in `layout`.
-enum Staged {
-    Bundle(PathBuf),
-    Rewritten(TempFile),
-}
-
-impl Staged {
-    fn path(&self) -> &std::path::Path {
-        match self {
-            Staged::Bundle(p) => p,
-            Staged::Rewritten(t) => t.path(),
-        }
-    }
-}
-
-fn stage(bundle: &Prepared, layout: &Layout, name: &str, binary: &Binary) -> Result<Staged> {
     let source = bundle.bin(name);
+    let dir = stage.join(BIN_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
+    let to = dir.join(name);
     if !binary.dynamic {
-        return Ok(Staged::Bundle(source));
+        // A link costs nothing; a copy is for a bundle cache on another filesystem.
+        if std::fs::hard_link(&source, &to).is_err() {
+            std::fs::copy(&source, &to).with_context(|| format!("staging {}", source.display()))?;
+        }
+        return Ok(());
     }
     let linker = bundle
         .manifest
@@ -100,9 +45,26 @@ fn stage(bundle: &Prepared, layout: &Layout, name: &str, binary: &Binary) -> Res
         std::fs::read(&source).with_context(|| format!("reading {}", source.display()))?;
     elf::set_interpreter(&mut bytes, &layout.lib_file(linker))
         .with_context(|| format!("preparing {name} to run from {}", layout.prefix()))?;
-    let tmp = TempFile::write(&format!("lodge-{name}"), &bytes)?;
-    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))?;
-    Ok(Staged::Rewritten(tmp))
+    std::fs::write(&to, &bytes).with_context(|| format!("staging {}", to.display()))?;
+    std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+/// Where the config asked for an extra wrapper (a script, so any program that
+/// looks for the tool at that path finds it), writes it and returns its path.
+pub(super) fn place_wrapper(
+    env: &dyn Env,
+    user: &ContainerUser,
+    layout: &Layout,
+    tool: &Tool,
+    binary: &Binary,
+) -> Result<Option<String>> {
+    let Some(dest) = binary.dest.as_deref().map(|d| user.expand_home(d)) else {
+        return Ok(None);
+    };
+    install_wrapper(env, &layout.bin_of(&tool.name), &dest)
+        .with_context(|| format!("{}: writing the wrapper {dest}", tool.name))?;
+    Ok(Some(dest))
 }
 
 // Refuses a bundle built for a different CPU than the container runs on: its
@@ -165,16 +127,15 @@ mod tests {
         }
     }
 
-    fn tool(skip: bool, hash: &str, wrapper: Option<&str>) -> Tool {
+    fn tool(wrapper: Option<&str>) -> Tool {
         Tool {
             name: "hello".into(),
             binary: Some(Binary {
                 dest: wrapper.map(String::from),
                 dynamic: false,
-                hash: hash.into(),
+                hash: "aaaaaaaaaaaaaaaa".into(),
             }),
             config: None,
-            skip_if_exists: skip,
         }
     }
 
@@ -200,18 +161,19 @@ mod tests {
         (dir, prepared)
     }
 
-    fn inject(env: &FakeEnv, bundle: &Prepared) {
+    /// Stages the bundle's first tool for `layout` and returns what was staged.
+    fn staged(bundle: &Prepared, layout: &Layout) -> Result<(TempDir, std::path::PathBuf)> {
+        let stage = TempDir::new("bin-stage").unwrap();
         let tool = &bundle.manifest.tools[0];
-        let user = dev();
-        inject_binary(
-            &Acting::new(env, &user),
-            &user,
-            &layout(),
+        stage_binary(
             bundle,
+            layout,
             tool,
             tool.binary.as_ref().unwrap(),
-        )
-        .unwrap();
+            stage.path(),
+        )?;
+        let file = stage.path().join("bin/hello");
+        Ok((stage, file))
     }
 
     #[test]
@@ -226,71 +188,45 @@ mod tests {
     }
 
     #[test]
-    fn a_binary_is_installed_into_the_prefix_and_recorded_with_no_wrapper() {
-        let (_dir, b) = bundle(tool(false, "aaaaaaaaaaaaaaaa", None), "x86_64");
-        let env = FakeEnv::new();
-        inject(&env, &b);
-        assert_eq!(env.file("/p/bin/hello").unwrap(), "#!/bin/sh\necho hi\n");
+    fn a_static_binary_is_staged_as_it_is_in_bin() {
+        let (_dir, b) = bundle(tool(None), "x86_64");
+        let (_stage, file) = staged(&b, &layout()).unwrap();
         assert_eq!(
-            env.file("/p/installed/hello.bin").unwrap().trim(),
-            "aaaaaaaaaaaaaaaa\n/p/bin/hello"
-        );
-        assert!(
-            !env.ran_matching(|c| c[0] == "chmod" || c[0] == "chown"),
-            "mode and owner come with the copy"
-        );
-        assert_eq!(
-            env.owner_of("/p/bin/hello"),
-            Some((1000, 1000)),
-            "the copy is made for the user, who then owns it"
+            std::fs::read_to_string(file).unwrap(),
+            "#!/bin/sh\necho hi\n"
         );
     }
 
     #[test]
     fn a_wrapper_is_written_only_where_the_config_asked_for_one() {
-        let (_dir, b) = bundle(
-            tool(false, "aaaaaaaaaaaaaaaa", Some("~/.local/bin/hello")),
-            "x86_64",
-        );
+        let (_dir, none) = bundle(tool(None), "x86_64");
         let env = FakeEnv::new();
-        inject(&env, &b);
+        let user = dev();
+        let place = |b: &Prepared| {
+            let tool = &b.manifest.tools[0];
+            place_wrapper(
+                &Acting::new(&env, &user),
+                &user,
+                &layout(),
+                tool,
+                tool.binary.as_ref().unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(place(&none), None);
+        assert!(!env.ran_matching(|_| true), "nothing was written");
+
+        let (_dir, some) = bundle(tool(Some("~/.local/bin/hello")), "x86_64");
+        assert_eq!(
+            place(&some).as_deref(),
+            Some("/home/dev/.local/bin/hello"),
+            "the path is returned so it is recorded and `ldg clean` can remove it"
+        );
         assert!(
             env.file("/home/dev/.local/bin/hello")
                 .unwrap()
                 .contains("exec /p/bin/hello")
         );
-        assert_eq!(
-            env.file("/p/installed/hello.bin").unwrap().trim(),
-            "aaaaaaaaaaaaaaaa\n/home/dev/.local/bin/hello",
-            "the record names the wrapper, so `ldg clean` can remove it"
-        );
-    }
-
-    #[test]
-    fn an_unchanged_binary_is_not_copied_again() {
-        let (_dir, b) = bundle(tool(false, "aaaaaaaaaaaaaaaa", None), "x86_64");
-        let env = FakeEnv::new()
-            .with_file("/p/bin/hello", "old contents")
-            .with_file("/p/installed/hello.bin", "aaaaaaaaaaaaaaaa\n/p/bin/hello");
-        inject(&env, &b);
-        assert_eq!(env.file("/p/bin/hello").unwrap(), "old contents");
-    }
-
-    #[test]
-    fn a_changed_binary_is_replaced_unless_protected() {
-        let installed = |env: FakeEnv| {
-            env.with_file("/p/bin/hello", "old contents")
-                .with_file("/p/installed/hello.bin", "1111111111111111\n")
-        };
-        let (_d1, replace) = bundle(tool(false, "aaaaaaaaaaaaaaaa", None), "x86_64");
-        let env = installed(FakeEnv::new());
-        inject(&env, &replace);
-        assert_eq!(env.file("/p/bin/hello").unwrap(), "#!/bin/sh\necho hi\n");
-
-        let (_d2, protect) = bundle(tool(true, "aaaaaaaaaaaaaaaa", None), "x86_64");
-        let env = installed(FakeEnv::new());
-        inject(&env, &protect);
-        assert_eq!(env.file("/p/bin/hello").unwrap(), "old contents");
     }
 
     /// An ELF64 image with a placeholder interpreter, as `ldg pack` leaves it.
@@ -313,27 +249,20 @@ mod tests {
 
     #[test]
     fn a_dynamic_binary_is_given_the_interpreter_of_the_prefix_it_goes_to() {
-        let (dir, mut b) = bundle(tool(false, "aaaaaaaaaaaaaaaa", None), "x86_64");
+        let (dir, mut b) = bundle(tool(None), "x86_64");
         std::fs::write(dir.path().join("bin/hello"), dynamic_image()).unwrap();
         b.manifest.linker = Some("ld-linux-x86-64.so.2".into());
         b.manifest.tools[0].binary.as_mut().unwrap().dynamic = true;
 
         for prefix in ["/p", "/home/dev/.local/share/lodge"] {
-            let env = FakeEnv::new();
-            let tool = &b.manifest.tools[0];
-            inject_binary(
-                &env,
-                &dev(),
-                &Layout::new(prefix),
-                &b,
-                tool,
-                tool.binary.as_ref().unwrap(),
-            )
-            .unwrap();
-            let installed = env.file_bytes(&format!("{prefix}/bin/hello")).unwrap();
-            let interp = elf::interpreter(&installed).unwrap().unwrap();
+            let (_stage, file) = staged(&b, &Layout::new(prefix)).unwrap();
+            let image = std::fs::read(&file).unwrap();
+            let interp = elf::interpreter(&image).unwrap().unwrap();
             assert_eq!(interp, format!("{prefix}/lib/ld-linux-x86-64.so.2"));
-            assert_eq!(env.mode(&format!("{prefix}/bin/hello")), Some(0o755));
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
         }
         // The bundle's own copy still holds the placeholder.
         let kept = std::fs::read(dir.path().join("bin/hello")).unwrap();
@@ -345,25 +274,18 @@ mod tests {
 
     #[test]
     fn a_prefix_too_long_for_the_reserved_space_is_refused_by_name() {
-        let (dir, mut b) = bundle(tool(false, "aaaaaaaaaaaaaaaa", None), "x86_64");
+        let (dir, mut b) = bundle(tool(None), "x86_64");
         std::fs::write(dir.path().join("bin/hello"), dynamic_image()).unwrap();
         b.manifest.linker = Some("ld.so".into());
         b.manifest.tools[0].binary.as_mut().unwrap().dynamic = true;
         let long = Layout::new(format!("/{}", "a".repeat(600)));
-        let env = FakeEnv::new();
-        let tool = &b.manifest.tools[0];
-        let err = format!(
-            "{:#}",
-            inject_binary(&env, &dev(), &long, &b, tool, tool.binary.as_ref().unwrap())
-                .unwrap_err()
-        );
+        let err = format!("{:#}", staged(&b, &long).err().unwrap());
         assert!(err.contains("hello") && err.contains("shorter"), "{err}");
-        assert!(env.file(&format!("{}/bin/hello", long.prefix())).is_none());
     }
 
     #[test]
     fn a_bundle_for_another_architecture_is_refused() {
-        let (_dir, b) = bundle(tool(false, "aaaaaaaaaaaaaaaa", None), "x86_64");
+        let (_dir, b) = bundle(tool(None), "x86_64");
         let env = FakeEnv::new().with_output(&["uname", "-m"], "aarch64\n");
         let err = check_architecture(&env, &b.manifest)
             .unwrap_err()
@@ -373,7 +295,7 @@ mod tests {
 
     #[test]
     fn matching_architecture_and_bundles_without_binaries_pass() {
-        let (_dir, b) = bundle(tool(false, "aaaaaaaaaaaaaaaa", None), "x86_64");
+        let (_dir, b) = bundle(tool(None), "x86_64");
         let env = FakeEnv::new().with_output(&["uname", "-m"], "x86_64\n");
         check_architecture(&env, &b.manifest).unwrap();
 

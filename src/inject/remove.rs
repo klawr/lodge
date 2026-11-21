@@ -1,7 +1,7 @@
 //! Taking an injection back out of a container (`ldg clean`).
 //!
 //! Removes what injection put there: the user's prefix (binaries, libraries, the
-//! dynamic linker and the records) and the wrappers the config asked for, if they
+//! dynamic linker and the record) and the wrappers the config asked for, if they
 //! still point at lodge. Placed secrets are [`crate::secret`]'s to remove.
 //! Injected *configs* are left in place and reported, since the user may have
 //! changed them in the container. The devcontainer's own state (hook markers, the
@@ -10,8 +10,7 @@
 
 use anyhow::{Result, bail};
 
-use super::installed::{self, Kind};
-use crate::layout::Layout;
+use super::state::Installed;
 use crate::runtime::{Acting, ContainerUser, Env, ExecOpts};
 use crate::shell::{script_argv, shell_quote};
 
@@ -42,25 +41,15 @@ fn script(prefix: &str, marker: &str) -> String {
     )
 }
 
-/// Removes the injection for `user` from `container`. An error when something
-/// could not be removed (what could be is gone all the same).
-pub fn remove(container: &dyn Env, user: &ContainerUser, layout: &Layout) -> Result<Removed> {
+/// Removes the injection `installed` describes for `user` from `container`. An
+/// error when something could not be removed (what could be is gone all the
+/// same).
+pub fn remove(container: &dyn Env, user: &ContainerUser, installed: &Installed) -> Result<Removed> {
     let env = Acting::new(container, user);
-    let mut wrappers = Vec::new();
-    let mut configs_kept = Vec::new();
-    for (kind, path) in installed::placed(&env, &layout.installed())? {
-        match kind {
-            Kind::Binary => wrappers.push(path),
-            Kind::Config => configs_kept.push(path),
-        }
-    }
-    // A binary without a wrapper is recorded at its place in the prefix, which is
-    // removed as a whole below, so it is not a wrapper to report.
-    wrappers.retain(|w| !w.starts_with(layout.prefix()));
-
+    let layout = &installed.layout;
     let marker = format!("exec {}/", layout.bin());
     let script = script(layout.prefix(), &marker);
-    let recorded: Vec<&str> = wrappers.iter().map(String::as_str).collect();
+    let recorded: Vec<&str> = installed.wrappers.iter().map(String::as_str).collect();
     let out = env.output(&script_argv(&script, &recorded), &ExecOpts::default())?;
     if !out.success {
         bail!("removing lodge's files failed: {}", out.stderr.trim());
@@ -70,13 +59,14 @@ pub fn remove(container: &dyn Env, user: &ContainerUser, layout: &Layout) -> Res
     wrappers.dedup();
     Ok(Removed {
         wrappers,
-        configs_kept,
+        configs_kept: installed.configs.clone(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::Layout;
     use crate::runtime::fake::{FakeEnv, Who};
     use std::path::Path;
     use std::process::Command;
@@ -164,20 +154,17 @@ mod tests {
     #[test]
     fn cleaning_reports_the_kept_configs_and_never_runs_as_root() {
         let layout = Layout::preferred(&dev());
+        let installed = Installed {
+            layout: layout.clone(),
+            bundle: "abc".into(),
+            wrappers: vec![],
+            configs: vec!["/home/dev/.config/nvim".into()],
+        };
         let removal = script(layout.prefix(), &format!("exec {}/", layout.bin()));
-        let env = FakeEnv::new()
-            .with_output(
-                &["sh", "-c", &installed::placed_script(&layout.installed())],
-                "nvim.bin\t/home/dev/.local/share/lodge/bin/nvim\n\
-                 nvim.config\t/home/dev/.config/nvim\n",
-            )
-            .with_output(&script_argv(&removal, &[]), "");
-        let removed = remove(&env, &dev(), &layout).unwrap();
+        let env = FakeEnv::new().with_output(&script_argv(&removal, &[]), "");
+        let removed = remove(&env, &dev(), &installed).unwrap();
         assert_eq!(removed.configs_kept, ["/home/dev/.config/nvim"]);
-        assert!(
-            removed.wrappers.is_empty(),
-            "the binary lives in the prefix"
-        );
+        assert!(removed.wrappers.is_empty());
         for (call, who) in env.calls() {
             assert_ne!(who, Who::Root, "{call:?} ran as root");
         }

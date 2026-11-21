@@ -103,7 +103,6 @@ impl Packer<'_> {
             name: item.name.clone(),
             binary,
             config,
-            skip_if_exists: item.skip_if_exists,
         });
         Ok(())
     }
@@ -324,7 +323,6 @@ mod tests {
             config: None,
             target_binary: None,
             target_config: None,
-            skip_if_exists: true,
             // A script has no libraries, and this keeps the test free of ldd and
             // patchelf.
             copy_deps: false,

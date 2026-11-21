@@ -81,19 +81,11 @@ impl Layout {
         format!("{}/{name}", self.lib())
     }
 
-    /// Hash of every library copied into [`lib`](Self::lib).
-    pub fn lib_manifest(&self) -> String {
-        format!("{}/lib/.manifest", self.prefix)
-    }
-
-    /// A content hash and destination per installed binary and config.
-    pub fn installed(&self) -> String {
-        format!("{}/installed", self.prefix)
-    }
-
-    /// The id of the bundle last injected.
-    pub fn bundle_id(&self) -> String {
-        format!("{}/bundle", self.prefix)
+    /// What the last injection recorded: the bundle's id, and what it placed
+    /// outside the prefix. Written last, so its presence means the injection
+    /// finished.
+    pub fn record(&self) -> String {
+        format!("{}/injected", self.prefix)
     }
 
     /// Terminfo entries copied from the host, for [`TERMINFO_DIRS`](
@@ -155,9 +147,7 @@ mod tests {
             l.bin_of("nvim"),
             l.lib(),
             l.lib_file("ld.so"),
-            l.lib_manifest(),
-            l.installed(),
-            l.bundle_id(),
+            l.record(),
             l.terminfo(),
         ] {
             assert!(path.starts_with("/home/dev/.local/share/lodge/"), "{path}");

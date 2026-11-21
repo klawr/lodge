@@ -120,12 +120,6 @@ impl FakeEnv {
             .map(|b| String::from_utf8_lossy(b).into_owned())
     }
 
-    /// The bytes of a file, if it exists (for binary content, which `file`
-    /// would mangle).
-    pub fn file_bytes(&self, path: &str) -> Option<Vec<u8>> {
-        self.files.borrow().get(path).cloned()
-    }
-
     /// The `(uid, gid)` that owns a file copied in with [`Env::put`].
     pub fn owner_of(&self, path: &str) -> Option<(u32, u32)> {
         self.owners.borrow().get(path).copied()

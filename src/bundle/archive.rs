@@ -134,7 +134,6 @@ mod tests {
                     is_dir: true,
                     hash: hash_path(&p.join("config/hello")).unwrap(),
                 }),
-                skip_if_exists: true,
             }],
             git_safe_directories: vec![],
         };

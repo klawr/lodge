@@ -71,12 +71,6 @@ pub struct Injectable {
     pub target_binary: Option<String>,
     /// Where the config goes in the container (default: `~/.config/<name>`).
     pub target_config: Option<String>,
-    /// If true, never replace the binary/config once it exists in the container,
-    /// even when the bundle has a newer version (for a tree you update inside the
-    /// container yourself, such as installed plugins). The default, false, keeps
-    /// it current: replaced when the bundle changed, left alone when it did not.
-    #[serde(default)]
-    pub skip_if_exists: bool,
     /// Pack the shared libraries `ldd` finds for the binary (default: true).
     #[serde(default = "default_true")]
     pub copy_deps: bool,
@@ -359,7 +353,6 @@ mod tests {
             [[inject]]
             name = "nvim"
             binary = "/usr/bin/nvim"
-            skip_if_exists = false
 
             [session]
             shell = "/bin/zsh"
@@ -372,7 +365,6 @@ mod tests {
         .unwrap();
         assert_eq!(c.inject.len(), 1);
         assert_eq!(c.inject[0].name, "nvim");
-        assert!(!c.inject[0].skip_if_exists);
         assert!(c.inject[0].copy_deps); // defaults to true
         assert_eq!(c.session.shell, "/bin/zsh");
         assert_eq!(c.session.multiplexer, Multiplexer::None);
@@ -424,11 +416,11 @@ mod tests {
     fn a_typo_is_an_error_with_its_line_and_a_suggestion() {
         let err = format!(
             "{:#}",
-            parse("[[inject]]\nname = \"x\"\nbinary = \"/x\"\nskip_if_exist = true\n").unwrap_err()
+            parse("[[inject]]\nname = \"x\"\nbinary = \"/x\"\ncopy_dep = true\n").unwrap_err()
         );
-        assert!(err.contains("unknown field `skip_if_exist`"), "{err}");
+        assert!(err.contains("unknown field `copy_dep`"), "{err}");
         assert!(err.contains("line 4"), "{err}");
-        assert!(err.contains("did you mean `skip_if_exists`?"), "{err}");
+        assert!(err.contains("did you mean `copy_deps`?"), "{err}");
 
         let err = format!(
             "{:#}",

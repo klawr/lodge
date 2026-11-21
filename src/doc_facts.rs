@@ -61,29 +61,6 @@ fn the_architecture_lists_every_command() {
 }
 
 #[test]
-fn the_documented_skip_if_exists_default_is_the_real_one() {
-    let cfg = crate::config::Config::parse(
-        "[[inject]]\nname = \"x\"\nbinary = \"/x\"\n",
-        std::path::Path::new("/c.toml"),
-    )
-    .unwrap();
-    let default = format!("`{}`", cfg.inject[0].skip_if_exists);
-    let reference = read("docs/configuration.md");
-    let row = reference
-        .lines()
-        .find(|l| l.starts_with("| `skip_if_exists`"))
-        .expect("docs/configuration.md has a skip_if_exists row");
-    assert!(
-        row.contains(&default),
-        "docs/configuration.md says {row:?}, default is {default}"
-    );
-    assert!(
-        read("docs/architecture.md").contains(&format!("`skip_if_exists` defaults to {default}")),
-        "architecture.md must say `skip_if_exists` defaults to {default}"
-    );
-}
-
-#[test]
 fn the_readme_requirements_name_every_host_tool() {
     let readme = read("README.md");
     let start = readme

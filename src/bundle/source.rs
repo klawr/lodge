@@ -221,7 +221,6 @@ mod tests {
             config: None,
             target_binary: None,
             target_config: None,
-            skip_if_exists: false,
             copy_deps: false,
         }
     }
@@ -291,8 +290,7 @@ mod tests {
         };
         let plain = key(base());
         // (`copy_deps` too, but turning it on asks ldd about the binary.)
-        let changes: [fn(&mut Injectable); 3] = [
-            |i| i.skip_if_exists = true,
+        let changes: [fn(&mut Injectable); 2] = [
             |i| i.target_binary = Some("/opt/t".into()),
             |i| i.target_config = Some("~/.t".into()),
         ];
