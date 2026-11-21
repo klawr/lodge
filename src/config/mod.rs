@@ -26,7 +26,7 @@ use secret::{RawSecret, SecretDecl};
 )]
 pub struct Config<S = SecretDecl> {
     /// The container engine to drive, unless `--engine` says otherwise
-    /// (default: docker).
+    /// (`docker` or `podman`; default: docker).
     #[serde(default)]
     pub engine: Option<Engine>,
     /// A bundle file to inject from instead of packing the `[[inject]]` entries.

@@ -40,6 +40,8 @@ the login: run with `-vv` for ssh's own output.
   engine host can reach. With Docker Desktop on macOS/Windows, container IPs
   aren't reachable from the host; use `appPort` (published on loopback) or
   `--remote`.
+- With rootless Podman a container has no address the host can reach, so nothing
+  is forwarded on its own: publish the ports with `appPort`.
 - "could not forward port N": something on this machine already uses that port.
 - A service listening on `127.0.0.1` *inside* the container can't be reached
   from outside it; make it listen on `0.0.0.0`.

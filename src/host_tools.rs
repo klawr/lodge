@@ -1,5 +1,5 @@
 //! The helper programs lodge may run on this machine, apart from the container
-//! engine (`runtime::docker`) and the shell (`host`).
+//! engine (`runtime::cli`) and the shell (`host`).
 //!
 //! One table says what each tool is for and how to get it, so `ldg doctor`, the
 //! error messages and the docs say the same thing. Each is started only through

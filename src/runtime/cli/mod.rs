@@ -1,7 +1,9 @@
-//! The `docker` CLI as a [`Runtime`], [`Compose`], [`Container`] and
-//! [`Env`](super::Env).
+//! The docker-compatible command line (`docker`, `podman`) as a [`Runtime`],
+//! [`Compose`], [`Container`] and [`Env`](super::Env). Podman's CLI is docker's
+//! apart from a few places, which each engine's [`Flavor`] answers; everything else
+//! is shared.
 //!
-//! It runs `docker …` *on a [`Host`](crate::host::Host)* it is given: this machine, or another one
+//! It runs `docker …` (or `podman …`) *on a [`Host`](crate::host::Host)* it is given: this machine, or another one
 //! the host reaches (so a remote engine needs no local docker CLI, only whatever
 //! the host needs). It never starts a process itself and does not know which kind
 //! of host it has.
@@ -20,18 +22,73 @@ use crate::host::{HostRef, Repeat};
 
 mod container;
 mod copy;
+mod docker;
+mod podman;
 
-pub use container::DockerContainer;
+pub use container::CliContainer;
+pub use docker::DockerFlavor;
+pub use podman::PodmanFlavor;
 
-/// The docker CLI, run on a [`Host`](crate::host::Host).
-#[derive(Clone)]
-pub struct DockerCli {
-    host: HostRef,
+/// What one engine of the docker-compatible family does its own way: its
+/// program, and the few places where its command line or its behaviour differs
+/// from what [`CliEngine`] does for all of them. Docker and Podman are different
+/// engines that share the plumbing; each is a `Flavor`, and a [`CliEngine`] of it
+/// asks the flavor instead of checking which one it is.
+pub trait Flavor: Clone + Send + Sync + 'static {
+    /// The program, and what the user calls the engine (`--engine`).
+    fn program(&self) -> &'static str;
+
+    /// Flags for `run`, after the common ones and before the devcontainer's own
+    /// `runArgs`, which can override them.
+    fn extra_run_flags(&self, cli: &CliEngine<Self>, spec: &RunSpec) -> Vec<String>
+    where
+        Self: Sized;
+
+    /// The arguments of the command that streams a tar into a container,
+    /// keeping the archive's owners.
+    fn cp_in_args<'a>(&self, target: &'a str) -> Vec<&'a str>;
+
+    /// Whether `cp`'s error says the path is not in the container (as opposed to
+    /// the container, the engine or the connection being the problem).
+    fn says_path_is_missing(&self, stderr: &str) -> bool;
+
+    /// The arguments that ask the compose provider for its version.
+    fn compose_version_args(&self) -> &'static [&'static str];
+
+    /// Whether a container's own address (from `inspect`) can be connected to
+    /// from the host the engine runs on.
+    fn addresses_are_reachable(&self, cli: &CliEngine<Self>) -> bool
+    where
+        Self: Sized;
 }
 
-impl DockerCli {
-    pub fn new(host: HostRef) -> Self {
-        Self { host }
+/// A docker-compatible command line, run on a [`Host`](crate::host::Host).
+#[derive(Clone)]
+pub struct CliEngine<F: Flavor> {
+    host: HostRef,
+    flavor: F,
+}
+
+/// The `docker` CLI.
+pub type Docker = CliEngine<DockerFlavor>;
+/// The `podman` CLI.
+pub type Podman = CliEngine<PodmanFlavor>;
+
+impl<F: Flavor> CliEngine<F> {
+    fn with(host: HostRef, flavor: F) -> Self {
+        Self { host, flavor }
+    }
+
+    /// The program's name, for messages.
+    pub(super) fn name(&self) -> &'static str {
+        self.flavor.program()
+    }
+
+    /// The program and its arguments, as a vector.
+    fn argv<'a>(&self, args: &[&'a str]) -> Vec<&'a str> {
+        let mut v = vec![self.flavor.program()];
+        v.extend_from_slice(args);
+        v
     }
 
     /// Builds a command that runs `docker <args>` on the host. Stdin is closed
@@ -40,7 +97,7 @@ impl DockerCli {
     /// is built here, in [`command_in`](Self::command_in) or in
     /// [`interactive`](Self::interactive).
     pub(super) fn command(&self, args: &[&str]) -> Command {
-        let mut c = self.host.argv(&docker_argv(args), None);
+        let mut c = self.host.argv(&self.argv(args), None);
         c.stdin(Stdio::null());
         crate::output::trace(&c);
         c
@@ -51,7 +108,7 @@ impl DockerCli {
     /// i.e. on the host where the docker CLI runs, so the working directory has
     /// to be the project dir *there*.
     fn command_in(&self, dir: Option<&Path>, args: &[&str]) -> Command {
-        let c = self.host.argv(&docker_argv(args), dir);
+        let c = self.host.argv(&self.argv(args), dir);
         crate::output::trace(&c);
         c
     }
@@ -59,7 +116,7 @@ impl DockerCli {
     /// A command that opens an interactive `docker <args>` on the host, with a
     /// terminal.
     pub(super) fn interactive(&self, args: &[&str]) -> Command {
-        self.host.interactive(&docker_argv(args))
+        self.host.interactive(&self.argv(args))
     }
 
     /// `docker compose -p <project> -f <file>… <tail…>`, run in `dir`.
@@ -84,9 +141,9 @@ impl DockerCli {
         let status = self
             .host
             .attempt(repeat, || make().status())
-            .with_context(|| format!("spawning docker {what}"))?;
+            .with_context(|| format!("spawning {} {what}", self.name()))?;
         if !status.success() {
-            bail!("docker {what} failed ({status})");
+            bail!("{} {what} failed ({status})", self.name());
         }
         Ok(())
     }
@@ -98,10 +155,11 @@ impl DockerCli {
         let out = self
             .host
             .attempt(repeat, || make().output())
-            .with_context(|| format!("spawning docker {what}"))?;
+            .with_context(|| format!("spawning {} {what}", self.name()))?;
         if !out.status.success() {
             bail!(
-                "docker {what} failed: {}",
+                "{} {what} failed: {}",
+                self.name(),
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
@@ -153,16 +211,10 @@ fn subcommand(args: &[&str]) -> String {
     }
 }
 
-/// `docker <args>` as an argument vector.
-fn docker_argv<'a>(args: &[&'a str]) -> Vec<&'a str> {
-    let mut v = vec!["docker"];
-    v.extend_from_slice(args);
-    v
-}
-
-/// The `docker run` flags for `spec`, ahead of the image. `engine_args` come
-/// last, so they can override the rest.
-fn run_flags(spec: &RunSpec) -> Vec<String> {
+/// The `run` flags for `spec`, ahead of the image: the common ones, then the
+/// engine's own (`extra`), then the devcontainer's `engine_args`, last so they can
+/// override the rest.
+fn run_flags(spec: &RunSpec, extra: &[String]) -> Vec<String> {
     let mut args = Vec::new();
     for (k, v) in &spec.labels {
         args.extend(["--label".into(), format!("{k}={v}")]);
@@ -194,26 +246,30 @@ fn run_flags(spec: &RunSpec) -> Vec<String> {
     for port in &spec.publish {
         args.extend(["-p".into(), port.clone()]);
     }
+    args.extend(extra.iter().cloned());
     args.extend(spec.engine_args.iter().cloned());
     args
 }
 
-impl Runtime for DockerCli {
+impl<F: Flavor> Runtime for CliEngine<F> {
     fn container(&self, id: &str) -> Box<dyn Container> {
-        Box::new(DockerContainer {
+        Box::new(CliContainer {
             cli: self.clone(),
             id: id.to_string(),
         })
     }
 
     fn respawn_args(&self) -> Vec<String> {
-        vec!["--engine".into(), "docker".into()]
+        vec!["--engine".into(), self.name().into()]
     }
 
     fn version(&self) -> Result<String> {
         match self.capture_ok(&["version", "--format", "{{.Server.Version}}"]) {
-            Some(v) if !v.trim().is_empty() => Ok(format!("docker {}", v.trim())),
-            _ => bail!("cannot reach the docker daemon (is it running, and do you have access?)"),
+            Some(v) if !v.trim().is_empty() => Ok(format!("{} {}", self.name(), v.trim())),
+            _ => bail!(
+                "cannot reach {} (is it running, and do you have access?)",
+                self.name()
+            ),
         }
     }
 
@@ -267,7 +323,7 @@ impl Runtime for DockerCli {
 
     fn run_detached(&self, spec: &RunSpec) -> Result<()> {
         let name = spec.name.as_str();
-        let flags = run_flags(spec);
+        let flags = run_flags(spec, &self.flavor.extra_run_flags(self, spec));
         let mut args: Vec<&str> = vec!["run", "-d", "--name", name];
         args.extend(flags.iter().map(String::as_str));
         args.push(&spec.image);
@@ -287,9 +343,9 @@ impl Runtime for DockerCli {
                 }
                 self.command(&args).status()
             })
-            .context("spawning docker run")?;
+            .with_context(|| format!("spawning {} run", self.name()))?;
         if !status.success() {
-            bail!("docker run failed ({status})");
+            bail!("{} run failed ({status})", self.name());
         }
         Ok(())
     }
@@ -309,11 +365,18 @@ impl Runtime for DockerCli {
 }
 
 /// `docker compose`, which every current docker CLI has (as a plugin).
-impl Compose for DockerCli {
+impl<F: Flavor> Compose for CliEngine<F> {
     fn version(&self) -> Result<String> {
-        match self.capture_ok(&["compose", "version", "--short"]) {
-            Some(v) if !v.trim().is_empty() => Ok(format!("docker compose {}", v.trim())),
-            _ => bail!("`docker compose` is not available (install the compose plugin)"),
+        match self.capture_ok(self.flavor.compose_version_args()) {
+            Some(v) if !v.trim().is_empty() => Ok(format!(
+                "{} compose {}",
+                self.name(),
+                v.lines().next().unwrap_or("").trim()
+            )),
+            _ => bail!(
+                "`{} compose` is not available (install a compose provider)",
+                self.name()
+            ),
         }
     }
 
@@ -385,7 +448,9 @@ fn parse_listed(out: &str) -> Vec<Listed> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunSpec, docker_argv, parse_listed, run_flags, subcommand};
+    use super::{Docker, Podman, RunSpec, parse_listed, run_flags, subcommand};
+    use crate::host::LocalHost;
+    use std::sync::Arc;
 
     #[test]
     fn a_run_spec_becomes_docker_flags_with_the_pass_through_ones_last() {
@@ -404,7 +469,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            run_flags(&spec),
+            run_flags(&spec, &[]),
             [
                 "--label",
                 "a=b",
@@ -427,7 +492,7 @@ mod tests {
                 "--cap-drop=ALL"
             ]
         );
-        assert!(run_flags(&RunSpec::default()).is_empty());
+        assert!(run_flags(&RunSpec::default(), &[]).is_empty());
     }
 
     #[test]
@@ -448,10 +513,28 @@ mod tests {
     }
 
     #[test]
-    fn docker_runs_as_the_first_word_of_the_argument_vector() {
+    fn the_program_is_the_first_word_of_the_argument_vector() {
+        let args = ["exec", "my container", "sh"];
         assert_eq!(
-            docker_argv(&["exec", "my container", "sh"]),
+            Docker::new(Arc::new(LocalHost)).argv(&args),
             ["docker", "exec", "my container", "sh"]
+        );
+        assert_eq!(
+            Podman::new(Arc::new(LocalHost)).argv(&args),
+            ["podman", "exec", "my container", "sh"]
+        );
+    }
+
+    #[test]
+    fn the_engines_own_flags_come_after_the_common_ones_and_before_runargs() {
+        let spec = RunSpec {
+            user: Some("dev".into()),
+            engine_args: vec!["--cap-drop=ALL".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            run_flags(&spec, &["--mine".into()]),
+            ["-u", "dev", "--mine", "--cap-drop=ALL"]
         );
     }
 

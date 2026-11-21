@@ -26,7 +26,7 @@ use crate::cli::{Cli, Command};
 use crate::config::Config;
 use crate::forward::{DetachedDaemon, ForwardDaemon};
 use crate::host::{HostRef, LocalHost, SshHost};
-use crate::runtime::docker::DockerCli;
+use crate::runtime::cli::{Docker, Podman};
 use crate::runtime::{Engine, Runtime};
 use crate::tools::{Ldd, Oras, Patchelf, Toolchain};
 
@@ -55,7 +55,8 @@ fn choose_engine(
 /// chooses an implementation of the interface everything else takes.
 fn build_engine(kind: Engine, host: HostRef) -> Box<dyn Runtime> {
     match kind {
-        Engine::Docker => Box::new(DockerCli::new(host)),
+        Engine::Docker => Box::new(Docker::new(host)),
+        Engine::Podman => Box::new(Podman::new(host)),
     }
 }
 

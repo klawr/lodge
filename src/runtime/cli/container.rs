@@ -3,17 +3,17 @@
 
 use anyhow::{Context, Result, bail};
 
-use super::DockerCli;
+use super::{CliEngine, Flavor};
 use crate::host::Repeat;
 use crate::runtime::{Container, ContainerUser, Env, ExecOpts, Output, Reach, User};
 
 /// One container, driven through the docker CLI.
-pub struct DockerContainer {
-    pub(super) cli: DockerCli,
+pub struct CliContainer<F: Flavor> {
+    pub(super) cli: CliEngine<F>,
     pub(super) id: String,
 }
 
-impl DockerContainer {
+impl<F: Flavor> CliContainer<F> {
     /// `exec [-u U] [--workdir W] [-e K=V …] <id> <argv…>`.
     fn exec_args(&self, argv: &[&str], opts: &ExecOpts) -> Vec<String> {
         let mut a: Vec<String> = vec!["exec".into()];
@@ -107,7 +107,7 @@ fn compose_service_matches(name: &str, service: &str) -> bool {
         })
     })
 }
-impl Env for DockerContainer {
+impl<F: Flavor> Env for CliContainer<F> {
     fn exec(&self, argv: &[&str], opts: &ExecOpts) -> Result<()> {
         let args = self.exec_args(argv, opts);
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -115,9 +115,9 @@ impl Env for DockerContainer {
             .cli
             .host
             .attempt(opts.repeat, || self.cli.command(&refs).status())
-            .context("spawning docker exec")?;
+            .with_context(|| format!("spawning {} exec", self.cli.name()))?;
         if !status.success() {
-            bail!("docker exec failed: {argv:?}");
+            bail!("{} exec failed: {argv:?}", self.cli.name());
         }
         Ok(())
     }
@@ -129,7 +129,7 @@ impl Env for DockerContainer {
             .cli
             .host
             .attempt(opts.repeat, || self.cli.command(&refs).output())
-            .context("spawning docker exec")?;
+            .with_context(|| format!("spawning {} exec", self.cli.name()))?;
         Ok(Output {
             success: out.status.success(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -163,15 +163,15 @@ impl Env for DockerContainer {
                 let written = child
                     .stdin
                     .take()
-                    .ok_or_else(|| std::io::Error::other("docker exec stdin was not piped"))?
+                    .ok_or_else(|| std::io::Error::other("exec stdin was not piped"))?
                     .write_all(contents);
                 Ok((child.wait()?, written))
             })
-            .context("running docker exec")?;
+            .with_context(|| format!("running {} exec", self.cli.name()))?;
         if !status.success() {
             bail!("writing secret file {dest} failed ({status})");
         }
-        written.context("sending secret to docker exec")
+        written.with_context(|| format!("sending secret to {} exec", self.cli.name()))
     }
 
     fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> std::process::Command {
@@ -187,7 +187,7 @@ impl Env for DockerContainer {
     }
 }
 
-impl Container for DockerContainer {
+impl<F: Flavor> Container for CliContainer<F> {
     fn id(&self) -> &str {
         &self.id
     }
@@ -230,7 +230,7 @@ impl Container for DockerContainer {
             .cli
             .host
             .attempt(Repeat::Safe, || self.cli.command(&args).output())
-            .context("spawning docker inspect")?;
+            .with_context(|| format!("spawning {} inspect", self.cli.name()))?;
         if out.status.success() {
             return Ok(String::from_utf8_lossy(&out.stdout).trim() == "true");
         }
@@ -238,7 +238,7 @@ impl Container for DockerContainer {
         if is_no_such_container(&err) {
             return Ok(false);
         }
-        bail!("docker inspect failed: {}", err.trim())
+        bail!("{} inspect failed: {}", self.cli.name(), err.trim())
     }
 
     /// `docker cp <id>:<path> -`; see [`copy`](super::copy).
@@ -247,6 +247,11 @@ impl Container for DockerContainer {
     }
 
     fn reach(&self, peer: Option<&str>) -> Option<Reach> {
+        // A rootless engine's containers have an address, but not one the host
+        // can connect to.
+        if !self.cli.flavor.addresses_are_reachable(&self.cli) {
+            return None;
+        }
         match peer {
             None => self.ip_address(),
             Some(host) => self.resolve_peer(host),
@@ -255,7 +260,7 @@ impl Container for DockerContainer {
     }
 }
 
-impl DockerContainer {
+impl<F: Flavor> CliContainer<F> {
     /// The container's address on its first network.
     fn ip_address(&self) -> Option<String> {
         let out = self.cli.capture_ok(&[
@@ -280,6 +285,7 @@ impl DockerContainer {
 mod tests {
     use super::*;
     use crate::host::{LocalHost, SshHost};
+    use crate::runtime::cli::Docker;
     use std::sync::Arc;
 
     /// The program and arguments of a command, as one list.
@@ -292,8 +298,8 @@ mod tests {
 
     #[test]
     fn the_interactive_command_is_the_exec_command_with_a_tty_run_on_the_host() {
-        let local = DockerContainer {
-            cli: DockerCli::new(Arc::new(LocalHost)),
+        let local = CliContainer {
+            cli: Docker::new(Arc::new(LocalHost)),
             id: "abc".into(),
         };
         assert_eq!(
@@ -313,8 +319,8 @@ mod tests {
             ]
         );
         // On another host it is the host that decides how the terminal gets there.
-        let remote = DockerContainer {
-            cli: DockerCli::new(Arc::new(SshHost::new("h"))),
+        let remote = CliContainer {
+            cli: Docker::new(Arc::new(SshHost::new("h"))),
             id: "abc".into(),
         };
         let line = words(&remote.interactive_command(User::Root, "/", "x"));

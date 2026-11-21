@@ -13,11 +13,12 @@
 //! - [`Compose`]: an engine's compose support, which only the compose backend
 //!   needs.
 //!
-//! [`docker`] implements all four over the `docker` CLI (locally or over SSH).
+//! [`cli`] implements all four over the docker-compatible command line (`docker`
+//! or `podman`, locally or over SSH).
 //! `fake` (in tests) has the test doubles: `FakeEnv`, an in-memory `Env`, and
 //! `FakeRuntime`, an engine (with compose) whose containers each run in one.
 
-pub mod docker;
+pub mod cli;
 #[cfg(test)]
 pub mod fake;
 pub(crate) mod tarball;
@@ -453,6 +454,8 @@ pub enum Engine {
     /// The `docker` CLI (with `docker compose`).
     #[default]
     Docker,
+    /// The `podman` CLI (with `podman compose`, which needs a compose provider).
+    Podman,
 }
 
 /// A container engine.

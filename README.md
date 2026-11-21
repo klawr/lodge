@@ -71,7 +71,7 @@ for where to put them). Man page: `ldg man | man -l -`.
 
 Global flags, on every command: `-r/--remote HOST` runs against an engine on
 another machine over SSH, `--engine docker` picks the container engine (also
-`engine = "docker"` in the config; docker is the only one so far, and the default), `-c/--config FILE` uses another config
+`engine = "docker"` in the config; `docker` or `podman`, docker by default), `-c/--config FILE` uses another config
 file, and `-v/--verbose` prints
 every docker/ssh command lodge runs (`-vv`, `-vvv` add ssh's own debug output).
 `status`, `ls`, `ports` and `doctor` take `--json`.
@@ -135,7 +135,8 @@ linked binaries are copied as they are.
 - Dynamic port forwarding needs the container's bridge IP to be reachable from
   the engine's host: Linux with Docker Engine, or any engine with `--remote`.
   Docker Desktop on macOS/Windows doesn't expose container IPs.
-- Docker is the only container engine; the target must be a container.
+- The engines are docker and podman; the target must be a container.
+  With rootless Podman, ports are published with `appPort` instead of forwarded.
 - `ldg` itself runs on Linux, macOS and WSL2, not natively on Windows.
 - Change detection covers `devcontainer.json`, the Dockerfile, compose files
   and local features, not the Dockerfile's build context.

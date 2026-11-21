@@ -64,8 +64,9 @@ fn docker_is_run_through_a_host_and_named_only_by_the_docker_runtime() {
     // The engine never starts a process itself: it asks its `Host` to run
     // `docker …`, so it works the same on every host.
     assert_eq!(spawners("docker"), Vec::<String>::new());
+    assert_eq!(spawners("podman"), Vec::<String>::new());
     assert_eq!(
-        files_containing(&["\"docker\""], &["runtime/docker/"]),
+        files_containing(&["\"docker\"", "\"podman\""], &["runtime/cli/"]),
         Vec::<String>::new()
     );
 }
@@ -89,8 +90,8 @@ fn only_the_command_layer_chooses_implementations() {
     );
     assert_eq!(
         files_containing(
-            &["DockerCli", "DockerContainer"],
-            &["runtime/docker/", "cmd/"]
+            &["CliEngine", "CliContainer", "DockerFlavor", "PodmanFlavor"],
+            &["runtime/cli/", "cmd/"]
         ),
         Vec::<String>::new()
     );

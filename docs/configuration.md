@@ -150,10 +150,24 @@ This is covered by an integration test, so it keeps working.
 
 ## `engine`
 
-A top-level `engine = "docker"` names the container engine lodge drives. `--engine`
-on the command line overrides it, and without either it is `docker`, which is the
-only engine so far. The engine runs on the machine `--remote` names, or on this
-one. A value that is not an engine is an error.
+A top-level `engine = "docker"` names the container engine lodge drives: `docker` or
+`podman`. `--engine` on the command line overrides it, and without either it is
+`docker`. The engine runs on the machine `--remote` names, or on this one. A value
+that is not an engine is an error.
+
+With `podman`, lodge runs `podman` the way it runs `docker`, and adds what a
+project bind-mounted into a Podman container needs: `--userns=keep-id` when
+Podman runs without root (so your files are yours inside), and
+`--security-opt label=disable` (so SELinux does not block the mount). A
+`--userns` in `runArgs`, or a `label=` in `securityOpt`, replaces them. What
+differs from docker:
+
+- Compose needs a provider that `podman compose` finds (docker-compose or
+  podman-compose). lodge adds no user-namespace flag to a compose project; set
+  `userns_mode` in the compose file if you need one.
+- Without root, a container's address is not reachable from the host, so ports
+  are not forwarded automatically: publish them with `appPort`. With root, or on
+  another machine through `--remote` with a rootful Podman, it works as with docker.
 
 ## `bundle`
 

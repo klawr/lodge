@@ -12,7 +12,7 @@
       "default": null
     },
     "engine": {
-      "description": "The container engine to drive, unless `--engine` says otherwise\n(default: docker).",
+      "description": "The container engine to drive, unless `--engine` says otherwise\n(`docker` or `podman`; default: docker).",
       "anyOf": [
         {
           "$ref": "#/$defs/Engine"
@@ -65,6 +65,11 @@
           "description": "The `docker` CLI (with `docker compose`).",
           "type": "string",
           "const": "docker"
+        },
+        {
+          "description": "The `podman` CLI (with `podman compose`, which needs a compose provider).",
+          "type": "string",
+          "const": "podman"
         }
       ]
     },

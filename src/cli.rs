@@ -19,7 +19,7 @@ use crate::runtime::Engine;
 )]
 pub struct Cli {
     /// SSH remote to operate on; the docker CLI is run on the remote host over
-    /// SSH (`ssh <dest> docker …`), so no local docker CLI is needed — only an
+    /// SSH (`ssh <dest> docker …`), so no local container CLI is needed — only an
     /// ssh client. Accepts a Host alias from ~/.ssh/config, `user@host`,
     /// `user@host:port` (for a non-standard SSH port), `[v6addr]:port`, and any
     /// of those with an `ssh://` prefix.

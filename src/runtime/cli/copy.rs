@@ -16,11 +16,12 @@ use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
 
-use super::container::DockerContainer;
+use super::Flavor;
+use super::container::CliContainer;
 use crate::host::Repeat;
 use crate::runtime::{ContainerUser, Env, ExecOpts, tarball};
 
-impl DockerContainer {
+impl<F: Flavor> CliContainer<F> {
     /// Copies the local `src` into the container with the semantics
     /// [`Env::put`] promises.
     pub(super) fn copy_in(&self, src: &str, dest: &str, owner: &ContainerUser) -> Result<()> {
@@ -52,28 +53,27 @@ impl DockerContainer {
         let target = format!("{}:{into}", self.id);
         // Unpacking the same archive again leaves the same files, so a lost
         // connection reruns the whole send, packing the tar afresh.
-        let (status, packed) =
-            self.cli
-                .host
-                .attempt(Repeat::Safe, || {
-                    // `-q`: on a terminal docker otherwise prints "Successfully copied …"
-                    // for every file, which would bury lodge's own output.
-                    let mut cmd = self.cli.command(&["cp", "-q", "-a", "-", &target]);
-                    // `command` closes stdin; this one streams, so override it.
-                    cmd.stdin(Stdio::piped());
-                    let mut child = cmd.spawn()?;
-                    // Dropping the writer closes the pipe, so docker sees the end of input.
-                    let packed = {
-                        let stdin = child.stdin.take().ok_or_else(|| {
-                            std::io::Error::other("docker cp stdin was not piped")
-                        })?;
-                        tarball::pack(source, &name, owner, stdin)
-                    };
-                    Ok((child.wait()?, packed))
-                })
-                .context("running docker cp")?;
+        let (status, packed) = self
+            .cli
+            .host
+            .attempt(Repeat::Safe, || {
+                let mut cmd = self.cli.command(&self.cli.flavor.cp_in_args(&target));
+                // `command` closes stdin; this one streams, so override it.
+                cmd.stdin(Stdio::piped());
+                let mut child = cmd.spawn()?;
+                // Dropping the writer closes the pipe, so docker sees the end of input.
+                let packed = {
+                    let stdin = child
+                        .stdin
+                        .take()
+                        .ok_or_else(|| std::io::Error::other("cp stdin was not piped"))?;
+                    tarball::pack(source, &name, owner, stdin)
+                };
+                Ok((child.wait()?, packed))
+            })
+            .with_context(|| format!("running {} cp", self.cli.name()))?;
         if !status.success() {
-            bail!("docker cp failed: {src} -> {target}");
+            bail!("{} cp failed: {src} -> {target}", self.cli.name());
         }
         packed.with_context(|| format!("packing {src}"))
     }
@@ -89,51 +89,29 @@ impl DockerContainer {
             .attempt(Repeat::Safe, || {
                 self.cli.command(&["cp", &from, "-"]).output()
             })
-            .context("spawning docker cp")?;
+            .with_context(|| format!("spawning {} cp", self.cli.name()))?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
-            if is_missing_path(&err) {
+            if self.cli.flavor.says_path_is_missing(&err) {
                 return Ok(None);
             }
-            bail!("docker cp {from} failed: {}", err.trim());
+            bail!("{} cp {from} failed: {}", self.cli.name(), err.trim());
         }
         let mut archive = tar::Archive::new(out.stdout.as_slice());
-        let mut entries = archive.entries().context("reading docker cp's tar")?;
+        let mut entries = archive
+            .entries()
+            .with_context(|| format!("reading {} cp's tar", self.cli.name()))?;
         let Some(entry) = entries.next() else {
-            bail!("docker cp {from} returned an empty archive");
+            bail!("{} cp {from} returned an empty archive", self.cli.name());
         };
-        let mut entry = entry.context("reading docker cp's tar")?;
+        let mut entry = entry.with_context(|| format!("reading {} cp's tar", self.cli.name()))?;
         if !entry.header().entry_type().is_file() {
             return Ok(None);
         }
         let mut bytes = Vec::new();
         entry
             .read_to_end(&mut bytes)
-            .context("reading docker cp's tar")?;
+            .with_context(|| format!("reading {} cp's tar", self.cli.name()))?;
         Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
-    }
-}
-
-/// Whether `docker cp`'s error says the path doesn't exist in the container (as
-/// opposed to the container, the daemon or the connection being the problem).
-fn is_missing_path(stderr: &str) -> bool {
-    stderr.contains("Could not find the file")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_missing_path;
-
-    #[test]
-    fn a_missing_file_is_told_from_a_missing_container() {
-        assert!(is_missing_path(
-            "Error response from daemon: Could not find the file /nope/x in container f4b2"
-        ));
-        assert!(!is_missing_path(
-            "Error response from daemon: No such container: c"
-        ));
-        assert!(!is_missing_path(
-            "ssh: connect to host h port 22: Connection refused"
-        ));
     }
 }
