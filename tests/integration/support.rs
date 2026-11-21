@@ -234,14 +234,14 @@ impl Registry {
         format!("oci://localhost:{}/{name}:{tag}", self.port)
     }
 
-    /// What the registry holds for `name:tag`, as its own HTTP API says it: the
-    /// manifest's text, read by a client that is not lodge.
+    /// What the registry holds for `name:tag` (a tag or a digest), as its own HTTP
+    /// API says it: the manifest's text, read by a client that is not lodge.
     pub fn manifest(&self, name: &str, tag: &str) -> String {
         const SCRIPT: &str = r#"
 import sys, urllib.request
 req = urllib.request.Request(
     f"http://127.0.0.1:{sys.argv[1]}/v2/{sys.argv[2]}/manifests/{sys.argv[3]}",
-    headers={"Accept": "application/vnd.oci.image.manifest.v1+json"})
+    headers={"Accept": "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json"})
 sys.stdout.write(urllib.request.urlopen(req).read().decode())
 "#;
         let mut cmd = Command::new("python3");

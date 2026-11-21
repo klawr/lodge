@@ -587,6 +587,41 @@ mod push {
             artifact_type: TYPE,
             layer_media_type: LAYER_TYPE,
             layer: path,
+            arch: Arch::X86_64,
+        }
+    }
+
+    /// The image manifest that is written for the layer `layer`.
+    fn image_bytes(layer: &Digest) -> Vec<u8> {
+        manifest::image(
+            TYPE,
+            LAYER_TYPE,
+            (&config_digest(), 2),
+            (layer, b"the layer".len() as u64),
+        )
+        .unwrap()
+    }
+
+    fn image_url(layer: &Digest) -> String {
+        format!("{REPO}/manifests/{}", Digest::of(&image_bytes(layer)))
+    }
+
+    /// What a registry says once the blobs are there: it takes the image by its
+    /// digest and the index under the tag, and holds nothing under the tag yet.
+    trait Publishes {
+        fn takes_image(self, layer: &Digest) -> Self;
+        fn publishes(self, layer: &Digest) -> Self;
+    }
+
+    impl Publishes for FakeHttp {
+        fn takes_image(self, layer: &Digest) -> Self {
+            self.answer_to(Method::Put, &image_url(layer), 201, &[], b"")
+        }
+
+        fn publishes(self, layer: &Digest) -> Self {
+            self.takes_image(layer)
+                .answer(&format!("{REPO}/manifests/1"), 404, &[], b"")
+                .answer_to(Method::Put, &format!("{REPO}/manifests/1"), 201, &[], b"")
         }
     }
 
@@ -609,7 +644,7 @@ mod push {
                     b"",
                 );
         }
-        http.answer_to(Method::Put, &format!("{REPO}/manifests/1"), 201, &[], b"")
+        http.publishes(layer)
     }
 
     fn auth_encode(s: &str) -> String {
@@ -636,7 +671,9 @@ mod push {
                 Method::Head,
                 Method::Post,
                 Method::Put, // the layer
-                Method::Put, // the manifest
+                Method::Put, // the image, by its digest
+                Method::Get, // what the tag holds now
+                Method::Put, // the index, under the tag
             ]
         );
         // What was sent: the empty config, the layer, and a manifest naming both.
@@ -655,11 +692,19 @@ mod push {
             )),
             b"the layer"
         );
-        let manifest = put(format!("{REPO}/manifests/1"));
+        let manifest = put(format!(
+            "{REPO}/manifests/{}",
+            Digest::of(&image_bytes(&layer))
+        ));
         let text = String::from_utf8(manifest.clone()).unwrap();
         assert!(text.contains(TYPE) && text.contains(LAYER_TYPE), "{text}");
         assert!(text.contains(layer.as_str()), "{text}");
-        // And what comes back is the content the manifest has, which pulls.
+        // The tag holds an index naming that image for this machine.
+        let index = put(format!("{REPO}/manifests/1"));
+        let text = String::from_utf8(index.clone()).unwrap();
+        assert!(text.contains(&Digest::of(&manifest).to_string()), "{text}");
+        assert!(text.contains("\"architecture\":\"amd64\""), "{text}");
+        // And what comes back is the image, which pulls.
         assert_eq!(pinned.digest, Digest::of(&manifest).to_string());
         assert_eq!(
             pinned.reference,
@@ -687,7 +732,7 @@ mod push {
                     &[],
                     b"",
                 )
-                .answer_to(Method::Put, &format!("{REPO}/manifests/1"), 201, &[], b""),
+                .publishes(&layer),
         );
         oci(&http, FakeCredentials::new())
             .push("ghcr.io/x/feat:1", &artifact(&path))
@@ -727,7 +772,7 @@ mod push {
                     &[],
                     b"",
                 )
-                .answer_to(Method::Put, &format!("{REPO}/manifests/1"), 201, &[], b""),
+                .publishes(&layer),
         );
         oci(&http, FakeCredentials::new().with("ghcr.io", "kai", "pw"))
             .push("ghcr.io/x/feat:1", &artifact(&path))
@@ -782,6 +827,8 @@ mod push {
                     &[],
                     b"",
                 )
+                .takes_image(&layer)
+                .answer(&format!("{REPO}/manifests/1"), 404, &[], b"")
                 .answer_to(
                     Method::Put,
                     &format!("{REPO}/manifests/1"),
@@ -863,7 +910,7 @@ mod push {
                 &[],
                 b"",
             )
-            .answer_to(Method::Put, &format!("{REPO}/manifests/1"), 201, &[], b"")
+            .publishes(layer)
     }
 
     #[test]
@@ -961,7 +1008,7 @@ mod push {
                     &[],
                     b"",
                 )
-                .answer_to(Method::Put, &format!("{REPO}/manifests/1"), 201, &[], b""),
+                .publishes(&layer),
         );
         oci(&http, FakeCredentials::new())
             .push("ghcr.io/x/feat:1", &artifact(&path))
@@ -1013,6 +1060,88 @@ mod push {
             .filter(|(m, _)| *m == Method::Put)
             .count();
         assert_eq!(puts, 2);
+    }
+
+    #[test]
+    fn an_architecture_published_before_stays_in_the_index() {
+        let dir = crate::tmpfile::TempDir::new("push").unwrap();
+        let (path, layer) = layer_file(&dir);
+        let before =
+            manifest::merged_index(None, Arch::Aarch64, TYPE, (&Digest::of(b"arm image"), 9))
+                .unwrap();
+        let tag = format!("{REPO}/manifests/1");
+        let http = Arc::new(
+            FakeHttp::new()
+                .answer_to(
+                    Method::Head,
+                    &format!("{REPO}/blobs/{}", config_digest()),
+                    200,
+                    &[],
+                    b"",
+                )
+                .answer_to(
+                    Method::Head,
+                    &format!("{REPO}/blobs/{layer}"),
+                    200,
+                    &[],
+                    b"",
+                )
+                .takes_image(&layer)
+                .answer(&tag, 200, &[], &before)
+                .answer_to(Method::Put, &tag, 201, &[], b""),
+        );
+        oci(&http, FakeCredentials::new())
+            .push("ghcr.io/x/feat:1", &artifact(&path))
+            .unwrap();
+        let index = http.body_of(Method::Put, &tag, 0).unwrap();
+        let Manifest::Index(entries) = Manifest::parse(&index).unwrap() else {
+            panic!("not an index");
+        };
+        let found: Vec<(String, String)> = entries
+            .into_iter()
+            .map(|d| (d.platform.unwrap().architecture, d.digest))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("arm64".to_string(), Digest::of(b"arm image").to_string()),
+                (
+                    "amd64".to_string(),
+                    Digest::of(&image_bytes(&layer)).to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tag_that_cannot_be_read_is_not_overwritten() {
+        let dir = crate::tmpfile::TempDir::new("push").unwrap();
+        let (path, layer) = layer_file(&dir);
+        let tag = format!("{REPO}/manifests/1");
+        let http = Arc::new(
+            FakeHttp::new()
+                .answer_to(
+                    Method::Head,
+                    &format!("{REPO}/blobs/{}", config_digest()),
+                    200,
+                    &[],
+                    b"",
+                )
+                .answer_to(
+                    Method::Head,
+                    &format!("{REPO}/blobs/{layer}"),
+                    200,
+                    &[],
+                    b"",
+                )
+                .takes_image(&layer)
+                .answer(&tag, 500, &[], b""),
+        );
+        let err = oci(&http, FakeCredentials::new())
+            .push("ghcr.io/x/feat:1", &artifact(&path))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("answered 500"), "{err:#}");
+        assert!(http.body_of(Method::Put, &tag, 0).is_none());
     }
 
     #[test]

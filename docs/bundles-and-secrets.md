@@ -74,9 +74,13 @@ write); anything else is a file.
 
 **Publishing.** `ldg pack -o oci://…` packs as usual, uploads the bundle, and
 prints the exact reference it was written under (`oci://ghcr.io/me/lodge@sha256:…`),
-which you can pin. The tag is **replaced**: what it held before is gone, and if two
-machines publish at once the last one wins. A tag holds **one architecture**, so
-publish each architecture under its own tag (`:1-x86_64`, `:1-aarch64`) for now.
+which you can pin. A tag holds an **index with one image per architecture**:
+publishing from an x86_64 machine and then from an aarch64 one under `:1` gives a
+tag that both use, each getting its own. Publishing replaces only the entry for the
+machine's own architecture (its old image is no longer reachable by the tag), and
+keeps the others. If two machines publish at once the last one wins, and the
+other's entry may be lost: publish them one after the other. A tag that held a
+single image (not made by this lodge) is replaced.
 Publishing needs `docker login <registry>` with an account that may write there;
 lodge reads that login from docker's config file, not from a credential helper (see
 [Troubleshooting](troubleshooting.md#a-bundle-or-a-feature-cannot-be-pulled-or-published)).
@@ -90,10 +94,10 @@ are offline).
 **What is in the registry.** An image with an empty config and **one layer: the
 bundle's tar**, typed `application/vnd.lodge.bundle.v1` (the artifact) and
 `application/vnd.lodge.bundle.v1.tar` (the layer). That is all lodge reads, so a
-tool of your own that makes the same artifact works too. lodge also reads an
-index with one image per machine (each entry with its `platform`, such as
-`linux/amd64` or `linux/arm64`; the one for the machine lodge runs on is used),
-but does not write one yet. Anything with more than one layer is refused, and so
+tool of your own that makes the same artifact works too. The tag itself holds
+an index with one image per machine (each entry with its `platform`, such as
+`linux/amd64` or `linux/arm64`; the one for the machine lodge runs on is used).
+A single image under a tag is read too. Anything with more than one layer is refused, and so
 is a tar that is not a bundle; the media types are not checked, the bundle's own
 manifest is.
 

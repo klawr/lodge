@@ -94,6 +94,18 @@ impl<'a> Registry<'a> {
         Ok(bytes)
     }
 
+    /// The manifest `tag` points at, or `None` when there is none yet.
+    pub fn current_manifest(&mut self, tag: &str) -> Result<Option<Vec<u8>>> {
+        let url = self.url("manifests", tag);
+        let accept = ACCEPT.join(", ");
+        let response = self.request(Method::Get, &url, &[("Accept", &accept)], Body::None)?;
+        match response.status {
+            200 => Ok(Some(response.read_limited(MANIFEST_LIMIT)?)),
+            404 => Ok(None),
+            status => Err(self.failure(status, &url)),
+        }
+    }
+
     /// The manifest the descriptor names, checked against its digest.
     pub fn manifest_of(&mut self, d: &Descriptor) -> Result<Vec<u8>> {
         self.manifest(&Target::Digest(Digest::parse(&d.digest)?))

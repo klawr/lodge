@@ -67,22 +67,27 @@ pub trait OciFetcher {
     fn pin(&self, reference: &str, arch: Option<Arch>) -> Result<Pinned>;
 }
 
-/// What is published to a registry: one layer, which is a file, and the types
-/// that say what the artifact is. The pusher knows registries, not what the
+/// What is published to a registry: one layer, which is a file, for one machine,
+/// and the types that say what the artifact is. The pusher knows registries, not what the
 /// layer holds.
 pub struct Artifact<'a> {
     /// Says what kind of artifact this is, to anything that lists a registry.
     pub artifact_type: &'a str,
     pub layer_media_type: &'a str,
     pub layer: &'a Path,
+    /// The machine it is for (Linux on this CPU). A tag holds one image per
+    /// machine, so publishing for another one keeps what is there.
+    pub arch: Arch,
 }
 
 /// Publishes artifacts to an OCI registry. Separate from [`OciFetcher`], so a
 /// machine that only reads never needs a way to write, and a fake of one does not
 /// have to implement the other.
 pub trait OciPusher {
-    /// Publishes `artifact` as `reference`, which names a tag: what that tag held
-    /// is replaced (last write wins). Returns what was written, by digest.
+    /// Publishes `artifact` under `reference`, which names a tag. The tag holds an
+    /// index with one image per architecture: this architecture's entry is
+    /// replaced (last write wins) and the others are kept. Returns the image
+    /// that was written, by digest.
     fn push(&self, reference: &str, artifact: &Artifact) -> Result<Pinned>;
 }
 
@@ -118,14 +123,19 @@ impl OciFetcher for NoRegistry {
 }
 
 /// A registry that holds what it is given, for tests of what is built on
-/// [`OciFetcher`]: each artifact is one layer, under a tag, with a digest.
+/// [`OciFetcher`]: each tag holds one layer per architecture (or one for any,
+/// when it was put there by [`FakeRegistry::with`]), each with a digest.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct FakeRegistry {
-    artifacts: std::sync::Mutex<std::collections::BTreeMap<String, (String, Vec<u8>)>>,
+    tags: std::sync::Mutex<std::collections::BTreeMap<String, Images>>,
     pulled: std::sync::Mutex<Vec<String>>,
-    pushes: std::sync::Mutex<Vec<(String, String, String)>>,
+    pushes: std::sync::Mutex<Vec<(String, String, String, Arch)>>,
 }
+
+/// The images under a tag: by architecture, `None` for one that is for any.
+#[cfg(test)]
+type Images = std::collections::BTreeMap<Option<String>, (String, Vec<u8>)>;
 
 #[cfg(test)]
 impl FakeRegistry {
@@ -133,12 +143,15 @@ impl FakeRegistry {
         Self::default()
     }
 
-    /// `reference` (as asked for, tag and all) now holds `layer`, with `digest`.
+    /// `reference` (as asked for, tag and all) now holds `layer`, with `digest`,
+    /// for any architecture.
     pub fn with(self, reference: &str, digest: &str, layer: &[u8]) -> Self {
-        self.artifacts
+        self.tags
             .lock()
             .unwrap()
-            .insert(reference.into(), (digest.into(), layer.to_vec()));
+            .entry(reference.into())
+            .or_default()
+            .insert(None, (digest.into(), layer.to_vec()));
         self
     }
 
@@ -146,13 +159,40 @@ impl FakeRegistry {
     pub fn pulled(&self) -> Vec<String> {
         self.pulled.lock().unwrap().clone()
     }
-}
 
-#[cfg(test)]
-impl FakeRegistry {
-    /// What was pushed: the reference, the artifact type and the layer's type.
-    pub fn pushed(&self) -> Vec<(String, String, String)> {
+    /// What was pushed: the reference, the artifact type, the layer's type and
+    /// the architecture.
+    pub fn pushed(&self) -> Vec<(String, String, String, Arch)> {
         self.pushes.lock().unwrap().clone()
+    }
+
+    /// The architectures a tag holds an image for.
+    pub fn architectures(&self, reference: &str) -> Vec<String> {
+        self.tags
+            .lock()
+            .unwrap()
+            .get(reference)
+            .map(|images| images.keys().flatten().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The image of `reference` for `arch`, as a real index answers: the entry for
+    /// it, or the only one when none is asked for.
+    fn image(&self, reference: &str, arch: Option<Arch>) -> Result<(String, Vec<u8>)> {
+        let tags = self.tags.lock().unwrap();
+        let images = tags
+            .get(reference)
+            .ok_or_else(|| anyhow::anyhow!("not found: {reference}"))?;
+        let found = match arch {
+            Some(arch) => images
+                .get(&Some(arch.to_string()))
+                .or_else(|| images.get(&None)),
+            None if images.len() == 1 => images.values().next(),
+            None => None,
+        };
+        found
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no image of {reference} for {arch:?}"))
     }
 }
 
@@ -170,14 +210,17 @@ impl OciPusher for FakeRegistry {
     fn push(&self, reference: &str, artifact: &Artifact) -> Result<Pinned> {
         let layer = std::fs::read(artifact.layer)?;
         let digest = fake_digest(&layer);
-        self.artifacts
+        self.tags
             .lock()
             .unwrap()
-            .insert(reference.into(), (digest.clone(), layer));
+            .entry(reference.into())
+            .or_default()
+            .insert(Some(artifact.arch.to_string()), (digest.clone(), layer));
         self.pushes.lock().unwrap().push((
             reference.into(),
             artifact.artifact_type.into(),
             artifact.layer_media_type.into(),
+            artifact.arch,
         ));
         let name = reference.rsplit_once(':').map_or(reference, |(n, _)| n);
         Ok(Pinned {
@@ -189,29 +232,29 @@ impl OciPusher for FakeRegistry {
 
 #[cfg(test)]
 impl OciFetcher for FakeRegistry {
-    fn pull(&self, reference: &str, _arch: Option<Arch>, into: &Path) -> Result<()> {
+    fn pull(&self, reference: &str, arch: Option<Arch>, into: &Path) -> Result<()> {
         self.pulled.lock().unwrap().push(reference.into());
-        let artifacts = self.artifacts.lock().unwrap();
         // A pinned reference names the digest, a plain one the tag.
-        let (digest, layer) = artifacts
-            .iter()
-            .find(|(name, (digest, _))| {
-                name.as_str() == reference || reference == format!("{name}@{digest}")
-            })
-            .map(|(_, v)| v)
-            .ok_or_else(|| anyhow::anyhow!("not found: {reference}"))?;
+        let found = {
+            let tags = self.tags.lock().unwrap();
+            tags.iter()
+                .flat_map(|(name, images)| images.values().map(move |v| (name, v)))
+                .find(|(name, (digest, _))| reference == format!("{name}@{digest}"))
+                .map(|(_, v)| v.clone())
+        };
+        let (digest, layer) = match found {
+            Some(found) => found,
+            None => self.image(reference, arch)?,
+        };
         std::fs::write(into.join(digest.replace(':', "-")), layer)?;
         Ok(())
     }
 
-    fn pin(&self, reference: &str, _arch: Option<Arch>) -> Result<Pinned> {
-        let artifacts = self.artifacts.lock().unwrap();
-        let (digest, _) = artifacts
-            .get(reference)
-            .ok_or_else(|| anyhow::anyhow!("not found: {reference}"))?;
+    fn pin(&self, reference: &str, arch: Option<Arch>) -> Result<Pinned> {
+        let (digest, _) = self.image(reference, arch)?;
         Ok(Pinned {
             reference: format!("{reference}@{digest}"),
-            digest: digest.clone(),
+            digest,
         })
     }
 }

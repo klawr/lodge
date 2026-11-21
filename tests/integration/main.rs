@@ -633,8 +633,19 @@ fn a_bundle_published_by_pack_is_used_by_up() {
         .unwrap_or_else(|| panic!("no pinned reference in:\n{}", packed.tail(4)))
         .to_string();
 
-    // What is in the registry, as the registry's own API shows it: one layer, typed.
-    let manifest = registry.manifest("lodge", "1");
+    // What is in the registry, as the registry's own API shows it: the tag is an
+    // index with one image for this machine, and that image has one layer, typed.
+    let index = registry.manifest("lodge", "1");
+    assert!(
+        index.contains("image.index") && index.matches("\"platform\"").count() == 1,
+        "unexpected index:\n{index}"
+    );
+    let digest = exact.split('@').nth(1).unwrap();
+    assert!(
+        index.contains(digest),
+        "the index does not name {digest}:\n{index}"
+    );
+    let manifest = registry.manifest("lodge", digest);
     assert!(
         manifest.contains("application/vnd.lodge.bundle.v1")
             && manifest.matches("\"layers\"").count() == 1,
@@ -648,6 +659,16 @@ fn a_bundle_published_by_pack_is_used_by_up() {
         assert!(out.ok, "up from {how} failed:\n{}", out.tail(8));
         assert_eq!(p.exec(&[&root_tool("hello")]), "published");
     }
+
+    // Publishing again for the same machine replaces its entry and adds none.
+    script_tool_config(&sb, "hello", "#!/bin/sh\necho published again, longer\n");
+    let again = sb.run(&["pack", "-o", &reference]);
+    assert!(again.ok, "publishing again failed:\n{}", again.tail(8));
+    let index_after = registry.manifest("lodge", "1");
+    assert!(
+        index_after.matches("\"platform\"").count() == 1 && !index_after.contains(digest),
+        "expected one entry, replaced:\n{index_after}"
+    );
 
     // A reference nobody writes to is refused before anything is packed.
     let refused = sb.run(&["pack", "-o", "ftp://host/b.tar"]);

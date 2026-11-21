@@ -104,9 +104,10 @@ impl BundleSink for OciSink {
         None
     }
 
-    /// The tag is replaced (last write wins). What comes back names the digest
-    /// that was written, which a config can pin.
-    fn put(&self, reference: &str, tar: &Path) -> Result<String> {
+    /// This machine's entry under the tag is replaced (last write wins), the
+    /// others kept. What comes back names the digest that was written, which a
+    /// config can pin.
+    fn put(&self, reference: &str, tar: &Path, arch: Arch) -> Result<String> {
         let name = reference.strip_prefix(SCHEME).unwrap_or(reference);
         info!("publishing {reference}");
         let pinned = self
@@ -117,6 +118,7 @@ impl BundleSink for OciSink {
                     artifact_type: ARTIFACT_TYPE,
                     layer_media_type: LAYER_MEDIA_TYPE,
                     layer: tar,
+                    arch,
                 },
             )
             .with_context(|| format!("publishing bundle {reference}"))?;
@@ -138,7 +140,9 @@ mod tests {
         let registry = Arc::new(FakeRegistry::new());
         let sink = OciSink::new(registry.clone());
 
-        let exact = sink.put("oci://ghcr.io/me/lodge:1", &tar).unwrap();
+        let exact = sink
+            .put("oci://ghcr.io/me/lodge:1", &tar, Arch::X86_64)
+            .unwrap();
         // It says what it wrote by digest, as a reference that can be used.
         assert!(
             exact.starts_with("oci://ghcr.io/me/lodge@sha256:"),
@@ -150,7 +154,8 @@ mod tests {
             vec![(
                 "ghcr.io/me/lodge:1".into(),
                 ARTIFACT_TYPE.into(),
-                LAYER_MEDIA_TYPE.into()
+                LAYER_MEDIA_TYPE.into(),
+                Arch::X86_64
             )]
         );
         // And the tag now reads back as the same bytes.
@@ -168,11 +173,38 @@ mod tests {
         assert!(!sink.handles("lodge.tar"));
         let dir = TempDir::new("oci-sink").unwrap();
         let missing = dir.path().join("none.tar");
-        let err = sink.put("oci://ghcr.io/me/lodge:1", &missing).unwrap_err();
+        let err = sink
+            .put("oci://ghcr.io/me/lodge:1", &missing, Arch::X86_64)
+            .unwrap_err();
         assert!(
             format!("{err:#}").contains("oci://ghcr.io/me/lodge:1"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn publishing_for_another_architecture_keeps_the_first_one() {
+        let dir = TempDir::new("oci-sink").unwrap();
+        let registry = Arc::new(FakeRegistry::new());
+        let sink = OciSink::new(registry.clone());
+        let reference = "oci://ghcr.io/me/lodge:1";
+        for (arch, bytes) in [(Arch::X86_64, "amd"), (Arch::Aarch64, "arm")] {
+            let tar = dir.path().join(format!("{bytes}.tar"));
+            std::fs::write(&tar, bytes).unwrap();
+            sink.put(reference, &tar, arch).unwrap();
+        }
+        assert_eq!(
+            registry.architectures("ghcr.io/me/lodge:1"),
+            ["aarch64", "x86_64"]
+        );
+        // Each machine reads its own.
+        let store = OciStore::new(registry);
+        for (arch, bytes) in [(Arch::X86_64, "amd"), (Arch::Aarch64, "arm")] {
+            let id = store.identify(reference, Some(arch)).unwrap();
+            let out = TempDir::new("oci-sink-out").unwrap();
+            let got = store.fetch(&id, out.path()).unwrap();
+            assert_eq!(std::fs::read(got).unwrap(), bytes.as_bytes());
+        }
     }
 
     const DIGEST: &str = "sha256:aaaa";

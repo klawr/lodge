@@ -112,16 +112,35 @@ impl OciPusher for NativeOci {
             &layer_digest,
             http::Body::File(artifact.layer.to_path_buf()),
         )?;
-        let manifest = manifest::image(
+        let image = manifest::image(
             artifact.artifact_type,
             artifact.layer_media_type,
             (&config_digest, config_size),
             (&layer_digest, layer_size),
         )?;
-        let digest = registry
-            .put_manifest(tag, manifest::IMAGE_MANIFEST, manifest)
-            .with_context(|| format!("publishing {reference}"))?;
-        Ok(pinned(&r, &digest))
+        let image_size = image.len() as u64;
+        // The image by its digest, then the tag's index naming it: an index names
+        // only what is there. The tag is read as late as possible, so a push from
+        // another machine in between is lost as rarely as it can be.
+        let published = (|| {
+            let image_digest = registry.put_manifest(
+                Digest::of(&image).as_str(),
+                manifest::IMAGE_MANIFEST,
+                image,
+            )?;
+            let index = manifest::merged_index(
+                registry.current_manifest(tag)?.as_deref(),
+                artifact.arch,
+                artifact.artifact_type,
+                (&image_digest, image_size),
+            )?;
+            registry.put_manifest(tag, manifest::IMAGE_INDEX, index)?;
+            Ok::<_, anyhow::Error>(image_digest)
+        })()
+        .with_context(|| format!("publishing {reference}"))?;
+        // What can be used is the image for this machine, which is what `pin` of
+        // the tag answers here.
+        Ok(pinned(&r, &published))
     }
 }
 

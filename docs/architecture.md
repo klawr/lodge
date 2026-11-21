@@ -127,7 +127,7 @@ is) under a tag.
 | `credentials.rs` | `Credentials`, where a login comes from. `DockerConfig` reads what `docker login` stored in the config file itself (`$DOCKER_CONFIG` or `~/.docker`), through `Local`. A login kept by a credential helper is not asked for: that registry is reached anonymously. A helper would be one more implementation; `Login` never prints its password. |
 | `registry.rs` | One repository on one registry, for a pull or a push (`Access`, which decides the scope a token is asked for): the calls, and the handshake that lets them through. |
 | `reference.rs` | Splits `ghcr.io/owner/name:1` (or `@sha256:…`) into registry, repository and tag or digest, and refuses anything that would break a URL. Pure. |
-| `manifest.rs` | Reads a manifest as an image (layers) or an index (images per platform), picks the entry for an architecture, and writes an image manifest (same input, same bytes). Pure. |
+| `manifest.rs` | Reads a manifest as an image (layers) or an index (images per platform), picks the entry for an architecture, writes an image manifest, and merges one more image into a tag's index (same input, same bytes). Pure. |
 | `auth.rs` | Reads a `WWW-Authenticate` challenge and builds what answers it. Pure. |
 | `digest.rs` | `Digest`, the digest of a file, and copying a stream while checking its size and hash. The only file that names the hash crate. |
 
@@ -169,8 +169,13 @@ How a push stays safe, and what it does:
   closes, which the sender sees as a broken connection and not as a 401.
 - **What was stored is checked.** A registry that reports a digest for what it
   stored must report the one that was sent.
-- **The tag is replaced** (last write wins), and an index is not written yet: a tag
-  holds one architecture.
+- **The tag holds an index, one image per architecture.** A push writes the blobs,
+  then the image by its digest, then reads what the tag holds and writes the index
+  back with this architecture's entry replaced in place (or added) and every other
+  entry kept as it was read. A tag that held one image, or nothing, becomes an
+  index of one; one that cannot be read is an error, never overwritten. The tag is
+  read as late as possible, but last write still wins when two machines publish at
+  once. What a push returns is the digest of the image for this machine.
 
 What is not there: retries (a 429 or 5xx is an error) and a credential helper.
 
@@ -201,7 +206,7 @@ and the `pinned` reference to fetch), `fetch` returns the tar. Writing is one:
 | Place | Reference | `identify` | `fetch` | `put` |
 | --- | --- | --- | --- | --- |
 | `FileStore`, `FileSink` | no scheme: a path | `f-<hash of the file>` | the file itself, nothing copied | copies beside the destination, then renames: the file appears only when whole |
-| `OciStore`, `OciSink` | `oci://registry/name[:tag\|@digest]` (a sink wants a tag) | `OciFetcher::pin`: one manifest request, `o-<digest of the image for this machine>` | `OciFetcher::pull` of the pinned reference; one layer, which is the tar | `OciPusher::push` as one layer typed as a lodge bundle; returns `oci://registry/name@sha256:…` |
+| `OciStore`, `OciSink` | `oci://registry/name[:tag\|@digest]` (a sink wants a tag) | `OciFetcher::pin`: one manifest request, `o-<digest of the image for this machine>` | `OciFetcher::pull` of the pinned reference; one layer, which is the tar | `OciPusher::push` (given the bundle's architecture) as one layer typed as a lodge bundle, into the tag's index; returns `oci://registry/name@sha256:…` |
 | `FakeStore`, `FakeSink` (tests) | `fake://name` | a scripted key | a scripted tar, recording what was fetched | keeps what it is given |
 
 `OciStore` and `OciSink` are built on `OciFetcher` and `OciPusher` and know nothing

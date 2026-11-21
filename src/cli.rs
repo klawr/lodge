@@ -177,9 +177,9 @@ pub enum Command {
             patchelf, and it must run on a Linux machine of the architecture the bundle \
             is for. Credentials directories (~/.ssh, ~/.config/gh, …) trigger a warning: \
             a bundle is meant to be shared. The output is a file, or a registry as \
-            oci://ghcr.io/me/lodge:1, which publishes it there (what the tag held is \
-            replaced; one tag holds one architecture); `ldg up --bundle` takes the same \
-            reference. Publishing needs `docker login` for the registry."
+            oci://ghcr.io/me/lodge:1, which publishes it there (the tag holds one image per \
+            architecture: this machine's is replaced, the others are kept); \
+            `ldg up --bundle` takes the same reference. Publishing needs `docker login` for the registry."
     )]
     Pack {
         /// Where to write the bundle: a file, or an `oci://` reference to publish it

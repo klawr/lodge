@@ -71,10 +71,11 @@ pub trait BundleSink {
     /// bundle is not held in the scratch space as well. `None`: anywhere will do.
     fn staging(&self, reference: &str) -> Option<PathBuf>;
 
-    /// Writes the bundle tar at `tar` as `reference`, replacing what was there.
-    /// Returns the exact reference the bundle can be used by (a registry's tag
+    /// Writes the bundle tar at `tar`, packed for `arch`, as `reference`,
+    /// replacing what was there; a place that keeps one bundle per architecture
+    /// under one name (a registry) replaces only the one for `arch`. Returns the exact reference the bundle can be used by (a registry's tag
     /// becomes the digest it was written under).
-    fn put(&self, reference: &str, tar: &Path) -> Result<String>;
+    fn put(&self, reference: &str, tar: &Path, arch: Arch) -> Result<String>;
 }
 
 /// The stores lodge can read a bundle from.
@@ -230,7 +231,7 @@ pub mod fake {
             None
         }
 
-        fn put(&self, reference: &str, tar: &Path) -> Result<String> {
+        fn put(&self, reference: &str, tar: &Path, _arch: Arch) -> Result<String> {
             self.written
                 .lock()
                 .unwrap()

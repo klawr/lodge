@@ -25,7 +25,7 @@ pub fn pack(ctx: &Ctx, output: Option<String>) -> Result<()> {
     }?;
     let tar = scratch.path().join("bundle.tar");
     let manifest = bundle::pack::pack_to_file(&config, &tar, &ctx.tools)?;
-    let written = sink.put(&output, &tar)?;
+    let written = sink.put(&output, &tar, manifest.arch()?)?;
     info!(
         "packed {} and {} for {} into {} (id {})",
         plural(manifest.tools.len(), "tool", "tools"),

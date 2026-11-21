@@ -56,7 +56,7 @@ impl BundleSink for FileSink {
         dir.is_dir().then(|| dir.to_path_buf())
     }
 
-    fn put(&self, reference: &str, tar: &Path) -> Result<String> {
+    fn put(&self, reference: &str, tar: &Path, _arch: Arch) -> Result<String> {
         // On the same filesystem this is the whole job, and atomic.
         if std::fs::rename(tar, reference).is_ok() {
             return Ok(reference.into());
@@ -90,7 +90,9 @@ mod tests {
         let out = dir.path().join("out.tar");
         std::fs::write(&tar, "new").unwrap();
         std::fs::write(&out, "old").unwrap();
-        let said = FileSink.put(out.to_str().unwrap(), &tar).unwrap();
+        let said = FileSink
+            .put(out.to_str().unwrap(), &tar, Arch::X86_64)
+            .unwrap();
         assert_eq!(said, out.to_str().unwrap());
         assert_eq!(std::fs::read(&out).unwrap(), b"new");
         // The tar was moved into place, and nothing else is left beside it.
@@ -114,7 +116,7 @@ mod tests {
         let staged = TempDir::new_in(dir.path(), "stage").unwrap();
         let tar = staged.path().join("bundle.tar");
         std::fs::write(&tar, "whole").unwrap();
-        FileSink.put(reference, &tar).unwrap();
+        FileSink.put(reference, &tar, Arch::X86_64).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"whole");
         assert!(!tar.exists());
     }
@@ -125,7 +127,9 @@ mod tests {
         let tar = dir.path().join("in.tar");
         std::fs::write(&tar, "x").unwrap();
         let out = dir.path().join("no-such-dir/out.tar");
-        let err = FileSink.put(out.to_str().unwrap(), &tar).unwrap_err();
+        let err = FileSink
+            .put(out.to_str().unwrap(), &tar, Arch::X86_64)
+            .unwrap_err();
         assert!(format!("{err:#}").contains("out.tar"), "{err:#}");
     }
 
