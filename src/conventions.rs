@@ -94,6 +94,15 @@ fn only_the_command_layer_chooses_implementations() {
         ),
         Vec::<String>::new()
     );
+    // The way an endpoint is made, and the forward daemon, likewise.
+    assert_eq!(
+        files_containing(&["Devcontainer {"], &["devcontainer/", "cmd/"]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        files_containing(&["DetachedDaemon"], &["forward/", "cmd/"]),
+        Vec::<String>::new()
+    );
     // The helper tools, likewise: packing and feature fetching take `DepReader`,
     // `ElfEditor` and `OciFetcher`, never the programs behind them.
     assert_eq!(
@@ -173,6 +182,7 @@ const FOUNDATION: &[&str] = &[
     "layout",
     "output",
     "port",
+    "provision",
     "runtime",
     "shell",
     "tools",

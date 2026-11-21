@@ -19,66 +19,84 @@ pub use tunnel::HostForwarders;
 
 use crate::port::PortForward;
 
-/// Spawns a detached `ldg _forward` daemon that manages port forwarding for
-/// `container`. Returns immediately; the daemon outlives the calling process.
-/// Daemon stderr goes to a log file; the path is printed so the user can tail it.
-pub fn spawn_daemon(
-    container: &str,
-    host: &dyn Host,
-    rt: &dyn Runtime,
-    static_ports: &[PortForward],
-) {
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => {
-            warning!("cannot start port forwarding: {e}");
-            return;
-        }
-    };
+/// Starts the port forwarding for a container. A trait so that `ldg up` does not
+/// start a real process in a test, and so another way of forwarding is one more
+/// implementation.
+pub trait ForwardDaemon {
+    /// Starts forwarding for `container` and returns at once; what it does with
+    /// `static_ports` (the declared forwards) is its own business.
+    fn start(&self, container: &str, static_ports: &[PortForward]);
+}
 
-    let log = match log_path(container) {
-        Ok(l) => l,
-        Err(e) => {
-            warning!("cannot start port forwarding: {e}");
-            return;
-        }
-    };
-    let log_file = match open_log(&log) {
-        Ok(f) => f,
-        Err(e) => {
-            warning!("could not open forward log {}: {e}", log.display());
-            return;
-        }
-    };
+/// Spawns a detached `ldg _forward` daemon per container. It outlives the
+/// calling process; its stderr goes to a log file whose path is printed so the
+/// user can tail it.
+pub struct DetachedDaemon {
+    /// The arguments that point a child `ldg` at the same host and engine as this
+    /// process.
+    args: Vec<String>,
+}
 
-    info!("port forwarding log: {}", log.display());
-
-    let mut cmd = Command::new(exe);
-    // The daemon reaches the same host and drives the same engine as this process.
-    cmd.args(host.respawn_args());
-    cmd.args(rt.respawn_args());
-    // Forward verbosity to the daemon so its tunnels log into the log file.
-    for _ in 0..crate::output::verbosity() {
-        cmd.arg("-v");
+impl DetachedDaemon {
+    pub fn new(host: &dyn Host, rt: &dyn Runtime) -> Self {
+        let mut args = host.respawn_args();
+        args.extend(rt.respawn_args());
+        DetachedDaemon { args }
     }
-    cmd.arg("_forward").arg(container);
-    for p in static_ports {
-        cmd.args(["--port", &p.encode()]);
-    }
+}
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
+impl ForwardDaemon for DetachedDaemon {
+    fn start(&self, container: &str, static_ports: &[PortForward]) {
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => {
+                warning!("cannot start port forwarding: {e}");
+                return;
+            }
+        };
 
-    if let Err(e) = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(log_file)
-        .spawn()
-    {
-        warning!("could not start the port-forwarding daemon: {e}");
+        let log = match log_path(container) {
+            Ok(l) => l,
+            Err(e) => {
+                warning!("cannot start port forwarding: {e}");
+                return;
+            }
+        };
+        let log_file = match open_log(&log) {
+            Ok(f) => f,
+            Err(e) => {
+                warning!("could not open forward log {}: {e}", log.display());
+                return;
+            }
+        };
+
+        info!("port forwarding log: {}", log.display());
+
+        let mut cmd = Command::new(exe);
+        cmd.args(&self.args);
+        // Forward verbosity to the daemon so its tunnels log into the log file.
+        for _ in 0..crate::output::verbosity() {
+            cmd.arg("-v");
+        }
+        cmd.arg("_forward").arg(container);
+        for p in static_ports {
+            cmd.args(["--port", &p.encode()]);
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+
+        if let Err(e) = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log_file)
+            .spawn()
+        {
+            warning!("could not start the port-forwarding daemon: {e}");
+        }
     }
 }
 

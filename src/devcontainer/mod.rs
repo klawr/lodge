@@ -1,7 +1,7 @@
 //! Running a project's devcontainer: bring the container up, then run the
 //! pieces the spec defines around it.
 //!
-//! [`start`] is the orchestration; each step lives in its own module:
+//! [`Devcontainer`] provisions a project (its `start` is the orchestration); each step lives in its own module:
 //!
 //! - [`spec`]: parse `devcontainer.json` into a [`Spec`]
 //! - [`backend`]: create/start the container (compose, or image/build)
@@ -35,11 +35,11 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::host::HostRef;
-use crate::port::PortForward;
+use crate::provision::{Attached, PostAttach, Provisioner};
 use crate::runtime::{Container, Env, Runtime};
 use crate::tools::OciFetcher;
 use drift::{config_state, hash_inputs, write_hash};
-use lifecycle::{Hook, HookCtx, exec_env, run_create_hooks, run_in_container, run_on_host};
+use lifecycle::{HookCtx, exec_env, run_create_hooks, run_in_container, run_on_host};
 use profile::write_env_profile;
 use spec::{Spec, load_spec};
 
@@ -53,36 +53,19 @@ pub trait Prompt {
     fn choose_workdir(&self, configured: &str, candidates: &[String]) -> String;
 }
 
-/// The result of bringing a devcontainer up: the resolved container, the
-/// workspace folder to drop the user into, and the (deferred) postAttach hook.
-pub struct Started {
-    pub container: Box<dyn Container>,
-    /// The container was created by this call (new, or rebuilt), so nothing has
-    /// been injected into it yet.
-    pub created: bool,
-    pub workdir: String,
-    pub forward_ports: Vec<PortForward>,
-    /// The user to run as inside the container (`remoteUser` in devcontainer.json).
-    /// `None` means use the container's default CMD user.
-    pub remote_user: Option<String>,
-    /// The env hooks run with (`containerEnv`/`remoteEnv` without references).
-    hook_env: Vec<(String, String)>,
-    post_attach: Option<Hook>,
+/// The devcontainer provisioner: brings a project's devcontainer up on `host`
+/// (where the engine `rt` runs too). Registry features are pulled with `oci`,
+/// and anything that needs a person goes through `prompt`.
+pub struct Devcontainer<'a> {
+    pub host: &'a HostRef,
+    pub rt: &'a dyn Runtime,
+    pub oci: &'a dyn OciFetcher,
+    pub prompt: &'a dyn Prompt,
 }
 
-impl Started {
-    /// Runs `postAttachCommand`, if any. Called after lodge has injected the
-    /// environment and right before attaching the interactive session. A
-    /// failure is reported, never fatal.
-    pub fn run_post_attach(&self) {
-        if let Some(cmd) = &self.post_attach {
-            let ctx = HookCtx {
-                workdir: &self.workdir,
-                user: self.remote_user.as_deref(),
-                vars: &self.hook_env,
-            };
-            run_in_container(self.container.as_ref(), &ctx, "postAttachCommand", cmd);
-        }
+impl Provisioner for Devcontainer<'_> {
+    fn provision(&self, project: &Path, rebuild: bool) -> Result<Attached> {
+        start(project, self.host, rebuild, self.rt, self.oci, self.prompt)
     }
 }
 
@@ -95,7 +78,7 @@ pub fn start(
     rt: &dyn Runtime,
     oci: &dyn OciFetcher,
     prompt: &dyn Prompt,
-) -> Result<Started> {
+) -> Result<Attached> {
     let (spec, existing) = locate(project_path, host, rt)?;
     let current_hash = hash_inputs(&spec.config_path, &spec.hash_extra, host.as_ref())?;
 
@@ -180,14 +163,27 @@ pub fn start(
     }
 
     let workdir = workdir::resolve(container.as_ref(), &spec.workspace_folder, prompt);
-    Ok(Started {
+    // Runs `postAttachCommand`, once lodge has injected and right before the
+    // session. A failure is reported, never fatal.
+    let post_attach = spec.lifecycle.post_attach.map(|cmd| -> PostAttach {
+        let workdir = workdir.clone();
+        let user = spec.remote_user.clone();
+        Box::new(move |env| {
+            let ctx = HookCtx {
+                workdir: &workdir,
+                user: user.as_deref(),
+                vars: &hook_env,
+            };
+            run_in_container(env, &ctx, "postAttachCommand", &cmd);
+        })
+    });
+    Ok(Attached {
         container,
         created,
         workdir,
         forward_ports: spec.forward_ports,
         remote_user: spec.remote_user,
-        hook_env,
-        post_attach: spec.lifecycle.post_attach,
+        post_attach,
     })
 }
 

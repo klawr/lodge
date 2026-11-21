@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use crate::cli::{Cli, Command};
 use crate::config::Config;
+use crate::forward::{DetachedDaemon, ForwardDaemon};
 use crate::host::{HostRef, LocalHost, SshHost};
 use crate::runtime::docker::DockerCli;
 use crate::runtime::{Engine, Runtime};
@@ -66,6 +67,8 @@ pub struct Ctx {
     pub rt: Box<dyn Runtime>,
     /// The helper programs, for packing a bundle and fetching features.
     pub tools: Toolchain,
+    /// Starts port forwarding for a container once it is up.
+    pub forwarder: Box<dyn ForwardDaemon>,
     pub config_path: PathBuf,
 }
 
@@ -108,8 +111,10 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
     }
     let config_path = crate::config::path_for(cli.config)?;
     let engine = choose_engine(cli.engine, &cli.command, &config_path)?;
+    let rt = build_engine(engine, host.clone());
     let ctx = Ctx {
-        rt: build_engine(engine, host.clone()),
+        forwarder: Box::new(DetachedDaemon::new(host.as_ref(), rt.as_ref())),
+        rt,
         tools: Toolchain {
             deps: Box::new(Ldd),
             elf: Box::new(Patchelf),

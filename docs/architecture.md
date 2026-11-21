@@ -22,10 +22,11 @@ the host, and nothing is installed in the image.
 ## Commands and control flow
 
 ```
-ldg up [PATH]        devcontainer::start → ContainerUser::resolve → forward::spawn_daemon
+ldg up [PATH]        Provisioner::provision (devcontainer::Devcontainer) → Attached, then attach:
+                     ContainerUser::resolve → ForwardDaemon::start
                      → inject::installed (skipped for a new container or --reinject)
                      → inject::resolve_layout → inject::run (only when nothing is injected)
-                     → Started::run_post_attach → secret::deliver → session::enter
+                     → Attached::run_post_attach → secret::deliver → session::enter
 ldg down [PATH]      devcontainer::stop
 ldg status [PATH]    devcontainer::status (state, drift) + installed bundle + placed secrets
 ldg rm [PATH]        devcontainer::remove (container, and the compose project)
@@ -43,8 +44,8 @@ ldg _forward …       forward::run_daemon (internal; spawned by `up`)
 ```
 
 `src/main.rs` only parses the arguments and hands them to `cmd::run`. `cmd/` is
-the command layer: it builds a `Ctx` (the `Host`, the `Runtime` and the config
-path; see "Hosts and injection"), loads the config **once** per command, resolves the container user once
+the command layer: it builds a `Ctx` (the `Host`, the `Runtime`, the helper-tool `Toolchain`, the
+`ForwardDaemon` and the config path; see "Choices and how they are wired"), loads the config **once** per command, resolves the container user once
 (`ContainerUser`), and decides what to print (`--json` included) and how to ask
 the person at the terminal (`cmd::prompt`). The modules below it take what they
 need as arguments, don't read the config themselves, report progress with
@@ -65,7 +66,8 @@ every subcommand.
 | `layout.rs` | Every path lodge writes inside a container: `Layout`, the paths inside the user's prefix (the table under "What lives where"); the provisioning state, which is the devcontainer's own and root-owned; and the secrets directory. Nothing else spells these paths out. |
 | `secret/` | Secrets that must not be in a bundle. Their `[[secret]]` declarations are config (`config/secret.rs`: validated; names reach shell scripts). `mod` is the `Secret` value type (redacted `Debug`, no `Display`), matching `targets` globs, and `resolve` (env, file or a command run on *this* machine with a timeout, with errors that never contain the value). `place` writes values into a container under `/dev/shm/lodge-secrets-<uid>/` and builds the session lines that export them; `clear` removes the user's (`ldg clean`). `deliver` picks the secrets whose `targets` match, resolves and places them (or clears them when none are declared), and prints names only. |
 | `session/` | Opens the interactive session: `docker exec -it`, and nothing around it; after a lost `--remote` connection it offers to reconnect. Its start-up script (`startup_script`) starts the shell as a login shell, so the profile scripts run, then puts the user's prefix `bin/` first on `PATH` and restores what the profile dropped before running the shell interactively; that is how the injected tools reach the session without any file outside the prefix. `terminfo` makes the terminal the session is opened from work in the container (copies its entry from this machine into the prefix when the container lacks it, and sets `TERM`). |
-| `forward/` | Port forwarding. `mod` spawns the daemon and owns its state files (log, lock, and the ports file `ldg ports` reads, which starts with the daemon's pid so a dead daemon's file is ignored), `daemon` is the `_forward` loop (declared ports plus whatever starts listening), `tunnel` one forward behind the `Forward` and `Forwarders` traits: `HostForwarders` starts the tunnel process the `Host` provides (`ssh -L` for `SshHost`) or else the in-process TCP proxy; the daemon's start, restart, re-point and cooldown logic is tested with a fake `Forwarders`. The daemon decodes its own `--port` flags, re-points a forward when its destination's address changes (looked up again every 30 s), and exits when the container stops, not when the engine merely can't be reached for a while. |
+| `forward/` | Port forwarding. `mod` has the `ForwardDaemon` trait (`DetachedDaemon` spawns the daemon; a test records instead) and owns its state files (log, lock, and the ports file `ldg ports` reads, which starts with the daemon's pid so a dead daemon's file is ignored), `daemon` is the `_forward` loop (declared ports plus whatever starts listening), `tunnel` one forward behind the `Forward` and `Forwarders` traits: `HostForwarders` starts the tunnel process the `Host` provides (`ssh -L` for `SshHost`) or else the in-process TCP proxy; the daemon's start, restart, re-point and cooldown logic is tested with a fake `Forwarders`. The daemon decodes its own `--port` flags, re-points a forward when its destination's address changes (looked up again every 30 s), and exits when the container stops, not when the engine merely can't be reached for a while. |
+| `provision.rs` | The seam between making an endpoint and working in one: `Provisioner` (get an endpoint ready for a project) returns `Attached` (the endpoint, its user, workdir, forward ports, whether it was just created, and the post-attach hook). `cmd::attach::up` is `provision` then `attach`, and `attach` takes only an `Attached`, so it is tested with a fake container and no provisioner. |
 | `port.rs` | `PortForward`, a port to forward: what the devcontainer spec declares and the daemon carries out, so neither depends on the other. |
 | `tools/` | The build-time helpers behind interfaces: `DepReader` (which libraries a binary needs), `ElfEditor` (relink a copy of a binary for the bundle's prefix) and `OciFetcher` (pull a feature's layer), bundled as a `Toolchain` that `cmd::run` builds. `external` has the implementations that run the programs (`Ldd`, `Patchelf`, `Oras`, parsing `ldd`'s output); a native one is one more type. Packing, the bundle cache and feature fetching take the interfaces and are tested with fakes. |
 | `host_tools.rs` | The helper programs lodge may run here (`ssh`, `ldd`, `patchelf`, `oras`): what each is needed for (a `Need`, which decides when `doctor` requires it) and how to get it. `doctor` reports from this table and each tool is started only through it (the `tools` implementations and `host/ssh.rs`). |
@@ -80,11 +82,11 @@ every subcommand.
 
 ### `devcontainer/`
 
-`start()` in `mod.rs` is the orchestration; each step is its own module.
+`start()` in `mod.rs` is the orchestration, behind the `Devcontainer` provisioner; each step is its own module.
 
 | File | Responsibility |
 | --- | --- |
-| `mod.rs` | `start` / `stop` / `remove` / `status` / `find`, the `Started` result, whether the container was created, and `Prompt`, the questions only a person can answer (the command layer implements it). Drift and the installed bundle are read with `Container::read_stored_file`, which works on a stopped container too. |
+| `mod.rs` | `Devcontainer` (the `Provisioner`: `start` is its orchestration, and returns an `Attached`), `stop` / `remove` / `status` / `find`, and `Prompt`, the questions only a person can answer (the command layer implements it). Drift and the installed bundle are read with `Container::read_stored_file`, which works on a stopped container too. |
 | `spec.rs` | Find the config on the project's host (through `Host`, so every host shares one lookup order); parse `devcontainer.json` (JSONC) into a backend-agnostic `Spec`; derive the session name. |
 | `backend.rs` | Picks and builds the backend from the parsed config (with the stable container name, and the files outside the hashed folder that count toward drift: a Dockerfile, compose files). The `Backend` trait with two implementations: `ComposeBackend` (`docker compose`, run on the project's host) and `ContainerBackend` (`docker run` of an image or a local build). Both label the container `dev.lodge.project=<path>`. |
 | `create.rs` | `CreateSettings`, how a container is created (privileged, capabilities, mounts, published `appPort`s, …), from devcontainer.json and from features alike, applied to a `runtime::RunSpec` (the engine-neutral description of a container; `runtime/docker` renders it as `docker run` flags, and a devcontainer's `runArgs` ride along in `engine_args`, last, because the spec defines them as the engine's own flags) or rendered as a compose override (compose-file YAML, which is not docker's). |
@@ -105,7 +107,14 @@ and hooks all work from the resulting container id.
 
 ## What `ldg up` does, step by step
 
-0. **Load the config and ready the bundle** (`cmd::attach`), so a broken config or
+`up` is two halves. **Provision** (steps 1–9) makes the endpoint ready and hands
+back an `Attached`: the container plus the user, working directory, forward ports,
+whether it was just created, and the post-attach hook. **Attach** (steps 10–11)
+works in whatever it is given and knows nothing of how it was made. Today the
+only provisioner is the devcontainer one; a pod or a plain host would be another
+provisioner feeding the same attach half.
+
+0. **Load the config and ready the bundle** (before both halves) (`cmd::attach`), so a broken config or
    bundle fails before anything starts. The project path is made canonical on
    the project's host (`Host::canonical_dir`; on another machine, `pwd -P`
    there), so one folder is one container however it is spelled.
@@ -129,7 +138,7 @@ and hooks all work from the resulting container id.
    time. Hooks run as `remoteUser`. A failing hook or feature is reported but
    never aborts `ldg`.
 9. **Choose a working directory.** `workspaceFolder` if it exists, otherwise ask.
-10. **Look up the container user** (`remoteUser`, or the default user: name,
+10. **Attach starts here.** **Look up the container user** (`remoteUser`, or the default user: name,
     uid, gid, home) once, then **start the port-forward daemon**. Then **inject
     your environment** for that user, as that user, into the **prefix**, but only
     when the container was just created, `--reinject` was given, or nothing is
@@ -356,23 +365,30 @@ for it takes an explicit `exec_root`, which none of them contain.
 records commands and keeps a virtual filesystem, which is what the injection
 tests run against; `FakeRuntime` is an engine (with compose) that keeps its
 containers by name, each in its own `FakeEnv`, and refuses to act on one that
-doesn't exist, which is what `devcontainer::start`'s create / reuse / recreate decisions are
+doesn't exist, which is what `start`'s create / reuse / recreate decisions are
 tested against. Another engine (Podman, kubectl), or a plain host with no engine at all, would
 implement the same traits.
 
 Backends (`devcontainer/backend.rs`) are plain data: the `Runtime` is passed in
 rather than stored.
 
-## Hosts and injection
+## Choices and how they are wired
 
-Every dependency sits behind an interface and is injected, so a new
-implementation is one new type handed in at one place:
+lodge can vary in a few places: how a machine is reached, which engine runs the
+containers, how an endpoint is made ready, which helper tools build a bundle. Each
+is a choice behind a small interface, so a new option (Podman, a pod, a
+different ssh) is one new type plus one line where the choice is made, and
+options add up side by side instead of tangling into the code that uses them.
+Tests use the same seam to swap in fakes. That is the point; the wiring below is
+just how it is done.
 
 | Dependency | Interface | Implementations |
 | --- | --- | --- |
 | How a machine is reached | `host::Host` | `LocalHost`, `SshHost`; anything else that can run a command implements the two primitives |
 | The container engine | `runtime::Runtime`, `Compose`, `Container`, `Env` | `runtime::docker`, and the in-memory `FakeRuntime` for tests |
 | The build-time helpers | `tools::DepReader`, `ElfEditor`, `OciFetcher` (a `Toolchain`) | `Ldd`, `Patchelf`, `Oras`; a test passes fakes |
+| Making an endpoint ready | `provision::Provisioner` | `devcontainer::Devcontainer` (the only one so far) |
+| Port forwarding for a container | `forward::ForwardDaemon` (and `Forwarders` for one tunnel) | `DetachedDaemon`, `HostForwarders`; a test passes fakes |
 | What is injected | `[[inject]]` data | multiplexers and other tools are injected like any other, never named in code |
 
 The pieces compose instead of branching. The engine is built *on* a host
@@ -402,11 +418,30 @@ daemon reaches the same host), `tunnel` (the process that forwards a port, or
 `None` when the engine's addresses are reachable from here and the in-process
 proxy is used).
 
+Provisioning and attaching meet at `provision::Attached`, plain data holding the
+endpoint, its user, workdir, forward ports, whether it was just created and the
+post-attach hook. `cmd::attach::up` builds the provisioner and calls `provision`;
+`attach` takes only the `Attached`, the `Ctx` and the bundle. Because of that,
+`attach` is tested with a fake container and a recording `ForwardDaemon`, with no
+devcontainer involved. `up` currently builds `Devcontainer` directly. With a
+second provisioner, `up` is where it is picked, from the project's signals (a
+`.devcontainer` means provision one) and `--engine`; nothing in `attach` changes.
+
+**What is not a choice yet.** Some things are still used directly, so there is
+nothing to swap or fake there:
+- the interactive session's local side (`session/` runs `sh` for the terminfo
+  copy and reads the reconnect answer from this terminal);
+- a secret's `command` source (`secret/` runs `sh` on this machine);
+- this machine's own files and process (the bundle cache, temp files, loading the
+  config, finding `ldg`'s own executable to start the forward daemon).
+
+Making one of these a choice follows the same recipe as the others.
+
 To add a way of reaching machines (an ssh successor, `gh codespace ssh`, an
 agent), implement `Host` in a new file under `host/` and add one arm to the
 choice in `cmd::run`. To add an engine, implement `Runtime` (and `Env`,
 `Container`) under `runtime/`, add a variant to `runtime::Engine` and an arm to
-`cmd::build_engine`. To replace a helper tool (a native OCI client, a built-in ELF
+`cmd::build_engine`. To add a way of making an endpoint (a pod, a plain host), implement `Provisioner` and choose it in `cmd::attach::up`; `attach` is unchanged. To replace a helper tool (a native OCI client, a built-in ELF
 writer), implement `OciFetcher` or `ElfEditor` in `tools/` and swap it in the
 `Toolchain` that `cmd::run` builds. Nothing else changes, and
 `conventions.rs` fails if anything else starts to name the new type.
@@ -433,7 +468,7 @@ erode.
   engine a `Runtime`, and only `cmd/` (the composition root, `cmd::run`) names a
   concrete one (`SshHost`, `LocalHost`, `DockerCli`); everything else takes the
   interface. No code matches on a kind of host or engine or compares one's name:
-  it asks a capability (see "Hosts and injection"). Each interface has a fake or
+  it asks a capability (see "Choices and how they are wired"). Each interface has a fake or
   a test host, so a branch is tested without docker, ssh or a network.
   *Enforced:* `conventions.rs` fails if a concrete host, engine or tool is named
   outside its own module and `cmd/`.
@@ -451,10 +486,10 @@ erode.
   `cli`), lodge's features below it (`config`, `devcontainer`, `bundle`,
   `inject`, `secret`, `session`, `forward`), and a foundation (`runtime`,
   `host`, `tools`, `shell`, `layout`, `output`, `tmpfile`, `tree`,
-  `fingerprint`, `host_tools`, `port`) that names none of them. *Enforced:* the
+  `fingerprint`, `host_tools`, `port`, `provision`) that names none of them. *Enforced:* the
   tests in `conventions.rs`.
 - **Paths in the container** come from `layout.rs`; **the container user** is a
-  `ContainerUser` resolved once by the command, after `devcontainer::start`
+  `ContainerUser` resolved once by the command, after provisioning
   (inside `start` the user's uid may still change, so uid alignment and feature
   scripts look it up there); **names written into scripts** are checked with
   `shell::is_plain_name` / `is_var_name`, and **destinations
