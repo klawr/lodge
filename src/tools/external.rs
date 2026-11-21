@@ -19,7 +19,7 @@ impl DepReader for Ldd {
         crate::output::trace(&cmd);
         let output = cmd
             .output()
-            .with_context(|| format!("running ldd on {binary}"))?;
+            .with_context(|| format!("running ldd on {binary} (needed to pack): {}", LDD.hint))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         if stdout.contains("statically linked") {

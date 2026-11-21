@@ -61,11 +61,13 @@ safe_directories`); if you set it to `[]`, add the directories you need.
   `<prefix>/share/nvim/runtime` to the same path (`ldg init` adds this entry).
 - Run `ldg cache clear` if you suspect a stale packed bundle.
 
-## The devcontainer is reported as changed every time
+## The devcontainer is reported as changed
 
-Change detection hashes every file under `.devcontainer/`. A hook that writes
-there (for example `initializeCommand: touch .devcontainer/x`) changes the hash
-on every run. Write generated files elsewhere.
+Change detection hashes what the container is built from: `devcontainer.json`
+(comments and formatting do not count), the Dockerfile, the compose files and
+local feature folders. Other files under `.devcontainer/` (scripts, a hook's
+output) are not part of it. Files the image build copies in from its build
+context are not either; `ldg up --build` picks them up.
 
 ## A lifecycle hook or feature failed
 

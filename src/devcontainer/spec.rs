@@ -122,10 +122,10 @@ pub(super) struct BuildConfig {
 // The backend-agnostic parts of a parsed devcontainer.
 pub(super) struct Spec {
     pub(super) config_path: PathBuf,
-    // Directory the devcontainer.json lives in: hashed for change detection,
-    // used as cwd for initializeCommand, and as the base for local feature refs.
+    // Directory the devcontainer.json lives in: used as cwd for initializeCommand, and as the base for local feature refs.
     pub(super) base_dir: PathBuf,
-    // Extra files (besides the .devcontainer dir) to fold into the hash.
+    // Files besides the config that the container is built from (the Dockerfile,
+    // the compose files), folded into the drift hash.
     pub(super) hash_extra: Vec<PathBuf>,
     pub(super) workspace_folder: String,
     pub(super) forward_ports: Vec<PortForward>,
@@ -138,6 +138,20 @@ pub(super) struct Spec {
     // Whether to line the container user's uid up with the host user's.
     pub(super) sync_uid: bool,
     pub(super) backend: Box<dyn Backend>,
+}
+
+impl Spec {
+    /// What the container's config depends on, as a hash: see
+    /// [`drift::hash_inputs`](super::drift::hash_inputs).
+    pub(super) fn hash(&self, host: &dyn crate::host::Host) -> Result<String> {
+        let features: Vec<(String, PathBuf)> = self
+            .features
+            .iter()
+            .filter(|f| super::features::is_local_ref(&f.reference))
+            .map(|f| (f.reference.clone(), self.base_dir.join(&f.reference)))
+            .collect();
+        super::drift::hash_inputs(&self.config_path, &self.hash_extra, &features, host)
+    }
 }
 
 pub(super) fn load_spec(project_path: &Path, host: &HostRef) -> Result<Spec> {

@@ -38,7 +38,7 @@ use crate::host::HostRef;
 use crate::provision::{Attached, PostAttach, Provisioner};
 use crate::runtime::{Container, Env, Runtime};
 use crate::tools::OciFetcher;
-use drift::{config_state, hash_inputs, write_hash};
+use drift::{config_state, write_hash};
 use lifecycle::{HookCtx, exec_env, run_create_hooks, run_in_container, run_on_host};
 use profile::write_env_profile;
 use spec::{Spec, load_spec};
@@ -80,7 +80,7 @@ pub fn start(
     prompt: &dyn Prompt,
 ) -> Result<Attached> {
     let (spec, existing) = locate(project_path, host, rt)?;
-    let current_hash = hash_inputs(&spec.config_path, &spec.hash_extra, host.as_ref())?;
+    let current_hash = spec.hash(host.as_ref())?;
 
     // Has the config drifted since the existing container was created? It is
     // only reported: `--build` is what recreates.
@@ -90,7 +90,7 @@ pub fn start(
         })
     {
         note!(
-            ".devcontainer changed since this container was created \
+            "the devcontainer config changed since this container was created \
              (`ldg up --build` recreates it; anything installed in it is lost)"
         );
     }
@@ -247,7 +247,7 @@ pub fn status(project_path: &Path, host: &HostRef, rt: &dyn Runtime) -> Result<O
     };
     let container = rt.container(&id);
     let running = container.is_running()?;
-    let current = hash_inputs(&spec.config_path, &spec.hash_extra, host.as_ref())?;
+    let current = spec.hash(host.as_ref())?;
     let config = config_state(container.as_ref(), &current);
     Ok(Some(Status {
         found: Found {

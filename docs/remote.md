@@ -19,8 +19,8 @@ injected environment lives locally and is streamed into the remote container
 over the SSH connection: lodge packs directories into a tar stream itself (no
 local `tar` needed) and the remote daemon unpacks it.
 
-Change detection reads the `.devcontainer/` files from the remote host and
-hashes them here, the same way as for a local project, so a comment-only edit
+Change detection reads the config, Dockerfile, compose files and local
+features from the remote host and hashes them here, the same way as for a local project, so a comment-only edit
 doesn't count as a change either.
 
 lodge opens one SSH connection first and reuses it for the dozens of commands a

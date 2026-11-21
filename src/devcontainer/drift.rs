@@ -1,5 +1,5 @@
-//! Drift detection: have the devcontainer's inputs (`.devcontainer/`, and the
-//! files it names outside it) changed since this container was created?
+//! Drift detection: have the devcontainer's inputs (its config, Dockerfile, compose
+//! files and local features) changed since this container was created?
 //!
 //! A fingerprint of the config inputs is stored *inside* the container, so it
 //! survives reboots and is discarded automatically when the container is
@@ -7,7 +7,6 @@
 
 use anyhow::{Context, Result};
 use json_comments::StripComments;
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::fingerprint::Fingerprint;
@@ -60,39 +59,35 @@ pub(super) fn config_state(container: &dyn Container, current: &str) -> ConfigSt
 
 // ── change detection ───────────────────────────────────────────────────────────
 
-// Hashes the inputs that define the container: the folder the config lives in
-// when that is `.devcontainer/` or one of its subfolders
-// (`.devcontainer/<name>/devcontainer.json`), with everything in it (Dockerfile,
-// compose file, scripts, …); otherwise the standalone `.devcontainer.json`. Plus
-// any `extra` files the backend declares (a Dockerfile or compose files kept
-// elsewhere). The files are read from the project's host (copied over ssh with
-// `--remote`) and hashed here, so local and remote projects get the same answer
-// for the same files.
+// Hashes what the container is built from, and nothing else: the config file,
+// the `extra` files the backend declares (the Dockerfile, the compose files), and
+// each local feature folder (`features`: its reference as written, and the folder).
+// Not the rest of `.devcontainer/`: a hook or a tool may write there, and neither
+// changes the container. (The Dockerfile's build context is not hashed either; a
+// rebuild picks up what it copies in.) The files are read from the project's host
+// (copied over ssh with `--remote`) and hashed here, so local and remote projects
+// get the same answer for the same files.
 pub(super) fn hash_inputs(
     config_path: &Path,
     extra: &[PathBuf],
+    features: &[(String, PathBuf)],
     host: &dyn Host,
 ) -> Result<String> {
     let mut entries: Vec<(String, Vec<u8>)> = vec![];
-    let devcontainer_dir = config_folder(config_path);
 
-    let mut files: Vec<PathBuf> = Vec::new();
     // Kept alive until hashing is done: a remote directory is copied into it.
     let scratch = crate::tmpfile::TempDir::new("dchash").context("creating a scratch folder")?;
-    if let Some(root) = devcontainer_dir {
-        let local = host.fetch_dir(root, &scratch.path().join("dir"))?;
-        collect_dir(&local, &mut entries)?;
-    } else {
-        files.push(config_path.to_path_buf());
+    for (i, (reference, dir)) in features.iter().enumerate() {
+        let local = host.fetch_dir(dir, &scratch.path().join(format!("feature{i}")))?;
+        let mut files = vec![];
+        collect_dir(&local, &mut files)?;
+        entries.extend(
+            files
+                .into_iter()
+                .map(|(name, bytes)| (format!("{reference}/{name}"), bytes)),
+        );
     }
-    // Extra files outside the hashed directory (inside it, they already count).
-    files.extend(
-        extra
-            .iter()
-            .map(|f| lexical(f))
-            .filter(|f| devcontainer_dir.is_none_or(|root| !f.starts_with(lexical(root)))),
-    );
-    for f in files {
+    for f in std::iter::once(config_path.to_path_buf()).chain(extra.iter().map(|f| lexical(f))) {
         if let Some(bytes) = host.read_file(&f)? {
             let name = f
                 .file_name()
@@ -110,15 +105,6 @@ pub(super) fn hash_inputs(
         h.field(name.as_bytes()).put(bytes).put(&[0xff]);
     }
     Ok(h.hex())
-}
-
-/// The folder hashed whole for the config at `config_path`: `.devcontainer/`,
-/// or the `.devcontainer/<name>/` it is in. `None` for a standalone
-/// `.devcontainer.json`.
-fn config_folder(config_path: &Path) -> Option<&Path> {
-    let dir = config_path.parent()?;
-    let is_devcontainer = |p: &Path| p.file_name() == Some(OsStr::new(".devcontainer"));
-    (is_devcontainer(dir) || dir.parent().is_some_and(is_devcontainer)).then_some(dir)
 }
 
 // devcontainer.json is JSONC; canonicalize it before hashing so comment-only
@@ -180,41 +166,58 @@ mod tests {
     use crate::runtime::Runtime;
     use crate::runtime::fake::{FakeEnv, FakeRuntime};
 
-    #[test]
-    fn a_subfolder_config_hashes_its_folder_not_its_siblings() {
-        let tmp = crate::tmpfile::TempDir::new("dc-sub").unwrap();
-        let dc = tmp.path().join(".devcontainer");
-        for (f, body) in [
-            ("py/devcontainer.json", "{}"),
-            ("py/Dockerfile", "FROM a\n"),
-            ("go/devcontainer.json", "{}"),
-        ] {
-            std::fs::create_dir_all(dc.join(f).parent().unwrap()).unwrap();
-            std::fs::write(dc.join(f), body).unwrap();
+    fn project(files: &[(&str, &str)]) -> crate::tmpfile::TempDir {
+        let tmp = crate::tmpfile::TempDir::new("dc-hash").unwrap();
+        for (f, body) in files {
+            let path = tmp.path().join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
         }
-        let config = dc.join("py/devcontainer.json");
-        let before = hash_inputs(&config, &[], &LocalHost).unwrap();
-        std::fs::write(dc.join("go/devcontainer.json"), r#"{"a":1}"#).unwrap();
-        assert_eq!(hash_inputs(&config, &[], &LocalHost).unwrap(), before);
-        std::fs::write(dc.join("py/Dockerfile"), "FROM b\n").unwrap();
-        assert_ne!(
-            hash_inputs(&config, &[], &LocalHost).unwrap(),
-            before,
-            "the Dockerfile beside the config counts"
-        );
+        tmp
     }
 
     #[test]
-    fn only_devcontainer_folders_are_hashed_whole() {
-        assert_eq!(
-            config_folder(Path::new("/p/.devcontainer/devcontainer.json")),
-            Some(Path::new("/p/.devcontainer"))
+    fn files_nobody_declared_do_not_change_the_hash() {
+        let tmp = project(&[
+            (".devcontainer/devcontainer.json", "{}"),
+            (".devcontainer/Dockerfile", "FROM a\n"),
+            (".devcontainer/go/devcontainer.json", "{}"),
+        ]);
+        let dc = tmp.path().join(".devcontainer");
+        let config = dc.join("devcontainer.json");
+        let docker = [dc.join("Dockerfile")];
+        let hash = || hash_inputs(&config, &docker, &[], &LocalHost).unwrap();
+        let before = hash();
+        // A sibling config, a script, a hook's cache: none of them is an input.
+        std::fs::write(dc.join("go/devcontainer.json"), r#"{"a":1}"#).unwrap();
+        std::fs::write(dc.join("setup.sh"), "echo\n").unwrap();
+        std::fs::create_dir_all(dc.join(".cache")).unwrap();
+        std::fs::write(dc.join(".cache/x"), "y").unwrap();
+        assert_eq!(hash(), before);
+        std::fs::write(dc.join("Dockerfile"), "FROM b\n").unwrap();
+        assert_ne!(hash(), before, "the Dockerfile counts");
+        let before = hash();
+        std::fs::write(&config, r#"{"image":"x"}"#).unwrap();
+        assert_ne!(hash(), before, "the config counts");
+    }
+
+    #[test]
+    fn a_local_feature_counts_whole_under_the_reference_it_was_given() {
+        let tmp = project(&[
+            (".devcontainer/devcontainer.json", "{}"),
+            (".devcontainer/feat/install.sh", "a"),
+        ]);
+        let dc = tmp.path().join(".devcontainer");
+        let config = dc.join("devcontainer.json");
+        let feature = [("./feat".to_string(), dc.join("./feat"))];
+        let none = hash_inputs(&config, &[], &[], &LocalHost).unwrap();
+        let with = hash_inputs(&config, &[], &feature, &LocalHost).unwrap();
+        assert_ne!(with, none);
+        std::fs::write(dc.join("feat/install.sh"), "b").unwrap();
+        assert_ne!(
+            hash_inputs(&config, &[], &feature, &LocalHost).unwrap(),
+            with
         );
-        assert_eq!(
-            config_folder(Path::new("/p/.devcontainer/py/devcontainer.json")),
-            Some(Path::new("/p/.devcontainer/py"))
-        );
-        assert_eq!(config_folder(Path::new("/p/.devcontainer.json")), None);
     }
 
     #[test]
@@ -227,24 +230,20 @@ mod tests {
     }
 
     #[test]
-    fn a_compose_file_outside_the_folder_counts_and_one_inside_counts_once() {
-        let tmp = crate::tmpfile::TempDir::new("hash-extra").unwrap();
-        let dc = tmp.path().join(".devcontainer");
-        std::fs::create_dir_all(&dc).unwrap();
-        std::fs::write(dc.join("devcontainer.json"), "{}").unwrap();
-        std::fs::write(dc.join("compose.yml"), "a").unwrap();
-        std::fs::write(tmp.path().join("outside.yml"), "x").unwrap();
-        let config = dc.join("devcontainer.json");
-        let inside = [dc.join("compose.yml")];
-        let outside = [dc.join("../outside.yml")];
-        let none = hash_inputs(&config, &[], &LocalHost).unwrap();
-        assert_eq!(hash_inputs(&config, &inside, &LocalHost).unwrap(), none);
-        let with_outside = hash_inputs(&config, &outside, &LocalHost).unwrap();
-        assert_ne!(with_outside, none);
+    fn a_declared_file_counts_wherever_it_lives() {
+        let tmp = project(&[
+            (".devcontainer/devcontainer.json", "{}"),
+            ("outside.yml", "x"),
+        ]);
+        let config = tmp.path().join(".devcontainer/devcontainer.json");
+        let outside = [tmp.path().join(".devcontainer/../outside.yml")];
+        let none = hash_inputs(&config, &[], &[], &LocalHost).unwrap();
+        let with = hash_inputs(&config, &outside, &[], &LocalHost).unwrap();
+        assert_ne!(with, none);
         std::fs::write(tmp.path().join("outside.yml"), "y").unwrap();
         assert_ne!(
-            hash_inputs(&config, &outside, &LocalHost).unwrap(),
-            with_outside
+            hash_inputs(&config, &outside, &[], &LocalHost).unwrap(),
+            with
         );
     }
 

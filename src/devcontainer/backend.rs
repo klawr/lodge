@@ -295,7 +295,8 @@ pub(super) struct BackendContext<'a> {
 
 pub(super) struct BuiltBackend {
     pub(super) backend: Box<dyn Backend>,
-    /// Extra files (besides the `.devcontainer` dir) to fold into the drift hash.
+    /// Files besides the config (the Dockerfile, the compose files) to fold into the
+    /// drift hash.
     pub(super) hash_extra: Vec<PathBuf>,
 }
 

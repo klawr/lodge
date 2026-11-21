@@ -137,8 +137,8 @@ linked binaries are copied as they are.
   Docker Desktop on macOS/Windows doesn't expose container IPs.
 - Docker is the only container engine; the target must be a container.
 - `ldg` itself runs on Linux, macOS and WSL2, not natively on Windows.
-- Change detection hashes every file under `.devcontainer/`, so a hook that
-  writes there is reported as a change on the next run.
+- Change detection covers `devcontainer.json`, the Dockerfile, compose files
+  and local features, not the Dockerfile's build context.
 
 ## Development
 
