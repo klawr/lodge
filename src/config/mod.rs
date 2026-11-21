@@ -228,6 +228,39 @@ pub fn target_settings(path: &Path, name: &str) -> Result<toml::Table> {
         .with_context(|| format!("invalid [targets.{name}] in {}", path.display()))
 }
 
+/// The file in a project's folder that says what is particular to the project:
+/// only `[targets.<name>]` tables, for the targets that take settings per project.
+pub const PROJECT_FILE: &str = "lodge.toml";
+
+/// The `[targets.<name>]` table of the project file in `dir`: an empty table when
+/// there is no file or no such table. The file may hold nothing but `targets`, so
+/// a stray key (an `[[inject]]` that would be ignored) is an error and not a
+/// silent no-op; what is *in* the table is for the target to check.
+pub fn project_target_settings(dir: &Path, name: &str) -> Result<toml::Table> {
+    let path = dir.join(PROJECT_FILE);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(toml::Table::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let file: toml::Table = raw
+        .parse()
+        .with_context(|| format!("invalid {}", path.display()))?;
+    if let Some(key) = file.keys().find(|k| *k != "targets") {
+        anyhow::bail!(
+            "invalid {}: `{key}` is not allowed; a project file holds only [targets.<name>] \
+             tables (everything else is in your own config)",
+            path.display()
+        );
+    }
+    file.get("targets")
+        .and_then(|t| t.get(name))
+        .map(|v| v.clone().try_into::<toml::Table>())
+        .transpose()
+        .map(Option::unwrap_or_default)
+        .with_context(|| format!("invalid [targets.{name}] in {}", path.display()))
+}
+
 /// The config file as a raw table, `None` if it is missing or not TOML.
 fn peek(path: &Path) -> Option<toml::Table> {
     std::fs::read_to_string(path).ok()?.parse().ok()
@@ -597,5 +630,34 @@ mod tests {
             None
         );
         assert_eq!(edit_distance("kitten", "sitting"), 3);
+    }
+
+    #[test]
+    fn a_project_file_gives_a_targets_table_and_nothing_else() {
+        let dir = crate::tmpfile::TempDir::new("project-file").unwrap();
+        // No file: nothing.
+        assert!(
+            project_target_settings(dir.path(), "kubernetes")
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(
+            dir.path().join(PROJECT_FILE),
+            "[targets.kubernetes]\npod = \"dev-0\"\n[targets.docker]\ncontext = \"x\"\n",
+        )
+        .unwrap();
+        let table = project_target_settings(dir.path(), "kubernetes").unwrap();
+        assert_eq!(table["pod"].as_str(), Some("dev-0"));
+        assert!(
+            project_target_settings(dir.path(), "podman")
+                .unwrap()
+                .is_empty()
+        );
+        // A key that would be ignored is refused, and so is a file that is not TOML.
+        std::fs::write(dir.path().join(PROJECT_FILE), "[[inject]]\nname = \"x\"\n").unwrap();
+        let err = project_target_settings(dir.path(), "kubernetes").unwrap_err();
+        assert!(err.to_string().contains("`inject` is not allowed"), "{err}");
+        std::fs::write(dir.path().join(PROJECT_FILE), "= not toml").unwrap();
+        assert!(project_target_settings(dir.path(), "kubernetes").is_err());
     }
 }

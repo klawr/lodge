@@ -196,6 +196,23 @@ impl TargetKind for KubeTarget {
         Ok(Box::new(KubeEndpoints::new(with.host, options)))
     }
 
+    /// Which pod is the project's to say.
+    fn per_project(&self) -> bool {
+        true
+    }
+
+    /// A project that names a pod (or a selector) replaces how the user's config
+    /// found one, which is the other of the two: the pair is one setting.
+    fn merge_project(&self, user: &toml::Table, project: &toml::Table) -> toml::Table {
+        let mut merged = user.clone();
+        if project.contains_key("pod") || project.contains_key("selector") {
+            merged.remove("pod");
+            merged.remove("selector");
+        }
+        merged.extend(project.clone());
+        merged
+    }
+
     #[cfg(test)]
     fn made_of(&self) -> Made {
         Made {
@@ -265,6 +282,23 @@ mod tests {
         let host = find("host").unwrap();
         let err = host.build(wiring(), &table("anything = 1")).err().unwrap();
         assert!(err.to_string().contains("no setting `anything`"), "{err}");
+    }
+
+    #[test]
+    fn a_project_names_its_pod_over_the_users_and_keeps_the_rest() {
+        let kube = find("kubernetes").unwrap();
+        assert!(kube.per_project() && !find("docker").unwrap().per_project());
+        let user = table("selector = \"app=api\"\nnamespace = \"work\"\ncontext = \"staging\"");
+        let project = table("pod = \"dev-0\"\nnamespace = \"mine\"");
+        let merged = kube.merge_project(&user, &project);
+        assert_eq!(
+            merged,
+            table("pod = \"dev-0\"\nnamespace = \"mine\"\ncontext = \"staging\"")
+        );
+        // Both are accepted by the target as one pod.
+        kube.build(wiring(), &merged).unwrap();
+        // Where the project says nothing, the user's table stands.
+        assert_eq!(kube.merge_project(&user, &toml::Table::new()), user);
     }
 
     #[test]

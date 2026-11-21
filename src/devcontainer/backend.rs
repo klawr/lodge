@@ -21,6 +21,27 @@ use crate::shell::slug;
 /// path on its host. `ldg ls` lists containers by it.
 pub const LABEL_PROJECT: &str = "dev.lodge.project";
 
+/// The labels the devcontainer CLI and VS Code put on a container, and look it up
+/// by: the project folder and the config file, as paths on the engine's host.
+/// lodge writes them too, so they find its containers, and finds theirs by them.
+pub const LABEL_LOCAL_FOLDER: &str = "devcontainer.local_folder";
+pub const LABEL_CONFIG_FILE: &str = "devcontainer.config_file";
+
+/// The labels that say a container is the devcontainer of `config_path` in
+/// `project_path`, as the devcontainer CLI writes them.
+pub(super) fn editor_labels(project_path: &Path, config_path: &Path) -> Vec<(String, String)> {
+    vec![
+        (
+            LABEL_LOCAL_FOLDER.to_string(),
+            project_path.display().to_string(),
+        ),
+        (
+            LABEL_CONFIG_FILE.to_string(),
+            config_path.display().to_string(),
+        ),
+    ]
+}
+
 /// Brings a devcontainer's container up. Each backend only has to know how to
 /// find an existing container and create/start one; everything after that —
 /// hashing, env, features, lifecycle hooks — is shared and works off the id.
@@ -61,6 +82,8 @@ pub(super) struct ComposeBackend {
     pub(super) run_services: Vec<String>,
     /// The project's path, recorded as [`LABEL_PROJECT`] on the service.
     pub(super) project_path: PathBuf,
+    /// The devcontainer.json, recorded with it as [`LABEL_CONFIG_FILE`].
+    pub(super) config_path: PathBuf,
     /// The project's host, where compose runs and reads its files (and so
     /// where the override file is written).
     pub(super) host: HostRef,
@@ -109,7 +132,10 @@ impl Backend for ComposeBackend {
         // written on the project's host (where compose runs).
         let mut files = self.files.clone();
         let project_path = self.project_path.to_string_lossy();
-        let content = extra.compose_override(&self.service, &[(LABEL_PROJECT, &project_path)]);
+        let editor = editor_labels(&self.project_path, &self.config_path);
+        let mut labels = vec![(LABEL_PROJECT, project_path.as_ref())];
+        labels.extend(editor.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let content = extra.compose_override(&self.service, &labels);
         let override_file = self
             .host
             .write_scratch("compose-override.yml", &content)
@@ -252,24 +278,25 @@ fn build_run_spec(
     user_args: Option<Vec<String>>,
     workspace_mount: Option<String>,
     settings: &CreateSettings,
-    vars: &Vars,
-    project_path: &Path,
-    workspace_folder: &str,
+    ctx: &BackendContext,
 ) -> RunSpec {
+    let (vars, project_path) = (ctx.vars, ctx.project_path);
+    let mut labels = vec![(
+        LABEL_PROJECT.to_string(),
+        project_path.display().to_string(),
+    )];
+    labels.extend(editor_labels(project_path, ctx.config_path));
     let mut spec = RunSpec {
         name: name.to_string(),
-        labels: vec![(
-            LABEL_PROJECT.to_string(),
-            project_path.display().to_string(),
-        )],
-        workdir: Some(workspace_folder.to_string()),
+        labels,
+        workdir: Some(ctx.workspace_folder.to_string()),
         ..RunSpec::default()
     };
     match workspace_mount {
         Some(m) => spec.mounts.push(vars.apply(&m)),
         None => spec.binds.push((
             project_path.display().to_string(),
-            workspace_folder.to_string(),
+            ctx.workspace_folder.to_string(),
         )),
     }
     settings.apply(&mut spec);
@@ -291,6 +318,8 @@ pub(super) struct BackendContext<'a> {
     pub(super) base_dir: &'a Path,
     pub(super) workspace_folder: &'a str,
     pub(super) vars: &'a Vars<'a>,
+    /// The devcontainer.json being read.
+    pub(super) config_path: &'a Path,
 }
 
 pub(super) struct BuiltBackend {
@@ -342,6 +371,7 @@ fn compose_backend(source: SourceConfig, ctx: &BackendContext) -> Result<BuiltBa
             // Compose project names must be lowercase.
             project: container_name(ctx.project_path).to_lowercase(),
             project_path: ctx.project_path.to_path_buf(),
+            config_path: ctx.config_path.to_path_buf(),
             host: ctx.host.clone(),
         }),
         hash_extra,
@@ -375,9 +405,7 @@ fn container_backend(
         create.run_args,
         create.workspace_mount,
         &settings,
-        ctx.vars,
-        ctx.project_path,
-        ctx.workspace_folder,
+        ctx,
     );
     // The Dockerfile counts toward drift even when it lives outside the hashed
     // folder (`"dockerfile": "../Dockerfile"`), like compose files do.
@@ -442,9 +470,28 @@ mod tests {
     use crate::host::fake;
     use crate::local::fake::FakeLocal;
 
+    /// The context of the devcontainer of `p`, as read from the usual place.
+    fn context<'a>(p: &'a Path, vars: &'a Vars<'a>, workspace: &'a str) -> BackendContext<'a> {
+        // Leaked: a test's few bytes, and a borrowed host and path are all a context holds.
+        let host: &'static HostRef = Box::leak(Box::new(fake()));
+        let config: &'static Path =
+            Box::leak(p.join(".devcontainer/devcontainer.json").into_boxed_path());
+        let base: &'static Path = config.parent().unwrap();
+        BackendContext {
+            project_path: p,
+            host,
+            base_dir: base,
+            workspace_folder: workspace,
+            vars,
+            config_path: config,
+        }
+    }
+
     #[test]
     fn the_run_spec_has_the_workspace_the_settings_and_the_user_args_last() {
         let p = Path::new("/home/me/proj");
+        let local = FakeLocal::new();
+        let vars = Vars::new(p, &local);
         let spec = build_run_spec(
             "lodge-proj",
             Some(vec!["--cap-drop=ALL".into()]),
@@ -453,15 +500,20 @@ mod tests {
                 privileged: true,
                 ..Default::default()
             },
-            &Vars::new(p, &FakeLocal::new()),
-            p,
-            "/workspaces/proj",
+            &context(p, &vars, "/workspaces/proj"),
         );
         assert_eq!(
             spec,
             RunSpec {
                 name: "lodge-proj".into(),
-                labels: vec![("dev.lodge.project".into(), "/home/me/proj".into())],
+                labels: vec![
+                    ("dev.lodge.project".into(), "/home/me/proj".into()),
+                    ("devcontainer.local_folder".into(), "/home/me/proj".into()),
+                    (
+                        "devcontainer.config_file".into(),
+                        "/home/me/proj/.devcontainer/devcontainer.json".into()
+                    ),
+                ],
                 workdir: Some("/workspaces/proj".into()),
                 binds: vec![("/home/me/proj".into(), "/workspaces/proj".into())],
                 privileged: true,
@@ -504,14 +556,14 @@ mod tests {
     #[test]
     fn a_workspace_mount_replaces_the_default_bind() {
         let p = Path::new("/home/me/proj");
+        let local = FakeLocal::new();
+        let vars = Vars::new(p, &local);
         let spec = build_run_spec(
             "n",
             None,
             Some("type=bind,source=${localWorkspaceFolder},target=/w".into()),
             &CreateSettings::default(),
-            &Vars::new(p, &FakeLocal::new()),
-            p,
-            "/w",
+            &context(p, &vars, "/w"),
         );
         assert!(spec.binds.is_empty());
         assert_eq!(spec.mounts, ["type=bind,source=/home/me/proj,target=/w"]);
@@ -560,6 +612,7 @@ mod tests {
             base_dir: &base,
             workspace_folder: "/workspaces/proj",
             vars: &vars,
+            config_path: &base.join("devcontainer.json"),
         };
         let build = |source: SourceConfig| {
             build_backend(source, CreateConfig::default(), None, &ctx)

@@ -13,6 +13,7 @@ pub enum Method {
     Head,
     Post,
     Put,
+    Patch,
 }
 
 impl Method {
@@ -23,14 +24,20 @@ impl Method {
             Method::Head => "HEAD",
             Method::Post => "POST",
             Method::Put => "PUT",
+            Method::Patch => "PATCH",
         }
     }
 }
 
 /// How long a write may wait for the registry's answer: after the last byte is
-/// sent it verifies and commits the blob, which for a large bundle takes a while.
-/// The stall limits of a read do not apply to that wait.
-const WRITE_WAIT: Duration = Duration::from_secs(10 * 60);
+/// sent it verifies and commits the blob, which for a large bundle takes a while,
+/// so the wait grows with what was sent: two minutes, and a second more for every
+/// 8 MiB, at most half an hour. The stall limits of a read do not apply to it.
+fn write_wait(len: u64) -> Duration {
+    const BASE: u64 = 2 * 60;
+    const CAP: u64 = 30 * 60;
+    Duration::from_secs((BASE + len / (8 * 1024 * 1024)).min(CAP))
+}
 
 /// What is sent with a request. Either can be sent again, which a request that is
 /// answered with a 401 needs.
@@ -40,6 +47,29 @@ pub enum Body {
     Bytes(Vec<u8>),
     /// A file, streamed: a bundle is not read into memory to be sent.
     File(PathBuf),
+}
+
+impl Body {
+    /// How many bytes it holds (a file that cannot be read counts as none; sending
+    /// it says why).
+    pub fn len(&self) -> u64 {
+        match self {
+            Body::None => 0,
+            Body::Bytes(b) => b.len() as u64,
+            Body::File(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+        }
+    }
+
+    /// What it holds, from the start, to be read in pieces.
+    pub fn open(&self) -> Result<Box<dyn Read>> {
+        Ok(match self {
+            Body::None => Box::new(std::io::empty()),
+            Body::Bytes(b) => Box::new(std::io::Cursor::new(b.clone())),
+            Body::File(p) => Box::new(
+                std::fs::File::open(p).with_context(|| format!("reading {}", p.display()))?,
+            ),
+        })
+    }
 }
 
 pub struct Request<'a> {
@@ -125,16 +155,17 @@ impl Http for UreqHttp {
         let called = match (request.method, request.body) {
             (Method::Get, Body::None) => with_headers(self.0.get(url), request.headers).call(),
             (Method::Head, Body::None) => with_headers(self.0.head(url), request.headers).call(),
-            (method @ (Method::Post | Method::Put), body) => {
-                let builder = if method == Method::Post {
-                    self.0.post(url)
-                } else {
-                    self.0.put(url)
+            (method @ (Method::Post | Method::Put | Method::Patch), body) => {
+                let builder = match method {
+                    Method::Post => self.0.post(url),
+                    Method::Put => self.0.put(url),
+                    _ => self.0.patch(url),
                 };
+                let wait = write_wait(body.len());
                 let builder = with_headers(builder, request.headers)
                     .config()
-                    .timeout_recv_response(Some(WRITE_WAIT))
-                    .timeout_per_read(Some(WRITE_WAIT))
+                    .timeout_recv_response(Some(wait))
+                    .timeout_per_read(Some(wait))
                     .build();
                 match body {
                     Body::None => builder.send_empty(),
@@ -171,6 +202,21 @@ fn with_headers<B>(
         builder = builder.header(*k, *v);
     }
     builder
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_wait_for_a_write_grows_with_what_was_sent_up_to_a_cap() {
+        assert_eq!(write_wait(0), Duration::from_secs(120));
+        assert_eq!(
+            write_wait(1024 * 1024 * 1024),
+            Duration::from_secs(120 + 128)
+        );
+        assert_eq!(write_wait(u64::MAX), Duration::from_secs(30 * 60));
+    }
 }
 
 #[cfg(test)]

@@ -66,7 +66,7 @@ every subcommand.
 | `inject/` | Copies a bundle's binaries, libraries and configs into a container for one `ContainerUser`, reading only from the bundle directory and acting *as that user* (through `runtime::Acting`), so it never needs root: `prefix` (chooses and checks the prefix: the user's home, else a private `/tmp` directory; `installed`, in `state`, finds where it was installed), `binary` (rewrites a dynamic binary's interpreter for the prefix, and writes the wrapper a config asked for), `libs` (tracked by content hash), `config_files`, `git` (`safe.directory`), `installed` (a hash and the destination per installed piece; a record that can't be read means that piece is installed again, and the list of records `ldg clean` works from is an error when it can't be read, not "nothing installed"), `state` (the installed bundle id, and `installed`, which finds what was injected and where), `remove` (`ldg clean`; placed secrets are removed by `secret::place::clear`). |
 | `layout.rs` | Every path lodge writes inside a container: `Layout`, the paths inside the user's prefix (the table under "What lives where"); the provisioning state, which is the devcontainer's own and root-owned; and the secrets directory. Nothing else spells these paths out. |
 | `secret/` | Secrets that must not be in a bundle. Their `[[secret]]` declarations are config (`config/secret.rs`: validated; names reach shell scripts). `mod` is the `Secret` value type (redacted `Debug`, no `Display`), matching `targets` globs, and `resolve` (env, file or a command run on *this* machine with a timeout, with errors that never contain the value). `place` writes values into a container under `/dev/shm/lodge-secrets-<uid>/` and builds the session lines that export them; `clear` removes the user's (`ldg clean`). `deliver` picks the secrets whose `targets` match, resolves and places them (or clears them when none are declared), and prints names only. |
-| `session/` | Opens the interactive session: `docker exec -it`, and nothing around it; after a lost `--remote` connection it offers to reconnect. Its start-up script (`startup_script`) starts the shell as a login shell, so the profile scripts run, then puts the user's prefix `bin/` first on `PATH` and restores what the profile dropped before running the shell interactively; that is how the injected tools reach the session without any file outside the prefix. `terminfo` makes the terminal the session is opened from work in the container (copies its entry from this machine into the prefix when the container lacks it, and sets `TERM`). |
+| `session/` | Opens the interactive session: `docker exec -it`, and nothing around it; after a lost `--remote` connection it reconnects by itself (tries for about two and a half minutes) and opens a new shell, without asking. Its start-up script (`startup_script`) starts the shell as a login shell, so the profile scripts run, then puts the user's prefix `bin/` first on `PATH` and restores what the profile dropped before running the shell interactively; that is how the injected tools reach the session without any file outside the prefix. `terminfo` makes the terminal the session is opened from work in the container (copies its entry from this machine into the prefix when the container lacks it, and sets `TERM`). |
 | `forward/` | Port forwarding. `mod` has the `ForwardDaemon` trait (`start`, `stop`; `DetachedDaemon` spawns the daemon, and `stop` leaves it a note to end, which it looks for between polls; a test records instead) and owns its state files (log, lock, and the ports file `ldg ports` reads, which starts with the daemon's pid so a dead daemon's file is ignored), `daemon` is the `_forward` loop (declared ports plus whatever starts listening), `tunnel` one forward behind the `Forward` and `Forwarders` traits: `HostForwarders` starts the tunnel process the `Host` provides (`ssh -L` for `SshHost`) or else the in-process TCP proxy; the daemon's start, restart, re-point and cooldown logic is tested with a fake `Forwarders`. The daemon decodes its own `--port` flags, re-points a forward when its destination's address changes (looked up again every 30 s), and exits when the container stops, not when the engine merely can't be reached for a while, or when `ldg clean` asks it to (a machine is always up, so nothing else ends the daemon for a plain host). `up` starts none for an endpoint that says it has nothing to forward (`Container::forwards_ports`: this machine as a plain host). |
 | `provision.rs` | `TargetKind` (one kind of endpoint the user can name: its name, its one-line description, and how to build its `Endpoints` from the `Wiring` and the `[targets.<name>]` settings it was given; the whole of what is particular to a target outside its endpoint) and the seam between making an endpoint and working in one: `Endpoints` (provision a project's endpoint, find it, its status, hand out a handle by id for the forward daemon, which engine is behind it, whether `--remote` needs a project path, and an optional `Lifecycle`) returns `Attached` (the endpoint, its user, workdir, forward ports, whether it was just created, and the post-attach hook). `cmd::attach::up` is `provision` then `attach`, and `attach` takes only an `Attached`, so it is tested with a fake container and no provisioner. |
 | `plain_host.rs` | A machine you can reach as an endpoint (`--target host`): `PlainHost` is an `Env` and `Container` built on a `Host` only (commands and `tar` through `Host::exec`, secrets on stdin, the session through `Host::interactive`), acting as the user the host connects as and not [disposable](#capabilities); `PlainHostEndpoints` is its `Endpoints`: nothing to create, so it has no `Lifecycle` (`down`, `rm` and `ls` say so). |
@@ -92,7 +92,7 @@ every subcommand.
 | --- | --- |
 | `mod.rs` | `Devcontainer` (the `Endpoints` over an engine: `start` is its orchestration, and returns an `Attached`), `stop` / `remove` / `status` / `find`, and `Prompt`, the questions only a person can answer (the command layer implements it). Drift and the installed bundle are read with `Container::read_stored_file`, which works on a stopped container too. |
 | `spec.rs` | Find the config on the project's host (through `Host`, so every host shares one lookup order); parse `devcontainer.json` (JSONC) into a backend-agnostic `Spec`; derive the session name. |
-| `backend.rs` | Picks and builds the backend from the parsed config (with the stable container name, and the files besides the config that count toward drift: a Dockerfile, compose files). The `Backend` trait with two implementations: `ComposeBackend` (`docker compose`, run on the project's host) and `ContainerBackend` (`docker run` of an image or a local build). Both label the container `dev.lodge.project=<path>`. |
+| `backend.rs` | Picks and builds the backend from the parsed config (with the stable container name, and the files besides the config that count toward drift: a Dockerfile, compose files). The `Backend` trait with two implementations: `ComposeBackend` (`docker compose`, run on the project's host) and `ContainerBackend` (`docker run` of an image or a local build). Both label the container `dev.lodge.project=<path>`, and `devcontainer.local_folder` / `devcontainer.config_file` as the devcontainer CLI does (`editor_labels`). `devcontainer/mod.rs` finds a container by lodge's own name (or compose project) first, and only then by those two labels (`Runtime::find_by_labels`): that one is `foreign`, used as it is by `up` (started, injected into, no features or hooks) and never stopped or removed. |
 | `create.rs` | `CreateSettings`, how a container is created (privileged, capabilities, mounts, published `appPort`s, …), from devcontainer.json and from features alike, applied to a `runtime::RunSpec` (the engine-neutral description of a container; `runtime/cli` renders it as `docker run` flags, and a devcontainer's `runArgs` ride along in `engine_args`, last, because the spec defines them as the engine's own flags) or rendered as a compose override (compose-file YAML, which is not docker's). |
 | `features/` | Devcontainer *features*: `fetch` (OCI through the `OciFetcher`, or a local folder from the project's host; a feature's `id` must be a plain name, since it names a folder), and in `mod.rs` `resolve` (adds what `dependsOn` names, once each, and drops a feature whose dependency is unavailable), the order (`dependsOn` and `installsAfter`, then `overrideFeatureInstallOrder`, then the reference; a circle is warned about), the creation settings they ask for, and the install (as root, told `_REMOTE_USER`), with one env profile per feature. |
 | `lifecycle.rs` | The `Hook` type (string / argv / named map, all run as the same steps), running hooks on the host or in the container (as `remoteUser`), and the create-time hooks that run once successfully (`run_create_hooks`). |
@@ -149,15 +149,27 @@ How a pull stays safe:
   `127.0.0.1` and `[::1]`.
 - **A stall is an error, not a hang.** There is a timeout for connecting, for the
   response and for each read, and none for the whole download: a blob can be
-  large. A write is given ten minutes for the registry's answer instead, because
-  it verifies and commits a large blob before it replies.
+  large. A write is given longer for the registry's answer, growing with what was
+  sent (two minutes, a second more per 8 MiB, half an hour at most), because it
+  verifies and commits a large blob before it replies.
+- **"Not now" is tried again.** A 429, 502, 503 or 504 (and a plain 500 for a read,
+  which cannot have done anything) is sent again after 1, 3 and 9 seconds, or as
+  long as its `Retry-After` says when that is at most 30 s; after that the status
+  is the answer. A network failure is not retried here (an upload's hang-up has
+  its own retry, below).
+- **Proxies** are the HTTP crate's: `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and
+  `NO_PROXY` are honoured, as `curl` does.
+- **The older docker manifest types** (`manifest.v2`, `manifest.list.v2`) are
+  asked for and read as the OCI ones; a schema 1 manifest is an error.
 
 How a push stays safe, and what it does:
 
 - **The blobs first, the manifest last**, so a manifest never names what is not
   there. A blob the registry already has (`HEAD`) is not sent again. The empty
   config and the layer are uploaded in one piece (`POST` for a place, `PUT` with
-  the digest); the layer is streamed from its file.
+  the digest); the layer is streamed from its file. A registry (or a proxy in
+  front of it) that answers 413 to that gets the blob again in pieces of 32 MiB
+  (`PATCH` with a `Content-Range`, then an empty `PUT` that closes the upload).
 - **Writing is asked for as docker asks**: the token is requested for `pull,push`
   whatever scope the registry's challenge names. A refusal says to `docker login`
   with an account that may write.
@@ -178,7 +190,9 @@ How a push stays safe, and what it does:
   read as late as possible, but last write still wins when two machines publish at
   once. What a push returns is the digest of the image for this machine.
 
-What is not there: retries (a 429 or 5xx is an error).
+A push can refuse to replace: with `--no-clobber` the tag is read first, and an
+entry for this architecture (or a single image) already there is an error before
+anything is uploaded.
 
 ### `bundle/store/`
 
@@ -574,8 +588,8 @@ knows which it is.
 
 **What is not a choice yet.** Some things are still used directly, so there is
 nothing to swap or fake there:
-- the interactive session's local side (`session/` reads the reconnect answer
-  from this terminal);
+- the interactive session's local side (`session/` asks this process whether it
+  has a terminal, to decide whether to reconnect);
 - this machine's own files and standard directories (the bundle cache, temp
   files, loading the config, finding `ldg`'s own executable to start the forward
   daemon). `conventions.rs` lists which files still reach for the process itself,

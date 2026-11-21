@@ -1,9 +1,9 @@
 //! A bundle that is a file on this machine.
 
-use super::{BundleSink, BundleStore, Identity};
+use super::{BundleSink, BundleStore, Identity, Replace};
 use crate::arch::Arch;
 use crate::bundle::hash::hash_path;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 /// Every reference without a scheme is a path.
@@ -56,7 +56,10 @@ impl BundleSink for FileSink {
         dir.is_dir().then(|| dir.to_path_buf())
     }
 
-    fn put(&self, reference: &str, tar: &Path, _arch: Arch) -> Result<String> {
+    fn put(&self, reference: &str, tar: &Path, _arch: Arch, replace: Replace) -> Result<String> {
+        if replace == Replace::No && Path::new(reference).exists() {
+            bail!("{reference} exists already; publish without --no-clobber to replace it");
+        }
         // On the same filesystem this is the whole job, and atomic.
         if std::fs::rename(tar, reference).is_ok() {
             return Ok(reference.into());
@@ -91,7 +94,7 @@ mod tests {
         std::fs::write(&tar, "new").unwrap();
         std::fs::write(&out, "old").unwrap();
         let said = FileSink
-            .put(out.to_str().unwrap(), &tar, Arch::X86_64)
+            .put(out.to_str().unwrap(), &tar, Arch::X86_64, Replace::Yes)
             .unwrap();
         assert_eq!(said, out.to_str().unwrap());
         assert_eq!(std::fs::read(&out).unwrap(), b"new");
@@ -116,7 +119,9 @@ mod tests {
         let staged = TempDir::new_in(dir.path(), "stage").unwrap();
         let tar = staged.path().join("bundle.tar");
         std::fs::write(&tar, "whole").unwrap();
-        FileSink.put(reference, &tar, Arch::X86_64).unwrap();
+        FileSink
+            .put(reference, &tar, Arch::X86_64, Replace::Yes)
+            .unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"whole");
         assert!(!tar.exists());
     }
@@ -128,7 +133,7 @@ mod tests {
         std::fs::write(&tar, "x").unwrap();
         let out = dir.path().join("no-such-dir/out.tar");
         let err = FileSink
-            .put(out.to_str().unwrap(), &tar, Arch::X86_64)
+            .put(out.to_str().unwrap(), &tar, Arch::X86_64, Replace::Yes)
             .unwrap_err();
         assert!(format!("{err:#}").contains("out.tar"), "{err:#}");
     }
@@ -155,5 +160,26 @@ mod tests {
         assert_eq!(FileStore.fetch(&id, dir.path()).unwrap(), file);
         let err = FileStore.identify("/no/such.tar", None).unwrap_err();
         assert!(format!("{err:#}").contains("/no/such.tar"), "{err:#}");
+    }
+
+    #[test]
+    fn a_file_that_exists_is_kept_when_replacing_is_refused() {
+        let dir = TempDir::new("file-sink").unwrap();
+        let tar = dir.path().join("in.tar");
+        let out = dir.path().join("out.tar");
+        std::fs::write(&tar, b"new").unwrap();
+        std::fs::write(&out, b"old").unwrap();
+        let err = FileSink
+            .put(out.to_str().unwrap(), &tar, Arch::X86_64, Replace::No)
+            .unwrap_err();
+        assert!(err.to_string().contains("--no-clobber"), "{err}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"old");
+        assert!(tar.exists());
+        // Where nothing is, it is written.
+        let fresh = dir.path().join("fresh.tar");
+        FileSink
+            .put(fresh.to_str().unwrap(), &tar, Arch::X86_64, Replace::No)
+            .unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"new");
     }
 }

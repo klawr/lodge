@@ -525,6 +525,10 @@ pub trait Runtime {
     /// The id of the container (running or stopped) with exactly this name.
     fn find_by_name(&self, name: &str) -> Result<Option<String>>;
 
+    /// The id of a container (running or stopped) that carries every one of
+    /// `labels`, `None` when there is none.
+    fn find_by_labels(&self, labels: &[(String, String)]) -> Result<Option<String>>;
+
     /// Builds an image. Reads the build context on the engine's host.
     fn build_image(&self, spec: &BuildSpec) -> Result<()>;
 

@@ -82,6 +82,23 @@ pub trait TargetKind {
     /// checks them against its own settings type.
     fn build(&self, with: Wiring, settings: &toml::Table) -> Result<Box<dyn Endpoints>>;
 
+    /// Whether a project may say something about this target, in its own file
+    /// (`lodge.toml` in the project folder): a target whose endpoint is
+    /// something that was there before the project, which only the project can
+    /// name (a pod). Default: no.
+    fn per_project(&self) -> bool {
+        false
+    }
+
+    /// The settings the user's config gives and the project's file gives, as
+    /// one table. By default what the project sets replaces the user's, key by
+    /// key; a target whose keys exclude each other says so by overriding this.
+    fn merge_project(&self, user: &toml::Table, project: &toml::Table) -> toml::Table {
+        let mut merged = user.clone();
+        merged.extend(project.clone());
+        merged
+    }
+
     /// The concrete types this target is made of and where they live, for the
     /// architecture test that nothing else names them. Required, so a new target
     /// cannot leave itself unguarded.

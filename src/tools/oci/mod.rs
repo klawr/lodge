@@ -20,7 +20,7 @@ pub use credentials::{Credentials, DockerConfig};
 pub use http::{Http, UreqHttp};
 
 use crate::arch::Arch;
-use crate::tools::{Artifact, OciPusher, Pinned};
+use crate::tools::{Artifact, OciPusher, Pinned, Replace};
 use anyhow::{Context, Result, bail};
 use digest::Digest;
 use manifest::Manifest;
@@ -31,11 +31,25 @@ use std::path::Path;
 pub struct NativeOci {
     http: Box<dyn Http>,
     credentials: Box<dyn Credentials>,
+    waits: Vec<std::time::Duration>,
 }
 
 impl NativeOci {
     pub fn new(http: Box<dyn Http>, credentials: Box<dyn Credentials>) -> Self {
-        Self { http, credentials }
+        Self {
+            http,
+            credentials,
+            waits: registry::RETRY_WAITS.to_vec(),
+        }
+    }
+
+    /// How long to wait before each new try of a request the registry answered
+    /// with "not now" (a rate limit, an overloaded server). The real waits are
+    /// seconds; a test has none.
+    #[cfg(test)]
+    pub fn retrying(mut self, waits: &[std::time::Duration]) -> Self {
+        self.waits = waits.to_vec();
+        self
     }
 }
 
@@ -48,7 +62,8 @@ impl super::OciFetcher for NativeOci {
             &r.registry,
             &r.repository,
             Access::Pull,
-        );
+        )
+        .retrying(&self.waits);
         let mut bytes = registry.manifest(&r.target)?;
         let mut parsed = Manifest::parse(&bytes)?;
         if let Manifest::Index(entries) = &parsed {
@@ -79,7 +94,8 @@ impl super::OciFetcher for NativeOci {
             &r.registry,
             &r.repository,
             Access::Pull,
-        );
+        )
+        .retrying(&self.waits);
         let bytes = registry.manifest(&r.target)?;
         let digest = match Manifest::parse(&bytes)? {
             Manifest::Image(_) => Digest::of(&bytes),
@@ -101,7 +117,19 @@ impl OciPusher for NativeOci {
             &r.registry,
             &r.repository,
             Access::Push,
-        );
+        )
+        .retrying(&self.waits);
+        // A refusal comes before anything is sent.
+        if artifact.replace == Replace::No
+            && let Some(held) =
+                manifest::held_for(registry.current_manifest(tag)?.as_deref(), artifact.arch)?
+        {
+            bail!(
+                "{reference} already holds an image for {} ({held}); publish without \
+                 --no-clobber to replace it",
+                artifact.arch
+            );
+        }
         // The blobs first, the manifest last: a manifest names only what is there.
         let config = b"{}".to_vec();
         let config_digest = Digest::of(&config);

@@ -207,6 +207,7 @@ fn build_spec(
             base_dir: &base_dir,
             workspace_folder: &workspace_folder,
             vars: &vars,
+            config_path: &config_path,
         },
     )?;
     let env = build_env(container_env, remote_env, &vars);

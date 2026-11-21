@@ -70,6 +70,12 @@ struct StatusReport {
     container: Option<ContainerStatus>,
 }
 
+/// Which bundle is in a container: its id, and where it came from.
+struct InjectedBundle {
+    id: String,
+    source: Option<String>,
+}
+
 struct ContainerStatus {
     id: String,
     name: String,
@@ -78,7 +84,7 @@ struct ContainerStatus {
     config: Option<ConfigState>,
     /// The bundle installed (`Some(None)`: none); `None` when the container
     /// could not say.
-    bundle: Option<Option<String>>,
+    bundle: Option<Option<InjectedBundle>>,
     /// Each declared secret and whether it is placed; `None` when a running
     /// container could not say.
     secrets: Option<Vec<(String, bool)>>,
@@ -104,7 +110,12 @@ impl StatusReport {
         };
         let bundle = match &user {
             Ok(user) => crate::inject::installed(c, user)
-                .map(|found| found.map(|i| i.bundle))
+                .map(|found| {
+                    found.map(|i| InjectedBundle {
+                        id: i.bundle,
+                        source: i.source,
+                    })
+                })
                 .map_err(|e| warning!("could not tell which bundle is installed: {e:#}"))
                 .ok(),
             Err(e) => {
@@ -150,7 +161,8 @@ impl StatusReport {
                 "name": c.name,
                 "running": c.running,
                 "config": c.config,
-                "bundle": c.bundle.clone().flatten(),
+                "bundle": c.bundle.as_ref().and_then(|b| b.as_ref()).map(|b| &b.id),
+                "source": c.bundle.as_ref().and_then(|b| b.as_ref()).and_then(|b| b.source.as_ref()),
                 "secrets": c.secrets.as_ref().map(|s| {
                     s.iter()
                         .map(|(n, p)| json!({"name": n, "placed": p}))
@@ -181,7 +193,12 @@ impl StatusReport {
             ));
         }
         match &c.bundle {
-            Some(Some(id)) => out.push(format!("bundle     {id}")),
+            Some(Some(b)) => {
+                out.push(format!("bundle     {}", b.id));
+                if let Some(source) = &b.source {
+                    out.push(format!("source     {source}"));
+                }
+            }
             Some(None) => {}
             None => out.push("bundle     unknown".into()),
         }
@@ -416,7 +433,7 @@ mod tests {
         let c = start(&dir, &rt);
         c.write_file(
             "/home/dev/.local/share/lodge/injected",
-            b"bundle 0123456789abcdef\n",
+            b"bundle 0123456789abcdef\nsource ghcr.io/me/lodge@sha256:aa\n",
         )
         .unwrap();
 
@@ -427,12 +444,14 @@ mod tests {
                 format!("container  {} (running)", c.id()),
                 "config     up to date".into(),
                 "bundle     0123456789abcdef".into(),
+                "source     ghcr.io/me/lodge@sha256:aa".into(),
                 "secrets    T (placed)".into(),
             ]
         );
         let json = r.to_json();
         assert_eq!(json["container"]["config"], "up_to_date");
         assert_eq!(json["container"]["bundle"], "0123456789abcdef");
+        assert_eq!(json["container"]["source"], "ghcr.io/me/lodge@sha256:aa");
         assert_eq!(json["container"]["secrets"][0]["placed"], true);
     }
 

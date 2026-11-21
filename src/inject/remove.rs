@@ -179,6 +179,7 @@ mod tests {
         let installed = Installed {
             layout: layout.clone(),
             bundle: "abc".into(),
+            source: None,
             wrappers: vec![],
             configs: vec!["/home/dev/.config/nvim".into()],
             safe_directories: vec!["/w".into()],

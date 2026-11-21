@@ -36,6 +36,9 @@ pub struct Prepared {
     pub dir: PathBuf,
     pub manifest: Manifest,
     pub origin: Origin,
+    /// Where it came from, as exactly as the place can say (a registry's digest),
+    /// for `ldg status`; `None` for one packed from the config.
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +125,9 @@ pub(crate) fn from_store(root: &Path, stores: &Stores, reference: &str) -> Resul
                 "cannot reach {reference} ({}); using the bundle it named last time ({key})",
                 short(&e)
             );
-            return cached(root, &key);
+            let mut prepared = cached(root, &key)?;
+            prepared.source = Some(format!("{reference} as it was last time ({key})"));
+            return Ok(prepared);
         }
         Err(e) => return Err(e),
     };
@@ -133,6 +138,7 @@ pub(crate) fn from_store(root: &Path, stores: &Stores, reference: &str) -> Resul
             dir,
             manifest,
             origin: Origin::Cached,
+            source: Some(identity.pinned),
         });
     }
     let fetched = cache::staging(root, "fetch")?;
@@ -145,7 +151,47 @@ pub(crate) fn from_store(root: &Path, stores: &Stores, reference: &str) -> Resul
         dir,
         manifest,
         origin: Origin::Extracted,
+        source: Some(identity.pinned),
     })
+}
+
+/// What a reference names, found without fetching or extracting anything: for a
+/// check that must have no side effects.
+pub struct Lookup {
+    /// The reference made exact (a registry's tag as the digest it names).
+    pub pinned: String,
+    /// The bundle, when the cache holds that content.
+    pub cached: Option<Manifest>,
+    /// The place could not be reached, so this is what it named last time.
+    pub offline: bool,
+}
+
+/// Looks `reference` up in its store (and in the cache), and changes nothing.
+pub(crate) fn look_up(root: &Path, stores: &Stores, reference: &str) -> Result<Lookup> {
+    let store = stores.find(reference)?;
+    let arch = Arch::host().ok();
+    match store.identify(reference, arch) {
+        Ok(identity) => Ok(Lookup {
+            cached: cache::load(&root.join(&identity.key)),
+            pinned: identity.pinned,
+            offline: false,
+        }),
+        Err(e) if e.downcast_ref::<Unreachable>().is_some() => {
+            let remembered =
+                cache::recall(root, reference, arch).and_then(|key| cache::load(&root.join(key)));
+            match remembered {
+                Some(manifest) => Ok(Lookup {
+                    pinned: reference.into(),
+                    cached: Some(manifest),
+                    offline: true,
+                }),
+                None => Err(e.context(format!(
+                    "{reference} is not in the cache either, so there is nothing to use offline"
+                ))),
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The bundle in the cache under `key`.
@@ -156,6 +202,7 @@ fn cached(root: &Path, key: &str) -> Result<Prepared> {
         dir,
         manifest,
         origin: Origin::Cached,
+        source: None,
     })
 }
 
@@ -174,6 +221,7 @@ fn live(root: &Path, config: &Config, tools: &Toolchain) -> Result<Prepared> {
             dir,
             manifest,
             origin: Origin::Cached,
+            source: None,
         });
     }
     let staging = cache::staging(root, "pack")?;
@@ -182,6 +230,7 @@ fn live(root: &Path, config: &Config, tools: &Toolchain) -> Result<Prepared> {
         dir: cache::install(staging, &dir)?,
         manifest,
         origin: Origin::Packed,
+        source: None,
     })
 }
 
@@ -501,6 +550,42 @@ mod tests {
             last.unwrap().dir.exists(),
             "the bundle in use must survive pruning"
         );
+    }
+
+    #[test]
+    fn looking_a_bundle_up_fetches_nothing_and_says_whether_it_is_cached() {
+        let work = TempDir::new("lookup").unwrap();
+        let cache = TempDir::new("cache-lookup").unwrap();
+        let fake = FakeStore::new().with("a", "x-1", bundle_tar(work.path(), "#!/bin/sh\n"));
+        let fetched = fake.fetched();
+        let stores = Stores::new(vec![Box::new(fake)]);
+
+        let before = look_up(cache.path(), &stores, "fake://a").unwrap();
+        assert!(before.cached.is_none() && !before.offline);
+        assert_eq!(before.pinned, "fake://a");
+        assert!(fetched.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 0);
+
+        prepare_a(&cache, &stores).unwrap();
+        let after = look_up(cache.path(), &stores, "fake://a").unwrap();
+        assert!(after.cached.is_some());
+        assert_eq!(fetched.lock().unwrap().len(), 1, "only `prepare` fetched");
+    }
+
+    #[test]
+    fn looking_up_a_place_that_cannot_be_reached_uses_what_was_remembered() {
+        let work = TempDir::new("lookup2").unwrap();
+        let cache = TempDir::new("cache-lookup2").unwrap();
+        let online = Stores::new(vec![Box::new(FakeStore::new().with(
+            "a",
+            "x-1",
+            bundle_tar(work.path(), "#!/bin/sh\n"),
+        ))]);
+        let offline = Stores::new(vec![Box::new(FakeStore::new().unreachable())]);
+        assert!(look_up(cache.path(), &offline, "fake://a").is_err());
+        prepare_a(&cache, &online).unwrap();
+        let found = look_up(cache.path(), &offline, "fake://a").unwrap();
+        assert!(found.offline && found.cached.is_some());
     }
 
     #[test]

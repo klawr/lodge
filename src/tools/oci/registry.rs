@@ -11,7 +11,9 @@ use super::reference::Target;
 use crate::output::warning;
 use crate::tools::Unreachable;
 use anyhow::{Context, Result, bail};
+use std::io::Read;
 use std::path::Path;
+use std::time::Duration;
 
 /// A manifest is a few KB; this is generous, and keeps a registry from filling memory.
 const MANIFEST_LIMIT: u64 = 4 * 1024 * 1024;
@@ -22,6 +24,22 @@ const ACCEPT: &[&str] = &[
     "application/vnd.docker.distribution.manifest.list.v2+json",
     "application/vnd.docker.distribution.manifest.v2+json",
 ];
+
+/// How long to wait before each new try of a request the registry answered with
+/// "not now" (a rate limit, an overloaded server); once per entry, then the
+/// answer is the caller's.
+pub const RETRY_WAITS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+    Duration::from_secs(9),
+];
+
+/// The longest a registry's `Retry-After` is obeyed: a longer wait is a failure.
+const RETRY_AFTER_LIMIT: Duration = Duration::from_secs(30);
+
+/// A blob that a registry refused in one piece is sent in pieces of this size,
+/// each held in memory while it is sent.
+const CHUNK: u64 = 32 * 1024 * 1024;
 
 /// What the token is asked to allow. A pull is anonymous-friendly; a push is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +56,7 @@ pub struct Registry<'a> {
     access: Access,
     /// What was last agreed with the registry: sent with every request after.
     authorization: Option<String>,
+    waits: Vec<Duration>,
 }
 
 impl<'a> Registry<'a> {
@@ -55,7 +74,14 @@ impl<'a> Registry<'a> {
             repository,
             access,
             authorization: None,
+            waits: RETRY_WAITS.to_vec(),
         }
+    }
+
+    /// The waits before each new try of a request answered with "not now".
+    pub fn retrying(mut self, waits: &[Duration]) -> Self {
+        self.waits = waits.to_vec();
+        self
     }
 
     /// A registry on this machine is spoken to without TLS, as docker does.
@@ -160,7 +186,7 @@ impl<'a> Registry<'a> {
         let location = started
             .header("location")
             .context("the registry did not say where to upload")?;
-        let target = self.upload_url(location, digest)?;
+        let target = self.upload_url(location, Some(digest))?;
         let headers = [("Content-Type", "application/octet-stream")];
         let done = match self.request(Method::Put, &target, &headers, body.clone()) {
             Ok(done) => done,
@@ -173,6 +199,54 @@ impl<'a> Registry<'a> {
             }
             Err(e) => return Err(e),
         };
+        // A registry (or a proxy in front of it) that limits one request's size.
+        if done.status == 413 {
+            return self.upload_chunked(digest, &body);
+        }
+        if done.status != 201 {
+            return Err(self.failure(done.status, &target));
+        }
+        Self::check_echo(&done, digest)
+    }
+
+    /// Uploads a blob in pieces, in a new upload: each piece is `PATCH`ed where the
+    /// last answer said, and an empty `PUT` with the digest closes it.
+    fn upload_chunked(&mut self, digest: &Digest, body: &Body) -> Result<()> {
+        let start = self.url("blobs", "uploads/");
+        let started = self.request(Method::Post, &start, &[], Body::None)?;
+        if started.status != 202 {
+            return Err(self.failure(started.status, &start));
+        }
+        let mut location = started
+            .header("location")
+            .context("the registry did not say where to upload")?
+            .to_string();
+        let mut reader = body.open()?;
+        let mut sent = 0u64;
+        loop {
+            let mut piece = Vec::new();
+            (&mut reader).take(CHUNK).read_to_end(&mut piece)?;
+            if piece.is_empty() {
+                break;
+            }
+            let range = format!("{sent}-{}", sent + piece.len() as u64 - 1);
+            let target = self.upload_url(&location, None)?;
+            let headers = [
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Range", range.as_str()),
+            ];
+            let len = piece.len() as u64;
+            let answer = self.request(Method::Patch, &target, &headers, Body::Bytes(piece))?;
+            if answer.status != 202 {
+                return Err(self.failure(answer.status, &target));
+            }
+            if let Some(next) = answer.header("location") {
+                location = next.to_string();
+            }
+            sent += len;
+        }
+        let target = self.upload_url(&location, Some(digest))?;
+        let done = self.request(Method::Put, &target, &[], Body::None)?;
         if done.status != 201 {
             return Err(self.failure(done.status, &target));
         }
@@ -192,12 +266,13 @@ impl<'a> Registry<'a> {
         Ok(digest)
     }
 
-    /// Where the registry wants the bytes: its `Location`, with the digest added.
+    /// Where the registry wants the bytes: its `Location`, with the digest added
+    /// when the upload is being closed.
     /// It must be this registry, because the token is sent along. Only the host
     /// is compared: the URL is rebuilt with the scheme lodge chose, so a registry
     /// behind a proxy that writes `http://` in its answers is still spoken to
     /// the way it was asked.
-    fn upload_url(&self, location: &str, digest: &Digest) -> Result<String> {
+    fn upload_url(&self, location: &str, digest: Option<&Digest>) -> Result<String> {
         let base = format!("{}://{}", self.scheme(), self.registry);
         let path = match location.split_once("://") {
             Some((_, rest)) => match rest.split_once('/') {
@@ -210,6 +285,9 @@ impl<'a> Registry<'a> {
             None if location.starts_with('/') => location.to_string(),
             // Relative to where the upload was started.
             None => format!("/v2/{}/blobs/uploads/{location}", self.repository),
+        };
+        let Some(digest) = digest else {
+            return Ok(format!("{base}{path}"));
         };
         let sep = if path.contains('?') { '&' } else { '?' };
         Ok(format!(
@@ -296,20 +374,57 @@ impl<'a> Registry<'a> {
         headers: &[(&str, &str)],
         body: Body,
     ) -> Result<Response> {
-        crate::output::trace_line(&format!("{} {url}", method.name()));
-        let mut all: Vec<(&str, &str)> = headers.to_vec();
-        if let Some(a) = &self.authorization {
-            all.push(("Authorization", a));
+        let mut waits = self.waits.iter();
+        loop {
+            crate::output::trace_line(&format!("{} {url}", method.name()));
+            let mut all: Vec<(&str, &str)> = headers.to_vec();
+            if let Some(a) = &self.authorization {
+                all.push(("Authorization", a));
+            }
+            // `Http` answers every status as a response, so an error is the network.
+            let response = self
+                .http
+                .send(Request {
+                    method,
+                    url,
+                    headers: &all,
+                    body: body.clone(),
+                })
+                .map_err(|e| e.context(Unreachable))?;
+            if !Self::is_not_now(method, response.status) {
+                return Ok(response);
+            }
+            let Some(wait) = waits.next() else {
+                return Ok(response);
+            };
+            let asked = response
+                .header("retry-after")
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(Duration::from_secs);
+            let wait = match asked {
+                Some(asked) if asked > RETRY_AFTER_LIMIT => return Ok(response),
+                Some(asked) if !wait.is_zero() => asked.max(*wait),
+                _ => *wait,
+            };
+            crate::output::trace_line(&format!(
+                "{} answered {}; trying again in {}s",
+                self.registry,
+                response.status,
+                wait.as_secs()
+            ));
+            std::thread::sleep(wait);
         }
-        // `Http` answers every status as a response, so an error is the network.
-        self.http
-            .send(Request {
-                method,
-                url,
-                headers: &all,
-                body,
-            })
-            .map_err(|e| e.context(Unreachable))
+    }
+
+    /// A status that says "not now", so the same request may be sent again: a
+    /// rate limit, or a server that is overloaded or behind a gateway that is. A
+    /// plain 500 is only retried for a read, which cannot have done anything.
+    fn is_not_now(method: Method, status: u16) -> bool {
+        match status {
+            429 | 502 | 503 | 504 => true,
+            500 => matches!(method, Method::Get | Method::Head),
+            _ => false,
+        }
     }
 
     /// The `Authorization` value that answers a challenge.

@@ -311,6 +311,20 @@ impl<F: Flavor> Runtime for CliEngine<F> {
         )?))
     }
 
+    fn find_by_labels(&self, labels: &[(String, String)]) -> Result<Option<String>> {
+        let mut args: Vec<String> = ["ps", "-aq"].map(String::from).to_vec();
+        for (k, v) in labels {
+            args.push("--filter".into());
+            args.push(format!("label={k}={v}"));
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        Ok(first_line(&self.checked(
+            self.job(&args),
+            &args,
+            Repeat::Safe,
+        )?))
+    }
+
     fn build_image(&self, spec: &BuildSpec) -> Result<()> {
         let mut a: Vec<String> = vec!["build".into(), "-t".into(), spec.tag.clone()];
         if let Some(df) = &spec.dockerfile {

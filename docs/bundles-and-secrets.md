@@ -19,7 +19,7 @@ carry the file:
 ```sh
 ldg pack -o lodge-x86_64.tar             # on the Linux/WSL machine: resolves, relinks, snapshots
 ldg bundle verify lodge-x86_64.tar       # after copying it somewhere
-ldg bundle inspect lodge-x86_64.tar      # what it holds
+ldg bundle inspect lodge-x86_64.tar      # what it holds (both also take oci://…)
 ldg up --bundle lodge-x86_64.tar         # anywhere with a container runtime (or just ssh with -r)
 ```
 
@@ -80,7 +80,10 @@ tag that both use, each getting its own. Publishing replaces only the entry for 
 machine's own architecture (its old image is no longer reachable by the tag), and
 keeps the others. If two machines publish at once the last one wins, and the
 other's entry may be lost: publish them one after the other. A tag that held a
-single image (not made by this lodge) is replaced.
+single image (not made by this lodge) is replaced. Replacing is silent; for CI that
+must not overwrite, `ldg pack -o oci://… --no-clobber` refuses, before uploading
+anything, when the tag already holds an image for this machine (the same flag
+refuses to overwrite an output file that exists).
 Publishing needs `docker login <registry>` with an account that may write there;
 lodge reads that login from docker's config file or its credential helper (see
 [Troubleshooting](troubleshooting.md#a-bundle-or-a-feature-cannot-be-pulled-or-published)).
@@ -112,7 +115,13 @@ Two things to keep in mind:
   repository (see the warning below about what a config directory can hold).
   Secrets are never in a bundle.
 
-`ldg bundle inspect` and `ldg bundle verify` still take a file.
+`ldg bundle inspect` and `ldg bundle verify` take a file or a reference
+(`ldg bundle verify oci://ghcr.io/me/lodge:1`): a reference is always fetched, since
+a check must look at the bytes and not at what the cache remembers, and kept no
+longer than the command runs. `ldg status` shows which bundle a container holds and
+where it came from (`source`: the digest, for a registry), which answers "what is
+actually in my container?". `ldg doctor` only looks a bundle up, as `up` would: it
+says what the tag resolves to and whether it is cached, and fetches nothing.
 
 ## Secrets
 

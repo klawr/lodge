@@ -427,6 +427,8 @@ pub struct FakeRuntime {
     projects: RefCell<Vec<String>>,
     ops: RefCell<Vec<String>>,
     runs: RefCell<Vec<RunSpec>>,
+    /// The labels each container carries, by name.
+    labels: RefCell<BTreeMap<String, Vec<(String, String)>>>,
 }
 
 impl FakeRuntime {
@@ -438,7 +440,21 @@ impl FakeRuntime {
             projects: RefCell::default(),
             ops: RefCell::default(),
             runs: RefCell::default(),
+            labels: RefCell::default(),
         }
+    }
+
+    /// Adds an existing, running container `name` that carries `labels`, as one
+    /// another tool made would.
+    pub fn with_labeled_container(self, name: &str, labels: &[(&str, &str)], env: FakeEnv) -> Self {
+        self.labels.borrow_mut().insert(
+            name.to_string(),
+            labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        self.with_container(name, env)
     }
 
     /// Adds an existing, running container `name`, running in `env`.
@@ -565,6 +581,19 @@ impl Runtime for FakeRuntime {
             .then(|| name.to_string()))
     }
 
+    fn find_by_labels(&self, labels: &[(String, String)]) -> Result<Option<String>> {
+        let held = self.labels.borrow();
+        Ok(self
+            .containers
+            .borrow()
+            .keys()
+            .find(|name| {
+                held.get(*name)
+                    .is_some_and(|have| labels.iter().all(|l| have.contains(l)))
+            })
+            .cloned())
+    }
+
     fn build_image(&self, spec: &BuildSpec) -> Result<()> {
         self.op(format!("build {}", spec.tag));
         Ok(())
@@ -577,6 +606,9 @@ impl Runtime for FakeRuntime {
         }
         self.op(format!("run {name}"));
         self.runs.borrow_mut().push(spec.clone());
+        self.labels
+            .borrow_mut()
+            .insert(name.to_string(), spec.labels.clone());
         self.containers
             .borrow_mut()
             .insert(name.to_string(), self.create());
@@ -631,6 +663,10 @@ impl Runtime for Rc<FakeRuntime> {
 
     fn find_by_name(&self, name: &str) -> Result<Option<String>> {
         self.as_ref().find_by_name(name)
+    }
+
+    fn find_by_labels(&self, labels: &[(String, String)]) -> Result<Option<String>> {
+        self.as_ref().find_by_labels(labels)
     }
 
     fn build_image(&self, spec: &BuildSpec) -> Result<()> {

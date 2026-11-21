@@ -14,7 +14,7 @@ use crate::config::SessionConfig;
 use crate::host::Host;
 use crate::layout::Layout;
 use crate::local::Local;
-use crate::output::{info, note, prompt, warning};
+use crate::output::{info, note, warning};
 use crate::runtime::{Acting, Container, ContainerUser};
 use crate::shell::shell_quote;
 use anyhow::Result;
@@ -125,15 +125,25 @@ pub fn enter(
     let mut started = Instant::now();
     let mut status = start()?;
     // The connection dropped under a session that had been in use. The shell on
-    // the other side is gone (or going), so the only thing to offer is a new one;
-    // if the user's shell setup attaches to something that outlived the
-    // disconnect, that is where they land. Not offered after an instant failure,
-    // which is the connection never coming up, and not without a terminal to ask.
+    // the other side is gone (or going), so a new one is opened, without asking:
+    // lodge cannot know whether the user's shell setup attaches to something that
+    // outlived the disconnect (it knows no multiplexer), but if it does, that is
+    // where they land, and if it does not, they are where a new shell puts them.
+    // Not after an instant failure, which is the connection never coming up, and
+    // not without a terminal, where nobody is there to want it. A connection that
+    // does not come back at once is tried for a while, and Ctrl-C gives up.
     while host.link_lost(status, &[])
         && started.elapsed() >= Duration::from_secs(2)
-        && ask_to_reconnect(host)
+        && std::io::stdin().is_terminal()
     {
-        host.connect()?;
+        let to = host.label().map(|h| format!(" to {h}")).unwrap_or_default();
+        note!("lost the connection{to}; reconnecting (Ctrl-C gives up)");
+        reconnect(
+            || host.connect(),
+            RECONNECT_TRIES,
+            RECONNECT_WAIT,
+            std::thread::sleep,
+        )?;
         info!("entering {container_id}");
         started = Instant::now();
         status = start()?;
@@ -162,22 +172,32 @@ pub fn enter(
     result
 }
 
-/// Asks whether to open a new shell after the connection to `host` was lost.
-/// Without a terminal to ask on, no.
-fn ask_to_reconnect(host: &dyn Host) -> bool {
-    if !std::io::stdin().is_terminal() {
-        return false;
-    }
-    let to = host.label().map(|h| format!(" to {h}")).unwrap_or_default();
-    note!("lost the connection{to}");
-    prompt!("reconnect and open a new shell? [Y/n] ");
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line).is_ok() && !declined(&line)
-}
+/// How often, and how far apart, a lost connection is tried again: about two
+/// and a half minutes, which rides out a laptop changing networks.
+const RECONNECT_TRIES: u32 = 30;
+const RECONNECT_WAIT: Duration = Duration::from_secs(5);
 
-/// Whether an answer to a yes-by-default question is a no.
-fn declined(answer: &str) -> bool {
-    answer.trim().to_ascii_lowercase().starts_with('n')
+/// Calls `connect` until it succeeds, at most `tries` times with `wait` between
+/// them (given to `sleep`, which a test replaces); the last failure is the answer.
+fn reconnect(
+    mut connect: impl FnMut() -> Result<()>,
+    tries: u32,
+    wait: Duration,
+    sleep: impl Fn(Duration),
+) -> Result<()> {
+    let mut attempt = 1;
+    loop {
+        match connect() {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt >= tries => {
+                return Err(e.context(format!("could not reconnect after {tries} tries")));
+            }
+            Err(_) => {
+                attempt += 1;
+                sleep(wait);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -297,12 +317,44 @@ mod tests {
     }
 
     #[test]
-    fn only_an_answer_starting_with_n_declines() {
-        for no in ["n", "N\n", " no ", "No"] {
-            assert!(declined(no), "{no:?}");
-        }
-        for yes in ["", "\n", "y", "Y", "yes", "ok"] {
-            assert!(!declined(yes), "{yes:?}");
-        }
+    fn a_connection_that_comes_back_is_used_and_one_that_does_not_gives_up() {
+        use std::cell::{Cell, RefCell};
+        let slept = RefCell::new(Vec::new());
+        let calls = Cell::new(0);
+        let wait = Duration::from_secs(5);
+        // Fails twice, then works: two waits, and the session goes on.
+        reconnect(
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    anyhow::bail!("no route")
+                }
+                Ok(())
+            },
+            30,
+            wait,
+            |d| slept.borrow_mut().push(d),
+        )
+        .unwrap();
+        assert_eq!((calls.get(), slept.borrow().len()), (3, 2));
+        assert!(slept.borrow().iter().all(|d| *d == wait));
+        // Never works: tried the given number of times, the last reason kept.
+        calls.set(0);
+        let err = reconnect(
+            || {
+                calls.set(calls.get() + 1);
+                anyhow::bail!("no route {}", calls.get())
+            },
+            4,
+            wait,
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(calls.get(), 4);
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("could not reconnect after 4 tries") && text.contains("no route 4"),
+            "{text}"
+        );
     }
 }

@@ -1,15 +1,17 @@
 //! Bundle commands: `pack`, `bundle inspect|verify`, `cache [list|clear]`.
 
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{Ctx, ago, human_size};
+use crate::arch::Arch;
 use crate::bundle;
+use crate::bundle::store::{Identity, Replace};
 use crate::cli::{BundleCommand, CacheCommand};
 use crate::output::{info, line, note, plural};
 use crate::tmpfile::TempDir;
 
-pub fn pack(ctx: &Ctx, output: Option<String>) -> Result<()> {
+pub fn pack(ctx: &Ctx, output: Option<String>, replace: Replace) -> Result<()> {
     let config = ctx.config()?;
     let output = match output {
         Some(o) => o,
@@ -25,7 +27,7 @@ pub fn pack(ctx: &Ctx, output: Option<String>) -> Result<()> {
     }?;
     let tar = scratch.path().join("bundle.tar");
     let manifest = bundle::pack::pack_to_file(&config, &tar, &ctx.tools)?;
-    let written = sink.put(&output, &tar, manifest.arch()?)?;
+    let written = sink.put(&output, &tar, manifest.arch()?, replace)?;
     info!(
         "packed {} and {} for {} into {} (id {})",
         plural(manifest.tools.len(), "tool", "tools"),
@@ -37,11 +39,26 @@ pub fn pack(ctx: &Ctx, output: Option<String>) -> Result<()> {
     Ok(())
 }
 
-pub fn bundle(command: BundleCommand) -> Result<()> {
+/// The tar of the bundle `reference` names, from whichever store owns it: always
+/// fetched (a check must look at the bytes, not at what the cache remembers) and
+/// kept only as long as the returned directory lives.
+fn fetch(ctx: &Ctx, reference: &str) -> Result<(TempDir, PathBuf, Identity)> {
+    let store = ctx.bundles.find(reference)?;
+    let identity = store.identify(reference, Arch::host().ok())?;
+    let scratch = TempDir::new("bundle-fetch")?;
+    let tar = store.fetch(&identity, scratch.path())?;
+    Ok((scratch, tar, identity))
+}
+
+pub fn bundle(ctx: &Ctx, command: BundleCommand) -> Result<()> {
     match command {
-        BundleCommand::Inspect { file } => inspect(&file),
-        BundleCommand::Verify { file } => {
-            let manifest = bundle::verify_file(&file)?;
+        BundleCommand::Inspect { reference } => {
+            let (_scratch, tar, identity) = fetch(ctx, &reference)?;
+            inspect(&reference, &identity.pinned, &tar)
+        }
+        BundleCommand::Verify { reference } => {
+            let (_scratch, tar, _) = fetch(ctx, &reference)?;
+            let manifest = bundle::verify_file(&tar)?;
             line!(
                 "ok  {}, {}, id {}",
                 plural(manifest.tools.len(), "tool", "tools"),
@@ -53,14 +70,18 @@ pub fn bundle(command: BundleCommand) -> Result<()> {
     }
 }
 
-/// Prints what is in the bundle at `file`.
-fn inspect(file: &Path) -> Result<()> {
+/// Prints what is in the bundle `reference` names, whose tar is at `file`;
+/// `pinned` is the reference made exact, shown when it says more.
+fn inspect(reference: &str, pinned: &str, file: &Path) -> Result<()> {
     let manifest = bundle::archive::read_manifest(file)?;
     let size = std::fs::metadata(file)
         .with_context(|| format!("reading {}", file.display()))?
         .len();
 
-    line!("bundle    {} ({})", file.display(), human_size(size));
+    line!("bundle    {reference} ({})", human_size(size));
+    if pinned != reference {
+        line!("source    {pinned}");
+    }
     line!("id        {}", manifest.id());
     line!(
         "packed    {} by ldg {}",

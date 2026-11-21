@@ -245,6 +245,7 @@ mod tests {
             dir: dir.path().to_path_buf(),
             manifest: manifest(),
             origin: Origin::Packed,
+            source: None,
         };
 
         attach(&ctx, &attached, &Config::default(), &prepared, false, true).unwrap();

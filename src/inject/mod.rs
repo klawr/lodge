@@ -120,6 +120,7 @@ pub fn run(
         &Installed {
             layout: layout.clone(),
             bundle: bundle.manifest.id(),
+            source: bundle.source.clone(),
             wrappers,
             configs,
             safe_directories,
@@ -178,6 +179,7 @@ mod tests {
             dir: dir.path().to_path_buf(),
             manifest,
             origin: Origin::Packed,
+            source: None,
         };
         let env = FakeEnv::new()
             .with_output(&["uname", "-m"], "x86_64\n")
@@ -248,6 +250,7 @@ mod tests {
             dir: dir.path().to_path_buf(),
             manifest,
             origin: Origin::Packed,
+            source: None,
         };
         let env = FakeEnv::new();
         let root = ContainerUser::root();

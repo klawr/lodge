@@ -2,7 +2,7 @@
 //! which bundle was injected, and what lodge placed *outside* the prefix, so
 //! `ldg status` can show the first and `ldg clean` can act on the second.
 //!
-//! One line per fact: `bundle <id>`, `wrapper <path>`, `config <path>`,
+//! One line per fact: `bundle <id>`, `source <where it came from>`, `wrapper <path>`, `config <path>`,
 //! `safe_directory <dir>` (a git `safe.directory` entry lodge added).
 
 use anyhow::Result;
@@ -16,6 +16,10 @@ use crate::runtime::{Container, ContainerUser, Env};
 pub struct Installed {
     pub layout: Layout,
     pub bundle: String,
+    /// Where the bundle came from, as exactly as its place said (a registry's
+    /// digest): what answers "what is actually in my container?". `None` for a
+    /// bundle packed from the config.
+    pub source: Option<String>,
     /// Wrapper scripts the config asked for.
     pub wrappers: Vec<String>,
     /// Config files and directories copied into place.
@@ -26,6 +30,9 @@ pub struct Installed {
 
 fn render(installed: &Installed) -> String {
     let mut text = format!("bundle {}\n", installed.bundle);
+    if let Some(source) = &installed.source {
+        text.push_str(&format!("source {source}\n"));
+    }
     for path in &installed.wrappers {
         text.push_str(&format!("wrapper {path}\n"));
     }
@@ -44,6 +51,7 @@ fn parse(layout: &Layout, text: &str) -> Option<Installed> {
     let mut installed = Installed {
         layout: layout.clone(),
         bundle: String::new(),
+        source: None,
         wrappers: Vec::new(),
         configs: Vec::new(),
         safe_directories: Vec::new(),
@@ -55,6 +63,7 @@ fn parse(layout: &Layout, text: &str) -> Option<Installed> {
         let value = value.trim();
         match key {
             "bundle" => installed.bundle = value.to_string(),
+            "source" => installed.source = Some(value.to_string()),
             "wrapper" => installed.wrappers.push(value.to_string()),
             "config" => installed.configs.push(value.to_string()),
             "safe_directory" => installed.safe_directories.push(value.to_string()),
@@ -110,6 +119,7 @@ mod tests {
         Installed {
             layout: Layout::new("/p"),
             bundle: "abc".into(),
+            source: Some("ghcr.io/me/lodge@sha256:aa".into()),
             wrappers: vec!["/home/dev/.local/bin/nvim".into()],
             configs: vec!["/home/dev/.config/nvim".into(), "/home/dev/.hellorc".into()],
             safe_directories: vec!["/w".into()],
@@ -168,7 +178,8 @@ mod tests {
         record(&env, &sample()).unwrap();
         assert_eq!(
             env.file("/p/injected").unwrap(),
-            "bundle abc\nwrapper /home/dev/.local/bin/nvim\n\
+            "bundle abc\nsource ghcr.io/me/lodge@sha256:aa\n\
+             wrapper /home/dev/.local/bin/nvim\n\
              config /home/dev/.config/nvim\nconfig /home/dev/.hellorc\n\
              safe_directory /w\n"
         );

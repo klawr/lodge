@@ -31,7 +31,7 @@ mod vars;
 mod workdir;
 
 use crate::output::{note, warning};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -147,7 +147,16 @@ pub fn start(
     oci: &dyn OciFetcher,
     prompt: &dyn Prompt,
 ) -> Result<Attached> {
-    let (spec, existing) = locate(project_path, host, local, rt)?;
+    let (spec, found) = locate(project_path, host, local, rt)?;
+    // A container another tool made for this project is worked in as it is, unless
+    // `--build` asks for one of lodge's own.
+    let existing = match found {
+        Some(Existing { id, foreign: true }) if !build => {
+            return adopt(spec, &id, rt, prompt);
+        }
+        Some(Existing { id, foreign: false }) => Some(id),
+        Some(Existing { foreign: true, .. }) | None => None,
+    };
     let current_hash = spec.hash(host.as_ref())?;
 
     // Has the config drifted since the existing container was created? It is
@@ -255,16 +264,63 @@ pub fn start(
     })
 }
 
-/// The project's spec and the id of its existing container, if there is one.
+/// A container that is the project's.
+struct Existing {
+    id: String,
+    /// Another tool made it (VS Code, the devcontainer CLI), found by the labels
+    /// they write. What is in it, and what it did, is theirs: lodge installs
+    /// nothing in it, runs none of its hooks, and neither stops nor removes it.
+    foreign: bool,
+}
+
+/// The project's spec and its existing container, if there is one: lodge's own,
+/// else one another tool made for the same folder and config file.
 fn locate(
     project_path: &Path,
     host: &HostRef,
     local: &dyn Local,
     rt: &dyn Runtime,
-) -> Result<(Spec, Option<String>)> {
+) -> Result<(Spec, Option<Existing>)> {
     let spec = load_spec(project_path, host, local)?;
-    let existing = spec.backend.existing(rt)?;
+    let existing = match spec.backend.existing(rt)? {
+        Some(id) => Some(Existing { id, foreign: false }),
+        None => rt
+            .find_by_labels(&backend::editor_labels(project_path, &spec.config_path))?
+            .map(|id| Existing { id, foreign: true }),
+    };
     Ok((spec, existing))
+}
+
+/// Works in a container another tool made for the project: started if it is
+/// stopped, and nothing else is done to it.
+fn adopt(spec: Spec, id: &str, rt: &dyn Runtime, prompt: &dyn Prompt) -> Result<Attached> {
+    let container = rt.container(id);
+    note!(
+        "using {}, which another tool (VS Code, the devcontainer CLI) made for this \
+         project; lodge installs no features and runs no hooks in it \
+         (`ldg up --build` makes a container of its own)",
+        container.display_name()
+    );
+    if !container.is_running()? {
+        rt.start(id).context("starting the container")?;
+    }
+    let workdir = workdir::resolve(container.as_ref(), &spec.workspace_folder, prompt);
+    Ok(Attached {
+        container,
+        created: false,
+        workdir,
+        forward_ports: spec.forward_ports,
+        remote_user: spec.remote_user,
+        post_attach: None,
+    })
+}
+
+/// Why lodge leaves a container another tool made alone.
+fn not_lodges(id: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{id} was made by another tool (VS Code, the devcontainer CLI), not by lodge, \
+         so lodge neither stops nor removes it; `ldg clean` takes what lodge injected out"
+    )
 }
 
 /// Finds the container `ldg up` manages for this project.
@@ -275,8 +331,8 @@ pub fn find(
     rt: &dyn Runtime,
 ) -> Result<Option<Found>> {
     let (spec, existing) = locate(project_path, host, local, rt)?;
-    Ok(existing.map(|id| Found {
-        container: rt.container(&id),
+    Ok(existing.map(|e| Found {
+        container: rt.container(&e.id),
         remote_user: spec.remote_user,
     }))
 }
@@ -290,10 +346,14 @@ pub fn stop(
     rt: &dyn Runtime,
 ) -> Result<Option<String>> {
     let (_, existing) = locate(project_path, host, local, rt)?;
-    if let Some(id) = &existing {
-        rt.stop(id)?;
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    if existing.foreign {
+        return Err(not_lodges(&existing.id));
     }
-    Ok(existing)
+    rt.stop(&existing.id)?;
+    Ok(Some(existing.id))
 }
 
 /// Removes the project's container (and compose project), throwing away
@@ -305,10 +365,14 @@ pub fn remove(
     rt: &dyn Runtime,
 ) -> Result<Option<String>> {
     let (spec, existing) = locate(project_path, host, local, rt)?;
-    if existing.is_some() {
-        spec.backend.remove(rt)?;
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    if existing.foreign {
+        return Err(not_lodges(&existing.id));
     }
-    Ok(existing)
+    spec.backend.remove(rt)?;
+    Ok(Some(existing.id))
 }
 
 /// The project's container, if it has one: whether it runs, and whether its
@@ -320,7 +384,7 @@ pub fn status(
     rt: &dyn Runtime,
 ) -> Result<Option<Status>> {
     let (spec, existing) = locate(project_path, host, local, rt)?;
-    let Some(id) = existing else {
+    let Some(Existing { id, .. }) = existing else {
         return Ok(None);
     };
     let container = rt.container(&id);
@@ -454,6 +518,119 @@ mod tests {
             rt.ops()
         );
         assert_eq!(state(&dir, &rt), ConfigState::UpToDate);
+    }
+
+    /// The labels VS Code puts on the devcontainer of the test project.
+    const EDITOR: [(&str, &str); 2] = [
+        ("devcontainer.local_folder", "/proj"),
+        (
+            "devcontainer.config_file",
+            "/proj/.devcontainer/devcontainer.json",
+        ),
+    ];
+
+    #[test]
+    fn a_container_lodge_creates_carries_the_labels_the_editor_looks_for() {
+        let dir = project(PLAIN);
+        let rt = engine(&dir, false);
+        start(
+            dir.path(),
+            &dir.host,
+            &FakeLocal::new(),
+            false,
+            &rt,
+            &NoRegistry,
+            &Nothing,
+        )
+        .unwrap();
+        let labels = &rt.runs()[0].labels;
+        for (k, v) in EDITOR {
+            assert!(labels.contains(&(k.into(), v.into())), "{k}: {labels:?}");
+        }
+        assert!(labels.iter().any(|(k, _)| k == "dev.lodge.project"));
+    }
+
+    #[test]
+    fn a_container_the_editor_made_is_used_as_it_is_and_never_stopped_or_removed() {
+        let dir = project(PLAIN);
+        let rt =
+            FakeRuntime::new(container).with_labeled_container("vscode-made", &EDITOR, container());
+        crate::runtime::Runtime::stop(&rt, "vscode-made").unwrap();
+        let started = start(
+            dir.path(),
+            &dir.host,
+            &FakeLocal::new(),
+            false,
+            &rt,
+            &NoRegistry,
+            &Nothing,
+        )
+        .unwrap();
+        assert!(
+            !started.created,
+            "nothing is created, so no hooks or features"
+        );
+        assert_eq!(started.container.id(), "vscode-made");
+        assert_eq!(started.workdir, "/w");
+        // Started because it was stopped, and nothing else was done to it.
+        assert_eq!(rt.ops(), ["stop vscode-made", "start vscode-made"]);
+        // It is the project's container for every command that asks.
+        let found = find(dir.path(), &dir.host, &FakeLocal::new(), &rt).unwrap();
+        assert_eq!(found.unwrap().container.id(), "vscode-made");
+        assert_eq!(state(&dir, &rt), ConfigState::Unknown);
+        // It is not lodge's to stop or to remove.
+        for result in [
+            stop(dir.path(), &dir.host, &FakeLocal::new(), &rt),
+            remove(dir.path(), &dir.host, &FakeLocal::new(), &rt),
+        ] {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("not by lodge"), "{err}");
+        }
+        assert_eq!(rt.ops().len(), 2, "{:?}", rt.ops());
+    }
+
+    #[test]
+    fn a_rebuild_makes_a_container_of_lodges_own_beside_the_editors() {
+        let dir = project(PLAIN);
+        let rt =
+            FakeRuntime::new(container).with_labeled_container("vscode-made", &EDITOR, container());
+        let started = start(
+            dir.path(),
+            &dir.host,
+            &FakeLocal::new(),
+            true,
+            &rt,
+            &NoRegistry,
+            &Nothing,
+        )
+        .unwrap();
+        assert!(started.created);
+        assert!(
+            !rt.ops().iter().any(|o| o.contains("vscode-made")),
+            "{:?}",
+            rt.ops()
+        );
+    }
+
+    #[test]
+    fn a_container_for_another_folder_is_not_the_projects() {
+        let dir = project(PLAIN);
+        let rt = FakeRuntime::new(container).with_labeled_container(
+            "other",
+            &[
+                ("devcontainer.local_folder", "/elsewhere"),
+                (
+                    "devcontainer.config_file",
+                    "/elsewhere/.devcontainer/devcontainer.json",
+                ),
+            ],
+            container(),
+        );
+        assert!(
+            find(dir.path(), &dir.host, &FakeLocal::new(), &rt)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

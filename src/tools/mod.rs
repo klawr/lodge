@@ -68,6 +68,15 @@ pub trait OciFetcher {
     fn pin(&self, reference: &str, arch: Option<Arch>) -> Result<Pinned>;
 }
 
+/// What publishing does when something is already published where it is going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replace {
+    /// Take its place.
+    Yes,
+    /// Refuse, and leave it as it is.
+    No,
+}
+
 /// What is published to a registry: one layer, which is a file, for one machine,
 /// and the types that say what the artifact is. The pusher knows registries, not what the
 /// layer holds.
@@ -79,6 +88,8 @@ pub struct Artifact<'a> {
     /// The machine it is for (Linux on this CPU). A tag holds one image per
     /// machine, so publishing for another one keeps what is there.
     pub arch: Arch,
+    /// What to do when the tag already holds an image for this machine.
+    pub replace: Replace,
 }
 
 /// Publishes artifacts to an OCI registry. Separate from [`OciFetcher`], so a
@@ -87,8 +98,8 @@ pub struct Artifact<'a> {
 pub trait OciPusher {
     /// Publishes `artifact` under `reference`, which names a tag. The tag holds an
     /// index with one image per architecture: this architecture's entry is
-    /// replaced (last write wins) and the others are kept. Returns the image
-    /// that was written, by digest.
+    /// replaced (last write wins, unless the artifact says not to) and the others
+    /// are kept. Returns the image that was written, by digest.
     fn push(&self, reference: &str, artifact: &Artifact) -> Result<Pinned>;
 }
 
@@ -225,6 +236,15 @@ impl OciPusher for FakeRegistry {
     fn push(&self, reference: &str, artifact: &Artifact) -> Result<Pinned> {
         let layer = std::fs::read(artifact.layer)?;
         let digest = fake_digest(&layer);
+        let held = self
+            .tags
+            .lock()
+            .unwrap()
+            .get(reference)
+            .is_some_and(|images| images.contains_key(&Some(artifact.arch.to_string())));
+        if held && artifact.replace == Replace::No {
+            anyhow::bail!("{reference} already holds an image for {}", artifact.arch);
+        }
         self.tags
             .lock()
             .unwrap()

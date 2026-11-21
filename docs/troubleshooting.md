@@ -26,9 +26,12 @@ With `--remote`, lodge reconnects and reruns a step that is safe to repeat (up
 to three tries); you see `retrying (2/3)` and nothing else if it works. A step
 that is not safe to repeat (a lifecycle hook, a feature's `install.sh`) is not
 rerun: run the same command again, which picks up where it stopped. If the
-connection drops under your shell, `ldg` asks whether to reconnect and open a new
-one; to land back in your work, keep a multiplexer running in the container (see
-[Keeping a session alive](configuration.md#keeping-a-session-alive)).
+connection drops under your shell, `ldg` reconnects by itself (trying for about
+two and a half minutes; Ctrl-C gives up) and opens a new shell, which reads your
+rc file again; to land back in your work, keep a multiplexer running in the
+container and attach to it from there (see
+[Keeping a session alive](configuration.md#keeping-a-session-alive)). Without a
+terminal (a script) it does not reconnect.
 `cannot connect to <host>` after the retries means the host is down or refused
 the login: run with `-vv` for ssh's own output.
 
@@ -127,9 +130,11 @@ names the step that failed:
 - A pull that stops moving fails after 30 seconds without data. Every other
   failure to connect or answer is reported as it came (`requesting <url>`).
 
-`ldg up -v` prints each registry request as `GET <url>`. A failed request is not
-retried, so on a flaky connection run `ldg up` again: a feature that was already
-installed is not installed twice.
+`ldg up -v` prints each registry request as `GET <url>`. A request the registry
+answers with "not now" (429, 502, 503, 504) is retried three times, 1, 3 and 9
+seconds apart; any other failure is not, so on a flaky connection run `ldg up`
+again: a feature that was already installed is not installed twice. A registry
+reached through a proxy needs `HTTPS_PROXY` (and `NO_PROXY` for what is not).
 
 ## A plain host
 

@@ -27,6 +27,7 @@ pub use oci::{OciSink, OciStore};
 use crate::arch::Arch;
 use anyhow::{Result, bail};
 
+pub use crate::tools::Replace;
 /// What a store marks an error from [`BundleStore::identify`] with when it could
 /// not reach the place at all (no connection), as opposed to the place refusing
 /// or not having the bundle: the bundle may be in the cache from the last time.
@@ -81,7 +82,10 @@ pub trait BundleSink {
     /// replacing what was there; a place that keeps one bundle per architecture
     /// under one name (a registry) replaces only the one for `arch`. Returns the exact reference the bundle can be used by (a registry's tag
     /// becomes the digest it was written under).
-    fn put(&self, reference: &str, tar: &Path, arch: Arch) -> Result<String>;
+    ///
+    /// With [`Replace::No`] it refuses, and leaves what is there, when there is
+    /// something to replace.
+    fn put(&self, reference: &str, tar: &Path, arch: Arch, replace: Replace) -> Result<String>;
 }
 
 /// The stores lodge can read a bundle from.
@@ -247,7 +251,13 @@ pub mod fake {
             None
         }
 
-        fn put(&self, reference: &str, tar: &Path, _arch: Arch) -> Result<String> {
+        fn put(
+            &self,
+            reference: &str,
+            tar: &Path,
+            _arch: Arch,
+            _replace: Replace,
+        ) -> Result<String> {
             self.written
                 .lock()
                 .unwrap()

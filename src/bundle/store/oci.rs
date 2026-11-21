@@ -5,7 +5,7 @@
 //! decides that it is a bundle is the manifest inside the tar, which
 //! extraction checks.
 
-use super::{BundleSink, BundleStore, Identity};
+use super::{BundleSink, BundleStore, Identity, Replace};
 use crate::arch::Arch;
 use crate::output::info;
 use crate::tools::{Artifact, OciFetcher, OciPusher};
@@ -107,7 +107,7 @@ impl BundleSink for OciSink {
     /// This machine's entry under the tag is replaced (last write wins), the
     /// others kept. What comes back names the digest that was written, which a
     /// config can pin.
-    fn put(&self, reference: &str, tar: &Path, arch: Arch) -> Result<String> {
+    fn put(&self, reference: &str, tar: &Path, arch: Arch, replace: Replace) -> Result<String> {
         let name = reference.strip_prefix(SCHEME).unwrap_or(reference);
         info!("publishing {reference}");
         let pinned = self
@@ -119,6 +119,7 @@ impl BundleSink for OciSink {
                     layer_media_type: LAYER_MEDIA_TYPE,
                     layer: tar,
                     arch,
+                    replace,
                 },
             )
             .with_context(|| format!("publishing bundle {reference}"))?;
@@ -141,7 +142,7 @@ mod tests {
         let sink = OciSink::new(registry.clone());
 
         let exact = sink
-            .put("oci://ghcr.io/me/lodge:1", &tar, Arch::X86_64)
+            .put("oci://ghcr.io/me/lodge:1", &tar, Arch::X86_64, Replace::Yes)
             .unwrap();
         // It says what it wrote by digest, as a reference that can be used.
         assert!(
@@ -174,7 +175,12 @@ mod tests {
         let dir = TempDir::new("oci-sink").unwrap();
         let missing = dir.path().join("none.tar");
         let err = sink
-            .put("oci://ghcr.io/me/lodge:1", &missing, Arch::X86_64)
+            .put(
+                "oci://ghcr.io/me/lodge:1",
+                &missing,
+                Arch::X86_64,
+                Replace::Yes,
+            )
             .unwrap_err();
         assert!(
             format!("{err:#}").contains("oci://ghcr.io/me/lodge:1"),
@@ -191,7 +197,7 @@ mod tests {
         for (arch, bytes) in [(Arch::X86_64, "amd"), (Arch::Aarch64, "arm")] {
             let tar = dir.path().join(format!("{bytes}.tar"));
             std::fs::write(&tar, bytes).unwrap();
-            sink.put(reference, &tar, arch).unwrap();
+            sink.put(reference, &tar, arch, Replace::Yes).unwrap();
         }
         assert_eq!(
             registry.architectures("ghcr.io/me/lodge:1"),

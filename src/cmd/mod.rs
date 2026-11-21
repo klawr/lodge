@@ -20,11 +20,11 @@ pub(crate) mod targets;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, FromArgMatches};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use crate::bundle::store::{FileSink, FileStore, OciSink, OciStore, Sinks, Stores};
+use crate::bundle::store::{FileSink, FileStore, OciSink, OciStore, Replace, Sinks, Stores};
 use crate::cli::{Cli, Command};
 use crate::config::Config;
 use crate::forward::{DetachedDaemon, ForwardDaemon};
@@ -73,12 +73,20 @@ fn choose_target(
 fn build_endpoints(
     target: &str,
     config: &std::path::Path,
+    project: Option<&Path>,
     with: Wiring,
     command: &Command,
 ) -> Result<Box<dyn Endpoints>> {
     let kind = targets::find(target).with_context(|| format!("no target `{target}`"))?;
     let settings = if uses_target(command) {
-        crate::config::target_settings(config, target)?
+        let user = crate::config::target_settings(config, target)?;
+        match project.filter(|_| kind.per_project()) {
+            Some(dir) => {
+                let theirs = crate::config::project_target_settings(dir, target)?;
+                kind.merge_project(&user, &theirs)
+            }
+            None => user,
+        }
     } else {
         toml::Table::new()
     };
@@ -109,13 +117,37 @@ pub fn parse() -> Cli {
 /// same host and work in the same target as this one, in front of its subcommand.
 /// The command-line surface is the command layer's to know, not the host's or the
 /// target's.
-fn respawn_args(remote: Option<&str>, target: &str) -> Vec<String> {
+fn respawn_args(remote: Option<&str>, target: &str, project: Option<&Path>) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(remote) = remote {
         args.extend(["--remote".to_string(), remote.to_string()]);
     }
     args.extend(["--target".to_string(), target.to_string()]);
+    if let Some(project) = project {
+        args.extend(["--project-dir".to_string(), project.display().to_string()]);
+    }
     args
+}
+
+/// The project folder a command is about, for the settings a project gives its
+/// target: the path it was handed, else the folder it is run in. A command that
+/// is about no project has none.
+fn project_dir(command: &Command, handed: Option<PathBuf>) -> Option<PathBuf> {
+    match command {
+        Command::Up { project, .. }
+        | Command::Down { project }
+        | Command::Status { project, .. }
+        | Command::Rm { project }
+        | Command::Ports { project, .. }
+        | Command::Logs { project, .. }
+        | Command::Clean { project, .. }
+        | Command::Doctor { project, .. } => project
+            .path
+            .clone()
+            .or_else(|| std::env::current_dir().ok()),
+        // The daemon is told which folder; the rest have no project.
+        _ => handed,
+    }
 }
 
 /// What every command works with: the host the project is on, the endpoints on it,
@@ -222,9 +254,12 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         elf: Box::new(Patchelf),
         oci: registry.clone(),
     };
+    // Read on this machine, even with `--remote`: the folder you stand in is here.
+    let project = project_dir(&cli.command, cli.project_dir);
     let endpoints = build_endpoints(
         target,
         &config_path,
+        project.as_deref(),
         Wiring {
             host: host.clone(),
             local: local.clone(),
@@ -233,7 +268,11 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         &cli.command,
     )?;
     let ctx = Ctx {
-        forwarder: Box::new(DetachedDaemon::new(respawn_args(remote.as_deref(), target))),
+        forwarder: Box::new(DetachedDaemon::new(respawn_args(
+            remote.as_deref(),
+            target,
+            project.as_deref(),
+        ))),
         endpoints,
         bundles: bundle_stores(tools.oci.clone()),
         sinks: bundle_sinks(registry),
@@ -281,8 +320,15 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Clean { project, container } => {
             project::clean(&ctx, project.path, container.as_deref())?
         }
-        Command::Pack { output } => bundle::pack(&ctx, output)?,
-        Command::Bundle { command } => bundle::bundle(command)?,
+        Command::Pack { output, no_clobber } => {
+            let replace = if no_clobber {
+                Replace::No
+            } else {
+                Replace::Yes
+            };
+            bundle::pack(&ctx, output, replace)?
+        }
+        Command::Bundle { command } => bundle::bundle(&ctx, command)?,
         Command::Cache { command } => bundle::cache(command)?,
         Command::Init { force, print } => init::run(&ctx, force, print)?,
         Command::Doctor { project, json } => {
@@ -449,27 +495,68 @@ mod tests {
             config_with("[targets.docker]\ncontext = \"colima\"\n[targets.podman]\nbogus = 1\n");
         let ls = Cli::try_parse_from(["ldg", "ls"]).unwrap().command;
         // Docker's own table is fine; podman's mistake is not docker's problem.
-        build_endpoints("docker", &path, wiring(), &ls).unwrap();
-        let err = build_endpoints("podman", &path, wiring(), &ls)
+        build_endpoints("docker", &path, None, wiring(), &ls).unwrap();
+        let err = build_endpoints("podman", &path, None, wiring(), &ls)
             .err()
             .unwrap();
         assert!(format!("{err:#}").contains("[targets.podman]"), "{err:#}");
         // `init` builds from no settings at all.
         let init = Cli::try_parse_from(["ldg", "init"]).unwrap().command;
-        build_endpoints("podman", &path, wiring(), &init).unwrap();
+        build_endpoints("podman", &path, None, wiring(), &init).unwrap();
     }
 
     #[test]
     fn a_child_lodge_is_pointed_at_the_same_target_and_host() {
         for target in targets::names() {
             let mut args = vec!["ldg".to_string()];
-            args.extend(respawn_args(Some("me@h:22"), target));
+            args.extend(respawn_args(Some("me@h:22"), target, None));
             args.push("ls".into());
             let matches = command().try_get_matches_from(args).unwrap();
             let cli = Cli::from_arg_matches(&matches).unwrap();
             assert_eq!(cli.remote.as_deref(), Some("me@h:22"));
             assert_eq!(cli.target.as_deref(), Some(target));
         }
+    }
+
+    #[test]
+    fn a_pod_comes_from_the_project_over_the_users_config_and_the_daemon_is_told_where() {
+        use crate::host::fake::FakeHost;
+        use crate::local::fake::FakeLocal;
+        use crate::tools::NoRegistry;
+        let host = Arc::new(FakeHost::new());
+        let wiring = || Wiring {
+            host: host.clone(),
+            local: Arc::new(FakeLocal::new()),
+            oci: Arc::new(NoRegistry),
+        };
+        let (_dir, path) = config_with("[targets.kubernetes]\nselector = \"app=api\"\n");
+        let project = crate::tmpfile::TempDir::new("project").unwrap();
+        std::fs::write(
+            project.path().join(crate::config::PROJECT_FILE),
+            "[targets.kubernetes]\npod = \"dev-0\"\nnamespace = \"mine\"\n",
+        )
+        .unwrap();
+        let down = Cli::try_parse_from(["ldg", "down"]).unwrap().command;
+        let endpoints =
+            build_endpoints("kubernetes", &path, Some(project.path()), wiring(), &down).unwrap();
+        // The pod and the namespace are the project's: `kubectl` is asked about them.
+        endpoints.checks();
+        let asked = host.argvs().concat().join(" ");
+        assert!(asked.contains("--namespace mine"), "{asked}");
+        assert!(asked.contains("dev-0"), "{asked}");
+        // A target that takes nothing per project ignores the file.
+        build_endpoints("docker", &path, Some(project.path()), wiring(), &down).unwrap();
+        // The folder reaches a child lodge, which has no project argument of its own.
+        let args = respawn_args(None, "kubernetes", Some(project.path()));
+        let mut full = vec!["ldg".to_string()];
+        full.extend(args);
+        full.extend(["_forward".into(), "pod".into()]);
+        let cli = Cli::from_arg_matches(&command().try_get_matches_from(full).unwrap()).unwrap();
+        assert_eq!(cli.project_dir.as_deref(), Some(project.path()));
+        assert_eq!(
+            project_dir(&cli.command, cli.project_dir.clone()).as_deref(),
+            Some(project.path())
+        );
     }
 
     #[test]

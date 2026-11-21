@@ -99,6 +99,7 @@ mod tests {
             dir: dir.path().to_path_buf(),
             manifest,
             origin: Origin::Packed,
+            source: None,
         };
         (dir, prepared)
     }

@@ -29,7 +29,16 @@ For the image/build backends, `privileged`, `capAdd`, `securityOpt`, `init`,
 container is created; with compose, those belong in the compose file.
 
 Every container lodge creates carries the label `dev.lodge.project=<path>`,
-which is how `ldg ls` finds them.
+which is how `ldg ls` finds them, and the two labels the devcontainer CLI and
+VS Code write (`devcontainer.local_folder` and `devcontainer.config_file`), so
+"Attach to Running Container" and the CLI find lodge's container too.
+
+The other way round works as well: when lodge has no container for a project but
+one with those labels exists for the same folder and config file (VS Code made it),
+`ldg up` uses it. It is started if it is stopped and lodge injects into it, and
+that is all: lodge installs no features and runs no hooks in it (the editor did),
+and `down` and `rm` refuse to stop or remove it, because it is the editor's.
+`ldg up --build` makes a container of lodge's own beside it.
 
 ## Lifecycle hooks
 

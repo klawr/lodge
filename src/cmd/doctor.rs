@@ -219,23 +219,34 @@ fn config_check(path: &Path, config: &Result<Config>) -> Check {
     }
 }
 
-/// Readies the bundle the config names, as `up` would, so a reference that
+/// Looks the bundle the config names up, as `up` would, so a reference that
 /// cannot be read (a missing file, a registry that says no) shows up here and not
-/// in the middle of `ldg up`. A bundle that is not cached yet is fetched.
+/// in the middle of `ldg up`. Nothing is fetched or cached: a check has no side
+/// effects, so a bundle that is not cached yet is said to be so.
 fn bundle_check(reference: &str, ctx: &Ctx) -> Check {
-    let prepared = crate::bundle::cache::root()
-        .and_then(|root| crate::bundle::source::from_store(&root, &ctx.bundles, reference));
-    match prepared {
-        Ok(p) => Check::new(
-            "bundle",
-            Level::Ok,
-            format!(
-                "{reference} ({}, {}, id {})",
-                p.manifest.arch,
-                plural(p.manifest.tools.len(), "tool", "tools"),
-                p.manifest.id()
-            ),
-        ),
+    let found = crate::bundle::cache::root()
+        .and_then(|root| crate::bundle::source::look_up(&root, &ctx.bundles, reference));
+    match found {
+        Ok(found) => {
+            let detail = match &found.cached {
+                Some(m) => format!(
+                    "{reference} ({}{}, {}, id {})",
+                    if found.offline {
+                        "not reachable, the cached copy from last time: "
+                    } else {
+                        ""
+                    },
+                    m.arch,
+                    plural(m.tools.len(), "tool", "tools"),
+                    m.id()
+                ),
+                None => format!(
+                    "{reference} resolves to {} (not cached yet; `ldg up` fetches it)",
+                    found.pinned
+                ),
+            };
+            Check::new("bundle", Level::Ok, detail)
+        }
         Err(e) => Check::new("bundle", Level::Missing, format!("{e:#}")),
     }
 }

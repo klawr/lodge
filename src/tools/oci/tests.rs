@@ -4,6 +4,7 @@ use super::http::fake::FakeHttp;
 use super::*;
 use crate::tools::OciFetcher;
 use std::sync::Arc;
+use std::time::Duration;
 
 const REPO: &str = "https://ghcr.io/v2/x/feat";
 /// What a pull of `REPO` asks a token service for, when the registry names no scope.
@@ -31,7 +32,7 @@ fn serving(layer: &(Digest, Vec<u8>)) -> FakeHttp {
 }
 
 fn oci(http: &Arc<FakeHttp>, creds: FakeCredentials) -> NativeOci {
-    NativeOci::new(Box::new(http.clone()), Box::new(creds))
+    NativeOci::new(Box::new(http.clone()), Box::new(creds)).retrying(&[Duration::ZERO; 3])
 }
 
 fn pull(
@@ -436,9 +437,9 @@ fn a_missing_artifact_and_a_server_error_are_told_apart() {
         err.to_string().contains("not found: ghcr.io/x/feat"),
         "{err}"
     );
-    let http = Arc::new(FakeHttp::new().answer(&format!("{REPO}/manifests/1"), 500, &[], b""));
+    let http = Arc::new(FakeHttp::new().answer(&format!("{REPO}/manifests/1"), 501, &[], b""));
     let err = pull(&http, FakeCredentials::new(), None).0.unwrap_err();
-    assert!(err.to_string().contains("500"), "{err}");
+    assert!(err.to_string().contains("501"), "{err}");
 }
 
 #[test]
@@ -514,7 +515,7 @@ fn only_a_network_that_fails_is_marked_unreachable_not_a_registry_that_answers()
     let down = pin(FakeHttp::new().break_on(http::Method::Get, &url));
     assert!(down.downcast_ref::<Unreachable>().is_some(), "{down:#}");
     // It said no, or had nothing, or failed: all answers, so all the registry's own.
-    for status in [401, 403, 404, 500] {
+    for status in [401, 403, 404, 501] {
         let said = pin(FakeHttp::new().answer(&url, status, &[], b""));
         assert!(
             said.downcast_ref::<Unreachable>().is_none(),
@@ -585,7 +586,7 @@ fn a_pinned_reference_pulls_what_it_was_pinned_to() {
 
 mod push {
     use super::*;
-    use crate::tools::{Artifact, OciPusher};
+    use crate::tools::{Artifact, OciPusher, Replace};
     use http::Method;
 
     const UPLOADS: &str = "https://ghcr.io/v2/x/feat/blobs/uploads/";
@@ -609,6 +610,7 @@ mod push {
             layer_media_type: LAYER_TYPE,
             layer: path,
             arch: Arch::X86_64,
+            replace: Replace::Yes,
         }
     }
 
@@ -1156,6 +1158,10 @@ mod push {
                     b"",
                 )
                 .takes_image(&layer)
+                // A read is tried again after a 500, and then the answer stands.
+                .answer(&tag, 500, &[], b"")
+                .answer(&tag, 500, &[], b"")
+                .answer(&tag, 500, &[], b"")
                 .answer(&tag, 500, &[], b""),
         );
         let err = oci(&http, FakeCredentials::new())
@@ -1172,6 +1178,7 @@ mod push {
             (Method::Head, "HEAD"),
             (Method::Post, "POST"),
             (Method::Put, "PUT"),
+            (Method::Patch, "PATCH"),
         ] {
             assert_eq!(method.name(), name);
         }
@@ -1191,4 +1198,249 @@ mod push {
         assert!(err.to_string().contains("names a digest"), "{err}");
         assert!(http.asked().is_empty());
     }
+
+    #[test]
+    fn a_blob_refused_in_one_piece_is_sent_in_pieces() {
+        let dir = crate::tmpfile::TempDir::new("push").unwrap();
+        let (path, layer) = layer_file(&dir);
+        let blob = format!("{REPO}/blobs/{layer}");
+        let location = |n: &str| format!("/v2/x/feat/blobs/uploads/{n}");
+        let at = |n: &str, digest: &Digest| {
+            format!(
+                "https://ghcr.io{}?digest={}",
+                location(n),
+                auth_encode(digest.as_str())
+            )
+        };
+        let config = config_digest();
+        let http = Arc::new(
+            FakeHttp::new()
+                .answer_to(
+                    Method::Head,
+                    &format!("{REPO}/blobs/{config}"),
+                    200,
+                    &[],
+                    b"",
+                )
+                .answer_to(Method::Head, &blob, 404, &[], b"")
+                .answer_to(
+                    Method::Post,
+                    UPLOADS,
+                    202,
+                    &[("Location", &location("a"))],
+                    b"",
+                )
+                .answer_to(Method::Put, &at("a", &layer), 413, &[], b"")
+                .answer_to(
+                    Method::Post,
+                    UPLOADS,
+                    202,
+                    &[("Location", &location("b"))],
+                    b"",
+                )
+                .answer_to(
+                    Method::Patch,
+                    &format!("https://ghcr.io{}", location("b")),
+                    202,
+                    &[("Location", &location("c"))],
+                    b"",
+                )
+                .answer_to(Method::Put, &at("c", &layer), 201, &[], b"")
+                .publishes(&layer),
+        );
+        oci(&http, FakeCredentials::new())
+            .push("ghcr.io/x/feat:1", &artifact(&path))
+            .unwrap();
+        let piece = format!("https://ghcr.io{}", location("b"));
+        assert_eq!(
+            http.body_of(Method::Patch, &piece, 0).unwrap(),
+            b"the layer"
+        );
+        assert_eq!(http.sent(&piece, 0, "content-range").unwrap(), "0-8");
+        // The closing request carries no bytes: they went in the piece.
+        assert_eq!(http.body_of(Method::Put, &at("c", &layer), 0).unwrap(), b"");
+    }
+
+    #[test]
+    fn a_request_answered_with_not_now_is_tried_again() {
+        let dir = crate::tmpfile::TempDir::new("push").unwrap();
+        let (path, layer) = layer_file(&dir);
+        let blob = format!("{REPO}/blobs/{layer}");
+        let config = format!("{REPO}/blobs/{}", config_digest());
+        let http = Arc::new(
+            FakeHttp::new()
+                .answer_to(Method::Head, &config, 429, &[("Retry-After", "0")], b"")
+                .answer_to(Method::Head, &config, 503, &[], b"")
+                .answer_to(Method::Head, &config, 200, &[], b"")
+                .answer_to(Method::Head, &blob, 200, &[], b"")
+                .publishes(&layer),
+        );
+        oci(&http, FakeCredentials::new())
+            .push("ghcr.io/x/feat:1", &artifact(&path))
+            .unwrap();
+        let heads = http
+            .asked()
+            .iter()
+            .filter(|(m, u)| *m == Method::Head && *u == config)
+            .count();
+        assert_eq!(heads, 3);
+    }
+
+    #[test]
+    fn a_registry_that_stays_busy_is_given_up_on_after_a_few_tries() {
+        let dir = crate::tmpfile::TempDir::new("push").unwrap();
+        let (path, _) = layer_file(&dir);
+        let config = format!("{REPO}/blobs/{}", config_digest());
+        let mut http = FakeHttp::new();
+        for _ in 0..4 {
+            http = http.answer_to(Method::Head, &config, 503, &[], b"");
+        }
+        let http = Arc::new(http);
+        let err = oci(&http, FakeCredentials::new())
+            .push("ghcr.io/x/feat:1", &artifact(&path))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("answered 503"), "{err:#}");
+        assert_eq!(http.asked().len(), 4);
+    }
+
+    #[test]
+    fn a_wait_the_registry_asks_for_that_is_too_long_is_not_obeyed() {
+        let dir = crate::tmpfile::TempDir::new("push").unwrap();
+        let (path, _) = layer_file(&dir);
+        let config = format!("{REPO}/blobs/{}", config_digest());
+        let http = Arc::new(FakeHttp::new().answer_to(
+            Method::Head,
+            &config,
+            429,
+            &[("Retry-After", "3600")],
+            b"",
+        ));
+        let err = oci(&http, FakeCredentials::new())
+            .push("ghcr.io/x/feat:1", &artifact(&path))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("answered 429"), "{err:#}");
+        assert_eq!(http.asked().len(), 1);
+    }
+
+    #[test]
+    fn a_write_that_failed_with_a_plain_500_is_not_sent_again() {
+        let dir = crate::tmpfile::TempDir::new("push").unwrap();
+        let (path, layer) = layer_file(&dir);
+        let http = Arc::new(
+            FakeHttp::new()
+                .answer_to(
+                    Method::Head,
+                    &format!("{REPO}/blobs/{}", config_digest()),
+                    200,
+                    &[],
+                    b"",
+                )
+                .answer_to(
+                    Method::Head,
+                    &format!("{REPO}/blobs/{layer}"),
+                    200,
+                    &[],
+                    b"",
+                )
+                .answer_to(Method::Put, &image_url(&layer), 500, &[], b""),
+        );
+        let err = oci(&http, FakeCredentials::new())
+            .push("ghcr.io/x/feat:1", &artifact(&path))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("answered 500"), "{err:#}");
+        let puts = http
+            .asked()
+            .iter()
+            .filter(|(m, _)| *m == Method::Put)
+            .count();
+        assert_eq!(puts, 1);
+    }
+
+    #[test]
+    fn publishing_that_must_not_replace_refuses_before_anything_is_sent() {
+        let dir = crate::tmpfile::TempDir::new("push").unwrap();
+        let (path, layer) = layer_file(&dir);
+        let image = image_bytes(&layer);
+        let held = Digest::of(&image);
+        let index = format!(
+            r#"{{"manifests": [{{"digest": "{held}", "size": {}, "platform": {{"architecture": "amd64", "os": "linux"}}}}]}}"#,
+            image.len()
+        );
+        let tag = format!("{REPO}/manifests/1");
+        let http = Arc::new(FakeHttp::new().answer(&tag, 200, &[], index.as_bytes()));
+        let mut keep = artifact(&path);
+        keep.replace = Replace::No;
+        let err = oci(&http, FakeCredentials::new())
+            .push("ghcr.io/x/feat:1", &keep)
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("already holds an image for x86_64") && text.contains(&held.to_string()),
+            "{text}"
+        );
+        // Only the tag was looked at: nothing was uploaded or written.
+        assert_eq!(http.asked(), vec![(Method::Get, tag)]);
+    }
+
+    #[test]
+    fn publishing_that_must_not_replace_goes_ahead_when_nothing_is_there_for_this_machine() {
+        let dir = crate::tmpfile::TempDir::new("push").unwrap();
+        let (path, layer) = layer_file(&dir);
+        let arm = format!(
+            r#"{{"manifests": [{{"digest": "sha256:{}", "size": 1, "platform": {{"architecture": "arm64", "os": "linux"}}}}]}}"#,
+            "a".repeat(64)
+        );
+        let tag = format!("{REPO}/manifests/1");
+        let mut keep = artifact(&path);
+        keep.replace = Replace::No;
+        // The tag is read once to decide, and once more to merge into.
+        let blob = |d: &Digest| format!("{REPO}/blobs/{d}");
+        let http = Arc::new(
+            FakeHttp::new()
+                .answer(&tag, 200, &[], arm.as_bytes())
+                .answer_to(Method::Head, &blob(&config_digest()), 200, &[], b"")
+                .answer_to(Method::Head, &blob(&layer), 200, &[], b"")
+                .takes_image(&layer)
+                .answer(&tag, 200, &[], arm.as_bytes())
+                .answer_to(Method::Put, &tag, 201, &[], b""),
+        );
+        oci(&http, FakeCredentials::new())
+            .push("ghcr.io/x/feat:1", &keep)
+            .unwrap();
+        assert!(http.body_of(Method::Put, &tag, 0).is_some());
+    }
+}
+
+#[test]
+fn a_registry_that_serves_only_the_older_docker_types_is_pulled_from() {
+    let l = layer();
+    let amd = format!(
+        r#"{{"schemaVersion": 2, "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "layers": [{{"mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip", "digest": "{}", "size": {}}}]}}"#,
+        l.0,
+        l.1.len()
+    )
+    .into_bytes();
+    let list = format!(
+        r#"{{"schemaVersion": 2, "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+            "manifests": [{{"mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+              "digest": "{}", "size": {}, "platform": {{"architecture": "amd64", "os": "linux"}}}}]}}"#,
+        Digest::of(&amd),
+        amd.len()
+    )
+    .into_bytes();
+    let http = Arc::new(
+        FakeHttp::new()
+            .answer(&format!("{REPO}/manifests/1"), 200, &[], &list)
+            .answer(
+                &format!("{REPO}/manifests/{}", Digest::of(&amd)),
+                200,
+                &[],
+                &amd,
+            )
+            .answer(&format!("{REPO}/blobs/{}", l.0), 200, &[], &l.1),
+    );
+    let (result, left) = pull(&http, FakeCredentials::new(), Some(Arch::X86_64));
+    result.unwrap();
+    assert_eq!(left, vec![l.0.file_name()]);
 }

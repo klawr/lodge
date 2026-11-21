@@ -41,6 +41,11 @@ pub struct Cli {
     #[arg(long, short, global = true, action = ArgAction::Count)]
     pub verbose: u8,
 
+    /// Internal: the project folder whose `lodge.toml` the settings of a target
+    /// were read from, handed to the forward daemon so it works on the same pod.
+    #[arg(long, global = true, hide = true, value_name = "DIR")]
+    pub project_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -56,13 +61,15 @@ pub struct ProjectArg {
 pub enum BundleCommand {
     /// Show what a bundle contains
     Inspect {
-        /// The bundle file
-        file: PathBuf,
+        /// The bundle: a file, or an `oci://` reference (fetched, not cached)
+        #[arg(value_name = "FILE|oci://REF")]
+        reference: String,
     },
     /// Check that a bundle is intact (for example after copying it)
     Verify {
-        /// The bundle file
-        file: PathBuf,
+        /// The bundle: a file, or an `oci://` reference (fetched, not cached)
+        #[arg(value_name = "FILE|oci://REF")]
+        reference: String,
     },
 }
 
@@ -208,14 +215,18 @@ pub enum Command {
             is for. Credentials directories (~/.ssh, ~/.config/gh, …) trigger a warning: \
             a bundle is meant to be shared. The output is a file, or a registry as \
             oci://ghcr.io/me/lodge:1, which publishes it there (the tag holds one image per \
-            architecture: this machine's is replaced, the others are kept); \
-            `ldg up --bundle` takes the same reference. Publishing needs `docker login` for the registry."
+            architecture: this machine's is replaced without asking, the others are kept; \
+            `--no-clobber` refuses instead); `ldg up --bundle` takes the same reference. Publishing needs `docker login` for the registry."
     )]
     Pack {
         /// Where to write the bundle: a file, or an `oci://` reference to publish it
         /// to (default: `lodge-<arch>.tar` here)
         #[arg(short, long, value_name = "FILE|oci://REF")]
         output: Option<String>,
+        /// Refuse to replace what is already there: a file that exists, or this
+        /// machine's image under the tag (for CI that must not overwrite)
+        #[arg(long)]
+        no_clobber: bool,
     },
     /// Work with bundle files
     Bundle {

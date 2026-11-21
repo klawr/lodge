@@ -113,6 +113,27 @@ pub fn merged_index(
     Ok(serde_json::to_vec(&index)?)
 }
 
+/// What a tag already holds for `arch`, named by digest, when publishing there
+/// would replace it: its entry in an index, or the image itself when the tag
+/// holds a single image (whose machine nothing says, and which publishing turns
+/// into an index of one).
+pub fn held_for(existing: Option<&[u8]>, arch: Arch) -> Result<Option<String>> {
+    let Some(bytes) = existing else {
+        return Ok(None);
+    };
+    Ok(match Manifest::parse(bytes)? {
+        Manifest::Image(_) => Some(Digest::of(bytes).to_string()),
+        Manifest::Index(entries) => entries
+            .iter()
+            .find(|d| {
+                d.platform
+                    .as_ref()
+                    .is_some_and(|p| p.os == "linux" && p.architecture == oci_arch(arch))
+            })
+            .map(|d| d.digest.clone()),
+    })
+}
+
 /// Go's name for an architecture, which is what registries use.
 pub fn oci_arch(arch: Arch) -> &'static str {
     match arch {

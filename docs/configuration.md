@@ -94,8 +94,8 @@ outlives a disconnect, use a multiplexer: see
 A multiplexer (tmux, zellij, screen) is a tool like any other: inject it, and
 start it from your shell's rc file. The container keeps it running when you
 leave, so the next `ldg up` (or `ldg attach`) lands in the same session, with
-your editor as you left it. The same holds after a dropped `--remote` connection: `ldg` asks whether
-to reconnect and open a new shell, which reads the rc file again and attaches.
+your editor as you left it. The same holds after a dropped `--remote` connection: `ldg` reconnects
+by itself and opens a new shell, which reads the rc file again and attaches.
 
 A tmux setup, with three `[[inject]]` entries:
 
@@ -238,6 +238,24 @@ namespace = "work"       # kubectl --namespace work (default: the context's)
 context = "staging"      # kubectl --context staging (default: the current one)
 workdir = "/srv/app"     # where a session starts (default: the user's home)
 ```
+
+**Per project.** A project says which pod it uses in a `lodge.toml` in its folder
+(`ldg up [PATH]`'s PATH, else where you run `ldg`), read on this machine even with
+`--remote`:
+
+```toml
+# my-project/lodge.toml
+[targets.kubernetes]
+pod = "api-dev-0"
+namespace = "my-team"
+```
+
+It may hold nothing but `[targets.<name>]` tables, and only `kubernetes` takes one per
+project. What it sets replaces the same key in your own `[targets.kubernetes]`, and
+the rest of your table stands (a `pod` or `selector` in the project replaces how your
+config found a pod, as the two are one setting). `-c FILE` still works for a
+whole config of its own. The background port forwarder is told the folder, so it
+works on the same pod.
 
 Only `pod` or `selector` is needed, not both. A selector (`kubectl get pods -l`) is
 for pods whose names change: it must match **exactly one running pod**, and more than
