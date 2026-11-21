@@ -613,6 +613,53 @@ fn a_bundle_in_a_registry_is_pulled_once_and_injected() {
 
 #[test]
 #[ignore = "needs docker"]
+fn a_bundle_published_by_pack_is_used_by_up() {
+    let sb = Sandbox::new();
+    script_tool_config(&sb, "hello", "#!/bin/sh\necho published\n");
+    let registry = Registry::start();
+    let reference = registry.reference("lodge", "1");
+
+    // `pack -o` takes the same reference as `--bundle`, and says what it wrote.
+    let packed = sb.run(&["pack", "-o", &reference]);
+    assert!(
+        packed.ok && packed.has("publishing"),
+        "publishing failed:\n{}",
+        packed.tail(8)
+    );
+    let exact = packed
+        .text
+        .split_whitespace()
+        .find(|w| w.starts_with("oci://") && w.contains("@sha256:"))
+        .unwrap_or_else(|| panic!("no pinned reference in:\n{}", packed.tail(4)))
+        .to_string();
+
+    // What is in the registry, as the registry's own API shows it: one layer, typed.
+    let manifest = registry.manifest("lodge", "1");
+    assert!(
+        manifest.contains("application/vnd.lodge.bundle.v1")
+            && manifest.matches("\"layers\"").count() == 1,
+        "unexpected manifest:\n{manifest}"
+    );
+
+    // Used by its tag, and by the exact digest `pack` reported.
+    let p = sb.project("publishedbundle", &json(r#"{ "image": "@IMAGE@" }"#));
+    for how in [&reference, &exact] {
+        let out = p.ldg("up", &["--no-attach", "--reinject", "--bundle", how]);
+        assert!(out.ok, "up from {how} failed:\n{}", out.tail(8));
+        assert_eq!(p.exec(&[&root_tool("hello")]), "published");
+    }
+
+    // A reference nobody writes to is refused before anything is packed.
+    let refused = sb.run(&["pack", "-o", "ftp://host/b.tar"]);
+    assert!(
+        !refused.ok && refused.has("cannot write a bundle to"),
+        "expected a refusal:\n{}",
+        refused.tail(4)
+    );
+}
+
+#[test]
+#[ignore = "needs docker"]
 fn a_repeated_up_reuses_the_cached_bundle_and_a_change_updates_the_container() {
     let sb = Sandbox::new();
     let script = script_tool_config(&sb, "hello", "#!/bin/sh\necho one\n");

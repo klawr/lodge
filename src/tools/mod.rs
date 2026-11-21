@@ -67,6 +67,25 @@ pub trait OciFetcher {
     fn pin(&self, reference: &str, arch: Option<Arch>) -> Result<Pinned>;
 }
 
+/// What is published to a registry: one layer, which is a file, and the types
+/// that say what the artifact is. The pusher knows registries, not what the
+/// layer holds.
+pub struct Artifact<'a> {
+    /// Says what kind of artifact this is, to anything that lists a registry.
+    pub artifact_type: &'a str,
+    pub layer_media_type: &'a str,
+    pub layer: &'a Path,
+}
+
+/// Publishes artifacts to an OCI registry. Separate from [`OciFetcher`], so a
+/// machine that only reads never needs a way to write, and a fake of one does not
+/// have to implement the other.
+pub trait OciPusher {
+    /// Publishes `artifact` as `reference`, which names a tag: what that tag held
+    /// is replaced (last write wins). Returns what was written, by digest.
+    fn push(&self, reference: &str, artifact: &Artifact) -> Result<Pinned>;
+}
+
 /// A reference and the content it named when it was pinned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pinned {
@@ -105,6 +124,7 @@ impl OciFetcher for NoRegistry {
 pub(crate) struct FakeRegistry {
     artifacts: std::sync::Mutex<std::collections::BTreeMap<String, (String, Vec<u8>)>>,
     pulled: std::sync::Mutex<Vec<String>>,
+    pushes: std::sync::Mutex<Vec<(String, String, String)>>,
 }
 
 #[cfg(test)]
@@ -125,6 +145,45 @@ impl FakeRegistry {
     /// What was pulled, in order.
     pub fn pulled(&self) -> Vec<String> {
         self.pulled.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+impl FakeRegistry {
+    /// What was pushed: the reference, the artifact type and the layer's type.
+    pub fn pushed(&self) -> Vec<(String, String, String)> {
+        self.pushes.lock().unwrap().clone()
+    }
+}
+
+/// A digest that follows the content, which is all a fake needs.
+#[cfg(test)]
+fn fake_digest(bytes: &[u8]) -> String {
+    format!(
+        "sha256:{:0>64x}",
+        bytes.iter().map(|b| u64::from(*b)).sum::<u64>()
+    )
+}
+
+#[cfg(test)]
+impl OciPusher for FakeRegistry {
+    fn push(&self, reference: &str, artifact: &Artifact) -> Result<Pinned> {
+        let layer = std::fs::read(artifact.layer)?;
+        let digest = fake_digest(&layer);
+        self.artifacts
+            .lock()
+            .unwrap()
+            .insert(reference.into(), (digest.clone(), layer));
+        self.pushes.lock().unwrap().push((
+            reference.into(),
+            artifact.artifact_type.into(),
+            artifact.layer_media_type.into(),
+        ));
+        let name = reference.rsplit_once(':').map_or(reference, |(n, _)| n);
+        Ok(Pinned {
+            reference: format!("{name}@{digest}"),
+            digest,
+        })
     }
 }
 

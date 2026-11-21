@@ -103,7 +103,7 @@ pub enum Command {
         #[arg(long)]
         no_attach: bool,
         /// Inject from this bundle instead of packing your config
-        #[arg(long, value_name = "FILE|oci://REF")]
+        #[arg(long, short, value_name = "FILE|oci://REF")]
         bundle: Option<String>,
     },
     /// Stop a project's devcontainer
@@ -176,12 +176,16 @@ pub enum Command {
             and your configs, in one tar. This is the only step that needs ldd and \
             patchelf, and it must run on a Linux machine of the architecture the bundle \
             is for. Credentials directories (~/.ssh, ~/.config/gh, …) trigger a warning: \
-            a bundle is meant to be shared."
+            a bundle is meant to be shared. The output is a file, or a registry as \
+            oci://ghcr.io/me/lodge:1, which publishes it there (what the tag held is \
+            replaced; one tag holds one architecture); `ldg up --bundle` takes the same \
+            reference. Publishing needs `docker login` for the registry."
     )]
     Pack {
-        /// Where to write the bundle (default: `lodge-<arch>.tar` here)
-        #[arg(short, long)]
-        output: Option<PathBuf>,
+        /// Where to write the bundle: a file, or an `oci://` reference to publish it
+        /// to (default: `lodge-<arch>.tar` here)
+        #[arg(short, long, value_name = "FILE|oci://REF")]
+        output: Option<String>,
     },
     /// Work with bundle files
     Bundle {

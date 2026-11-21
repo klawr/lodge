@@ -192,6 +192,7 @@ mod tests {
             )),
             tools: tools::external(),
             bundles: crate::bundle::store::Stores::new(vec![]),
+            sinks: crate::bundle::store::Sinks::new(vec![]),
             config_path: dir.path().join("config.toml"),
         };
         let attached = Attached {

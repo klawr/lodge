@@ -24,14 +24,16 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use crate::bundle::store::{FileStore, OciStore, Stores};
+use crate::bundle::store::{FileSink, FileStore, OciSink, OciStore, Sinks, Stores};
 use crate::cli::{Cli, Command};
 use crate::config::Config;
 use crate::forward::{DetachedDaemon, ForwardDaemon};
 use crate::host::{HostRef, LocalHost, SshHost};
 use crate::local::{Local, SystemLocal};
 use crate::provision::{Endpoints, Wiring};
-use crate::tools::{DockerConfig, Ldd, NativeOci, OciFetcher, Patchelf, Toolchain, UreqHttp};
+use crate::tools::{
+    DockerConfig, Ldd, NativeOci, OciFetcher, OciPusher, Patchelf, Toolchain, UreqHttp,
+};
 
 /// Whether a command works in a target at all. `init` and the generated
 /// completions and man page do not, so a bad value in the config can't stop
@@ -130,6 +132,8 @@ pub struct Ctx {
     pub tools: Toolchain,
     /// Where a bundle can be read from, chosen by how the reference is written.
     pub bundles: Stores,
+    /// Where a bundle can be written to, chosen the same way.
+    pub sinks: Sinks,
     /// Starts port forwarding for a container once it is up.
     pub forwarder: Box<dyn ForwardDaemon>,
     pub config_path: PathBuf,
@@ -171,6 +175,11 @@ fn bundle_stores(oci: Arc<dyn OciFetcher>) -> Stores {
     Stores::new(vec![Box::new(FileStore), Box::new(OciStore::new(oci))])
 }
 
+/// Where a bundle can be written. A new place is one more entry here.
+fn bundle_sinks(oci: Arc<dyn OciPusher>) -> Sinks {
+    Sinks::new(vec![Box::new(FileSink), Box::new(OciSink::new(oci))])
+}
+
 pub fn run(cli: Cli) -> Result<ExitCode> {
     // The composition root: the one place that picks how the project's machine
     // is reached and which target is worked in on it. Each is an interface everything
@@ -193,13 +202,16 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
     let config_path = crate::config::path_for(cli.config)?;
     let target = choose_target(cli.target, &cli.command, &config_path)?;
     let local: Arc<dyn Local> = Arc::new(SystemLocal);
+    // One registry client, handed to what reads from a registry and to what
+    // writes to one: they are separate interfaces and the same implementation.
+    let registry = Arc::new(NativeOci::new(
+        Box::new(UreqHttp::new()),
+        Box::new(DockerConfig::new(local.clone())),
+    ));
     let tools = Toolchain {
         deps: Box::new(Ldd),
         elf: Box::new(Patchelf),
-        oci: Arc::new(NativeOci::new(
-            Box::new(UreqHttp::new()),
-            Box::new(DockerConfig::new(local.clone())),
-        )),
+        oci: registry.clone(),
     };
     let endpoints = build_endpoints(
         target,
@@ -215,6 +227,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         forwarder: Box::new(DetachedDaemon::new(respawn_args(remote.as_deref(), target))),
         endpoints,
         bundles: bundle_stores(tools.oci.clone()),
+        sinks: bundle_sinks(registry),
         tools,
         host,
         local,
@@ -377,6 +390,24 @@ mod tests {
             .unwrap()
             .command;
         assert_eq!(choose_target(None, &init, &bad).unwrap(), "docker");
+    }
+
+    #[test]
+    fn a_bundle_is_named_with_a_flag_long_or_short() {
+        for flag in ["--bundle", "-b"] {
+            let up = Cli::try_parse_from(["ldg", "up", flag, "oci://ghcr.io/me/lodge:1"])
+                .unwrap()
+                .command;
+            let Command::Up { bundle, build, .. } = up else {
+                panic!("not up");
+            };
+            assert_eq!(
+                bundle.as_deref(),
+                Some("oci://ghcr.io/me/lodge:1"),
+                "{flag}"
+            );
+            assert!(!build, "{flag} must not mean --build");
+        }
     }
 
     #[test]

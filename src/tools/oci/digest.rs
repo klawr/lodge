@@ -41,6 +41,25 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The digest and size of a file, read in pieces: a bundle is not held in memory.
+pub fn of_file(path: &std::path::Path) -> Result<(Digest, u64)> {
+    use anyhow::Context as _;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((Digest(format!("sha256:{}", hex(&hasher.finalize()))), total))
+}
+
 /// Copies `from` to `to`, at most `size` bytes, and checks that it was exactly
 /// `size` bytes and hashes to `expected`. Nothing past `size` is read, so a
 /// registry cannot send more than the manifest declared.
@@ -101,6 +120,15 @@ mod tests {
             Digest::of(b"x").file_name().split_once('-').unwrap().0,
             "sha256"
         );
+    }
+
+    #[test]
+    fn a_file_has_the_digest_and_size_of_its_content() {
+        let dir = crate::tmpfile::TempDir::new("digest-file").unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"hello").unwrap();
+        assert_eq!(of_file(&path).unwrap(), (Digest::of(b"hello"), 5));
+        assert!(of_file(&dir.path().join("missing")).is_err());
     }
 
     #[test]

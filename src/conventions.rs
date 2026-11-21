@@ -138,13 +138,17 @@ fn only_the_command_layer_chooses_implementations() {
 #[test]
 fn where_a_bundle_comes_from_is_a_store_and_only_the_command_layer_picks_them() {
     // `bundle::source` asks `Stores` for whichever store owns a reference and
-    // never names one; the concrete stores are named in `bundle/store/` and `cmd/`.
+    // never names one, and `pack` asks `Sinks`; the concrete stores and sinks are
+    // named in `bundle/store/` and `cmd/`.
     assert_eq!(
-        files_containing(&["FileStore", "OciStore"], &["bundle/store/", "cmd/"]),
+        files_containing(
+            &["FileStore", "OciStore", "FileSink", "OciSink"],
+            &["bundle/store/", "cmd/"]
+        ),
         Vec::<String>::new()
     );
-    // And the scheme that marks a store's references is spelled in that store
-    // alone, so no other code decides what `oci://` means.
+    // And the scheme that marks a store's references is spelled in that store and
+    // its sink alone (one file), so no other code decides what `oci://` means.
     assert_eq!(
         files_containing(&["\"oci://\""], &["bundle/store/oci.rs"]),
         Vec::<String>::new()

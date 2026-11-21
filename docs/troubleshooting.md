@@ -78,10 +78,10 @@ Hooks and features are reported and skipped, never fatal, and a failed
 create-time hook or feature is retried on the next `ldg up`. Hooks run as
 `remoteUser`, feature scripts as root. Run `ldg up -v` to see the exact command.
 
-## A bundle or a feature cannot be pulled
+## A bundle or a feature cannot be pulled or published
 
-A devcontainer feature or an `oci://` bundle is pulled from its registry by lodge
-itself (see [Devcontainers](devcontainers.md#features) and
+A devcontainer feature or an `oci://` bundle is pulled from its registry, and a
+bundle is published to one, by lodge itself (see [Devcontainers](devcontainers.md#features) and
 [Bundles](bundles-and-secrets.md#keeping-a-bundle-in-a-registry)), and the error
 names the step that failed:
 
@@ -97,6 +97,15 @@ names the step that failed:
 - `content is sha256:…, expected sha256:…`, or `is N bytes, the manifest says M`:
   what came is not what the registry's manifest promised (a broken proxy or
   mirror). Nothing is kept; retry, or check what sits between you and the registry.
+- `… refused to write <repository> (401)`, when publishing with `ldg pack -o
+  oci://…`: run `docker login <registry>` with an account that may write there.
+  As for a pull, the login is read only from docker's config file, not from a
+  credential helper.
+- `the registry stored <digest>, not the <digest> that was sent`: the registry
+  changed the content it was given (a proxy in between). Nothing is usable under
+  that tag; publish again, or find what sits between you and the registry.
+- `names a digest`: a bundle is published to a tag (`oci://…/name:1`), not to a
+  digest.
 - `has N layers, a feature has exactly one`, or `has more than one layer, a bundle
   has exactly one`: the artifact is not shaped as lodge needs.
 - `no image for linux/<arch> (it has …)`: an index with no entry for this

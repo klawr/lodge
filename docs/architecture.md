@@ -110,23 +110,26 @@ and hooks all work from the resulting container id.
 
 ### `tools/oci/`
 
-`NativeOci` is the `OciFetcher` that talks to a registry itself, with no helper
-program. It knows registries and nothing about what an artifact holds, so
-devcontainer features use it today and anything else stored as an OCI artifact
-(a bundle, later) can use it unchanged. `pull(reference, arch, into)` resolves the
-reference, picks the image for `arch` out of an index, and writes each layer to
-`into` as a file named after its digest.
+`NativeOci` talks to a registry itself, with no helper program, and implements
+two separate interfaces: `OciFetcher` (read) and `OciPusher` (write). It knows
+registries and nothing about what an artifact holds, so devcontainer features and
+bundles use it unchanged. `pull(reference, arch, into)` resolves the reference,
+picks the image for `arch` out of an index, and writes each layer to `into` as a
+file named after its digest. `pin(reference, arch)` names what a tag points at
+right now by digest, which is how the bundle cache avoids a download. `push`
+publishes an `Artifact` (one layer from a file, with the types that say what it
+is) under a tag.
 
 | File | Responsibility |
 | --- | --- |
-| `mod.rs` | `NativeOci`: the order of a pull (manifest, then the image an index names, then each layer). Built from the two interfaces below, by `cmd::run`. |
-| `http.rs` | `Http`, the transport: one `GET`, any status returned as an answer, redirects followed without ever sending the request's headers to another host. `UreqHttp` is the real one and the only file that names the HTTP crate; `FakeHttp` (tests) answers each URL from a script and records what it was sent. |
+| `mod.rs` | `NativeOci`: the order of a pull (manifest, then the image an index names, then each layer) and of a push (blobs, then the manifest). Built from the two interfaces below, by `cmd::run`, and handed to what reads and to what writes as the same value. |
+| `http.rs` | `Http`, the transport: one request (a method, headers, and a body that is nothing, bytes or a file, so it can be sent again) and one answer, any status returned, redirects followed without ever sending the request's headers to another host. `UreqHttp` is the real one and the only file that names the HTTP crate; `FakeHttp` (tests) answers each URL from a script and records what it was sent. |
 | `credentials.rs` | `Credentials`, where a login comes from. `DockerConfig` reads what `docker login` stored in the config file itself (`$DOCKER_CONFIG` or `~/.docker`), through `Local`. A login kept by a credential helper is not asked for: that registry is reached anonymously. A helper would be one more implementation; `Login` never prints its password. |
-| `registry.rs` | One repository on one registry: the calls, and the handshake that lets them through. |
+| `registry.rs` | One repository on one registry, for a pull or a push (`Access`, which decides the scope a token is asked for): the calls, and the handshake that lets them through. |
 | `reference.rs` | Splits `ghcr.io/owner/name:1` (or `@sha256:…`) into registry, repository and tag or digest, and refuses anything that would break a URL. Pure. |
-| `manifest.rs` | Reads a manifest as an image (layers) or an index (images per platform), and picks the entry for an architecture. Pure. |
+| `manifest.rs` | Reads a manifest as an image (layers) or an index (images per platform), picks the entry for an architecture, and writes an image manifest (same input, same bytes). Pure. |
 | `auth.rs` | Reads a `WWW-Authenticate` challenge and builds what answers it. Pure. |
-| `digest.rs` | `Digest`, and copying a stream while checking its size and hash. The only file that names the hash crate. |
+| `digest.rs` | `Digest`, the digest of a file, and copying a stream while checking its size and hash. The only file that names the hash crate. |
 
 How a pull stays safe:
 
@@ -144,37 +147,73 @@ How a pull stays safe:
 - **Local registries are spoken to without TLS**, as docker does: `localhost`,
   `127.0.0.1` and `[::1]`.
 - **A stall is an error, not a hang.** There is a timeout for connecting, for the
-  response and for each read, and none for the whole download: a blob can be large.
+  response and for each read, and none for the whole download: a blob can be
+  large. A write is given ten minutes for the registry's answer instead, because
+  it verifies and commits a large blob before it replies.
 
-What is not there: retries (a 429 or 5xx is an error), a credential helper, a push.
+How a push stays safe, and what it does:
+
+- **The blobs first, the manifest last**, so a manifest never names what is not
+  there. A blob the registry already has (`HEAD`) is not sent again. The empty
+  config and the layer are uploaded in one piece (`POST` for a place, `PUT` with
+  the digest); the layer is streamed from its file.
+- **Writing is asked for as docker asks**: the token is requested for `pull,push`
+  whatever scope the registry's challenge names. A refusal says to `docker login`
+  with an account that may write.
+- **The upload goes where the registry says, and only there.** The `Location` it
+  answers with (absolute or relative) must name the same host and port, because the
+  token is sent along; the URL is rebuilt with the scheme lodge chose, so a proxy
+  that writes `http://` in its answers is still spoken to over TLS.
+- **A hang-up during an upload is tried once more**, from the start and with a new
+  handshake: a registry that refuses a write (a stale token) answers at once and
+  closes, which the sender sees as a broken connection and not as a 401.
+- **What was stored is checked.** A registry that reports a digest for what it
+  stored must report the one that was sent.
+- **The tag is replaced** (last write wins), and an index is not written yet: a tag
+  holds one architecture.
+
+What is not there: retries (a 429 or 5xx is an error) and a credential helper.
 
 ### `bundle/store/`
 
-A bundle is named by a *reference* the user wrote (`--bundle`, `bundle =`), and a
-`BundleStore` is one kind of place it can be kept. `bundle::source` hands the
-reference to `Stores::find`, which returns the store that `handles` it, and never
-names a concrete store; `cmd::run` builds the list (`bundle_stores`), so a new
-place (an `https://` URL, a bucket) is one type and one line there. A reference
-without a scheme is a file; with one, it belongs to the store that reads that
-scheme, and a scheme nobody reads is an error that lists the forms that work. Two
-stores claiming a reference is a wiring error, reported and not resolved by order.
+A bundle is named by a *reference* the user wrote (`--bundle`, `bundle =`,
+`pack -o`), and a kind of place it can be kept has two halves, each its own
+interface:
 
-Getting a bundle takes two calls, so the cache can skip the costly one:
-`identify` is cheap and names the content as it is now (a `key` the cache uses as
-its directory name, and the `pinned` reference to fetch), `fetch` returns the tar.
+- a `BundleStore` reads from it, and
+- a `BundleSink` writes to it.
 
-| Store | Reference | `identify` | `fetch` |
-| --- | --- | --- | --- |
-| `FileStore` | no scheme: a path | `f-<hash of the file>` | the file itself, nothing copied |
-| `OciStore` | `oci://registry/name[:tag\|@digest]` | `OciFetcher::pin`: one manifest request, `o-<digest of the image for this machine>` | `OciFetcher::pull` of the pinned reference; one layer, which is the tar |
-| `FakeStore` (tests) | `fake://name` | a scripted key | a scripted tar, recording what was fetched |
+They are separate so a machine that only uses bundles never needs a way to write
+one, and a fake of one does not have to implement the other. `bundle::source`
+hands a reference to `Stores::find`, `ldg pack` hands its output to `Sinks::find`;
+each returns the one that `handles` it and never names a concrete type.
+`cmd::run` builds both lists (`bundle_stores`, `bundle_sinks`), so a new place (an
+`https://` URL, a bucket) is a type per direction and one line in each. A reference
+without a scheme is a file; with one, it belongs to whoever reads that scheme, and
+a scheme nobody reads is an error that lists the forms that work. Two claiming a
+reference is a wiring error, reported and not resolved by order.
 
-`OciStore` is built on `OciFetcher` and knows nothing of HTTP or registries;
-`FileStore` knows nothing of the cache. What comes out of either is a tar that
-`archive::extract` unpacks and checks, so a layer that is not a bundle fails there,
-whoever published it. *Enforced:* `conventions.rs` allows the concrete stores to be
-named only in `bundle/store/` and `cmd/`, and the `oci://` scheme to be spelled
-only in `oci.rs`.
+Reading takes two calls, so the cache can skip the costly one: `identify` is cheap
+and names the content as it is now (a `key` the cache uses as its directory name,
+and the `pinned` reference to fetch), `fetch` returns the tar. Writing is one:
+`put` writes the tar and returns the exact reference the bundle can be used by.
+
+| Place | Reference | `identify` | `fetch` | `put` |
+| --- | --- | --- | --- | --- |
+| `FileStore`, `FileSink` | no scheme: a path | `f-<hash of the file>` | the file itself, nothing copied | copies beside the destination, then renames: the file appears only when whole |
+| `OciStore`, `OciSink` | `oci://registry/name[:tag\|@digest]` (a sink wants a tag) | `OciFetcher::pin`: one manifest request, `o-<digest of the image for this machine>` | `OciFetcher::pull` of the pinned reference; one layer, which is the tar | `OciPusher::push` as one layer typed as a lodge bundle; returns `oci://registry/name@sha256:…` |
+| `FakeStore`, `FakeSink` (tests) | `fake://name` | a scripted key | a scripted tar, recording what was fetched | keeps what it is given |
+
+`OciStore` and `OciSink` are built on `OciFetcher` and `OciPusher` and know nothing
+of HTTP or registries; the file ones know nothing of the cache. What comes out of
+a store is a tar that `archive::extract` unpacks and checks, so a layer that is not
+a bundle fails there, whoever published it. `pack` builds the tar in a scratch
+directory and hands it to the sink, so a destination nobody writes to is refused
+before anything is packed, and a sink says where the tar is best built
+(`staging`): a file's is beside the destination, so placing it is a rename and a
+large bundle is not held in the scratch space as well. *Enforced:* `conventions.rs` allows the concrete stores
+and sinks to be named only in `bundle/store/` and `cmd/`, and the `oci://` scheme to
+be spelled only in `oci.rs`.
 
 ## What `ldg up` does, step by step
 
@@ -482,7 +521,7 @@ just how it is done.
 | The build-time helpers | `tools::DepReader`, `ElfEditor`, `OciFetcher` (a `Toolchain`) | `Ldd`, `Patchelf`, `NativeOci` (on `Http` and `Credentials`: `UreqHttp`, `DockerConfig`); a test passes fakes |
 | Making an endpoint ready, and finding it again | `provision::Endpoints` | `devcontainer::Devcontainer` (a devcontainer on an engine), `plain_host::PlainHostEndpoints` (the machine itself), `kube::KubeEndpoints` (a running pod, through `kubectl` on a `Host`) |
 | Port forwarding for a container | `forward::ForwardDaemon` (and `Forwarders` for one tunnel) | `DetachedDaemon`, `HostForwarders`; a test passes fakes |
-| Where a bundle comes from | `bundle::store::BundleStore` (the `Stores` in `Ctx`) | `FileStore`, `OciStore` (on `OciFetcher`); `FakeStore` for tests; a new place is one type and one line in `cmd::bundle_stores` |
+| Where a bundle comes from, and goes to | `bundle::store::BundleStore` and `BundleSink` (the `Stores` and `Sinks` in `Ctx`) | `FileStore`/`FileSink`, `OciStore`/`OciSink` (on `OciFetcher` and `OciPusher`); fakes for tests; a new place is a type per direction and a line in `cmd::bundle_stores` and `bundle_sinks` |
 | What is injected | `[[inject]]` data | multiplexers and other tools are injected like any other, never named in code |
 
 The pieces compose instead of branching. The engine is built *on* a host

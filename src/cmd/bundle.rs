@@ -1,26 +1,37 @@
 //! Bundle commands: `pack`, `bundle inspect|verify`, `cache [list|clear]`.
 
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::{Ctx, ago, human_size};
 use crate::bundle;
 use crate::cli::{BundleCommand, CacheCommand};
 use crate::output::{info, line, note, plural};
+use crate::tmpfile::TempDir;
 
-pub fn pack(ctx: &Ctx, output: Option<PathBuf>) -> Result<()> {
+pub fn pack(ctx: &Ctx, output: Option<String>) -> Result<()> {
     let config = ctx.config()?;
     let output = match output {
         Some(o) => o,
-        None => PathBuf::from(bundle::default_file_name()?),
+        None => bundle::default_file_name()?,
     };
-    let manifest = bundle::pack::pack_to_file(&config, &output, &ctx.tools)?;
+    // A destination nobody writes to fails before anything is packed.
+    let sink = ctx.sinks.find(&output)?;
+    // The tar is built where the sink can place it cheapest: for a file, beside it,
+    // so a large bundle is not held in the scratch space as well.
+    let scratch = match sink.staging(&output) {
+        Some(dir) => TempDir::new_in(&dir, "pack-out"),
+        None => TempDir::new("pack-out"),
+    }?;
+    let tar = scratch.path().join("bundle.tar");
+    let manifest = bundle::pack::pack_to_file(&config, &tar, &ctx.tools)?;
+    let written = sink.put(&output, &tar)?;
     info!(
         "packed {} and {} for {} into {} (id {})",
         plural(manifest.tools.len(), "tool", "tools"),
         plural(manifest.libs.len(), "library", "libraries"),
         manifest.arch,
-        output.display(),
+        written,
         manifest.id()
     );
     Ok(())

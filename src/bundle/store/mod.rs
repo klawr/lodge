@@ -11,12 +11,18 @@
 //! Fetching is two steps so the cache can skip the expensive one:
 //! [`identify`](BundleStore::identify) is cheap and names the content as it is
 //! now, [`fetch`](BundleStore::fetch) gets it.
+//!
+//! Writing is the other direction and a seam of its own, a [`BundleSink`], so a
+//! machine that only uses bundles never needs a way to write one, and a fake of
+//! either does not have to implement the other. A kind of place usually has both
+//! (`file.rs`, `oci.rs`), and the reference that is read from is the one that is
+//! written to.
 
 mod file;
 mod oci;
 
-pub use file::FileStore;
-pub use oci::OciStore;
+pub use file::{FileSink, FileStore};
+pub use oci::{OciSink, OciStore};
 
 use crate::arch::Arch;
 use anyhow::{Result, bail};
@@ -52,6 +58,25 @@ pub trait BundleStore {
     fn fetch(&self, identity: &Identity, into: &Path) -> Result<PathBuf>;
 }
 
+/// Where a bundle can be written.
+pub trait BundleSink {
+    /// What a reference to this sink looks like, for messages.
+    fn form(&self) -> &'static str;
+
+    /// Whether `reference` is this sink's. Sinks must not overlap.
+    fn handles(&self, reference: &str) -> bool;
+
+    /// Where the tar is best built before `put`: a directory on the same
+    /// filesystem as the destination, so placing it is a rename and a large
+    /// bundle is not held in the scratch space as well. `None`: anywhere will do.
+    fn staging(&self, reference: &str) -> Option<PathBuf>;
+
+    /// Writes the bundle tar at `tar` as `reference`, replacing what was there.
+    /// Returns the exact reference the bundle can be used by (a registry's tag
+    /// becomes the digest it was written under).
+    fn put(&self, reference: &str, tar: &Path) -> Result<String>;
+}
+
 /// The stores lodge can read a bundle from.
 pub struct Stores(Vec<Box<dyn BundleStore>>);
 
@@ -62,24 +87,59 @@ impl Stores {
 
     /// The store that owns `reference`.
     pub fn find(&self, reference: &str) -> Result<&dyn BundleStore> {
-        let mut owners = self.0.iter().filter(|s| s.handles(reference));
-        let Some(owner) = owners.next() else {
-            let forms: Vec<&str> = self.0.iter().map(|s| s.form()).collect();
-            bail!(
-                "cannot read a bundle from {reference:?}; it is {}",
-                forms.join(" or ")
-            );
-        };
-        if let Some(other) = owners.next() {
-            // A wiring mistake, not the user's: report it rather than pick one.
-            bail!(
-                "both {} and {} claim the bundle {reference:?}",
-                owner.form(),
-                other.form()
-            );
-        }
-        Ok(owner.as_ref())
+        owner(
+            &self.0,
+            reference,
+            "read a bundle from",
+            |s, r| s.handles(r),
+            |s| s.form(),
+        )
     }
+}
+
+/// The sinks lodge can write a bundle to.
+pub struct Sinks(Vec<Box<dyn BundleSink>>);
+
+impl Sinks {
+    pub fn new(sinks: Vec<Box<dyn BundleSink>>) -> Self {
+        Self(sinks)
+    }
+
+    /// The sink that owns `reference`.
+    pub fn find(&self, reference: &str) -> Result<&dyn BundleSink> {
+        owner(
+            &self.0,
+            reference,
+            "write a bundle to",
+            |s, r| s.handles(r),
+            |s| s.form(),
+        )
+    }
+}
+
+/// The one of `kinds` that owns `reference`: none is an error that lists what
+/// would work, and two is a wiring mistake that is reported and not decided by
+/// order.
+fn owner<'a, T: ?Sized>(
+    kinds: &'a [Box<T>],
+    reference: &str,
+    what: &str,
+    handles: impl Fn(&T, &str) -> bool,
+    form: impl Fn(&T) -> &'static str,
+) -> Result<&'a T> {
+    let mut owners = kinds.iter().filter(|k| handles(k, reference));
+    let Some(first) = owners.next() else {
+        let forms: Vec<&str> = kinds.iter().map(|k| form(k)).collect();
+        bail!("cannot {what} {reference:?}; it is {}", forms.join(" or "));
+    };
+    if let Some(second) = owners.next() {
+        bail!(
+            "both {} and {} claim the bundle {reference:?}",
+            form(first),
+            form(second)
+        );
+    }
+    Ok(first.as_ref())
 }
 
 #[cfg(test)]
@@ -141,11 +201,48 @@ pub mod fake {
             Ok(path)
         }
     }
+
+    /// What a sink was given: the reference, and the bytes.
+    pub type Written = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+    /// A sink for `fake://name` references that keeps what it is given.
+    #[derive(Default)]
+    pub struct FakeSink {
+        pub written: Written,
+    }
+
+    impl FakeSink {
+        pub fn new() -> Self {
+            Self::default()
+        }
+    }
+
+    impl BundleSink for FakeSink {
+        fn form(&self) -> &'static str {
+            "fake://<name>"
+        }
+
+        fn handles(&self, reference: &str) -> bool {
+            reference.starts_with("fake://")
+        }
+
+        fn staging(&self, _reference: &str) -> Option<PathBuf> {
+            None
+        }
+
+        fn put(&self, reference: &str, tar: &Path) -> Result<String> {
+            self.written
+                .lock()
+                .unwrap()
+                .push((reference.into(), std::fs::read(tar)?));
+            Ok(format!("{reference}#exact"))
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::fake::FakeStore;
+    use super::fake::{FakeSink, FakeStore};
     use super::*;
 
     fn stores() -> Stores {
@@ -167,6 +264,16 @@ mod tests {
     fn an_unknown_scheme_says_what_would_work() {
         let err = stores().find("ftp://x/b.tar").err().unwrap().to_string();
         assert!(err.contains("ftp://x/b.tar"), "{err}");
+        assert!(err.contains("a file path or fake://<name>"), "{err}");
+    }
+
+    #[test]
+    fn a_reference_to_write_goes_to_the_sink_that_owns_it() {
+        let sinks = Sinks::new(vec![Box::new(FileSink), Box::new(FakeSink::new())]);
+        assert_eq!(sinks.find("fake://a").unwrap().form(), "fake://<name>");
+        assert_eq!(sinks.find("out.tar").unwrap().form(), "a file path");
+        let err = sinks.find("ftp://x/b.tar").err().unwrap().to_string();
+        assert!(err.contains("cannot write a bundle to"), "{err}");
         assert!(err.contains("a file path or fake://<name>"), "{err}");
     }
 

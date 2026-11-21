@@ -67,7 +67,7 @@ for where to put them). Man page: `ldg man | man -l -`.
 | `ldg clean [PATH]` | Remove what lodge injected from the container (configs are kept and listed), and stop its port forwarding. |
 | `ldg init` | Write a starting config (`--print` to see it first). |
 | `ldg doctor [PATH]` | Check the host, the config, and what the project's devcontainer needs. |
-| `ldg pack` | Pack your tools and configs into a portable bundle (`lodge-<arch>.tar`). |
+| `ldg pack [-o FILE\|oci://REF]` | Pack your tools and configs into a portable bundle: a file (`lodge-<arch>.tar`), or published to a registry. |
 | `ldg bundle inspect\|verify FILE` | Show what a bundle holds; check it is intact. |
 | `ldg cache [clear]` | Show or clear the cache of prepared bundles. |
 | `ldg completions SHELL`, `ldg man` | Shell completions and the man page. |

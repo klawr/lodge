@@ -1,6 +1,7 @@
 //! What a manifest says: the layers of an image, or the images of an index and
 //! which one is for which machine. Pure.
 
+use super::digest::Digest;
 use crate::arch::Arch;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -42,6 +43,29 @@ impl Manifest {
             _ => bail!("the manifest is neither an image nor an index"),
         }
     }
+}
+
+/// The media types of what lodge writes.
+pub const IMAGE_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+const EMPTY_CONFIG: &str = "application/vnd.oci.empty.v1+json";
+
+/// An image manifest for an artifact: an empty config and one layer. The bytes
+/// are the same for the same input (keys in order), so publishing the same thing
+/// twice is the same digest.
+pub fn image(
+    artifact_type: &str,
+    layer_media_type: &str,
+    config: (&Digest, u64),
+    layer: (&Digest, u64),
+) -> Result<Vec<u8>> {
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": IMAGE_MANIFEST,
+        "artifactType": artifact_type,
+        "config": {"mediaType": EMPTY_CONFIG, "digest": config.0.as_str(), "size": config.1},
+        "layers": [{"mediaType": layer_media_type, "digest": layer.0.as_str(), "size": layer.1}],
+    });
+    Ok(serde_json::to_vec(&manifest)?)
 }
 
 /// Go's name for an architecture, which is what registries use.
@@ -122,6 +146,28 @@ mod tests {
         assert!(matches!(Manifest::parse(index).unwrap(), Manifest::Index(m) if m.len() == 1));
         assert!(Manifest::parse(b"{}").is_err());
         assert!(Manifest::parse(b"nope").is_err());
+    }
+
+    #[test]
+    fn what_is_written_reads_back_as_one_image_with_one_layer() {
+        let (config, layer) = (Digest::of(b"{}"), Digest::of(b"tar"));
+        let bytes = image("a/type", "a/layer", (&config, 2), (&layer, 3)).unwrap();
+        let Manifest::Image(layers) = Manifest::parse(&bytes).unwrap() else {
+            panic!("not an image");
+        };
+        assert_eq!(layers.len(), 1);
+        assert_eq!(
+            (layers[0].digest.as_str(), layers[0].size),
+            (layer.as_str(), 3)
+        );
+        // The same input is the same bytes, hence the same digest.
+        assert_eq!(
+            bytes,
+            image("a/type", "a/layer", (&config, 2), (&layer, 3)).unwrap()
+        );
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("\"artifactType\":\"a/type\""), "{text}");
+        assert!(text.contains(IMAGE_MANIFEST), "{text}");
     }
 
     #[test]
