@@ -305,7 +305,7 @@ impl Sandbox {
         let bin = self.root.join("bin");
         std::fs::create_dir_all(&bin).expect("creating bin");
         let script = "#!/bin/bash\n\
-            while [ $# -gt 0 ]; do case \"$1\" in -o|-p|-L|-S|-i|-l) shift 2 ;; -*) shift ;; *) break ;; esac; done\n\
+            while [ $# -gt 0 ]; do case \"$1\" in -o|-p|-L|-S|-i|-l|-E) shift 2 ;; -*) shift ;; *) break ;; esac; done\n\
             shift\n\
             exec sh -c \"$*\"\n";
         let path = bin.join("ssh");
@@ -582,6 +582,22 @@ impl Sandbox {
         capture(cmd)
     }
 
+    /// Like [`run`](Self::run), but gives up after `secs` seconds (the output is
+    /// then a failure), for a command that would otherwise hang the test.
+    pub fn run_within(&self, secs: u64, args: &[&str]) -> Out {
+        let ldg = self.command();
+        let mut cmd = Command::new("timeout");
+        cmd.arg(secs.to_string()).arg(ldg.get_program());
+        for (k, v) in ldg.get_envs() {
+            match v {
+                Some(v) => cmd.env(k, v),
+                None => cmd.env_remove(k),
+            };
+        }
+        cmd.args(args);
+        capture(cmd)
+    }
+
     /// Runs `ldg <args>` as a user whose home is `home`: where a plain host, which
     /// is the machine itself, keeps lodge's prefix and the dotfiles it must not
     /// touch.
@@ -672,6 +688,8 @@ impl Drop for Sandbox {
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+        // The connection's background master stays for ten minutes.
+        self.drop_ssh_master();
         // One that is left has lost what it forwards for (its sshd is gone before
         // it noticed its container was) and would wait minutes to give up: no test
         // leaves a process behind.

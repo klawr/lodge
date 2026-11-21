@@ -17,6 +17,7 @@ use super::{
     Child, Host, Job, Line, Ran, Repeat, RetryPolicy, Stream, run_interactive, run_process,
     start_process,
 };
+use crate::output::note;
 use crate::shell::shell_quote;
 
 /// A host reached with `ssh <destination>`: a `~/.ssh/config` alias, `user@host`,
@@ -104,6 +105,15 @@ fn control_path(remote: &str) -> PathBuf {
     dir.join(format!("{:x}.sock", hasher.finish()))
 }
 
+/// Where ssh's own debug output for `remote` goes with `--verbose`, beside the
+/// control socket. Not to the terminal: the connection's background master
+/// keeps a stderr that debug output goes to open for as long as it lives, and
+/// whoever waits for the end of a captured stderr (ours, for every command)
+/// would wait as long.
+fn debug_log(remote: &str) -> PathBuf {
+    control_path(remote).with_extension("log")
+}
+
 /// The `ssh` invocation for `remote` with the port (from a `host:port`
 /// destination), connection multiplexing and `--verbose` flags applied. Returns
 /// the destination separately: ssh options must precede it, so a caller adds
@@ -130,6 +140,7 @@ fn base(remote: &str) -> (Command, String) {
     let v = crate::output::verbosity().min(3);
     if v > 0 {
         c.arg(format!("-{}", "v".repeat(v as usize)));
+        c.arg("-E").arg(debug_log(remote));
     }
     (c, dest)
 }
@@ -161,10 +172,56 @@ fn tunnel(remote: &str, local: u16, to: &str) -> Command {
         "-o",
         "ExitOnForwardFailure=yes",
         "-L",
-        &format!("{local}:{to}"),
+        &forward_spec(local, to),
     ])
     .arg(dest);
     c
+}
+
+/// The forward `local` to `to` as `-L` takes it.
+fn forward_spec(local: u16, to: &str) -> String {
+    format!("{local}:{to}")
+}
+
+/// Asks the shared connection to `remote` to stop forwarding `local` to `to`.
+/// A forward requested through the connection by a tunnel process lives in the
+/// connection, not in that process, so ending the process leaves the local port
+/// bound for as long as the connection lives.
+fn cancel_forward(remote: &str, local: u16, to: &str) -> Command {
+    let (mut c, dest) = base(remote);
+    c.args(["-O", "cancel", "-L", &forward_spec(local, to)])
+        .arg(dest)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    c
+}
+
+/// A tunnel process, and the forward it asked the shared connection for: ending
+/// the tunnel also ends the forward, so the port is free for the next one.
+struct Tunnel {
+    process: Box<dyn Child>,
+    remote: String,
+    local: u16,
+    to: String,
+}
+
+impl Child for Tunnel {
+    fn kill(&mut self) -> std::io::Result<()> {
+        let killed = self.process.kill();
+        // There may be no connection left to ask, or the forward may be gone
+        // with it: nothing to undo then.
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "the connection may be gone, and the forward with it"
+        )]
+        let _ = cancel_forward(&self.remote, self.local, &self.to).status();
+        killed
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.process.try_wait()
+    }
 }
 
 /// A command that keeps `remote_command` running on `remote` until killed. A
@@ -225,6 +282,12 @@ fn drop_master(remote: &str) {
 /// rides on it. Runs a no-op remote command and leaves the master in the
 /// background (`ControlPersist`); a connection that is down is retried.
 fn connect(remote: &str) -> anyhow::Result<()> {
+    if crate::output::verbosity() > 0 {
+        note!(
+            "ssh's own debug output is in {}",
+            debug_log(remote).display()
+        );
+    }
     let out = crate::host::attempt(&SshHost::new(remote), Repeat::Safe, || {
         let (mut c, dest) = base(remote);
         // Prompts are read from the terminal, not stdin, so ssh's stderr can be
@@ -374,7 +437,16 @@ impl Host for SshHost {
         to: &str,
         chatter: Stream,
     ) -> Option<std::io::Result<Box<dyn Child>>> {
-        Some(start_process(tunnel(&self.remote, local, to), chatter))
+        Some(
+            start_process(tunnel(&self.remote, local, to), chatter).map(|process| {
+                Box::new(Tunnel {
+                    process,
+                    remote: self.remote.clone(),
+                    local,
+                    to: to.to_string(),
+                }) as Box<dyn Child>
+            }),
+        )
     }
 
     fn spawn(&self, argv: &[&str], chatter: Stream) -> std::io::Result<Box<dyn Child>> {
@@ -481,12 +553,33 @@ mod tests {
     }
 
     #[test]
+    fn the_connections_debug_output_goes_to_a_file_beside_its_socket() {
+        let socket = control_path("user@host");
+        let log = debug_log("user@host");
+        assert_eq!(log.parent(), socket.parent());
+        assert_eq!(log.extension().and_then(|e| e.to_str()), Some("log"));
+        assert_eq!(log.file_stem(), socket.file_stem());
+    }
+
+    #[test]
     fn a_tunnel_forwards_the_local_port_to_the_target() {
         let a = args(&tunnel("host", 8080, "172.18.0.5:80"));
         let l = a.iter().position(|x| x == "-L").unwrap();
         assert_eq!(a[l + 1], "8080:172.18.0.5:80");
         assert_eq!(a.last().unwrap(), "host", "the destination comes last");
         assert!(a.contains(&"ExitOnForwardFailure=yes".to_string()));
+    }
+
+    #[test]
+    fn ending_a_tunnel_cancels_the_same_forward_in_the_shared_connection() {
+        let up = args(&tunnel("user@host:2222", 8080, "172.18.0.5:80"));
+        let cancel = args(&cancel_forward("user@host:2222", 8080, "172.18.0.5:80"));
+        assert_eq!(&cancel[..2], ["-p", "2222"], "the same connection");
+        let o = cancel.iter().position(|x| x == "-O").unwrap();
+        assert_eq!(cancel[o + 1], "cancel");
+        let spec = |a: &[String]| a[a.iter().position(|x| x == "-L").unwrap() + 1].clone();
+        assert_eq!(spec(&cancel), spec(&up), "the forward that was asked for");
+        assert_eq!(cancel.last().unwrap(), "user@host");
     }
 
     #[test]

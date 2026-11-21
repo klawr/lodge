@@ -281,7 +281,10 @@ does behind the `Host` trait. Four things make it work:
   answered once, with the terminal available) and every later call is
   multiplexed over its `ControlMaster` socket, one per destination, with
   `ServerAliveInterval=15` so a dead link fails in about 45 s instead of
-  hanging.
+  hanging. A tunnel's forward lives in that connection, not in the tunnel's
+  process, so `SshHost` hands out a tunnel that also cancels its forward
+  (`ssh -O cancel`) when it is stopped; otherwise the local port stays bound
+  until the connection ends.
 - **Lost connections and repeat-safety.** ssh exiting 255 says the connection
   failed, not whether the remote command ran, so a step is rerun only if it is
   safe to run twice. Every remote step says which it is: `Repeat::Safe` (reads
@@ -497,7 +500,8 @@ erode.
   Every message line gets the `[lodge]` prefix, including continuation lines of
   a multi-line message, so call sites write plain text. `--verbose` also traces
   every command lodge spawns, in shell-pasteable form; `-vv` / `-vvv` pass `-v`
-  to ssh. Reports and questions belong to `cmd/`. *Enforced:* clippy denies
+  to ssh, whose debug output goes to a file beside the connection's socket (`-E`), because
+  a background master would keep a captured terminal stream open. Reports and questions belong to `cmd/`. *Enforced:* clippy denies
   `println!` and friends outside `output.rs`.
 - **Every dependency is injected.** The way a machine is reached is a `Host`, the
   engine a `Runtime`, and only `cmd/` (the composition root, `cmd::run`) names a

@@ -45,7 +45,9 @@ stopped. A dead forwarded port is restarted with a growing wait, up to a minute.
 Rejected logins and host-key failures are not retried.
 
 If something fails, run with `-v` to see each command, and `-vv`/`-vvv` for ssh's
-own debug output.
+own debug output. That goes to a file beside the connection's socket (`ldg` says
+where), not to the terminal: the connection's background process would keep the
+terminal's output open for as long as it lives.
 
 From a machine that isn't your Linux workstation (a CI runner, or WSL2 on Windows),
 combine `--remote` with a bundle: see [Bundles and secrets](bundles-and-secrets.md).

@@ -1353,6 +1353,62 @@ fn forwards_wait_for_a_login_after_the_link_is_lost_and_return_when_it_is_given(
     assert!(daemon.running());
 }
 
+#[test]
+#[ignore = "needs docker"]
+fn a_forwarded_port_is_free_again_once_its_forward_ends() {
+    let mut sb = Sandbox::new();
+    let host = sb.use_real_sshd();
+    let port = free_port();
+    let p = sb
+        .project(
+            "freeport",
+            &json(&format!(
+                r#"{{ "image": "@IMAGE@", "forwardPorts": [{port}] }}"#
+            )),
+        )
+        .remote_via(host.dest());
+    p.up();
+    assert!(
+        wait_until(8, || !listeners(port).is_empty()),
+        "the tunnel never came up"
+    );
+
+    // The daemon ends with its container and stops its forwards. The shared
+    // connection outlives it (ten minutes), and a forward asked of it lives in
+    // it, so the port stays bound unless the forward is cancelled.
+    assert!(p.ldg("rm", &[]).ok);
+    assert!(
+        wait_until(15, || listeners(port).is_empty()),
+        "the port is still bound after its forward ended"
+    );
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn a_verbose_run_over_a_new_ssh_connection_finishes_and_keeps_ssh_debug_output_in_a_file() {
+    let mut sb = Sandbox::new();
+    let host = sb.use_real_sshd();
+    // The first command opens the connection, whose background master keeps any
+    // stderr that ssh's debug output goes to open for as long as it lives.
+    let out = sb.run_within(
+        30,
+        &["--remote", host.dest(), "-vvv", "completions", "bash"],
+    );
+    assert!(out.ok, "it hung or failed:\n{}", out.tail(15));
+    let logs: Vec<std::path::PathBuf> = std::fs::read_dir(sb.root().join("tmp/lodge-ssh"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "log"))
+        .collect();
+    assert!(!logs.is_empty(), "no ssh debug log was written");
+    let text = std::fs::read_to_string(&logs[0]).unwrap();
+    assert!(text.contains("debug1"), "{text}");
+    assert!(
+        !out.text.contains("debug1"),
+        "ssh's debug output went to the terminal"
+    );
+}
+
 /// A plain host: lodge injects into the machine itself, as the user, and never
 /// overwrites that user's own files.
 fn plain_host_round_trip(sb: &Sandbox, remote: Option<&str>) {
