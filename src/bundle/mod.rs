@@ -8,7 +8,7 @@
 //!
 //! - [`manifest`]: what a bundle contains, and the rules it must obey
 //! - [`archive`]: writing, reading and verifying the tar
-//! - [`pack`]: building a bundle from the user's config (`deps` parses `ldd`,
+//! - [`pack`]: building a bundle from the user's config (`deps` remembers what a `DepReader` said,
 //!   `elf` reads a binary's architecture)
 //! - [`arch`]: CPU architectures, as bundles, binaries and machines name them
 //! - [`source`]: readying a bundle directory to inject from

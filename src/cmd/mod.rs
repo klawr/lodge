@@ -27,6 +27,7 @@ use crate::config::Config;
 use crate::host::{HostRef, LocalHost, SshHost};
 use crate::runtime::docker::DockerCli;
 use crate::runtime::{Engine, Runtime};
+use crate::tools::{Ldd, Oras, Patchelf, Toolchain};
 
 /// Which engine this run drives: `--engine`, else `engine` in the config file,
 /// else docker. A command that never touches an engine (`init`, the generated
@@ -57,12 +58,14 @@ fn build_engine(kind: Engine, host: HostRef) -> Box<dyn Runtime> {
     }
 }
 
-/// What every command works with: the host the project is on, the engine on it
-/// and where the config is. Built once, in [`run`], which is the only place that
+/// What every command works with: the host the project is on, the engine on it,
+/// the helper tools and where the config is. Built once, in [`run`], which is the only place that
 /// chooses an implementation of either; everything below takes the interfaces.
 pub struct Ctx {
     pub host: HostRef,
     pub rt: Box<dyn Runtime>,
+    /// The helper programs, for packing a bundle and fetching features.
+    pub tools: Toolchain,
     pub config_path: PathBuf,
 }
 
@@ -92,6 +95,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
     // The composition root: the one place that picks how the project's machine
     // is reached and which engine runs on it. Each is an interface everything
     // else takes; a new way of reaching a machine or a new engine is one more arm.
+    // The helper tools (`ldd`, `patchelf`, `oras`) are chosen here too.
     let host: HostRef = match cli.remote {
         Some(remote) => Arc::new(SshHost::new(remote)),
         None => Arc::new(LocalHost),
@@ -106,6 +110,11 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
     let engine = choose_engine(cli.engine, &cli.command, &config_path)?;
     let ctx = Ctx {
         rt: build_engine(engine, host.clone()),
+        tools: Toolchain {
+            deps: Box::new(Ldd),
+            elf: Box::new(Patchelf),
+            oci: Box::new(Oras),
+        },
         host,
         config_path,
     };

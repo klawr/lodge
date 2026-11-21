@@ -16,6 +16,7 @@ use crate::host::Host;
 use crate::output::{info, plural, warning};
 use crate::runtime::{ContainerUser, Env, ExecOpts, User};
 use crate::tmpfile::TempDir;
+use crate::tools::OciFetcher;
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -84,6 +85,8 @@ pub struct Context<'a> {
     pub base_dir: &'a Path,
     /// The project's host, where local features are read from.
     pub host: &'a dyn Host,
+    /// Where registry features are pulled from.
+    pub oci: &'a dyn OciFetcher,
 }
 
 /// A user an install script is told about. Falls back to root when the
@@ -168,9 +171,9 @@ impl Plan {
     }
 }
 
-/// Fetches and orders the given features (pulling OCI artifacts with `oras`,
-/// reading local-path features from the project's host). Returns an empty plan
-/// if there's nothing to do or `oras` is needed but missing.
+/// Fetches and orders the given features (pulling OCI artifacts through
+/// `ctx.oci`, reading local-path features from the project's host). Returns an
+/// empty plan if there's nothing to do or the registry tool is needed but missing.
 pub fn resolve(
     ctx: &Context,
     features: &[FeatureRequest],
@@ -180,10 +183,10 @@ pub fn resolve(
         return Ok(Plan::default());
     }
     if features.iter().any(|f| !is_local_ref(&f.reference))
-        && crate::host_tools::ORAS.find().is_none()
+        && let Err(e) = ctx.oci.check()
     {
         warning!(
-            "devcontainer features need `oras` (https://oras.land); skipping {}",
+            "{e:#}; skipping {}",
             plural(features.len(), "feature", "features")
         );
         return Ok(Plan::default());

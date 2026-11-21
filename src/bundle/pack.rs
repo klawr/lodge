@@ -20,13 +20,19 @@ use crate::layout;
 use crate::output::warning;
 use crate::shell::is_plain_name;
 use crate::tmpfile::{TempDir, TempFile, discard_file};
+use crate::tools::{ElfEditor, Toolchain};
 use crate::tree::{self, Denied, Links};
 
 /// Packs `config` into a bundle file at `output`. The file appears only when it is
 /// complete: it is written beside the destination and renamed into place.
-pub fn pack_to_file(config: &Config, output: &Path) -> Result<Manifest> {
+pub fn pack_to_file(config: &Config, output: &Path, tools: &Toolchain) -> Result<Manifest> {
     let scratch = TempDir::new("pack")?;
-    let manifest = build(config, scratch.path(), &mut deps::Resolver::default())?;
+    let manifest = build(
+        config,
+        scratch.path(),
+        &mut deps::Resolver::new(tools.deps.as_ref()),
+        tools.elf.as_ref(),
+    )?;
 
     let partial = PathBuf::from(format!("{}.partial", output.display()));
     let written = std::fs::File::create(&partial)
@@ -44,8 +50,14 @@ pub fn pack_to_file(config: &Config, output: &Path) -> Result<Manifest> {
 }
 
 /// Builds the bundle's directory layout and manifest in `dir`. `deps` answers
-/// which libraries a binary needs (and remembers what it was asked before).
-pub fn build(config: &Config, dir: &Path, deps: &mut deps::Resolver) -> Result<Manifest> {
+/// which libraries a binary needs (and remembers what it was asked before), and
+/// `elf` relinks the binaries that have some.
+pub fn build(
+    config: &Config,
+    dir: &Path,
+    deps: &mut deps::Resolver<'_>,
+    elf: &dyn ElfEditor,
+) -> Result<Manifest> {
     let host = Arch::host()?;
     for sub in [BIN_DIR, LIB_DIR, CONFIG_DIR] {
         std::fs::create_dir_all(dir.join(sub))?;
@@ -53,6 +65,7 @@ pub fn build(config: &Config, dir: &Path, deps: &mut deps::Resolver) -> Result<M
     let mut packer = Packer {
         dir,
         deps,
+        editor: elf,
         host,
         libs: BTreeMap::new(),
         linker: None,
@@ -69,9 +82,10 @@ pub fn build(config: &Config, dir: &Path, deps: &mut deps::Resolver) -> Result<M
     Ok(manifest)
 }
 
-struct Packer<'a> {
+struct Packer<'a, 'r> {
     dir: &'a Path,
-    deps: &'a mut deps::Resolver,
+    deps: &'a mut deps::Resolver<'r>,
+    editor: &'a dyn ElfEditor,
     host: Arch,
     /// Bundled libraries: file name to content hash.
     libs: BTreeMap<String, String>,
@@ -79,7 +93,7 @@ struct Packer<'a> {
     tools: Vec<Tool>,
 }
 
-impl Packer<'_> {
+impl Packer<'_, '_> {
     fn add(&mut self, item: &Injectable) -> Result<()> {
         // `Config::parse` checks this too; a `Config` built in code may not
         // have been, and the name becomes a path in the bundle.
@@ -126,7 +140,7 @@ impl Packer<'_> {
                         format!("{name} is dynamic but ldd named no dynamic linker")
                     })?;
                 self.add_libs(&deps.libs, &linker, name)?;
-                let patched = patch_binary(&path)?;
+                let patched = patch_binary(&path, self.editor)?;
                 std::fs::copy(patched.path(), &dst)
                     .with_context(|| format!("copying the relinked {name}"))?;
                 dynamic = true;
@@ -273,7 +287,7 @@ fn sensitive_reason(path: &Path, home: Option<&Path>) -> Option<&'static str> {
 }
 
 /// Relinks a copy of `binary` so that, once injected, it runs *directly* against
-/// the bundled glibc, with `patchelf`:
+/// the bundled glibc, with an [`ElfEditor`] (`patchelf`, today):
 ///
 /// - `--set-interpreter <placeholder>`: a path that fills the space reserved for
 ///   the interpreter ([`elf::INTERP_CAPACITY`]); injection overwrites it in place
@@ -290,31 +304,16 @@ fn sensitive_reason(path: &Path, home: Option<&Path>) -> Option<&'static str> {
 /// subprocesses it spawns (git, shells, LSPs) on the container's own glibc.
 /// patchelf copes even when there is no slack in the original `.dynstr` and
 /// `.dynamic`, which is the common case for real binaries.
-pub(crate) fn patch_binary(binary: &str) -> Result<TempFile> {
+pub(crate) fn patch_binary(binary: &str, editor: &dyn ElfEditor) -> Result<TempFile> {
     let data = std::fs::read(binary).with_context(|| format!("reading {binary} to patch"))?;
     let stem = Path::new(binary).file_name().map_or_else(
         || "binary".to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
     let tmp = TempFile::write(&format!("lodge-patched-{stem}"), &data)?;
-
-    let mut cmd = crate::host_tools::PATCHELF.command();
-    cmd.arg("--set-interpreter")
-        .arg(elf::placeholder_interpreter())
-        .arg("--force-rpath")
-        .arg("--set-rpath")
-        .arg(ORIGIN_RPATH)
-        .arg(tmp.path());
-    crate::output::trace(&cmd);
-    let status = cmd.status().with_context(|| {
-        format!(
-            "running patchelf, which relinks dynamically linked binaries: {}",
-            crate::host_tools::PATCHELF.hint
-        )
-    })?;
-    if !status.success() {
-        bail!("patchelf failed to patch {binary}");
-    }
+    editor
+        .relink(tmp.path(), &elf::placeholder_interpreter(), ORIGIN_RPATH)
+        .with_context(|| format!("relinking {binary}"))?;
     Ok(tmp)
 }
 
@@ -322,6 +321,7 @@ pub(crate) fn patch_binary(binary: &str) -> Result<TempFile> {
 mod tests {
     use super::*;
     use crate::config::Injectable;
+    use crate::tools::{self, Ldd, Patchelf};
 
     fn script_tool(dir: &Path, name: &str) -> Injectable {
         let bin = dir.join(format!("{name}-src"));
@@ -358,7 +358,7 @@ mod tests {
 
         let out = TempDir::new("pack-out").unwrap();
         let file = out.path().join("b.tar");
-        let manifest = pack_to_file(&config_with(vec![tool]), &file).unwrap();
+        let manifest = pack_to_file(&config_with(vec![tool]), &file, &tools::external()).unwrap();
 
         let tool = &manifest.tools[0];
         assert_eq!(tool.name, "hello");
@@ -390,12 +390,62 @@ mod tests {
         let manifest = build(
             &config_with(vec![tool]),
             out.path(),
-            &mut deps::Resolver::default(),
+            &mut deps::Resolver::new(&Ldd),
+            &Patchelf,
         )
         .unwrap();
         assert_eq!(
             manifest.tools[0].binary.as_ref().unwrap().dest.as_deref(),
             Some("~/.local/bin/hello")
+        );
+    }
+
+    /// An editor that only records what it was asked to do.
+    struct Recording(std::cell::RefCell<Vec<(PathBuf, String, String)>>);
+
+    impl ElfEditor for Recording {
+        fn relink(&self, file: &Path, interpreter: &str, rpath: &str) -> Result<()> {
+            self.0
+                .borrow_mut()
+                .push((file.to_path_buf(), interpreter.into(), rpath.into()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_binary_is_relinked_as_a_copy_with_the_placeholder_interpreter_and_origin_rpath() {
+        let dir = TempDir::new("relink").unwrap();
+        let binary = dir.path().join("tool");
+        std::fs::write(&binary, "original").unwrap();
+        let editor = Recording(Default::default());
+        let copy = patch_binary(&binary.to_string_lossy(), &editor).unwrap();
+        let calls = editor.0.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, copy.path());
+        assert_ne!(calls[0].0, binary, "the original is never edited");
+        assert_eq!(calls[0].1, elf::placeholder_interpreter());
+        assert_eq!(calls[0].2, ORIGIN_RPATH);
+        assert_eq!(std::fs::read_to_string(&binary).unwrap(), "original");
+    }
+
+    #[test]
+    fn an_editor_that_fails_fails_the_pack_naming_the_binary() {
+        struct Failing;
+        impl ElfEditor for Failing {
+            fn relink(&self, _: &Path, _: &str, _: &str) -> Result<()> {
+                bail!("no editor here")
+            }
+        }
+        let dir = TempDir::new("relink-fail").unwrap();
+        let binary = dir.path().join("tool");
+        std::fs::write(&binary, "x").unwrap();
+        let err = patch_binary(&binary.to_string_lossy(), &Failing)
+            .err()
+            .unwrap();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("tool") && text.contains("no editor here"),
+            "{text}"
         );
     }
 
@@ -409,7 +459,7 @@ mod tests {
         let Ok(sh) = std::fs::canonicalize("/bin/sh") else {
             return;
         };
-        if deps::Resolver::default()
+        if deps::Resolver::new(&Ldd)
             .resolve(&sh.to_string_lossy())
             .is_ok_and(|d| d.is_empty())
         {
@@ -421,7 +471,8 @@ mod tests {
         let manifest = build(
             &config_with(vec![tool]),
             out.path(),
-            &mut deps::Resolver::default(),
+            &mut deps::Resolver::new(&Ldd),
+            &Patchelf,
         )
         .unwrap();
         assert!(manifest.tools[0].binary.as_ref().unwrap().dynamic);
@@ -451,8 +502,8 @@ mod tests {
         let cfg = config_with(vec![tool]);
         let a = TempDir::new("id-a").unwrap();
         let b = TempDir::new("id-b").unwrap();
-        let ma = build(&cfg, a.path(), &mut deps::Resolver::default()).unwrap();
-        let mb = build(&cfg, b.path(), &mut deps::Resolver::default()).unwrap();
+        let ma = build(&cfg, a.path(), &mut deps::Resolver::new(&Ldd), &Patchelf).unwrap();
+        let mb = build(&cfg, b.path(), &mut deps::Resolver::new(&Ldd), &Patchelf).unwrap();
         assert_eq!(ma.id(), mb.id());
     }
 
@@ -464,7 +515,8 @@ mod tests {
         let err = build(
             &config_with(vec![tool]),
             out.path(),
-            &mut deps::Resolver::default(),
+            &mut deps::Resolver::new(&Ldd),
+            &Patchelf,
         )
         .unwrap_err()
         .to_string();
@@ -482,7 +534,8 @@ mod tests {
             build(
                 &config_with(vec![tool]),
                 out.path(),
-                &mut deps::Resolver::default()
+                &mut deps::Resolver::new(&Ldd),
+                &Patchelf
             )
             .unwrap_err()
         );
@@ -513,7 +566,8 @@ mod tests {
         let err = build(
             &config_with(vec![tool]),
             out.path(),
-            &mut deps::Resolver::default(),
+            &mut deps::Resolver::new(&Ldd),
+            &Patchelf,
         )
         .unwrap_err()
         .to_string();

@@ -14,7 +14,7 @@ pub fn pack(ctx: &Ctx, output: Option<PathBuf>) -> Result<()> {
         Some(o) => o,
         None => PathBuf::from(bundle::default_file_name()?),
     };
-    let manifest = bundle::pack::pack_to_file(&config, &output)?;
+    let manifest = bundle::pack::pack_to_file(&config, &output, &ctx.tools)?;
     info!(
         "packed {} and {} for {} into {} (id {})",
         plural(manifest.tools.len(), "tool", "tools"),

@@ -28,6 +28,7 @@ mod secret;
 mod session;
 mod shell;
 mod tmpfile;
+mod tools;
 mod tree;
 
 use clap::Parser;

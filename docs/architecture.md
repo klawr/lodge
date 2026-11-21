@@ -60,14 +60,15 @@ every subcommand.
 | `cmd/` | One file per group of commands (`attach`: up/exec, `project`: down/status/rm/ls/ports/logs/clean, `doctor`, `init`, `bundle`: pack/bundle/cache), plus `prompt`, the terminal side of `devcontainer::Prompt`. The only layer that loads the config, prints reports and reads the terminal. |
 | `config/` | The user's `config.toml`: `[[inject]]`, `[session]`, `[git]`, `[[secret]]` (its declaration types are in `config/secret.rs`: `RawSecret` as written, `SecretDecl` once checked), `bundle`, `engine` (also readable on its own with `engine_setting`, because the engine is chosen before a command loads the config). Unknown keys and wrong types are errors (with a "did you mean"); past those, every problem, secrets included, is reported at once. A relative `bundle =` resolves against the file's folder. The JSON schema in `docs/config.schema.json` is generated from these types. |
 | `devcontainer/` | Everything about running a `devcontainer.json` (see below). |
-| `bundle/` | A bundle is a portable tar of relinked binaries, their libraries and configs, with a manifest, and is tied to no install prefix (see "Injection"). `manifest` defines and validates it (paths derive from names, so a bundle can't point outside itself), `archive` writes, reads and verifies the tar, `pack` builds one from the config (the only step needing `patchelf`; `deps` parses `ldd`, asking it once per binary however often the answer is needed, `elf` reads a binary's architecture, as an `arch::Arch`, the one name for a CPU that bundles, binaries and machines are compared by, and `Arch::host()` is this machine's, and writes the interpreter of a dynamic binary in place), `source` readies a bundle *directory* to inject from (extracted from a file, or packed live), keyed by the file's hash or a fingerprint of the live inputs, and `cache` keeps those directories under `~/.cache/lodge/bundles/`. `hash` is the content hash of a file or tree. |
+| `bundle/` | A bundle is a portable tar of relinked binaries, their libraries and configs, with a manifest, and is tied to no install prefix (see "Injection"). `manifest` defines and validates it (paths derive from names, so a bundle can't point outside itself), `archive` writes, reads and verifies the tar, `pack` builds one from the config (the only step needing a relinker; `deps` asks a `DepReader` once per binary however often the answer is needed, `elf` reads a binary's architecture, as an `arch::Arch`, the one name for a CPU that bundles, binaries and machines are compared by, and `Arch::host()` is this machine's, and writes the interpreter of a dynamic binary in place), `source` readies a bundle *directory* to inject from (extracted from a file, or packed live), keyed by the file's hash or a fingerprint of the live inputs, and `cache` keeps those directories under `~/.cache/lodge/bundles/`. `hash` is the content hash of a file or tree. |
 | `inject/` | Copies a bundle's binaries, libraries and configs into a container for one `ContainerUser`, reading only from the bundle directory and acting *as that user* (through `runtime::Acting`), so it never needs root: `prefix` (chooses and checks the prefix: the user's home, else a private `/tmp` directory; `installed`, in `state`, finds where it was installed), `binary` (rewrites a dynamic binary's interpreter for the prefix, and writes the wrapper a config asked for), `libs` (tracked by content hash), `config_files`, `git` (`safe.directory`), `installed` (a hash and the destination per installed piece; a record that can't be read means that piece is installed again, and the list of records `ldg clean` works from is an error when it can't be read, not "nothing installed"), `state` (the installed bundle id, and `installed`, which finds what was injected and where), `remove` (`ldg clean`; placed secrets are removed by `secret::place::clear`). |
 | `layout.rs` | Every path lodge writes inside a container: `Layout`, the paths inside the user's prefix (the table under "What lives where"); the provisioning state, which is the devcontainer's own and root-owned; and the secrets directory. Nothing else spells these paths out. |
 | `secret/` | Secrets that must not be in a bundle. Their `[[secret]]` declarations are config (`config/secret.rs`: validated; names reach shell scripts). `mod` is the `Secret` value type (redacted `Debug`, no `Display`), matching `targets` globs, and `resolve` (env, file or a command run on *this* machine with a timeout, with errors that never contain the value). `place` writes values into a container under `/dev/shm/lodge-secrets-<uid>/` and builds the session lines that export them; `clear` removes the user's (`ldg clean`). `deliver` picks the secrets whose `targets` match, resolves and places them (or clears them when none are declared), and prints names only. |
 | `session/` | Opens the interactive session: `docker exec -it`, and nothing around it; after a lost `--remote` connection it offers to reconnect. Its start-up script (`startup_script`) starts the shell as a login shell, so the profile scripts run, then puts the user's prefix `bin/` first on `PATH` and restores what the profile dropped before running the shell interactively; that is how the injected tools reach the session without any file outside the prefix. `terminfo` makes the terminal the session is opened from work in the container (copies its entry from this machine into the prefix when the container lacks it, and sets `TERM`). |
 | `forward/` | Port forwarding. `mod` spawns the daemon and owns its state files (log, lock, and the ports file `ldg ports` reads, which starts with the daemon's pid so a dead daemon's file is ignored), `daemon` is the `_forward` loop (declared ports plus whatever starts listening), `tunnel` one forward: the in-process TCP proxy, or the tunnel process the `Host` provides (`ssh -L` for `SshHost`). The daemon decodes its own `--port` flags, re-points a forward when its destination's address changes (looked up again every 30 s), and exits when the container stops, not when the engine merely can't be reached for a while. |
 | `port.rs` | `PortForward`, a port to forward: what the devcontainer spec declares and the daemon carries out, so neither depends on the other. |
-| `host_tools.rs` | The helper programs lodge may run here (`ssh`, `ldd`, `patchelf`, `oras`): what each is needed for (a `Need`, which decides when `doctor` requires it) and how to get it. `doctor` reports from this table and each tool is started only through it. |
+| `tools/` | The build-time helpers behind interfaces: `DepReader` (which libraries a binary needs), `ElfEditor` (relink a copy of a binary for the bundle's prefix) and `OciFetcher` (pull a feature's layer), bundled as a `Toolchain` that `cmd::run` builds. `external` has the implementations that run the programs (`Ldd`, `Patchelf`, `Oras`, parsing `ldd`'s output); a native one is one more type. Packing, the bundle cache and feature fetching take the interfaces and are tested with fakes. |
+| `host_tools.rs` | The helper programs lodge may run here (`ssh`, `ldd`, `patchelf`, `oras`): what each is needed for (a `Need`, which decides when `doctor` requires it) and how to get it. `doctor` reports from this table and each tool is started only through it (the `tools` implementations and `host/ssh.rs`). |
 | `host/` | How a machine is reached. `mod` is the `Host` trait (a local process that runs a command on the host, one with a terminal, a tunnel, the connection hooks) with everything built on those provided: running a script, `read_first` (finds files by pattern and reads the first in one round trip), `read_file`, `canonical_dir`, `fetch_dir` (copies a folder from the project's host), `write_scratch`, `uid_gid`; and `attempt`, which reruns a step after a lost connection if it is marked `Repeat::Safe`. `local` is `LocalHost`, this machine. `ssh` is `SshHost`: `--remote` destination parsing, the shared connection (`connect` opens it up front with the terminal available, `ControlMaster` multiplexes everything after), and the few ssh invocations lodge needs, all built from one private `base`. |
 | `runtime/` | The seam to whatever runs the workload: the `Env`, `Container`, `Runtime` and `Compose` traits (see below), `User` (who a command runs as) and `ContainerUser` (the session user's name, uid, gid and home, looked up once), `Acting` (an `Env` seen as one user, below), `tarball` (packs files as a tar owned by a user), the docker CLI implementation (`docker/`: the engine, which runs on a `Host` it is given, the per-container `Env`, and the file-copy streaming), and strict in-memory fakes for tests (`FakeEnv`, and `FakeRuntime`, whose containers each run in one). |
 | `shell.rs` | POSIX `shell_quote`, which everything that builds a command string goes through; `script_argv`, how every script with arguments is started (`sh -c <script> sh <args…>`, so arguments are `$1`, `$2`, …); the rules for names written into scripts unquoted (`is_plain_name`, `is_var_name`) and for destinations in a container (`container_path_problem`); `slug` for container names; and `CmdLine`, a command as `sh -c` script or argv. |
@@ -356,7 +357,8 @@ implementation is one new type handed in at one place:
 | --- | --- | --- |
 | How a machine is reached | `host::Host` | `LocalHost`, `SshHost`; anything else that can run a command implements the two primitives |
 | The container engine | `runtime::Runtime`, `Compose`, `Container`, `Env` | `runtime::docker`, and the in-memory `FakeRuntime` for tests |
-| Helper tools and what is injected | `host_tools` (a registry) and `[[inject]]` data | multiplexers and other tools are injected like any other, never named in code |
+| The build-time helpers | `tools::DepReader`, `ElfEditor`, `OciFetcher` (a `Toolchain`) | `Ldd`, `Patchelf`, `Oras`; a test passes fakes |
+| What is injected | `[[inject]]` data | multiplexers and other tools are injected like any other, never named in code |
 
 The pieces compose instead of branching. The engine is built *on* a host
 (`DockerCli::new(host)`), so "docker over ssh" is the same engine with a different
@@ -374,7 +376,7 @@ removes it again.
 `--remote` and `--engine` (or `engine` in the config, `choose_engine`) are read once, in
 `cmd::run`, which is the composition root: the only place that picks `LocalHost` or `SshHost` and, with
 `build_engine`, the engine built on it (`DockerCli`, for `--engine docker`), then
-puts both in the `Ctx`. A child lodge (the forward daemon) is pointed at the same
+puts both in the `Ctx`, together with the `Toolchain` of helper tools it builds. A child lodge (the forward daemon) is pointed at the same
 pair through `Host::respawn_args` and `Runtime::respawn_args`. From there on nothing handles a bare `Option<String>`
 or matches on a kind of host. The command hands `&dyn Host` (or `HostRef`, where a
 backend keeps one) to whatever needs it (`devcontainer`, `forward`, `secret`,
@@ -388,8 +390,10 @@ proxy is used).
 To add a way of reaching machines (an ssh successor, `gh codespace ssh`, an
 agent), implement `Host` in a new file under `host/` and add one arm to the
 choice in `cmd::run`. To add an engine, implement `Runtime` (and `Env`,
-`Container`) under `runtime/`, add a variant to `cli::Engine` and an arm to
-`cmd::build_engine`. Nothing else changes, and
+`Container`) under `runtime/`, add a variant to `runtime::Engine` and an arm to
+`cmd::build_engine`. To replace a helper tool (a native OCI client, a built-in ELF
+writer), implement `OciFetcher` or `ElfEditor` in `tools/` and swap it in the
+`Toolchain` that `cmd::run` builds. Nothing else changes, and
 `conventions.rs` fails if anything else starts to name the new type.
 
 ## Conventions
@@ -416,21 +420,22 @@ erode.
   interface. No code matches on a kind of host or engine or compares one's name:
   it asks a capability (see "Hosts and injection"). Each interface has a fake or
   a test host, so a branch is tested without docker, ssh or a network.
-  *Enforced:* `conventions.rs` fails if a concrete host or engine is named
+  *Enforced:* `conventions.rs` fails if a concrete host, engine or tool is named
   outside its own module and `cmd/`.
 - **One place per external program.** `ssh` is started only in `host/ssh.rs`;
   `docker` is never started directly: `runtime/docker/` asks its `Host` to run it,
   and no other module spells it out; a local `sh` only in `host/local.rs` (scripts
   on this machine as the project's host) and `secret/` (a secret's `command`
   source, which is on this machine whatever the host); and the helper tools
-  (`ldd`, `patchelf`, `oras`) only through `host_tools`. lodge never runs a local
+  (`ldd`, `patchelf`, `oras`) only in `tools/external.rs`, through `host_tools`,
+  behind `DepReader`, `ElfEditor` and `OciFetcher`. lodge never runs a local
   `tar`; tar streams are built and unpacked in-process. `host/ssh.rs` builds
   every `ssh` command from one private `base`. *Enforced:* the tests in
   `conventions.rs`.
 - **Dependencies point one way.** `cmd/` on top (the only layer that knows
   `cli`), lodge's features below it (`config`, `devcontainer`, `bundle`,
   `inject`, `secret`, `session`, `forward`), and a foundation (`runtime`,
-  `host`, `shell`, `layout`, `output`, `tmpfile`, `tree`,
+  `host`, `tools`, `shell`, `layout`, `output`, `tmpfile`, `tree`,
   `fingerprint`, `host_tools`, `port`) that names none of them. *Enforced:* the
   tests in `conventions.rs`.
 - **Paths in the container** come from `layout.rs`; **the container user** is a

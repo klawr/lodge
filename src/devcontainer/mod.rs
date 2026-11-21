@@ -37,6 +37,7 @@ use std::path::Path;
 use crate::host::HostRef;
 use crate::port::PortForward;
 use crate::runtime::{Container, Env, Runtime};
+use crate::tools::OciFetcher;
 use drift::{config_state, hash_inputs, write_hash};
 use lifecycle::{Hook, HookCtx, exec_env, run_create_hooks, run_in_container, run_on_host};
 use profile::write_env_profile;
@@ -86,12 +87,13 @@ impl Started {
 }
 
 /// Brings up the devcontainer of `project_path`, whose files are on `host`
-/// (where the engine `rt` runs too).
+/// (where the engine `rt` runs too); registry features are pulled with `oci`.
 pub fn start(
     project_path: &Path,
     host: &HostRef,
     build: bool,
     rt: &dyn Runtime,
+    oci: &dyn OciFetcher,
     prompt: &dyn Prompt,
 ) -> Result<Started> {
     let (spec, existing) = locate(project_path, host, rt)?;
@@ -119,6 +121,7 @@ pub fn start(
     let features_ctx = features::Context {
         base_dir: &spec.base_dir,
         host: host.as_ref(),
+        oci,
     };
 
     // A new container needs every feature, resolved up front so their
@@ -290,6 +293,7 @@ mod tests {
     use crate::host::local;
     use crate::runtime::fake::{FakeEnv, FakeRuntime};
     use crate::tmpfile::TempDir;
+    use crate::tools::NoRegistry;
 
     /// The prompt for a workspace that exists: nothing to choose.
     struct Nothing;
@@ -341,7 +345,7 @@ mod tests {
     fn a_new_container_is_created_and_records_its_config() {
         let dir = project(PLAIN);
         let rt = engine(&dir, false);
-        let started = start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
+        let started = start(dir.path(), &local(), false, &rt, &NoRegistry, &Nothing).unwrap();
         assert_eq!(started.workdir, "/w");
         assert!(started.created);
         assert!(
@@ -356,8 +360,8 @@ mod tests {
     fn an_unchanged_container_is_started_not_created() {
         let dir = project(PLAIN);
         let rt = engine(&dir, false);
-        start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
-        let again = start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
+        start(dir.path(), &local(), false, &rt, &NoRegistry, &Nothing).unwrap();
+        let again = start(dir.path(), &local(), false, &rt, &NoRegistry, &Nothing).unwrap();
         assert!(!again.created);
         let ops = rt.ops();
         assert_eq!(
@@ -372,11 +376,11 @@ mod tests {
     fn a_changed_config_is_reported_and_the_container_kept() {
         let dir = project(PLAIN);
         let rt = engine(&dir, false);
-        start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
+        start(dir.path(), &local(), false, &rt, &NoRegistry, &Nothing).unwrap();
         write_config(&dir, EDITED);
         assert_eq!(state(&dir, &rt), ConfigState::Changed);
 
-        let again = start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
+        let again = start(dir.path(), &local(), false, &rt, &NoRegistry, &Nothing).unwrap();
         assert!(!again.created);
         assert!(!rt.ops().iter().any(|o| o.starts_with("remove")));
         assert_eq!(state(&dir, &rt), ConfigState::Changed, "kept as it was");
@@ -386,7 +390,7 @@ mod tests {
     fn a_container_without_a_recorded_config_is_kept_and_reported_unknown() {
         let dir = project(PLAIN);
         let rt = engine(&dir, true);
-        let started = start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
+        let started = start(dir.path(), &local(), false, &rt, &NoRegistry, &Nothing).unwrap();
         assert!(!started.created, "not knowing is not drift");
         let ops = rt.ops();
         assert!(ops.len() == 1 && ops[0].starts_with("start "), "{ops:?}");
@@ -397,7 +401,7 @@ mod tests {
     fn a_stopped_container_whose_config_changed_is_still_noticed() {
         let dir = project(PLAIN);
         let rt = engine(&dir, false);
-        let started = start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
+        let started = start(dir.path(), &local(), false, &rt, &NoRegistry, &Nothing).unwrap();
         rt.stop(started.container.id()).unwrap();
         write_config(&dir, EDITED);
         // The fake refuses commands in a stopped container, so the record is
@@ -411,7 +415,7 @@ mod tests {
     fn build_recreates_the_container() {
         let dir = project(PLAIN);
         let rt = engine(&dir, true);
-        let started = start(dir.path(), &local(), true, &rt, &Nothing).unwrap();
+        let started = start(dir.path(), &local(), true, &rt, &NoRegistry, &Nothing).unwrap();
         assert!(started.created);
         let ops = rt.ops();
         assert!(
@@ -426,13 +430,13 @@ mod tests {
         let dir =
             project(r#"{"dockerComposeFile": "c.yml", "service": "app", "workspaceFolder": "/w"}"#);
         let rt = FakeRuntime::new(container);
-        let first = start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
+        let first = start(dir.path(), &local(), false, &rt, &NoRegistry, &Nothing).unwrap();
         assert!(
             first.container.id().ends_with("-app-1"),
             "{}",
             first.container.id()
         );
-        let again = start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
+        let again = start(dir.path(), &local(), false, &rt, &NoRegistry, &Nothing).unwrap();
         assert_eq!(again.container.id(), first.container.id());
         assert!(!again.created);
         assert_eq!(state(&dir, &rt), ConfigState::UpToDate);

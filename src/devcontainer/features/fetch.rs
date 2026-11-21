@@ -1,9 +1,9 @@
 //! Getting a feature's files onto this machine, so they can be copied into the
-//! container: OCI references are pulled with `oras`, local paths are read from
-//! the project's host (over SSH with `--remote`).
+//! container: OCI references are pulled through the context's `OciFetcher`,
+//! local paths are read from the project's host (over SSH with `--remote`).
 
 use super::{Context, FeatureMeta};
-use crate::host_tools;
+use crate::tools::OciFetcher;
 use anyhow::{Context as _, Result, bail};
 use std::path::{Path, PathBuf};
 
@@ -22,7 +22,7 @@ pub(super) fn fetch(ctx: &Context, reference: &str, work: &Path) -> Result<(Feat
             .fetch_dir(&ctx.base_dir.join(reference), work)
             .with_context(|| format!("reading local feature {reference}"))?
     } else {
-        pull(reference, work)?
+        pull(ctx.oci, reference, work)?
     };
     read_meta(&dir).map(|meta| (meta, dir))
 }
@@ -46,22 +46,17 @@ fn read_meta(dir: &Path) -> Result<FeatureMeta> {
     Ok(meta)
 }
 
-/// `oras pull` drops the feature's layer (a plain tar, per the features spec)
+/// The fetcher drops the feature's layer (a plain tar, per the features spec)
 /// into `work`; unpack it and return the directory holding `install.sh`.
-fn pull(reference: &str, work: &Path) -> Result<PathBuf> {
+fn pull(oci: &dyn OciFetcher, reference: &str, work: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(work)?;
-    let mut cmd = host_tools::ORAS.command();
-    cmd.args(["pull", reference]).current_dir(work);
-    crate::output::trace(&cmd);
-    let status = cmd.status().context("running oras pull")?;
-    if !status.success() {
-        bail!("oras pull failed for feature {reference}");
-    }
+    oci.pull(reference, work)
+        .with_context(|| format!("pulling feature {reference}"))?;
 
     let layer = std::fs::read_dir(work)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .find(|p| p.is_file())
-        .with_context(|| format!("oras pull produced no artifact for {reference}"))?;
+        .with_context(|| format!("pulling {reference} produced no artifact"))?;
     let content = work.join("content");
     unpack(&layer, &content).with_context(|| format!("unpacking feature {reference}"))?;
     Ok(content)
@@ -81,6 +76,61 @@ fn unpack(layer: &Path, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A registry that holds one feature, as a plain-tar layer.
+    struct OneFeature;
+
+    impl OciFetcher for OneFeature {
+        fn check(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn pull(&self, reference: &str, into: &Path) -> Result<()> {
+            assert_eq!(reference, "ghcr.io/x/feat:1");
+            let mut layer = tar::Builder::new(Vec::new());
+            let mut add = |name: &str, body: &str| {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(body.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                layer.append_data(&mut h, name, body.as_bytes()).unwrap();
+            };
+            add(
+                "devcontainer-feature.json",
+                r#"{"id": "feat", "version": "1.0.0"}"#,
+            );
+            add("install.sh", "#!/bin/sh\n");
+            std::fs::write(into.join("sha256-abc"), layer.into_inner().unwrap())?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_registry_feature_is_pulled_through_the_fetcher_and_unpacked() {
+        let work = crate::tmpfile::TempDir::new("pull-test").unwrap();
+        let ctx = Context {
+            base_dir: Path::new("/p/.devcontainer"),
+            host: &crate::host::LocalHost,
+            oci: &OneFeature,
+        };
+        let (meta, dir) = fetch(&ctx, "ghcr.io/x/feat:1", &work.path().join("0")).unwrap();
+        assert_eq!(meta.id, "feat");
+        assert!(dir.join("install.sh").is_file());
+    }
+
+    #[test]
+    fn a_fetcher_that_fails_fails_the_feature_with_its_reference() {
+        let work = crate::tmpfile::TempDir::new("pull-fail").unwrap();
+        let ctx = Context {
+            base_dir: Path::new("/p/.devcontainer"),
+            host: &crate::host::LocalHost,
+            oci: &crate::tools::NoRegistry,
+        };
+        let err = fetch(&ctx, "ghcr.io/x/feat:1", &work.path().join("0"))
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("ghcr.io/x/feat:1"), "{err:#}");
+    }
 
     #[test]
     fn distinguishes_local_refs() {

@@ -2,7 +2,7 @@
 //!
 //! Every dependency sits behind an interface and is injected: the way a machine
 //! is reached (`host::Host`), the container engine (`runtime::Runtime`), the
-//! helper tools. Each external program lodge runs on the user's behalf is started
+//! helper tools (`tools::DepReader`, `ElfEditor`, `OciFetcher`). Each external program lodge runs on the user's behalf is started
 //! from one place, and only the command layer chooses implementations. That
 //! keeps quoting, tracing, connection reuse and the local/remote decision in one
 //! spot instead of copied around, and makes a new implementation (another way of
@@ -80,9 +80,9 @@ fn local_shells_are_started_by_the_local_host_and_secrets_only() {
 
 #[test]
 fn only_the_command_layer_chooses_implementations() {
-    // The composition root (`cmd/`) builds the concrete host and engine; every
-    // other module takes `&dyn Host`, `HostRef` or `&dyn Runtime`, so swapping an
-    // implementation (or adding one) touches that one place.
+    // The composition root (`cmd/`) builds the concrete host, engine and tools;
+    // every other module takes `&dyn Host`, `HostRef`, `&dyn Runtime` or a tool
+    // trait, so swapping an implementation (or adding one) touches that one place.
     assert_eq!(
         files_containing(&["SshHost", "LocalHost"], &["host/", "cmd/"]),
         Vec::<String>::new()
@@ -92,6 +92,12 @@ fn only_the_command_layer_chooses_implementations() {
             &["DockerCli", "DockerContainer"],
             &["runtime/docker/", "cmd/"]
         ),
+        Vec::<String>::new()
+    );
+    // The helper tools, likewise: packing and feature fetching take `DepReader`,
+    // `ElfEditor` and `OciFetcher`, never the programs behind them.
+    assert_eq!(
+        files_containing(&["Ldd", "Patchelf", "Oras"], &["tools/", "cmd/"]),
         Vec::<String>::new()
     );
 }
@@ -169,6 +175,7 @@ const FOUNDATION: &[&str] = &[
     "port",
     "runtime",
     "shell",
+    "tools",
     "tmpfile",
     "tree",
 ];

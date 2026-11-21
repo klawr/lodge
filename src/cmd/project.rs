@@ -300,6 +300,7 @@ mod tests {
     use crate::devcontainer::Prompt;
     use crate::host::local;
     use crate::runtime::fake::{FakeEnv, FakeRuntime};
+    use crate::tools::NoRegistry;
 
     struct NoQuestions;
 
@@ -334,7 +335,7 @@ mod tests {
         dir: &crate::tmpfile::TempDir,
         rt: &FakeRuntime,
     ) -> Box<dyn crate::runtime::Container> {
-        devcontainer::start(dir.path(), &local(), false, rt, &NoQuestions)
+        devcontainer::start(dir.path(), &local(), false, rt, &NoRegistry, &NoQuestions)
             .unwrap()
             .container
     }

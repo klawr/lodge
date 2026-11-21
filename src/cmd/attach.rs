@@ -26,12 +26,13 @@ pub fn up(
     let project = ctx.project(path)?;
     let config = ctx.config()?;
     // Ready the bundle first, so a problem with it fails before anything starts.
-    let prepared = bundle::source::prepare(&config, bundle_file)?;
+    let prepared = bundle::source::prepare(&config, bundle_file, &ctx.tools)?;
     let started = devcontainer::start(
         &project,
         &ctx.host,
         build,
         ctx.rt.as_ref(),
+        ctx.tools.oci.as_ref(),
         &super::prompt::Terminal,
     )?;
     let container = started.container.as_ref();

@@ -26,6 +26,7 @@ use crate::bundle::arch::Arch;
 use crate::config::Config;
 use crate::fingerprint::Fingerprint;
 use crate::output::{info, warning};
+use crate::tools::Toolchain;
 use crate::tree::{self, Denied, Links};
 
 /// A bundle directory ready to inject from.
@@ -61,11 +62,16 @@ impl Prepared {
 
 /// Readies the bundle to inject from: `file` if given, else the config's
 /// `bundle`, else a live pack of the config.
-pub fn prepare(config: &Config, file: Option<&Path>) -> Result<Prepared> {
-    prepare_in(&cache::root()?, config, file)
+pub fn prepare(config: &Config, file: Option<&Path>, tools: &Toolchain) -> Result<Prepared> {
+    prepare_in(&cache::root()?, config, file, tools)
 }
 
-pub(crate) fn prepare_in(root: &Path, config: &Config, file: Option<&Path>) -> Result<Prepared> {
+pub(crate) fn prepare_in(
+    root: &Path,
+    config: &Config,
+    file: Option<&Path>,
+    tools: &Toolchain,
+) -> Result<Prepared> {
     let explicit = file
         .map(Path::to_path_buf)
         .or_else(|| config.bundle.clone());
@@ -76,7 +82,7 @@ pub(crate) fn prepare_in(root: &Path, config: &Config, file: Option<&Path>) -> R
             }
             from_file(root, &file)?
         }
-        None => live(root, config)?,
+        None => live(root, config, tools)?,
     };
     cache::prune(root, &prepared.dir);
 
@@ -107,9 +113,10 @@ fn from_file(root: &Path, file: &Path) -> Result<Prepared> {
     })
 }
 
-fn live(root: &Path, config: &Config) -> Result<Prepared> {
-    // Shared by the fingerprint and the pack, so `ldd` runs once per binary.
-    let mut deps = deps::Resolver::default();
+fn live(root: &Path, config: &Config, tools: &Toolchain) -> Result<Prepared> {
+    // Shared by the fingerprint and the pack, so the libraries of a binary are
+    // looked up once.
+    let mut deps = deps::Resolver::new(tools.deps.as_ref());
     let dir = root.join(format!("p-{}", inputs_fingerprint(config, &mut deps)?));
     if let Some(manifest) = cache::load(&dir) {
         return Ok(Prepared {
@@ -119,7 +126,7 @@ fn live(root: &Path, config: &Config) -> Result<Prepared> {
         });
     }
     let staging = cache::staging(root, "pack")?;
-    let manifest = pack::build(config, staging.path(), &mut deps)?;
+    let manifest = pack::build(config, staging.path(), &mut deps, tools.elf.as_ref())?;
     Ok(Prepared {
         dir: cache::install(staging, &dir)?,
         manifest,
@@ -134,7 +141,7 @@ fn live(root: &Path, config: &Config) -> Result<Prepared> {
 /// name. The entries and settings go in whole, serialized, so a
 /// setting added to them later counts without anyone remembering to list it
 /// here; the files go in by size, mtime and mode.
-fn inputs_fingerprint(config: &Config, deps: &mut deps::Resolver) -> Result<String> {
+fn inputs_fingerprint(config: &Config, deps: &mut deps::Resolver<'_>) -> Result<String> {
     let host = Arch::host()?;
     let mut h = Fingerprint::new();
     h.field(env!("CARGO_PKG_VERSION").as_bytes())
@@ -211,6 +218,7 @@ mod tests {
     use super::*;
     use crate::config::Injectable;
     use crate::tmpfile::TempDir;
+    use crate::tools::{self, Ldd};
 
     fn script_tool(dir: &Path, name: &str, body: &str) -> Injectable {
         let bin = dir.join(format!("{name}-src"));
@@ -238,9 +246,9 @@ mod tests {
         let cache = TempDir::new("cache").unwrap();
         let cfg = config(vec![script_tool(work.path(), "t", "#!/bin/sh\necho 1\n")]);
 
-        let first = prepare_in(cache.path(), &cfg, None).unwrap();
+        let first = prepare_in(cache.path(), &cfg, None, &tools::external()).unwrap();
         assert_eq!(first.origin, Origin::Packed);
-        let second = prepare_in(cache.path(), &cfg, None).unwrap();
+        let second = prepare_in(cache.path(), &cfg, None, &tools::external()).unwrap();
         assert_eq!(second.origin, Origin::Cached);
         assert_eq!(first.dir, second.dir);
         assert_eq!(first.manifest.id(), second.manifest.id());
@@ -254,10 +262,10 @@ mod tests {
         let source = tool.binary.clone().unwrap();
         let cfg = config(vec![tool]);
 
-        let first = prepare_in(cache.path(), &cfg, None).unwrap();
+        let first = prepare_in(cache.path(), &cfg, None, &tools::external()).unwrap();
         // A different size, so the change is noticed whatever the mtime resolution.
         std::fs::write(&source, "#!/bin/sh\necho changed, and longer\n").unwrap();
-        let second = prepare_in(cache.path(), &cfg, None).unwrap();
+        let second = prepare_in(cache.path(), &cfg, None, &tools::external()).unwrap();
         assert_eq!(second.origin, Origin::Packed);
         assert_ne!(first.dir, second.dir);
         assert_ne!(first.manifest.id(), second.manifest.id());
@@ -274,9 +282,9 @@ mod tests {
         tool.config = Some(cfg_dir.clone());
         let cfg = config(vec![tool]);
 
-        let first = prepare_in(cache.path(), &cfg, None).unwrap();
+        let first = prepare_in(cache.path(), &cfg, None, &tools::external()).unwrap();
         std::fs::write(cfg_dir.join("added"), "new file").unwrap();
-        let second = prepare_in(cache.path(), &cfg, None).unwrap();
+        let second = prepare_in(cache.path(), &cfg, None, &tools::external()).unwrap();
         assert_eq!(second.origin, Origin::Packed);
         assert_ne!(first.dir, second.dir);
     }
@@ -286,7 +294,7 @@ mod tests {
         let work = TempDir::new("src7").unwrap();
         let base = || script_tool(work.path(), "t", "#!/bin/sh\n");
         let key = |item: Injectable| {
-            inputs_fingerprint(&config(vec![item]), &mut deps::Resolver::default()).unwrap()
+            inputs_fingerprint(&config(vec![item]), &mut deps::Resolver::new(&Ldd)).unwrap()
         };
         let plain = key(base());
         // (`copy_deps` too, but turning it on asks ldd about the binary.)
@@ -307,12 +315,12 @@ mod tests {
         let mut b = config(vec![]);
         b.git.safe_directories = vec!["/work".into()];
         assert_ne!(
-            inputs_fingerprint(&a, &mut deps::Resolver::default()).unwrap(),
-            inputs_fingerprint(&b, &mut deps::Resolver::default()).unwrap()
+            inputs_fingerprint(&a, &mut deps::Resolver::new(&Ldd)).unwrap(),
+            inputs_fingerprint(&b, &mut deps::Resolver::new(&Ldd)).unwrap()
         );
         assert_eq!(
-            inputs_fingerprint(&a, &mut deps::Resolver::default()).unwrap(),
-            inputs_fingerprint(&config(vec![]), &mut deps::Resolver::default()).unwrap()
+            inputs_fingerprint(&a, &mut deps::Resolver::new(&Ldd)).unwrap(),
+            inputs_fingerprint(&config(vec![]), &mut deps::Resolver::new(&Ldd)).unwrap()
         );
     }
 
@@ -323,15 +331,15 @@ mod tests {
         let cache = TempDir::new("cache4").unwrap();
         let cfg = config(vec![script_tool(work.path(), "t", "#!/bin/sh\n")]);
         let file = out.path().join("b.tar");
-        pack::pack_to_file(&cfg, &file).unwrap();
+        pack::pack_to_file(&cfg, &file, &tools::external()).unwrap();
 
         // The config used to *inject* has no tools: the bundle supplies them.
         let empty = config(vec![]);
-        let first = prepare_in(cache.path(), &empty, Some(&file)).unwrap();
+        let first = prepare_in(cache.path(), &empty, Some(&file), &tools::external()).unwrap();
         assert_eq!(first.origin, Origin::Extracted);
         assert_eq!(first.manifest.tools.len(), 1);
         assert!(first.bin("t").exists());
-        let second = prepare_in(cache.path(), &empty, Some(&file)).unwrap();
+        let second = prepare_in(cache.path(), &empty, Some(&file), &tools::external()).unwrap();
         assert_eq!(second.origin, Origin::Cached);
     }
 
@@ -346,15 +354,20 @@ mod tests {
             "#!/bin/sh\necho data\n",
         )]);
         let file = out.path().join("b.tar");
-        pack::pack_to_file(&cfg, &file).unwrap();
+        pack::pack_to_file(&cfg, &file, &tools::external()).unwrap();
         let mut bytes = std::fs::read(&file).unwrap();
         let pos = bytes.windows(4).position(|w| w == b"data").unwrap();
         bytes[pos] ^= 0xFF;
         std::fs::write(&file, bytes).unwrap();
 
-        let err = prepare_in(cache.path(), &config(vec![]), Some(&file))
-            .err()
-            .unwrap();
+        let err = prepare_in(
+            cache.path(),
+            &config(vec![]),
+            Some(&file),
+            &tools::external(),
+        )
+        .err()
+        .unwrap();
         assert!(format!("{err:#}").contains("damaged"), "{err:#}");
         let leftovers: Vec<_> = std::fs::read_dir(cache.path()).unwrap().collect();
         assert!(
@@ -369,7 +382,7 @@ mod tests {
         let tmp = TempDir::new("cache-list").unwrap();
         let root = tmp.path().join("bundles");
         let script = script_tool(tmp.path(), "hello", "echo hi");
-        prepare_in(&root, &config(vec![script]), None).unwrap();
+        prepare_in(&root, &config(vec![script]), None, &tools::external()).unwrap();
         let entries = cache::entries(&root);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].manifest.is_some());
@@ -390,7 +403,7 @@ mod tests {
                 "t",
                 &format!("#!/bin/sh\necho {i}{}\n", "x".repeat(i)),
             )]);
-            last = Some(prepare_in(cache.path(), &cfg, None).unwrap());
+            last = Some(prepare_in(cache.path(), &cfg, None, &tools::external()).unwrap());
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let kept = std::fs::read_dir(cache.path()).unwrap().count();
