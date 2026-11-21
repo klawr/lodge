@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::fingerprint::Fingerprint;
 use crate::host::Host;
 use crate::output::warning;
+use crate::provision::ConfigState;
 use crate::runtime::{Container, Env};
 use crate::tree::{self, Denied, Links};
 
@@ -29,17 +30,6 @@ pub(super) fn read_hash(container: &dyn Container) -> Result<Option<String>> {
 
 pub(super) fn write_hash(env: &dyn Env, hash: &str) -> Result<()> {
     env.write_file(HASH_PATH, hash.as_bytes())
-}
-
-/// Whether the config changed since the container was created.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConfigState {
-    UpToDate,
-    Changed,
-    /// The container has no recorded config hash, or it could not be read.
-    /// Not knowing is no reason to throw a container away, so this is not drift.
-    Unknown,
 }
 
 /// Compares the hash recorded in the container with `current`, the hash of

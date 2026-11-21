@@ -21,6 +21,20 @@ pub(super) fn configure_git_safe(
     before: &[String],
 ) -> Result<Vec<String>> {
     let mut ours = before.to_vec();
+    // `*` switches git's ownership check off for every folder, which is for a
+    // throwaway container, not for someone's real machine.
+    let wildcard_refused = !env.is_disposable() && dirs.iter().any(|d| d == "*");
+    let dirs: Vec<String> = if wildcard_refused {
+        dirs.iter().filter(|d| *d != "*").cloned().collect()
+    } else {
+        dirs.to_vec()
+    };
+    let dirs = dirs.as_slice();
+    if wildcard_refused {
+        warning!(
+            "not setting git safe.directory = * on a machine that is not thrown away; list the folders in [git] safe_directories"
+        );
+    }
     if dirs.is_empty() {
         return Ok(ours);
     }
@@ -146,5 +160,18 @@ mod tests {
         assert!(out.status.success());
         let left = run(&["config", "--global", "--get-all", "safe.directory"]).unwrap();
         assert_eq!(String::from_utf8_lossy(&left.stdout).trim(), "/aXb");
+    }
+
+    #[test]
+    fn a_real_machine_never_gets_the_wildcard_but_may_name_folders() {
+        let env = FakeEnv::new()
+            .shared()
+            .with_commands(&["git"])
+            .with_output(&["sh", "-c", &script("'/w'")], "added\n");
+        let ours = configure_git_safe(&env, &["*".to_string(), "/w".to_string()], &[]).unwrap();
+        assert_eq!(ours, ["/w"]);
+        assert!(!env.ran_matching(|c| c.iter().any(|a| a.contains("'*'"))));
+        let only_wildcard = configure_git_safe(&env, &["*".to_string()], &[]).unwrap();
+        assert!(only_wildcard.is_empty());
     }
 }

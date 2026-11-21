@@ -1,8 +1,6 @@
 use clap::{ArgAction, Args, Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::runtime::Engine;
-
 #[derive(Parser)]
 #[command(
     name = "ldg",
@@ -26,10 +24,10 @@ pub struct Cli {
     #[arg(long, short, global = true, value_name = "SSH_DEST")]
     pub remote: Option<String>,
 
-    /// The container engine to drive; it runs on the host `--remote` names, or
-    /// on this machine. Default: `engine` in the config file, else docker.
-    #[arg(long, global = true, value_enum)]
-    pub engine: Option<Engine>,
+    /// Where to work. It is on the host `--remote` names, or on this machine.
+    /// Default: `target` in the config file, else the first one listed.
+    #[arg(long, global = true, value_name = "TARGET")]
+    pub target: Option<String>,
 
     /// Use this config file instead of ~/.config/lodge/config.toml. A relative
     /// `bundle =` path in it is resolved against the file's folder, so a folder

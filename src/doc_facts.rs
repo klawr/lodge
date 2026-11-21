@@ -93,9 +93,49 @@ fn every_doc_the_readme_links_exists() {
 }
 
 #[test]
+fn the_docs_name_every_target() {
+    // The targets are listed once in code (`cmd/targets.rs`). Where the docs list
+    // them by hand, they must name each one there is, so a new target cannot be
+    // left out of the prose.
+    for doc in ["README.md", "docs/configuration.md"] {
+        let text = read(doc);
+        let missing: Vec<&str> = crate::cmd::targets::names()
+            .into_iter()
+            .filter(|name| !text.contains(&format!("`{name}`")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{doc} never names the target(s) {missing:?}"
+        );
+    }
+}
+
+#[test]
 fn the_config_schema_is_current() {
     // The schema describes the file as written, so secrets in their raw form.
-    let schema = schemars::schema_for!(crate::config::Config<crate::config::secret::RawSecret>);
+    let mut schema = serde_json::to_value(schemars::schema_for!(
+        crate::config::Config<crate::config::secret::RawSecret>
+    ))
+    .unwrap();
+    // What each target lets you say is its own to describe: the file's schema
+    // lists the targets that exist, each with its settings, from the registry.
+    let mut targets = serde_json::Map::new();
+    for kind in crate::cmd::targets::all() {
+        let mut settings = match kind.settings_schema() {
+            Some(s) => serde_json::to_value(s).unwrap(),
+            None => serde_json::json!({ "type": "object", "additionalProperties": false }),
+        };
+        settings.as_object_mut().unwrap().remove("$schema");
+        targets.insert(kind.name().to_string(), settings);
+    }
+    schema["properties"]["targets"]["properties"] = targets.into();
+    let mut names: Vec<serde_json::Value> = crate::cmd::targets::names()
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    names.push(serde_json::Value::Null);
+    schema["properties"]["target"]["enum"] = names.into();
+    schema["properties"]["targets"]["additionalProperties"] = false.into();
     let text = serde_json::to_string_pretty(&schema).unwrap() + "\n";
     let path = root().join("docs/config.schema.json");
     if std::env::var_os("UPDATE_SCHEMA").is_some() {

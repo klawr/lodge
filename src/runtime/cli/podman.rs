@@ -3,20 +3,46 @@
 
 use std::sync::{Arc, OnceLock};
 
+use serde::{Deserialize, Serialize};
+
 use super::{CliEngine, Flavor, Podman};
 use crate::host::HostRef;
 use crate::runtime::RunSpec;
 
+/// What the user can say about podman, under `[targets.podman]` in the config.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct PodmanOptions {
+    /// The podman connection to use (`podman --connection NAME`): which engine to
+    /// talk to when you have several (a remote machine, a podman machine).
+    /// Default: the one `podman system connection default` selected.
+    #[serde(default)]
+    pub connection: Option<String>,
+}
+
 /// The `podman` CLI's part of [`CliEngine`].
 #[derive(Clone, Default)]
 pub struct PodmanFlavor {
+    options: PodmanOptions,
     /// Whether Podman runs without root (asked once).
     rootless: Arc<OnceLock<bool>>,
 }
 
 impl Podman {
+    #[cfg(test)]
     pub fn new(host: HostRef) -> Self {
-        Self::with(host, PodmanFlavor::default())
+        Self::with_options(host, PodmanOptions::default())
+    }
+
+    pub fn with_options(host: HostRef, options: PodmanOptions) -> Self {
+        Self::with(
+            host,
+            PodmanFlavor {
+                options,
+                ..PodmanFlavor::default()
+            },
+        )
     }
 }
 
@@ -53,6 +79,14 @@ fn mount_flags(spec: &RunSpec, rootless: bool) -> Vec<String> {
 impl Flavor for PodmanFlavor {
     fn program(&self) -> &'static str {
         "podman"
+    }
+
+    fn global_args(&self) -> Vec<String> {
+        self.options
+            .connection
+            .iter()
+            .flat_map(|c| ["--connection".to_string(), c.clone()])
+            .collect()
     }
 
     fn extra_run_flags(&self, cli: &CliEngine<Self>, spec: &RunSpec) -> Vec<String> {
@@ -117,5 +151,40 @@ mod tests {
         ));
         assert!(!podman.says_path_is_missing("Error: no such container c"));
         assert!(!podman.says_path_is_missing("ssh: connect to host h port 22: Connection refused"));
+    }
+
+    #[test]
+    fn a_rootless_containers_published_ports_are_what_can_be_reached() {
+        use crate::host::fake::FakeHost;
+        use crate::runtime::cli::CliContainer;
+        use crate::runtime::{Container as _, Reach};
+        let inspect = r#"{"3000/tcp":[{"HostIp":"","HostPort":"3000"}]}"#;
+        let host = std::sync::Arc::new(
+            FakeHost::new()
+                .on(&["podman", "info"], "true\n")
+                .on(&["podman", "inspect"], inspect),
+        );
+        let c = CliContainer {
+            cli: Podman::new(host.clone()),
+            id: "abc".into(),
+        };
+        assert_eq!(
+            c.reach(None),
+            Some(Reach::Published(
+                [(3000, "127.0.0.1:3000".to_string())].into()
+            ))
+        );
+        assert_eq!(c.reach(Some("db")), None, "a peer has no published address");
+        // Rootful: the container's own address, as with docker.
+        let rootful = std::sync::Arc::new(
+            FakeHost::new()
+                .on(&["podman", "info"], "false\n")
+                .on(&["podman", "inspect"], "10.88.0.4\n"),
+        );
+        let c = CliContainer {
+            cli: Podman::new(rootful),
+            id: "abc".into(),
+        };
+        assert_eq!(c.reach(None), Some(Reach::Address("10.88.0.4".into())));
     }
 }

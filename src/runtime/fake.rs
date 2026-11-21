@@ -63,6 +63,8 @@ pub struct FakeEnv {
     calls: RefCell<Vec<(Vec<String>, Who)>>,
     /// How [`Container::reach`] answers, by peer (`None`: the container itself).
     reach: HashMap<Option<String>, Reach>,
+    /// Whether this stands in for a machine that is not thrown away.
+    shared: bool,
 }
 
 impl FakeEnv {
@@ -76,7 +78,14 @@ impl FakeEnv {
             owners: RefCell::default(),
             calls: RefCell::default(),
             reach: HashMap::new(),
+            shared: false,
         }
+    }
+
+    /// Stands in for a real machine, which injection treats with more care.
+    pub fn shared(mut self) -> Self {
+        self.shared = true;
+        self
     }
 
     /// Makes the container reachable at `reach` (for `peer`, a peer by name;
@@ -278,6 +287,10 @@ impl FakeEnv {
 }
 
 impl Env for FakeEnv {
+    fn is_disposable(&self) -> bool {
+        !self.shared
+    }
+
     fn exec(&self, argv: &[&str], opts: &ExecOpts) -> Result<()> {
         let out = self.handle(argv, opts.user, false);
         if out.success {
@@ -516,6 +529,50 @@ impl Runtime for FakeRuntime {
 /// Compose with one container per service, named `<project>-<service>-1` as
 /// compose names them, created when a project that is up is first asked about.
 /// `up` starts the project's containers again.
+/// A fake engine shared between the code under test, which owns it as a
+/// `Box<dyn Runtime>`, and the test, which looks at what it did.
+impl Runtime for Rc<FakeRuntime> {
+    fn container(&self, id: &str) -> Box<dyn Container> {
+        self.as_ref().container(id)
+    }
+
+    fn version(&self) -> Result<String> {
+        Runtime::version(self.as_ref())
+    }
+
+    fn compose(&self) -> Result<&dyn Compose> {
+        self.as_ref().compose()
+    }
+
+    fn list_labeled(&self, label: &str) -> Result<Vec<Listed>> {
+        self.as_ref().list_labeled(label)
+    }
+
+    fn find_by_name(&self, name: &str) -> Result<Option<String>> {
+        self.as_ref().find_by_name(name)
+    }
+
+    fn build_image(&self, spec: &BuildSpec) -> Result<()> {
+        self.as_ref().build_image(spec)
+    }
+
+    fn run_detached(&self, spec: &RunSpec) -> Result<()> {
+        self.as_ref().run_detached(spec)
+    }
+
+    fn start(&self, id: &str) -> Result<()> {
+        self.as_ref().start(id)
+    }
+
+    fn stop(&self, id: &str) -> Result<()> {
+        self.as_ref().stop(id)
+    }
+
+    fn remove(&self, id: &str) -> Result<()> {
+        self.as_ref().remove(id)
+    }
+}
+
 impl Compose for FakeRuntime {
     fn version(&self) -> Result<String> {
         Ok("fake".into())

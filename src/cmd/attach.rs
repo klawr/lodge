@@ -5,9 +5,8 @@ use std::path::{Path, PathBuf};
 
 use super::Ctx;
 use crate::config::Config;
-use crate::devcontainer::Devcontainer;
 use crate::output::note;
-use crate::provision::{Attached, Provisioner};
+use crate::provision::Attached;
 use crate::runtime::ContainerUser;
 use crate::session::{self, Session};
 use crate::{bundle, inject, secret};
@@ -28,17 +27,9 @@ pub fn up(
     let config = ctx.config()?;
     // Ready the bundle first, so a problem with it fails before anything starts.
     let prepared = bundle::source::prepare(&config, bundle_file, &ctx.tools)?;
-    // The one place that picks how an endpoint is made. A devcontainer is the only
-    // provisioner so far; a second one is chosen here, from the project's signals
-    // and `--engine`, and nothing below changes.
-    let provisioner = Devcontainer {
-        host: &ctx.host,
-        local: ctx.local.as_ref(),
-        rt: ctx.rt.as_ref(),
-        oci: ctx.tools.oci.as_ref(),
-        prompt: &super::prompt::Terminal,
-    };
-    let attached = provisioner.provision(&project, build)?;
+    // How an endpoint is made, or found, is the endpoints' business; which
+    // endpoints is chosen once, in `cmd::run`.
+    let attached = ctx.endpoints.provision(&project, build)?;
     attach(ctx, &attached, &config, &prepared, reinject, no_attach)
 }
 
@@ -109,11 +100,13 @@ mod tests {
     use super::*;
     use crate::bundle::manifest::Manifest;
     use crate::bundle::source::{Origin, Prepared};
+    use crate::devcontainer::{Devcontainer, Prompt};
     use crate::forward::ForwardDaemon;
     use crate::host::fake;
     use crate::local::fake::FakeLocal;
     use crate::port::PortForward;
     use crate::runtime::RUN_PROBE_SCRIPT;
+    use crate::runtime::Runtime as _;
     use crate::runtime::fake::{FakeEnv, FakeRuntime};
     use crate::shell::script_argv;
     use crate::tmpfile::TempDir;
@@ -155,6 +148,14 @@ mod tests {
         }
     }
 
+    struct NoQuestions;
+
+    impl Prompt for NoQuestions {
+        fn choose_workdir(&self, _: &str, _: &[String]) -> String {
+            panic!("attaching asks nothing")
+        }
+    }
+
     #[test]
     fn attaching_to_a_container_that_exists_forwards_and_injects_without_a_provisioner() {
         let dir = TempDir::new("attach").unwrap();
@@ -169,18 +170,24 @@ mod tests {
             )
             .with_output(&["uname", "-m"], "x86_64\n")
             .with_commands(&["git"]);
-        let rt = FakeRuntime::new(FakeEnv::new).with_container("c1", env);
+        let rt = Rc::new(FakeRuntime::new(FakeEnv::new).with_container("c1", env));
         let forwarded = Rc::new(RefCell::new(Vec::new()));
         let ctx = Ctx {
             host: fake(),
             local: Arc::new(FakeLocal::new()),
             forwarder: Box::new(RecordingDaemon(forwarded.clone())),
-            rt: Box::new(rt),
+            endpoints: Box::new(Devcontainer::new(
+                fake(),
+                Arc::new(FakeLocal::new()),
+                Box::new(rt.clone()),
+                Arc::new(tools::NoRegistry),
+                Arc::new(NoQuestions),
+            )),
             tools: tools::external(),
             config_path: dir.path().join("config.toml"),
         };
         let attached = Attached {
-            container: ctx.rt.container("c1"),
+            container: rt.container("c1"),
             created: false,
             workdir: "/w".into(),
             forward_ports: Vec::new(),

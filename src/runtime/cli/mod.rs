@@ -26,8 +26,8 @@ mod docker;
 mod podman;
 
 pub use container::CliContainer;
-pub use docker::DockerFlavor;
-pub use podman::PodmanFlavor;
+pub use docker::{DockerFlavor, DockerOptions};
+pub use podman::{PodmanFlavor, PodmanOptions};
 
 /// What one engine of the docker-compatible family does its own way: its
 /// program, and the few places where its command line or its behaviour differs
@@ -35,8 +35,13 @@ pub use podman::PodmanFlavor;
 /// engines that share the plumbing; each is a `Flavor`, and a [`CliEngine`] of it
 /// asks the flavor instead of checking which one it is.
 pub trait Flavor: Clone + Send + Sync + 'static {
-    /// The program, and what the user calls the engine (`--engine`).
+    /// The program, and what the user calls the target (`--target`).
     fn program(&self) -> &'static str;
+
+    /// Arguments that go right after the program on every command, to say which
+    /// engine to talk to (a docker context, a podman connection): from the user's
+    /// `[docker]` or `[podman]` settings.
+    fn global_args(&self) -> Vec<String>;
 
     /// Flags for `run`, after the common ones and before the devcontainer's own
     /// `runArgs`, which can override them.
@@ -84,10 +89,12 @@ impl<F: Flavor> CliEngine<F> {
         self.flavor.program()
     }
 
-    /// The program and its arguments, as a vector.
-    fn argv<'a>(&self, args: &[&'a str]) -> Vec<&'a str> {
-        let mut v = vec![self.flavor.program()];
-        v.extend_from_slice(args);
+    /// The program, the flavor's own arguments for every command (which engine to
+    /// talk to) and then `args`, as a vector.
+    fn argv(&self, args: &[&str]) -> Vec<String> {
+        let mut v = vec![self.flavor.program().to_string()];
+        v.extend(self.flavor.global_args());
+        v.extend(args.iter().map(|a| a.to_string()));
         v
     }
 
@@ -96,7 +103,8 @@ impl<F: Flavor> CliEngine<F> {
     /// override it. Every container-engine command lodge runs is built here, in
     /// [`job_in`](Self::job_in) or in [`interactive`](Self::interactive).
     pub(super) fn job<'a>(&self, args: &[&str]) -> Job<'a> {
-        Job::argv(&self.argv(args))
+        let argv = self.argv(args);
+        Job::argv(&argv.iter().map(String::as_str).collect::<Vec<_>>())
     }
 
     /// Like [`job`](Self::job) for operations that read *files* from disk (a
@@ -110,7 +118,9 @@ impl<F: Flavor> CliEngine<F> {
     /// Opens an interactive `<program> <args>` on the host, with a terminal, and
     /// waits for it.
     pub(super) fn interactive(&self, args: &[&str]) -> std::io::Result<ExitStatus> {
-        self.host.interactive(&self.argv(args))
+        let argv = self.argv(args);
+        self.host
+            .interactive(&argv.iter().map(String::as_str).collect::<Vec<_>>())
     }
 
     /// `compose -p <project> -f <file>… <tail…>`, run in `dir`.
@@ -704,5 +714,43 @@ mod tests {
         assert!(err.to_string().contains("docker"), "{err}");
         let ok = Arc::new(FakeHost::new().on(&["podman", "version"], "5.0.1\n"));
         assert_eq!(Runtime::version(&Podman::new(ok)).unwrap(), "podman 5.0.1");
+    }
+
+    #[test]
+    fn the_engine_the_user_chose_is_named_on_every_command() {
+        use super::{DockerOptions, PodmanOptions};
+        let host = Arc::new(FakeHost::new());
+        let docker = Docker::with_options(
+            host.clone(),
+            DockerOptions {
+                context: Some("colima".into()),
+            },
+        );
+        docker.find_by_name("x").unwrap();
+        docker.start("c").unwrap();
+        assert_eq!(
+            host.argvs()[0][..4],
+            words(&["docker", "--context", "colima", "ps"])[..]
+        );
+        assert_eq!(
+            host.argvs()[1],
+            words(&["docker", "--context", "colima", "start", "c"])
+        );
+        let host = Arc::new(FakeHost::new());
+        let podman = Podman::with_options(
+            host.clone(),
+            PodmanOptions {
+                connection: Some("vm".into()),
+            },
+        );
+        podman.stop("c").unwrap();
+        assert_eq!(
+            host.argvs()[0],
+            words(&["podman", "--connection", "vm", "stop", "c"])
+        );
+        // Nothing said: nothing added.
+        let host = Arc::new(FakeHost::new());
+        Docker::new(host.clone()).start("c").unwrap();
+        assert_eq!(host.argvs()[0], words(&["docker", "start", "c"]));
     }
 }

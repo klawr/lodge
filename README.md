@@ -36,6 +36,9 @@ cd my-project     # a project with a .devcontainer
 ldg up            # start it, inject your tools, open a shell
 ```
 
+No devcontainer, just a machine you can reach? `ldg --remote me@server --target host up /srv/app`
+injects your tools into that machine and opens a shell there.
+
 Inside, your editor and tools run as if they were installed in the image. Leave
 the shell and come back with `ldg up` again; the container, and everything
 installed in it, is kept until you `ldg rm` it. Coming back only attaches: what
@@ -70,8 +73,8 @@ for where to put them). Man page: `ldg man | man -l -`.
 | `ldg completions SHELL`, `ldg man` | Shell completions and the man page. |
 
 Global flags, on every command: `-r/--remote HOST` runs against an engine on
-another machine over SSH, `--engine docker` picks the container engine (also
-`engine = "docker"` in the config; `docker` or `podman`, docker by default), `-c/--config FILE` uses another config
+another machine over SSH, `--target docker` picks the container engine (also
+`target = "docker"` in the config; `docker`, `podman`, or `host` for no container at all, docker by default), `-c/--config FILE` uses another config
 file, and `-v/--verbose` prints
 every docker/ssh command lodge runs (`-vv`, `-vvv` add ssh's own debug output).
 `status`, `ls`, `ports` and `doctor` take `--json`.
@@ -135,9 +138,19 @@ linked binaries are copied as they are.
 - Dynamic port forwarding needs the container's bridge IP to be reachable from
   the engine's host: Linux with Docker Engine, or any engine with `--remote`.
   Docker Desktop on macOS/Windows doesn't expose container IPs.
-- The engines are docker and podman; the target must be a container.
-  With rootless Podman, ports are published with `appPort` instead of forwarded.
-- `ldg` itself runs on Linux, macOS and WSL2, not natively on Windows.
+- The engines are docker and podman, or no engine at all (`--target host`, below).
+  With rootless Podman a container has no address the host can reach, so only the
+  ports it publishes (`appPort`) are forwarded.
+- `--target host` injects into a machine itself (this one, or another over
+  `--remote`) as the user you connect as: your tools in `~/.local/share/lodge`,
+  your configs where you said, and a session. It is a real machine, not a
+  throwaway, so lodge never overwrites a config file it did not place, never sets
+  git's `safe.directory = *`, and cannot act as another user. The machine must be
+  Linux with `tar`; there is no devcontainer, so nothing is created, stopped or
+  removed (`down`, `rm` and `ls` say so, and `ldg clean` takes lodge out).
+- `ldg` itself is tested on Linux, and on Windows through WSL2. There is no native
+  Windows client. macOS is Unix and should build and run, but nobody has tried it:
+  it is untested and there is no release binary (build from source).
 - Change detection covers `devcontainer.json`, the Dockerfile, compose files
   and local features, not the Dockerfile's build context.
 

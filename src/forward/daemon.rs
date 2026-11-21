@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use super::tunnel::{Forward, Forwarders};
 use super::{acquire_lock, lock_path, ports_path, truncate_log, write_ports};
 use crate::port::PortForward;
-use crate::runtime::{Container, ExecOpts, Reach, Runtime};
+use crate::provision::Endpoints;
+use crate::runtime::{Container, ExecOpts, Reach};
 
 /// A line in the daemon's log (its stderr).
 macro_rules! log {
@@ -36,9 +37,9 @@ const UNREACHABLE_POLLS: u32 = 150;
 /// can't be reached.
 ///
 /// `ports` are the declared forwards as `spawn_daemon` encoded them on the
-/// command line; `rt` is the engine, and `forwarders` starts each forward.
+/// command line; `endpoints` finds the container, and `forwarders` starts each forward.
 pub fn run_daemon(
-    rt: &dyn Runtime,
+    endpoints: &dyn Endpoints,
     forwarders: &dyn Forwarders,
     container_id: &str,
     ports: &[String],
@@ -67,7 +68,7 @@ pub fn run_daemon(
     if let Err(e) = truncate_log(container_id) {
         log!("could not start a new log ({e}); appending");
     }
-    let container = rt.container(container_id);
+    let container = endpoints.container(container_id);
     let mut forwards = Forwards::new(container.as_ref(), forwarders, ports_file);
     let mut unreachable = 0;
 
@@ -162,6 +163,8 @@ struct Forwards<'a> {
     /// (likely failing the same way, e.g. host port occupied) doesn't spam the
     /// log.
     failed: HashSet<u16>,
+    /// Container ports that have no way in (not published), already reported.
+    unreachable_ports: HashSet<u16>,
     /// Tunnels that died (the connection dropped, say): not restarted before
     /// their time, so a host that is down is not hammered every 2 s.
     cooling: HashMap<u16, Cooldown>,
@@ -183,6 +186,7 @@ impl<'a> Forwards<'a> {
             addresses: Addresses::new(Box::new(lookup), REFRESH),
             active: HashMap::new(),
             failed: HashSet::new(),
+            unreachable_ports: HashSet::new(),
             cooling: HashMap::new(),
             ports_file,
             published: None,
@@ -196,7 +200,19 @@ impl<'a> Forwards<'a> {
         let mut dests = HashMap::new();
         for (&local, f) in &wanted {
             if let Some(reach) = self.addresses.get(f.host.as_deref()) {
-                dests.insert(local, reach.destination(f.port));
+                match reach.destination(f.port) {
+                    Some(dest) => {
+                        dests.insert(local, dest);
+                    }
+                    // Said once per port, not every 2 s.
+                    None if self.unreachable_ports.insert(f.port) => {
+                        log!(
+                            "port {} is not reachable ({reach}), so it is not forwarded",
+                            f.port
+                        );
+                    }
+                    None => {}
+                }
             }
         }
         let cooling = &mut self.cooling;
@@ -386,6 +402,7 @@ fn is_loopback_hex(addr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::Runtime as _;
     use crate::runtime::fake::{FakeEnv, FakeRuntime};
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
@@ -428,12 +445,18 @@ mod tests {
         let container = rt.container("web");
         let fake = FakeForwarders::default();
         let mut forwards = Forwards::new(container.as_ref(), &fake, PathBuf::new());
-        let own = forwards.addresses.get(None).unwrap().destination(8080);
+        let own = forwards
+            .addresses
+            .get(None)
+            .unwrap()
+            .destination(8080)
+            .unwrap();
         let peer = forwards
             .addresses
             .get(Some("db"))
             .unwrap()
-            .destination(5432);
+            .destination(5432)
+            .unwrap();
         assert_eq!(
             (own.as_str(), peer.as_str()),
             ("10.0.0.2:8080", "10.0.0.7:5432")
@@ -566,6 +589,29 @@ mod tests {
             fake.started.borrow()[0].3.get(),
             "stopped when no longer wanted"
         );
+    }
+
+    #[test]
+    fn only_a_published_port_is_forwarded_and_to_where_the_host_has_it() {
+        let rt = FakeRuntime::new(FakeEnv::new).with_container(
+            "web",
+            FakeEnv::new().with_reach(
+                None,
+                Reach::Published([(3000, "127.0.0.1:13000".to_string())].into()),
+            ),
+        );
+        let (fake, dir) = (
+            FakeForwarders::default(),
+            crate::tmpfile::TempDir::new("fwd").unwrap(),
+        );
+        let container = rt.container("web");
+        let mut forwards = daemon_state(container.as_ref(), &fake, &dir);
+        // 4000 is listening in the container but nothing publishes it: it is not
+        // forwarded, said once, and does not stop 3000.
+        forwards.update(wanted_ports(&[3000, 4000]));
+        forwards.update(wanted_ports(&[3000, 4000]));
+        assert_eq!(fake.starts(), [(3000, "127.0.0.1:13000".to_string())]);
+        assert_eq!(forwards.unreachable_ports.len(), 1);
     }
 
     #[test]

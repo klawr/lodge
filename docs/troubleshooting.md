@@ -37,11 +37,12 @@ the login: run with `-vv` for ssh's own output.
 - `ldg ports` shows what the forwarding daemon has set up, `ldg logs` (or
   `ldg logs -f`) why something wasn't.
 - "could not determine container IP": the container has no bridge address the
-  engine host can reach. With Docker Desktop on macOS/Windows, container IPs
+  engine host can reach. With Docker Desktop (macOS, Windows), container IPs
   aren't reachable from the host; use `appPort` (published on loopback) or
   `--remote`.
-- With rootless Podman a container has no address the host can reach, so nothing
-  is forwarded on its own: publish the ports with `appPort`.
+- With rootless Podman a container has no address the host can reach, so only the
+  ports it publishes are forwarded (publish them with `appPort`); the log says once
+  per other port that it is not reachable.
 - "could not forward port N": something on this machine already uses that port.
 - A service listening on `127.0.0.1` *inside* the container can't be reached
   from outside it; make it listen on `0.0.0.0`.
@@ -76,6 +77,16 @@ context are not either; `ldg up --build` picks them up.
 Hooks and features are reported and skipped, never fatal, and a failed
 create-time hook or feature is retried on the next `ldg up`. Hooks run as
 `remoteUser`, feature scripts as root. Run `ldg up -v` to see the exact command.
+
+## A plain host
+
+`ldg --target host up` works on the machine itself, as the user you connect as. If
+it says a config "already exists and was not injected by lodge; leaving it as it
+is", that is on purpose: lodge does not overwrite your files on a real machine.
+Remove or move the file if you want the bundle's version, then `ldg up --reinject`.
+"The bundle's binaries are for Linux" means the machine is not Linux; "cannot act as
+another user" means a `remoteUser`-style request was made of a host, which only
+has the login user.
 
 ## Removing lodge from a container
 

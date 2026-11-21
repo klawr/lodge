@@ -9,7 +9,9 @@ use crate::runtime::{ContainerUser, Env};
 
 /// Copies the tool's config to its destination and returns that path.
 /// `placed_before` is what an earlier injection placed: anything else already
-/// at the destination is not lodge's, so replacing it is warned about.
+/// at the destination is not lodge's, so replacing it is warned about, and on a
+/// machine that is not thrown away (a plain host) it is left alone and `None` is
+/// returned: lodge never overwrites someone's real dotfiles.
 pub(super) fn inject_config(
     env: &dyn Env,
     user: &ContainerUser,
@@ -17,10 +19,14 @@ pub(super) fn inject_config(
     tool: &Tool,
     config: &ConfigTree,
     placed_before: &[String],
-) -> Result<String> {
+) -> Result<Option<String>> {
     let name = &tool.name;
     let dest = user.expand_home(&config.dest);
     if !placed_before.contains(&dest) && env.exists(&dest)? {
+        if !env.is_disposable() {
+            warning!("{dest} already exists and was not injected by lodge; leaving it as it is");
+            return Ok(None);
+        }
         warning!("{dest} already exists and was not injected by lodge; replacing it");
     }
     info!("injecting {name} config → {dest}");
@@ -44,7 +50,7 @@ pub(super) fn inject_config(
             user.name
         )
     })?;
-    Ok(dest)
+    Ok(Some(dest))
 }
 
 #[cfg(test)]
@@ -102,6 +108,14 @@ mod tests {
     }
 
     fn inject_known(env: &FakeEnv, b: &Prepared, placed_before: &[String]) -> Result<String> {
+        Ok(inject_maybe(env, b, placed_before)?.expect("the config was placed"))
+    }
+
+    fn inject_maybe(
+        env: &FakeEnv,
+        b: &Prepared,
+        placed_before: &[String],
+    ) -> Result<Option<String>> {
         let tool = &b.manifest.tools[0];
         let user = dev();
         inject_config(
@@ -180,5 +194,29 @@ mod tests {
             err.contains("never uses root") && err.contains("/etc/hello") && err.contains("dev"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_real_machine_keeps_a_config_it_did_not_place_and_lodges_own_is_updated() {
+        let (_dir, b) = bundle("~/.config/hello");
+        let env = FakeEnv::new()
+            .shared()
+            .with_file("/home/dev/.config/hello", "mine");
+        // Someone's own file: untouched, and not recorded as lodge's.
+        assert_eq!(inject_maybe(&env, &b, &[]).unwrap(), None);
+        assert_eq!(env.file("/home/dev/.config/hello").as_deref(), Some("mine"));
+        assert!(!env.ran_matching(|c| c[0] == "rm"));
+        // Not there yet, or placed by an earlier injection: written.
+        let fresh = FakeEnv::new().shared();
+        assert!(inject_maybe(&fresh, &b, &[]).unwrap().is_some());
+        let again = inject_maybe(&env, &b, &["/home/dev/.config/hello".to_string()]);
+        assert!(again.unwrap().is_some());
+    }
+
+    #[test]
+    fn a_container_replaces_what_is_there() {
+        let (_dir, b) = bundle("~/.config/hello");
+        let env = FakeEnv::new().with_file("/home/dev/.config/hello", "mine");
+        assert!(inject_maybe(&env, &b, &[]).unwrap().is_some());
     }
 }

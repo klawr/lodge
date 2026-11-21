@@ -370,6 +370,15 @@ impl Sandbox {
         capture(cmd)
     }
 
+    /// Runs `ldg <args>` as a user whose home is `home`: where a plain host, which
+    /// is the machine itself, keeps lodge's prefix and the dotfiles it must not
+    /// touch.
+    pub fn run_with_home(&self, home: &Path, args: &[&str]) -> Out {
+        let mut cmd = self.command();
+        cmd.env("HOME", home).args(args);
+        capture(cmd)
+    }
+
     /// A directory containing only the named tools (symlinks to the real ones),
     /// for running `ldg` with a `PATH` that lacks everything else.
     pub fn restricted_path(&self, tools: &[&str]) -> PathBuf {

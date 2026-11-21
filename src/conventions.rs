@@ -66,7 +66,12 @@ fn docker_is_run_through_a_host_and_named_only_by_the_docker_runtime() {
     assert_eq!(spawners("docker"), Vec::<String>::new());
     assert_eq!(spawners("podman"), Vec::<String>::new());
     assert_eq!(
-        files_containing(&["\"docker\"", "\"podman\""], &["runtime/cli/"]),
+        // `cmd/targets.rs` spells them as the names a user types, not as programs
+        // it starts.
+        files_containing(
+            &["\"docker\"", "\"podman\""],
+            &["runtime/cli/", "cmd/targets.rs"]
+        ),
         Vec::<String>::new()
     );
 }
@@ -88,18 +93,22 @@ fn only_the_command_layer_chooses_implementations() {
         files_containing(&["SshHost", "LocalHost"], &["host/", "cmd/"]),
         Vec::<String>::new()
     );
-    assert_eq!(
-        files_containing(
-            &["CliEngine", "CliContainer", "DockerFlavor", "PodmanFlavor"],
-            &["runtime/cli/", "cmd/"]
-        ),
-        Vec::<String>::new()
-    );
-    // The way an endpoint is made, and the forward daemon, likewise.
-    assert_eq!(
-        files_containing(&["Devcontainer {"], &["devcontainer/", "cmd/"]),
-        Vec::<String>::new()
-    );
+    // Every target says what it is made of and where that lives, so the guard for
+    // a new one comes with it: nothing but its home and the command layer names
+    // those types.
+    for kind in crate::cmd::targets::all() {
+        let made = kind.made_of();
+        let mut skip: Vec<&str> = made.home.to_vec();
+        skip.push("cmd/");
+        assert_eq!(
+            files_containing(made.types, &skip),
+            Vec::<String>::new(),
+            "the {} target's types are named outside {:?}",
+            kind.name(),
+            made.home
+        );
+    }
+    // The forward daemon, likewise.
     assert_eq!(
         files_containing(&["DetachedDaemon"], &["forward/", "cmd/"]),
         Vec::<String>::new()
@@ -110,6 +119,33 @@ fn only_the_command_layer_chooses_implementations() {
         files_containing(&["Ldd", "Patchelf", "Oras"], &["tools/", "cmd/"]),
         Vec::<String>::new()
     );
+}
+
+#[test]
+fn what_a_target_says_it_is_made_of_is_real_so_its_guard_is_not_vacuous() {
+    // A guard that names a type that does not exist passes for the wrong reason.
+    // Each declared type must be spelled in its home or in the command layer.
+    for kind in crate::cmd::targets::all() {
+        let made = kind.made_of();
+        assert!(
+            !made.types.is_empty() && !made.home.is_empty(),
+            "{}",
+            kind.name()
+        );
+        let everywhere = files_containing(made.types, &[]);
+        for ty in made.types {
+            let spelled = files_containing(&[ty], &[]);
+            assert!(
+                spelled
+                    .iter()
+                    .any(|f| made.home.iter().any(|h| f.starts_with(h)) || f.starts_with("cmd/")),
+                "the {} target names `{ty}`, which is not in {:?} or cmd/ (found in {spelled:?})",
+                kind.name(),
+                made.home
+            );
+        }
+        assert!(!everywhere.is_empty());
+    }
 }
 
 #[test]
@@ -251,13 +287,13 @@ fn the_foundation_depends_on_nothing_above_it() {
 #[test]
 fn only_the_command_layer_knows_the_command_line() {
     // `main.rs` hands the parsed `cli` to `cmd`; `doc_facts.rs` checks the docs
-    // against it.
+    // against it, and this file reads the list of targets from it.
     let wrong: Vec<String> = dependencies()
         .into_iter()
         .filter(|(file, from, to)| {
             matches!(to.as_str(), "cmd" | "cli")
                 && from != "cmd"
-                && !matches!(file.as_str(), "main.rs" | "doc_facts.rs")
+                && !matches!(file.as_str(), "main.rs" | "doc_facts.rs" | "conventions.rs")
         })
         .map(|(file, _, to)| format!("{file} uses crate::{to}"))
         .collect();
@@ -294,7 +330,7 @@ fn root_is_asked_for_by_provisioning_and_the_runtime_only() {
     assert_eq!(
         files_containing(
             &["exec_root", "User::Root", "ExecOpts::root"],
-            &["devcontainer/", "runtime/"]
+            &["devcontainer/", "runtime/", "plain_host.rs"]
         ),
         Vec::<String>::new()
     );

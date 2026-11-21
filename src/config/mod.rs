@@ -4,12 +4,11 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub mod secret;
 
-use crate::runtime::Engine;
 use crate::shell::{container_path_problem, is_plain_name};
 use secret::{RawSecret, SecretDecl};
 
@@ -25,10 +24,17 @@ use secret::{RawSecret, SecretDecl};
     schemars(rename = "Config")
 )]
 pub struct Config<S = SecretDecl> {
-    /// The container engine to drive, unless `--engine` says otherwise
-    /// (`docker` or `podman`; default: docker).
+    /// Where to work, unless `--target` says otherwise. Default: docker.
     #[serde(default)]
-    pub engine: Option<Engine>,
+    pub target: Option<String>,
+    /// What each target lets you say about it, by target name: `[targets.docker]`.
+    /// The keys of a table are checked by the target that reads it.
+    #[serde(default)]
+    #[cfg_attr(
+        test,
+        schemars(with = "BTreeMap<String, serde_json::Map<String, serde_json::Value>>")
+    )]
+    pub targets: BTreeMap<String, toml::Table>,
     /// A bundle file to inject from instead of packing the `[[inject]]` entries.
     /// A relative path is relative to this file's folder.
     #[serde(default)]
@@ -52,7 +58,8 @@ pub struct Config<S = SecretDecl> {
 impl<S> Default for Config<S> {
     fn default() -> Self {
         Self {
-            engine: None,
+            target: None,
+            targets: BTreeMap::new(),
             bundle: None,
             inject: Vec::new(),
             session: SessionConfig::default(),
@@ -175,23 +182,42 @@ fn resolve_against(config_file: &Path, path: PathBuf) -> PathBuf {
         .map_or(path.clone(), |dir| dir.join(&path))
 }
 
-/// The `engine` the config at `path` names, if it does. Read on its own, before
-/// the whole config is loaded, because the engine is chosen before a command
-/// loads the config. A file that is missing or is not valid TOML names none:
-/// the command that loads the config reports that. A value that is not an
-/// engine is an error here.
-pub fn engine_setting(path: &Path) -> Result<Option<Engine>> {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return Ok(None);
-    };
-    let Ok(table) = raw.parse::<toml::Table>() else {
+/// The `target` the config at `path` names, if it does. Read on its own, before
+/// the whole config is loaded, because the target is chosen before a command
+/// loads the config. A file that is missing or is not valid TOML names none: the
+/// command that loads the config reports that. A value that is not a string is an
+/// error here; whether it names a target is for the command layer, which knows them.
+pub fn target_setting(path: &Path) -> Result<Option<String>> {
+    let Some(table) = peek(path) else {
         return Ok(None);
     };
     table
-        .get("engine")
-        .map(|v| v.clone().try_into::<Engine>())
+        .get("target")
+        .map(|v| v.clone().try_into::<String>())
         .transpose()
-        .with_context(|| format!("invalid `engine` in {}", path.display()))
+        .with_context(|| format!("invalid `target` in {}", path.display()))
+}
+
+/// The `[targets.<name>]` table of the config at `path`, read on its own like
+/// [`target_setting`] (the target is built before a command loads the config). A
+/// table that is missing, or a file that is missing or not TOML, gives an empty
+/// table; one that is not a table is an error. What is *in* it is for the target
+/// to check.
+pub fn target_settings(path: &Path, name: &str) -> Result<toml::Table> {
+    let Some(file) = peek(path) else {
+        return Ok(toml::Table::new());
+    };
+    file.get("targets")
+        .and_then(|t| t.get(name))
+        .map(|v| v.clone().try_into::<toml::Table>())
+        .transpose()
+        .map(Option::unwrap_or_default)
+        .with_context(|| format!("invalid [targets.{name}] in {}", path.display()))
+}
+
+/// The config file as a raw table, `None` if it is missing or not TOML.
+fn peek(path: &Path) -> Option<toml::Table> {
+    std::fs::read_to_string(path).ok()?.parse().ok()
 }
 
 impl Config {
@@ -229,7 +255,8 @@ impl Config {
     /// `[[secret]]` checked; what is wrong with a secret goes to `problems`.
     fn from_file(file: Config<RawSecret>, path: &Path, problems: &mut Vec<String>) -> Self {
         let Config {
-            engine,
+            target,
+            targets,
             bundle,
             mut inject,
             session,
@@ -251,7 +278,8 @@ impl Config {
             })
             .collect();
         Self {
-            engine,
+            target,
+            targets,
             bundle: bundle.map(|b| resolve_against(path, b)),
             inject,
             session,
@@ -380,30 +408,71 @@ mod tests {
     }
 
     #[test]
-    fn the_engine_is_a_known_name_or_an_error() {
+    fn the_target_is_a_name_the_command_layer_checks() {
         assert_eq!(
-            parse("engine = \"docker\"").unwrap().engine,
-            Some(Engine::Docker)
+            parse("target = \"docker\"").unwrap().target.as_deref(),
+            Some("docker")
         );
-        assert_eq!(parse("").unwrap().engine, None);
-        let err = format!("{:#}", parse("engine = \"nonesuch\"").unwrap_err());
+        assert_eq!(parse("").unwrap().target, None);
+        // Which names are targets is for the command layer, which knows them; the
+        // config only needs it to be a name.
+        assert_eq!(
+            parse("target = \"nonesuch\"").unwrap().target.as_deref(),
+            Some("nonesuch")
+        );
+        assert!(parse("target = 3").is_err());
+    }
+
+    #[test]
+    fn each_target_has_its_own_table_whose_keys_its_target_checks() {
+        let c = parse(
+            "[targets.docker]\ncontext = \"colima\"\n[targets.podman]\nconnection = \"vm\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.targets["docker"]["context"].as_str(), Some("colima"));
+        assert_eq!(c.targets["podman"]["connection"].as_str(), Some("vm"));
+        assert!(parse("").unwrap().targets.is_empty());
+        // Which tables exist is for the command layer, which knows the targets; a
+        // table that is not a table is the config's own error.
+        assert!(parse("[targets]\ndocker = 3\n").is_err());
+    }
+
+    #[test]
+    fn a_targets_table_can_be_read_alone_like_the_target() {
+        let dir = crate::tmpfile::TempDir::new("target-settings").unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "bogus = 1\n[targets.docker]\ncontext = \"colima\"\n").unwrap();
+        let docker = target_settings(&path, "docker").unwrap();
+        assert_eq!(docker["context"].as_str(), Some("colima"));
+        // Another target's table, a missing table, a missing file, and a file that is
+        // not TOML (the config load reports it) all give an empty table.
+        assert!(target_settings(&path, "podman").unwrap().is_empty());
         assert!(
-            err.contains("nonesuch") || err.contains("unknown variant"),
-            "{err}"
+            target_settings(&dir.path().join("none.toml"), "docker")
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(&path, "= not toml").unwrap();
+        assert!(target_settings(&path, "docker").unwrap().is_empty());
+        std::fs::write(&path, "[targets]\ndocker = 3\n").unwrap();
+        let err = target_settings(&path, "docker").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("invalid [targets.docker]"),
+            "{err:#}"
         );
     }
 
     #[test]
-    fn the_engine_alone_can_be_read_from_a_file_that_is_otherwise_unchecked() {
-        let dir = crate::tmpfile::TempDir::new("engine-peek").unwrap();
+    fn the_target_alone_can_be_read_from_a_file_that_is_otherwise_unchecked() {
+        let dir = crate::tmpfile::TempDir::new("target-peek").unwrap();
         let path = dir.path().join("c.toml");
         // Wrong in other ways (an unknown key): not this function's business.
-        std::fs::write(&path, "engine = \"docker\"\nbogus = 1\n").unwrap();
-        assert_eq!(engine_setting(&path).unwrap(), Some(Engine::Docker));
-        // Not TOML at all: no engine named; loading the config reports it.
+        std::fs::write(&path, "target = \"docker\"\nbogus = 1\n").unwrap();
+        assert_eq!(target_setting(&path).unwrap().as_deref(), Some("docker"));
+        // Not TOML at all: no target named; loading the config reports it.
         std::fs::write(&path, "= = =").unwrap();
-        assert_eq!(engine_setting(&path).unwrap(), None);
-        assert_eq!(engine_setting(&dir.path().join("none.toml")).unwrap(), None);
+        assert_eq!(target_setting(&path).unwrap(), None);
+        assert_eq!(target_setting(&dir.path().join("none.toml")).unwrap(), None);
     }
 
     #[test]

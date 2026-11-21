@@ -165,12 +165,17 @@ fn render(found: &[Detected], home: &Path) -> String {
          # Reference: https://github.com/klawr/lodge/blob/master/docs/configuration.md\n\
          # Check it with `ldg doctor`.\n\n"
     );
-    s.push_str(
-        "# ── Engine ───────────────────────────────────────────────────────────\n\
-         # The container engine to drive (--engine overrides it). docker is the\n\
-         # default and the only one so far.\n\
-         # engine = \"docker\"\n\n",
-    );
+    s.push_str(&format!(
+        "# ── Target ───────────────────────────────────────────────────────────\n\
+             # Where to work (--target overrides it): {}. The first is the default.\n\
+             # target = \"{}\"\n\n",
+        super::targets::all()
+            .iter()
+            .map(|t| format!("\"{}\" ({})", t.name(), t.about()))
+            .collect::<Vec<_>>()
+            .join(", "),
+        super::targets::default_name()
+    ));
     s.push_str("# ── Tools ────────────────────────────────────────────────────────────\n");
     s.push_str("# Each [[inject]] copies a binary (with its libraries) and/or a config.\n");
     s.push_str("# Uncomment what you want in your containers.\n");

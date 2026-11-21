@@ -33,11 +33,12 @@ mod workdir;
 use crate::output::{note, warning};
 use anyhow::Result;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::host::HostRef;
 use crate::local::Local;
-use crate::provision::{Attached, PostAttach, Provisioner};
-use crate::runtime::{Container, Env, Runtime};
+use crate::provision::{Attached, ConfigState, Endpoints, Found, Lifecycle, PostAttach, Status};
+use crate::runtime::{Container, Env, Listed, Runtime};
 use crate::tools::OciFetcher;
 use drift::{config_state, write_hash};
 use lifecycle::{HookCtx, exec_env, run_create_hooks, run_in_container, run_on_host};
@@ -45,7 +46,6 @@ use profile::write_env_profile;
 use spec::{Spec, load_spec};
 
 pub use backend::LABEL_PROJECT;
-pub use drift::ConfigState;
 
 /// The questions [`start`] may need a person to answer.
 pub trait Prompt {
@@ -54,29 +54,85 @@ pub trait Prompt {
     fn choose_workdir(&self, configured: &str, candidates: &[String]) -> String;
 }
 
-/// The devcontainer provisioner: brings a project's devcontainer up on `host`
-/// (where the engine `rt` runs too). Registry features are pulled with `oci`,
-/// and anything that needs a person goes through `prompt`.
-pub struct Devcontainer<'a> {
-    pub host: &'a HostRef,
-    /// The machine lodge runs on, which `${localEnv:…}` reads.
-    pub local: &'a dyn Local,
-    pub rt: &'a dyn Runtime,
-    pub oci: &'a dyn OciFetcher,
-    pub prompt: &'a dyn Prompt,
+/// The devcontainer endpoints: a project's devcontainer on the container engine
+/// `rt`, on `host` (where the engine runs too). Registry features are pulled with
+/// `oci`, anything that needs a person goes through `prompt`, and `${localEnv:…}`
+/// is read from `local`.
+pub struct Devcontainer {
+    host: HostRef,
+    local: Arc<dyn Local>,
+    rt: Box<dyn Runtime>,
+    oci: Arc<dyn OciFetcher>,
+    prompt: Arc<dyn Prompt>,
 }
 
-impl Provisioner for Devcontainer<'_> {
+impl Devcontainer {
+    pub fn new(
+        host: HostRef,
+        local: Arc<dyn Local>,
+        rt: Box<dyn Runtime>,
+        oci: Arc<dyn OciFetcher>,
+        prompt: Arc<dyn Prompt>,
+    ) -> Self {
+        Self {
+            host,
+            local,
+            rt,
+            oci,
+            prompt,
+        }
+    }
+}
+
+impl Endpoints for Devcontainer {
     fn provision(&self, project: &Path, rebuild: bool) -> Result<Attached> {
         start(
             project,
-            self.host,
-            self.local,
+            &self.host,
+            self.local.as_ref(),
             rebuild,
-            self.rt,
-            self.oci,
-            self.prompt,
+            self.rt.as_ref(),
+            self.oci.as_ref(),
+            self.prompt.as_ref(),
         )
+    }
+
+    fn find(&self, project: &Path) -> Result<Option<Found>> {
+        find(project, &self.host, self.local.as_ref(), self.rt.as_ref())
+    }
+
+    fn status(&self, project: &Path) -> Result<Option<Status>> {
+        status(project, &self.host, self.local.as_ref(), self.rt.as_ref())
+    }
+
+    fn lifecycle(&self) -> Option<&dyn Lifecycle> {
+        Some(self)
+    }
+
+    fn container(&self, id: &str) -> Box<dyn Container> {
+        self.rt.container(id)
+    }
+
+    fn engine(&self) -> Option<&dyn Runtime> {
+        Some(self.rt.as_ref())
+    }
+
+    fn needs_project_path(&self) -> bool {
+        true
+    }
+}
+
+impl Lifecycle for Devcontainer {
+    fn stop(&self, project: &Path) -> Result<Option<String>> {
+        stop(project, &self.host, self.local.as_ref(), self.rt.as_ref())
+    }
+
+    fn remove(&self, project: &Path) -> Result<Option<String>> {
+        remove(project, &self.host, self.local.as_ref(), self.rt.as_ref())
+    }
+
+    fn list(&self) -> Result<Vec<Listed>> {
+        self.rt.list_labeled(LABEL_PROJECT)
     }
 }
 
@@ -211,13 +267,6 @@ fn locate(
     Ok((spec, existing))
 }
 
-/// The project's container, if it has one.
-pub struct Found {
-    pub container: Box<dyn Container>,
-    /// `remoteUser`, the user sessions and hooks run as.
-    pub remote_user: Option<String>,
-}
-
 /// Finds the container `ldg up` manages for this project.
 pub fn find(
     project_path: &Path,
@@ -262,14 +311,6 @@ pub fn remove(
     Ok(existing)
 }
 
-/// What [`status`] finds out about a project's container.
-pub struct Status {
-    pub found: Found,
-    pub running: bool,
-    /// Whether the config drifted (read from the container, running or not).
-    pub config: ConfigState,
-}
-
 /// The project's container, if it has one: whether it runs, and whether its
 /// config drifted.
 pub fn status(
@@ -292,7 +333,7 @@ pub fn status(
             remote_user: spec.remote_user,
         },
         running,
-        config,
+        config: Some(config),
     }))
 }
 
@@ -394,6 +435,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .config
+            .expect("a devcontainer has a config")
     }
 
     #[test]
@@ -528,7 +570,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!s.running);
-        assert_eq!(s.config, ConfigState::Changed);
+        assert_eq!(s.config, Some(ConfigState::Changed));
     }
 
     #[test]

@@ -42,5 +42,5 @@ Rejected logins and host-key failures are not retried.
 If something fails, run with `-v` to see each command, and `-vv`/`-vvv` for ssh's
 own debug output.
 
-From a machine that isn't your Linux workstation (macOS, Windows, a CI runner),
+From a machine that isn't your Linux workstation (a CI runner, or WSL2 on Windows),
 combine `--remote` with a bundle: see [Bundles and secrets](bundles-and-secrets.md).

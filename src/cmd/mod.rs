@@ -8,6 +8,7 @@
 //! - [`init`]: the `init` command
 //! - [`bundle`]: `pack`, `bundle`, `cache`
 //! - [`prompt`]: the questions `up` asks on the terminal
+//! - [`targets`]: the list of targets, the one place that says which there are
 
 mod attach;
 mod bundle;
@@ -15,9 +16,10 @@ mod doctor;
 mod init;
 mod project;
 mod prompt;
+pub(crate) mod targets;
 
 use anyhow::{Context, Result};
-use clap::CommandFactory;
+use clap::{CommandFactory, FromArgMatches};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -27,64 +29,102 @@ use crate::config::Config;
 use crate::forward::{DetachedDaemon, ForwardDaemon};
 use crate::host::{HostRef, LocalHost, SshHost};
 use crate::local::{Local, SystemLocal};
-use crate::runtime::cli::{Docker, Podman};
-use crate::runtime::{Engine, Runtime};
+use crate::provision::{Endpoints, Wiring};
 use crate::tools::{Ldd, Oras, Patchelf, Toolchain};
 
-/// Which engine this run drives: `--engine`, else `engine` in the config file,
-/// else docker. A command that never touches an engine (`init`, the generated
-/// completions and man page) does not read the config for it, so a bad value
-/// can't stop `ldg init --force` from fixing the file.
-fn choose_engine(
-    flag: Option<Engine>,
-    command: &Command,
-    config: &std::path::Path,
-) -> Result<Engine> {
-    if let Some(engine) = flag {
-        return Ok(engine);
-    }
-    if matches!(
+/// Whether a command works in a target at all. `init` and the generated
+/// completions and man page do not, so a bad value in the config can't stop
+/// `ldg init --force` from fixing the file.
+fn uses_target(command: &Command) -> bool {
+    !matches!(
         command,
         Command::Init { .. } | Command::Completions { .. } | Command::Man
-    ) {
-        return Ok(Engine::default());
-    }
-    Ok(crate::config::engine_setting(config)?.unwrap_or_default())
+    )
 }
 
-/// Builds the engine `kind` on `host`. With the host, the only place that
-/// chooses an implementation of the interface everything else takes.
-fn build_engine(kind: Engine, host: HostRef) -> Box<dyn Runtime> {
-    match kind {
-        Engine::Docker => Box::new(Docker::new(host)),
-        Engine::Podman => Box::new(Podman::new(host)),
+/// Which target this run works in: `--target`, else `target` in the config file,
+/// else the default. A command that never touches one (`init`, the generated
+/// completions and man page) does not read the config for it, so a bad value
+/// can't stop `ldg init --force` from fixing the file.
+fn choose_target(
+    flag: Option<String>,
+    command: &Command,
+    config: &std::path::Path,
+) -> Result<&'static str> {
+    if let Some(target) = flag {
+        return targets::check(&target);
     }
+    if !uses_target(command) {
+        return Ok(targets::default_name());
+    }
+    match crate::config::target_setting(config)? {
+        Some(target) => targets::check(&target)
+            .with_context(|| format!("invalid `target` in {}", config.display())),
+        None => Ok(targets::default_name()),
+    }
+}
+
+/// Builds the endpoints of `target`, from the settings the config gives it. A
+/// command that never uses a target builds none that matters: the default, with no
+/// settings, so a bad table can't stop `ldg init --force` from fixing the file.
+fn build_endpoints(
+    target: &str,
+    config: &std::path::Path,
+    with: Wiring,
+    command: &Command,
+) -> Result<Box<dyn Endpoints>> {
+    let kind = targets::find(target).with_context(|| format!("no target `{target}`"))?;
+    let settings = if uses_target(command) {
+        crate::config::target_settings(config, target)?
+    } else {
+        toml::Table::new()
+    };
+    kind.build(with, &settings)
+        .with_context(|| format!("setting up the {target} target (from {})", config.display()))
+}
+
+/// The command line, with the targets this build knows as the values `--target`
+/// takes (so a typo is caught by the parser, and completions offer them).
+pub fn command() -> clap::Command {
+    use clap::builder::{PossibleValue, PossibleValuesParser};
+    let values: Vec<PossibleValue> = targets::all()
+        .iter()
+        .map(|t| PossibleValue::new(t.name()).help(t.about()))
+        .collect();
+    Cli::command().mut_arg("target", |arg| {
+        arg.value_parser(PossibleValuesParser::new(values))
+    })
+}
+
+/// Parses the process's arguments; exits with the usage message when they are wrong.
+pub fn parse() -> Cli {
+    let matches = command().get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
 }
 
 /// The arguments that make a child lodge (the forward daemon is one) reach the
-/// same host and drive the same engine as this one, in front of its subcommand.
+/// same host and work in the same target as this one, in front of its subcommand.
 /// The command-line surface is the command layer's to know, not the host's or the
-/// engine's.
-fn respawn_args(remote: Option<&str>, engine: Engine) -> Vec<String> {
-    use clap::ValueEnum as _;
+/// target's.
+fn respawn_args(remote: Option<&str>, target: &str) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(remote) = remote {
         args.extend(["--remote".to_string(), remote.to_string()]);
     }
-    if let Some(name) = engine.to_possible_value() {
-        args.extend(["--engine".to_string(), name.get_name().to_string()]);
-    }
+    args.extend(["--target".to_string(), target.to_string()]);
     args
 }
 
-/// What every command works with: the host the project is on, the engine on it,
+/// What every command works with: the host the project is on, the endpoints on it,
 /// the helper tools and where the config is. Built once, in [`run`], which is the only place that
 /// chooses an implementation of either; everything below takes the interfaces.
 pub struct Ctx {
     pub host: HostRef,
     /// The machine lodge runs on: its environment, and a shell for secrets.
     pub local: Arc<dyn Local>,
-    pub rt: Box<dyn Runtime>,
+    /// Where the project's work happens and how to get there: a devcontainer on
+    /// an engine, or a plain host.
+    pub endpoints: Box<dyn Endpoints>,
     /// The helper programs, for packing a bundle and fetching features.
     pub tools: Toolchain,
     /// Starts port forwarding for a container once it is up.
@@ -95,7 +135,13 @@ pub struct Ctx {
 impl Ctx {
     /// Loads and validates the config. Commands call this once.
     pub fn config(&self) -> Result<Config> {
-        Config::load(&self.config_path)
+        let config = Config::load(&self.config_path)?;
+        // A table for a target that does not exist is a typo, and nothing reads it.
+        for name in config.targets.keys() {
+            targets::check(name)
+                .with_context(|| format!("`[targets.{name}]` in {}", self.config_path.display()))?;
+        }
+        Ok(config)
     }
 
     /// The project folder: `path` or the current directory, made absolute and
@@ -105,9 +151,12 @@ impl Ctx {
     pub fn project(&self, path: Option<PathBuf>) -> Result<PathBuf> {
         let path = match path {
             Some(p) => p,
-            None if !self.host.shares_cwd() => {
+            None if !self.host.shares_cwd() && self.endpoints.needs_project_path() => {
                 anyhow::bail!("with --remote, give the project's path on the remote host")
             }
+            // A plain host needs no project: work where the host starts (its login
+            // directory over ssh).
+            None if !self.host.shares_cwd() => PathBuf::from("."),
             None => std::env::current_dir().context("finding the current directory")?,
         };
         self.host.canonical_dir(&path)
@@ -116,8 +165,8 @@ impl Ctx {
 
 pub fn run(cli: Cli) -> Result<ExitCode> {
     // The composition root: the one place that picks how the project's machine
-    // is reached and which engine runs on it. Each is an interface everything
-    // else takes; a new way of reaching a machine or a new engine is one more arm.
+    // is reached and which target is worked in on it. Each is an interface everything
+    // else takes; a new way of reaching a machine or a new target is one more arm.
     // The helper tools (`ldd`, `patchelf`, `oras`) are chosen here too.
     let remote = cli.remote.clone();
     let host: HostRef = match cli.remote {
@@ -131,18 +180,29 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         host.connect()?;
     }
     let config_path = crate::config::path_for(cli.config)?;
-    let engine = choose_engine(cli.engine, &cli.command, &config_path)?;
-    let rt = build_engine(engine, host.clone());
-    let ctx = Ctx {
-        forwarder: Box::new(DetachedDaemon::new(respawn_args(remote.as_deref(), engine))),
-        rt,
-        tools: Toolchain {
-            deps: Box::new(Ldd),
-            elf: Box::new(Patchelf),
-            oci: Box::new(Oras),
+    let target = choose_target(cli.target, &cli.command, &config_path)?;
+    let local: Arc<dyn Local> = Arc::new(SystemLocal);
+    let tools = Toolchain {
+        deps: Box::new(Ldd),
+        elf: Box::new(Patchelf),
+        oci: Arc::new(Oras),
+    };
+    let endpoints = build_endpoints(
+        target,
+        &config_path,
+        Wiring {
+            host: host.clone(),
+            local: local.clone(),
+            oci: tools.oci.clone(),
         },
+        &cli.command,
+    )?;
+    let ctx = Ctx {
+        forwarder: Box::new(DetachedDaemon::new(respawn_args(remote.as_deref(), target))),
+        endpoints,
+        tools,
         host,
-        local: Arc::new(SystemLocal),
+        local,
         config_path,
     };
 
@@ -178,16 +238,16 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
         Command::Completions { shell } => {
-            clap_complete::generate(shell, &mut Cli::command(), "ldg", &mut std::io::stdout());
+            clap_complete::generate(shell, &mut command(), "ldg", &mut std::io::stdout());
         }
         Command::Man => {
-            clap_mangen::Man::new(Cli::command())
+            clap_mangen::Man::new(command())
                 .render(&mut std::io::stdout())
                 .context("writing the man page")?;
         }
         Command::Forward { container, port } => {
             let forwarders = crate::forward::HostForwarders::new(ctx.host.as_ref());
-            crate::forward::run_daemon(ctx.rt.as_ref(), &forwarders, &container, &port);
+            crate::forward::run_daemon(ctx.endpoints.as_ref(), &forwarders, &container, &port);
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -228,6 +288,7 @@ fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser as _;
 
     #[test]
     fn sizes_read_naturally() {
@@ -237,66 +298,101 @@ mod tests {
     }
 
     #[test]
-    fn the_engine_flag_is_optional_and_checked() {
-        use clap::Parser as _;
-        let engine = |args: &[&str]| Cli::try_parse_from(args).map(|c| c.engine);
-        assert_eq!(engine(&["ldg", "ls"]).unwrap(), None);
+    fn the_target_flag_is_optional_and_takes_only_the_targets_there_are() {
+        let target = |args: &[&str]| {
+            command()
+                .try_get_matches_from(args)
+                .map(|m| Cli::from_arg_matches(&m).unwrap().target)
+        };
+        assert_eq!(target(&["ldg", "ls"]).unwrap(), None);
         assert_eq!(
-            engine(&["ldg", "--engine", "docker", "ls"]).unwrap(),
-            Some(Engine::Docker)
+            target(&["ldg", "--target", "podman", "ls"])
+                .unwrap()
+                .as_deref(),
+            Some("podman")
         );
-        assert!(engine(&["ldg", "--engine", "nonesuch", "ls"]).is_err());
+        let err = target(&["ldg", "--target", "nonesuch", "ls"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("docker") && err.contains("host"), "{err}");
     }
 
     fn config_with(text: &str) -> (crate::tmpfile::TempDir, std::path::PathBuf) {
-        let dir = crate::tmpfile::TempDir::new("engine-config").unwrap();
+        let dir = crate::tmpfile::TempDir::new("target-config").unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, text).unwrap();
         (dir, path)
     }
 
     #[test]
-    fn the_engine_comes_from_the_flag_then_the_config_then_docker() {
-        use clap::Parser as _;
+    fn the_target_comes_from_the_flag_then_the_config_then_the_default() {
         let ls = Cli::try_parse_from(["ldg", "ls"]).unwrap().command;
-        let (_dir, with) = config_with("engine = \"docker\"\n");
-        let (_dir2, without) = config_with("bundle = \"b.tar\"\n");
-        let missing = with.with_file_name("nope.toml");
-        for path in [&with, &without, &missing] {
-            assert_eq!(choose_engine(None, &ls, path).unwrap(), Engine::Docker);
-        }
-        // A flag decides before the config is read, so a bad config value does
-        // not matter then; without the flag it is an error naming the key.
-        let (_dir3, bad) = config_with("engine = \"nonesuch\"\n");
+        let (_dir, with) = config_with("target = \"podman\"\n");
+        let (_dir2, without) = config_with("");
+        assert_eq!(choose_target(None, &ls, &with).unwrap(), "podman");
+        assert_eq!(choose_target(None, &ls, &without).unwrap(), "docker");
         assert_eq!(
-            choose_engine(Some(Engine::Docker), &ls, &bad).unwrap(),
-            Engine::Docker
+            choose_target(None, &ls, &without.with_file_name("none.toml")).unwrap(),
+            "docker"
         );
-        let err = choose_engine(None, &ls, &bad).unwrap_err();
-        assert!(format!("{err:#}").contains("invalid `engine`"), "{err:#}");
-        // Commands that never use an engine don't read it, so `init` can fix it.
+        // The flag wins over the file, even a bad one.
+        let (_dir3, bad) = config_with("target = \"nonesuch\"\n");
+        assert_eq!(
+            choose_target(Some("host".into()), &ls, &bad).unwrap(),
+            "host"
+        );
+        let err = choose_target(None, &ls, &bad).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("invalid `target`") && text.contains("docker, podman, host"),
+            "{text}"
+        );
+        // Commands that never use a target don't read it, so `init` can fix it.
         let init = Cli::try_parse_from(["ldg", "init", "--force"])
             .unwrap()
             .command;
-        assert_eq!(choose_engine(None, &init, &bad).unwrap(), Engine::Docker);
+        assert_eq!(choose_target(None, &init, &bad).unwrap(), "docker");
     }
 
     #[test]
-    fn a_child_lodge_is_pointed_at_the_same_engine_and_host() {
-        use clap::Parser as _;
-        for engine in [Engine::Docker, Engine::Podman] {
+    fn a_target_is_built_from_its_own_table_and_an_unused_one_is_not_read() {
+        use crate::host::fake::FakeHost;
+        use crate::local::fake::FakeLocal;
+        use crate::tools::NoRegistry;
+        let wiring = || Wiring {
+            host: Arc::new(FakeHost::new()),
+            local: Arc::new(FakeLocal::new()),
+            oci: Arc::new(NoRegistry),
+        };
+        let (_dir, path) =
+            config_with("[targets.docker]\ncontext = \"colima\"\n[targets.podman]\nbogus = 1\n");
+        let ls = Cli::try_parse_from(["ldg", "ls"]).unwrap().command;
+        // Docker's own table is fine; podman's mistake is not docker's problem.
+        build_endpoints("docker", &path, wiring(), &ls).unwrap();
+        let err = build_endpoints("podman", &path, wiring(), &ls)
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("[targets.podman]"), "{err:#}");
+        // `init` builds from no settings at all.
+        let init = Cli::try_parse_from(["ldg", "init"]).unwrap().command;
+        build_endpoints("podman", &path, wiring(), &init).unwrap();
+    }
+
+    #[test]
+    fn a_child_lodge_is_pointed_at_the_same_target_and_host() {
+        for target in targets::names() {
             let mut args = vec!["ldg".to_string()];
-            args.extend(respawn_args(Some("me@h:22"), engine));
+            args.extend(respawn_args(Some("me@h:22"), target));
             args.push("ls".into());
-            let cli = Cli::try_parse_from(args).unwrap();
+            let matches = command().try_get_matches_from(args).unwrap();
+            let cli = Cli::from_arg_matches(&matches).unwrap();
             assert_eq!(cli.remote.as_deref(), Some("me@h:22"));
-            assert_eq!(cli.engine, Some(engine));
+            assert_eq!(cli.target.as_deref(), Some(target));
         }
-        assert!(!respawn_args(None, Engine::Docker).contains(&"--remote".to_string()));
     }
 
     #[test]
     fn the_cli_definition_is_consistent() {
-        Cli::command().debug_assert();
+        command().debug_assert();
     }
 }

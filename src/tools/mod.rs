@@ -11,6 +11,7 @@
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 mod external;
 
@@ -60,7 +61,7 @@ pub trait OciFetcher {
 pub struct Toolchain {
     pub deps: Box<dyn DepReader>,
     pub elf: Box<dyn ElfEditor>,
-    pub oci: Box<dyn OciFetcher>,
+    pub oci: Arc<dyn OciFetcher>,
 }
 
 /// A registry that is never reached: for tests that must not pull.
@@ -84,6 +85,6 @@ pub(crate) fn external() -> Toolchain {
     Toolchain {
         deps: Box::new(Ldd),
         elf: Box::new(Patchelf),
-        oci: Box::new(NoRegistry),
+        oci: Arc::new(NoRegistry),
     }
 }

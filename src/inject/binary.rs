@@ -75,6 +75,17 @@ pub(super) fn check_architecture(env: &dyn Env, manifest: &Manifest) -> Result<(
     if !manifest.tools.iter().any(|t| t.binary.is_some()) {
         return Ok(());
     }
+    // A container is Linux whatever runs the engine; a real machine may not be,
+    // and a bundle holds Linux binaries.
+    if !env.is_disposable()
+        && let Ok(os) = env.exec_capture_with(&["uname", "-s"], &ExecOpts::default().repeatable())
+        && os.trim() != "Linux"
+    {
+        bail!(
+            "the bundle's binaries are for Linux, but this machine runs {}",
+            os.trim()
+        );
+    }
     let Ok(bundle_arch) = manifest.arch() else {
         return Ok(());
     };
@@ -309,5 +320,39 @@ mod tests {
         });
         // No `uname` is declared: a bundle with no binaries must not even ask.
         check_architecture(&FakeEnv::new(), &configs_only).unwrap();
+    }
+
+    #[test]
+    fn a_real_machine_that_is_not_linux_is_refused_but_a_container_is_never_asked() {
+        let manifest = Manifest {
+            lodge_version: "0".into(),
+            created: 0,
+            arch: "x86_64".into(),
+            linker: None,
+            libs: vec![],
+            tools: vec![crate::bundle::manifest::Tool {
+                name: "t".into(),
+                binary: Some(crate::bundle::manifest::Binary {
+                    dest: None,
+                    dynamic: false,
+                    hash: "00000000000000aa".into(),
+                }),
+                config: None,
+            }],
+            git_safe_directories: vec![],
+        };
+        let mac = FakeEnv::new()
+            .shared()
+            .with_output(&["uname", "-s"], "Darwin\n");
+        let err = check_architecture(&mac, &manifest).unwrap_err();
+        assert!(err.to_string().contains("Darwin"), "{err}");
+        let linux = FakeEnv::new()
+            .shared()
+            .with_output(&["uname", "-s"], "Linux\n")
+            .with_output(&["uname", "-m"], "x86_64\n");
+        check_architecture(&linux, &manifest).unwrap();
+        // A container declares no `uname -s`: asking would panic the strict fake.
+        let container = FakeEnv::new().with_output(&["uname", "-m"], "x86_64\n");
+        check_architecture(&container, &manifest).unwrap();
     }
 }

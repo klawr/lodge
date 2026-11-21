@@ -21,15 +21,16 @@
 pub mod cli;
 #[cfg(test)]
 pub mod fake;
+mod inside;
 pub(crate) mod tarball;
 mod user;
 
+pub use inside::Inside;
 #[cfg(test)]
 pub(crate) use user::PROBE_SCRIPT;
 pub use user::{ContainerUser, User};
 
 use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -163,6 +164,14 @@ pub trait Env {
         let opts = ExecOpts::as_user(user.exec_as()).repeatable();
         let out = self.output(&script_argv(RUN_PROBE_SCRIPT, &[dir, mode]), &opts)?;
         Ok(out.success)
+    }
+
+    /// Whether this is a place made for lodge's use and thrown away when done (a
+    /// container), so replacing what is there is fine. A real machine is not:
+    /// injection leaves a config lodge didn't place alone and does not loosen
+    /// git's ownership check there.
+    fn is_disposable(&self) -> bool {
+        true
     }
 
     /// Who the provided helpers below act as, and who owns what they create:
@@ -319,6 +328,10 @@ impl Env for Acting<'_> {
     fn actor(&self) -> ContainerUser {
         self.user.clone()
     }
+
+    fn is_disposable(&self) -> bool {
+        self.env.is_disposable()
+    }
 }
 
 /// An [`Env`] that can be inspected.
@@ -360,20 +373,27 @@ pub trait Container: Env {
 
 /// How the ports of a container can be reached from the host that runs its
 /// engine. What a forward does with it (the built-in proxy, or the host's own
-/// tunnel) is decided from the host, not from the answer. A published port or a
-/// `port-forward` is another variant, added with the engine that needs it.
+/// tunnel) is decided from the host, not from the answer. A way that is a
+/// *process* (`kubectl port-forward`) is not an address at all and would be
+/// another variant, with the `Host` hook that starts it, when an engine needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reach {
     /// Every port the container listens on is open at this address (an IP on
     /// the container network).
     Address(String),
+    /// Only the ports the container publishes are reachable, each at the address
+    /// the engine's host has for it (a rootless engine, whose containers have an
+    /// address the host cannot connect to). Container port to `host:port`.
+    Published(BTreeMap<u16, String>),
 }
 
 impl Reach {
-    /// `host:port` to connect to for `port` of the container.
-    pub fn destination(&self, port: u16) -> String {
+    /// `host:port` to connect to for `port` of the container, `None` when this
+    /// way of reaching it does not reach that port (one that is not published).
+    pub fn destination(&self, port: u16) -> Option<String> {
         match self {
-            Reach::Address(ip) => format!("{ip}:{port}"),
+            Reach::Address(ip) => Some(format!("{ip}:{port}")),
+            Reach::Published(ports) => ports.get(&port).cloned(),
         }
     }
 }
@@ -382,6 +402,10 @@ impl std::fmt::Display for Reach {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Reach::Address(ip) => f.write_str(ip),
+            Reach::Published(ports) => {
+                let shown: Vec<String> = ports.keys().map(u16::to_string).collect();
+                write!(f, "published ports [{}]", shown.join(", "))
+            }
         }
     }
 }
@@ -444,20 +468,6 @@ pub struct Listed {
     pub label: String,
 }
 
-/// The container engines lodge can drive, as the user names them: `--engine`, and
-/// `engine` in the config. Each is an implementation of [`Runtime`]; the command
-/// layer builds the one chosen.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-#[cfg_attr(test, derive(schemars::JsonSchema))]
-pub enum Engine {
-    /// The `docker` CLI (with `docker compose`).
-    #[default]
-    Docker,
-    /// The `podman` CLI (with `podman compose`, which needs a compose provider).
-    Podman,
-}
-
 /// A container engine.
 pub trait Runtime {
     /// A handle for the container with this id or name.
@@ -514,7 +524,18 @@ pub trait Compose {
 #[cfg(test)]
 mod tests {
     use super::fake::{FakeEnv, Who};
-    use super::{Acting, ContainerUser, Env, ExecOpts, User};
+    use super::{Acting, ContainerUser, Env, ExecOpts, Reach, User};
+
+    #[test]
+    fn a_way_in_gives_the_destination_of_each_port_it_reaches() {
+        let address = Reach::Address("10.0.0.2".into());
+        assert_eq!(address.destination(80).as_deref(), Some("10.0.0.2:80"));
+        let published = Reach::Published([(80, "127.0.0.1:8080".to_string())].into());
+        assert_eq!(published.destination(80).as_deref(), Some("127.0.0.1:8080"));
+        assert_eq!(published.destination(443), None, "not published");
+        assert_eq!(address.to_string(), "10.0.0.2");
+        assert_eq!(published.to_string(), "published ports [80]");
+    }
 
     fn dev() -> ContainerUser {
         ContainerUser {

@@ -1,96 +1,23 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Config",
-  "type": "object",
-  "properties": {
-    "bundle": {
-      "description": "A bundle file to inject from instead of packing the `[[inject]]` entries.\nA relative path is relative to this file's folder.",
-      "type": [
-        "string",
-        "null"
-      ],
-      "default": null
-    },
-    "engine": {
-      "description": "The container engine to drive, unless `--engine` says otherwise\n(`docker` or `podman`; default: docker).",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/Engine"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null
-    },
-    "git": {
-      "description": "Git settings applied in the container.",
-      "$ref": "#/$defs/GitConfig",
-      "default": {
-        "safe_directories": [
-          "*"
-        ]
-      }
-    },
-    "inject": {
-      "description": "Tools to inject: a binary, a config file or directory, or both.",
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/Injectable"
-      }
-    },
-    "secret": {
-      "description": "Secrets to deliver at attach time. Local config only, never in a bundle.",
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/Secret"
-      }
-    },
-    "session": {
-      "description": "How the interactive session is opened.",
-      "$ref": "#/$defs/SessionConfig",
-      "default": {
-        "shell": "/bin/bash"
-      }
-    }
-  },
-  "additionalProperties": false,
   "$defs": {
-    "Engine": {
-      "description": "The container engines lodge can drive, as the user names them: `--engine`, and\n`engine` in the config. Each is an implementation of [`Runtime`]; the command\nlayer builds the one chosen.",
-      "oneOf": [
-        {
-          "description": "The `docker` CLI (with `docker compose`).",
-          "type": "string",
-          "const": "docker"
-        },
-        {
-          "description": "The `podman` CLI (with `podman compose`, which needs a compose provider).",
-          "type": "string",
-          "const": "podman"
-        }
-      ]
-    },
     "GitConfig": {
-      "type": "object",
+      "additionalProperties": false,
       "properties": {
         "safe_directories": {
-          "description": "Directories to register as git `safe.directory` inside the container.\nInjected plugins and the mounted workspace are owned by the host user but\ngit may run as another user in the container, so without this git refuses\nthem with \"detected dubious ownership\". Default: [\"*\"]; [] disables it.",
-          "type": "array",
           "default": [
             "*"
           ],
+          "description": "Directories to register as git `safe.directory` inside the container.\nInjected plugins and the mounted workspace are owned by the host user but\ngit may run as another user in the container, so without this git refuses\nthem with \"detected dubious ownership\". Default: [\"*\"]; [] disables it.",
           "items": {
             "type": "string"
-          }
+          },
+          "type": "array"
         }
       },
-      "additionalProperties": false
+      "type": "object"
     },
     "Injectable": {
-      "type": "object",
+      "additionalProperties": false,
       "properties": {
         "binary": {
           "description": "Host path to the binary to inject.",
@@ -107,9 +34,9 @@
           ]
         },
         "copy_deps": {
+          "default": true,
           "description": "Pack the shared libraries `ldd` finds for the binary (default: true).",
-          "type": "boolean",
-          "default": true
+          "type": "boolean"
         },
         "name": {
           "description": "Identifier; used for default paths.",
@@ -130,19 +57,17 @@
           ]
         }
       },
-      "additionalProperties": false,
       "required": [
         "name"
-      ]
+      ],
+      "type": "object"
     },
     "RawAs": {
-      "description": "`\"env\"`, or a file in the container.",
       "anyOf": [
         {
           "type": "string"
         },
         {
-          "type": "object",
           "properties": {
             "file": {
               "type": "string"
@@ -156,13 +81,15 @@
           },
           "required": [
             "file"
-          ]
+          ],
+          "type": "object"
         }
-      ]
+      ],
+      "description": "`\"env\"`, or a file in the container."
     },
     "RawFrom": {
+      "additionalProperties": false,
       "description": "Where the value comes from on this machine: exactly one of the three.",
-      "type": "object",
       "properties": {
         "command": {
           "type": [
@@ -183,10 +110,10 @@
           ]
         }
       },
-      "additionalProperties": false
+      "type": "object"
     },
     "Secret": {
-      "type": "object",
+      "additionalProperties": false,
       "properties": {
         "as": {
           "$ref": "#/$defs/RawAs"
@@ -198,30 +125,134 @@
           "type": "string"
         },
         "targets": {
-          "type": "array",
           "default": [],
           "items": {
             "type": "string"
-          }
+          },
+          "type": "array"
         }
       },
-      "additionalProperties": false,
       "required": [
         "name",
         "from",
         "as"
-      ]
+      ],
+      "type": "object"
     },
     "SessionConfig": {
-      "type": "object",
+      "additionalProperties": false,
       "properties": {
         "shell": {
+          "default": "/bin/bash",
           "description": "Shell to launch inside the container (default: /bin/bash).",
-          "type": "string",
-          "default": "/bin/bash"
+          "type": "string"
         }
       },
-      "additionalProperties": false
+      "type": "object"
     }
-  }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "bundle": {
+      "default": null,
+      "description": "A bundle file to inject from instead of packing the `[[inject]]` entries.\nA relative path is relative to this file's folder.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "git": {
+      "$ref": "#/$defs/GitConfig",
+      "default": {
+        "safe_directories": [
+          "*"
+        ]
+      },
+      "description": "Git settings applied in the container."
+    },
+    "inject": {
+      "default": [],
+      "description": "Tools to inject: a binary, a config file or directory, or both.",
+      "items": {
+        "$ref": "#/$defs/Injectable"
+      },
+      "type": "array"
+    },
+    "secret": {
+      "default": [],
+      "description": "Secrets to deliver at attach time. Local config only, never in a bundle.",
+      "items": {
+        "$ref": "#/$defs/Secret"
+      },
+      "type": "array"
+    },
+    "session": {
+      "$ref": "#/$defs/SessionConfig",
+      "default": {
+        "shell": "/bin/bash"
+      },
+      "description": "How the interactive session is opened."
+    },
+    "target": {
+      "default": null,
+      "description": "Where to work, unless `--target` says otherwise. Default: docker.",
+      "enum": [
+        "docker",
+        "podman",
+        "host",
+        null
+      ],
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "targets": {
+      "additionalProperties": false,
+      "default": {},
+      "description": "What each target lets you say about it, by target name: `[targets.docker]`.\nThe keys of a table are checked by the target that reads it.",
+      "properties": {
+        "docker": {
+          "additionalProperties": false,
+          "description": "What the user can say about docker, under `[targets.docker]` in the config.",
+          "properties": {
+            "context": {
+              "default": null,
+              "description": "The docker context to use (`docker --context NAME`): which engine to talk\nto when you have several (a remote one, Colima, Docker Desktop). Default:\nthe one `docker context use` selected.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "title": "DockerOptions",
+          "type": "object"
+        },
+        "host": {
+          "additionalProperties": false,
+          "type": "object"
+        },
+        "podman": {
+          "additionalProperties": false,
+          "description": "What the user can say about podman, under `[targets.podman]` in the config.",
+          "properties": {
+            "connection": {
+              "default": null,
+              "description": "The podman connection to use (`podman --connection NAME`): which engine to\ntalk to when you have several (a remote machine, a podman machine).\nDefault: the one `podman system connection default` selected.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "title": "PodmanOptions",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "title": "Config",
+  "type": "object"
 }

@@ -17,6 +17,12 @@ macro_rules! log {
 // ── Forwarder ─────────────────────────────────────────────────────────────────
 
 enum Forwarder {
+    /// Nothing to run: what is published on this machine is already there, on
+    /// the port it was asked for.
+    Direct {
+        local: u16,
+        dest: String,
+    },
     Proxy(ProxyHandle),
     Tunnel {
         child: Box<dyn Child>,
@@ -80,6 +86,14 @@ impl Forwarders for HostForwarders<'_> {
         let forward = if let Some(child) = self.host.tunnel(local, dest, chatter) {
             log!("port {local} — tunnel to {dest}{}", self.on_host());
             Forwarder::tunnel(child?, local, dest)
+        } else if dest == format!("127.0.0.1:{local}") {
+            // The same machine, the same port: a proxy would only fight the
+            // listener that is already there for the port.
+            log!("port {local} — already reachable on this machine");
+            Forwarder::Direct {
+                local,
+                dest: dest.to_string(),
+            }
         } else {
             log!("port {local} — proxy 127.0.0.1:{local} → {dest}");
             Forwarder::proxy(local, dest.to_string())?
@@ -112,6 +126,7 @@ impl Forwarder {
 impl Forward for Forwarder {
     fn describe(&self) -> String {
         match self {
+            Forwarder::Direct { local, dest } => format!("{local}\t{dest}"),
             Forwarder::Proxy(h) => format!("{}\t{}", h.bound.port(), h.dest),
             Forwarder::Tunnel { local, dest, .. } => format!("{local}\t{dest}"),
         }
@@ -119,6 +134,7 @@ impl Forward for Forwarder {
 
     fn dest(&self) -> &str {
         match self {
+            Forwarder::Direct { dest, .. } => dest,
             Forwarder::Proxy(h) => &h.dest,
             Forwarder::Tunnel { dest, .. } => dest,
         }
@@ -126,13 +142,14 @@ impl Forward for Forwarder {
 
     fn ran_for(&self) -> Option<Duration> {
         match self {
-            Forwarder::Proxy(_) => None,
+            Forwarder::Direct { .. } | Forwarder::Proxy(_) => None,
             Forwarder::Tunnel { since, .. } => Some(since.elapsed()),
         }
     }
 
     fn is_alive(&mut self) -> bool {
         match self {
+            Forwarder::Direct { .. } => true,
             Forwarder::Proxy(h) => !h.stop.load(Ordering::Relaxed),
             Forwarder::Tunnel { child, .. } => {
                 child.try_wait().map(|s| s.is_none()).unwrap_or(false)
@@ -144,6 +161,7 @@ impl Forward for Forwarder {
 impl Drop for Forwarder {
     fn drop(&mut self) {
         match self {
+            Forwarder::Direct { .. } => {}
             Forwarder::Proxy(h) => h.stop.store(true, Ordering::Relaxed),
             Forwarder::Tunnel { child, .. } => {
                 #[allow(
@@ -253,6 +271,23 @@ mod tests {
         );
         assert_eq!(host.argvs(), [["tunnel", "8080", "10.0.0.2:80"]]);
         drop(forward);
+    }
+
+    #[test]
+    fn what_this_machine_already_has_on_the_port_is_not_proxied_over_itself() {
+        let host = crate::host::fake::FakeHost::new();
+        let mut forward = HostForwarders::new(&host)
+            .start(13000, "127.0.0.1:13000")
+            .unwrap();
+        assert_eq!(forward.describe(), "13000\t127.0.0.1:13000");
+        assert!(forward.is_alive() && forward.ran_for().is_none());
+        assert!(host.argvs().is_empty());
+        // Another machine still tunnels the same port, to its own loopback.
+        let remote = crate::host::fake::FakeHost::remote("h").with_tunnels();
+        HostForwarders::new(&remote)
+            .start(13000, "127.0.0.1:13000")
+            .unwrap();
+        assert_eq!(remote.argvs(), [["tunnel", "13000", "127.0.0.1:13000"]]);
     }
 
     #[test]

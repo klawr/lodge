@@ -106,7 +106,8 @@ this, with a built-in TCP proxy locally or `ssh -L` tunnels with `--remote`.
 
 Dynamic forwarding needs the container's bridge IP to be reachable from the
 engine's host: Linux with Docker Engine, or any engine with `--remote`. Rootless
-Podman has no such address; publish ports with `appPort` there. Docker
+Podman has no such address: there, the ports the container publishes
+(`appPort`) are forwarded, and the others are not. Docker
 Desktop on macOS/Windows doesn't expose container IPs.
 
 ## Read and ignored

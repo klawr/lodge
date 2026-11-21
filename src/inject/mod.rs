@@ -102,7 +102,7 @@ pub fn run(
             wrappers.push(wrapper);
         }
         if let Some(config) = &tool.config {
-            configs.push(inject_config(
+            configs.extend(inject_config(
                 &env,
                 user,
                 bundle,

@@ -2,10 +2,11 @@
 //! inspecting it, and resolving its peers.
 
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeMap;
 
 use super::{CliEngine, Flavor};
-use crate::host::{Input, Repeat};
-use crate::runtime::{Container, ContainerUser, Env, ExecOpts, Output, Reach, User};
+use crate::host::{HostRef, Job, Repeat};
+use crate::runtime::{Container, ExecOpts, Inside, Reach, User};
 use std::process::ExitStatus;
 
 /// One container, driven through the docker CLI.
@@ -108,69 +109,34 @@ fn compose_service_matches(name: &str, service: &str) -> bool {
         })
     })
 }
-impl<F: Flavor> Env for CliContainer<F> {
-    fn exec(&self, argv: &[&str], opts: &ExecOpts) -> Result<()> {
-        let args = self.exec_args(argv, opts);
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let ran = self
-            .cli
-            .host
-            .exec(self.cli.job(&refs).repeat(opts.repeat))
-            .with_context(|| format!("spawning {} exec", self.cli.name()))?;
-        if !ran.status.success() {
-            bail!("{} exec failed: {argv:?}", self.cli.name());
+/// What is the engine's own about working inside one of its containers: `exec` with
+/// the user, directory and environment as flags, `cp` to unpack a tar (which, with
+/// `-a`, keeps the archive's owners), and `exec -it` for a terminal. The rest of
+/// [`Env`](crate::runtime::Env) is built on this in `runtime::inside`.
+impl<F: Flavor> Inside for CliContainer<F> {
+    fn host(&self) -> &HostRef {
+        &self.cli.host
+    }
+
+    fn describe(&self) -> String {
+        format!("{} exec", self.cli.name())
+    }
+
+    fn command<'a>(&self, argv: &[&str], opts: &ExecOpts, stdin: bool) -> Result<Job<'a>> {
+        let mut args = self.exec_args(argv, opts);
+        if stdin {
+            args.insert(1, "-i".into());
         }
-        Ok(())
-    }
-
-    fn output(&self, argv: &[&str], opts: &ExecOpts) -> Result<Output> {
-        let args = self.exec_args(argv, opts);
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = self
-            .cli
-            .host
-            .exec(self.cli.job(&refs).capture().repeat(opts.repeat))
-            .with_context(|| format!("spawning {} exec", self.cli.name()))?;
-        Ok(Output {
-            success: out.status.success(),
-            stdout: out.stdout_text(),
-            stderr: out.stderr_text(),
-        })
+        Ok(self.cli.job(&refs))
     }
 
-    /// A tar stream through `docker cp -a -`; see [`copy`](super::copy).
-    fn put(&self, src: &str, dest: &str, owner: &ContainerUser) -> Result<()> {
-        self.copy_in(src, dest, owner)
+    fn extract<'a>(&self, dir: &str) -> Job<'a> {
+        let target = format!("{}:{dir}", self.id);
+        self.cli.job(&self.cli.flavor.cp_in_args(&target))
     }
 
-    fn write_secret(&self, dest: &str, contents: &[u8], mode: u32, user: User) -> Result<()> {
-        let script = crate::runtime::WRITE_SECRET_SCRIPT.replace("%MODE%", &format!("{mode:o}"));
-        // The value goes on stdin; argv carries only the script and the path.
-        let argv = crate::shell::script_argv(&script, &[dest]);
-        let mut args = self.exec_args(&argv, &ExecOpts::as_user(user));
-        args.insert(1, "-i".into());
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        // The script writes to a temporary file and renames it into place, so
-        // sending the secret again after a lost connection is harmless.
-        let mut feed = |stdin: &mut dyn std::io::Write| stdin.write_all(contents);
-        let ran = self
-            .cli
-            .host
-            .exec(
-                self.cli
-                    .job(&refs)
-                    .stdin(Input::Feed(&mut feed))
-                    .repeat(Repeat::Safe),
-            )
-            .with_context(|| format!("running {} exec", self.cli.name()))?;
-        if !ran.status.success() {
-            bail!("writing secret file {dest} failed ({})", ran.status);
-        }
-        ran.fed
-            .with_context(|| format!("sending secret to {} exec", self.cli.name()))
-    }
-
-    fn interactive(&self, user: User, workdir: &str, inner: &str) -> std::io::Result<ExitStatus> {
+    fn session(&self, user: User, workdir: &str, inner: &str) -> std::io::Result<ExitStatus> {
         let opts = ExecOpts {
             workdir: Some(workdir),
             ..ExecOpts::as_user(user)
@@ -178,7 +144,7 @@ impl<F: Flavor> Env for CliContainer<F> {
         let mut args = self.exec_args(&["sh", "-c", inner], &opts);
         args.insert(1, "-it".into());
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        // The host decides how a terminal reaches the docker CLI.
+        // The host decides how a terminal reaches the engine's CLI.
         self.cli.interactive(&refs)
     }
 }
@@ -243,10 +209,13 @@ impl<F: Flavor> Container for CliContainer<F> {
     }
 
     fn reach(&self, peer: Option<&str>) -> Option<Reach> {
-        // A rootless engine's containers have an address, but not one the host
-        // can connect to.
+        // A rootless engine's containers have an address, but not one the host can
+        // connect to: what is published is what can be reached, and a peer cannot.
         if !self.cli.flavor.addresses_are_reachable(&self.cli) {
-            return None;
+            return match peer {
+                None => self.published_ports().map(Reach::Published),
+                Some(_) => None,
+            };
         }
         match peer {
             None => self.ip_address(),
@@ -256,7 +225,53 @@ impl<F: Flavor> Container for CliContainer<F> {
     }
 }
 
+/// The published ports in `inspect`'s `NetworkSettings.Ports` (JSON): container
+/// port to the `host:port` the engine's host reaches it at. Only TCP, and the
+/// first binding of each. A binding to every interface (or none named) is reached
+/// on loopback.
+fn parse_published(json: &str) -> Option<BTreeMap<u16, String>> {
+    let ports: serde_json::Value = serde_json::from_str(json).ok()?;
+    let mut published = BTreeMap::new();
+    // `null` when the container publishes nothing.
+    for (key, bindings) in ports.as_object().into_iter().flatten() {
+        let Some(container_port) = key.strip_suffix("/tcp").and_then(|p| p.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let Some(binding) = bindings.as_array().and_then(|b| b.first()) else {
+            continue;
+        };
+        let (Some(host_port), ip) = (
+            binding
+                .get("HostPort")
+                .and_then(|p| p.as_str())
+                .filter(|p| !p.is_empty()),
+            binding.get("HostIp").and_then(|i| i.as_str()).unwrap_or(""),
+        ) else {
+            continue;
+        };
+        let ip = match ip {
+            "" | "0.0.0.0" | "::" => "127.0.0.1",
+            other => other,
+        };
+        published.insert(container_port, format!("{ip}:{host_port}"));
+    }
+    Some(published)
+}
+
 impl<F: Flavor> CliContainer<F> {
+    /// What the container publishes, as the engine's host reaches it; `None` when
+    /// that can't be told.
+    fn published_ports(&self) -> Option<BTreeMap<u16, String>> {
+        let out = self.cli.capture_ok(&[
+            "inspect",
+            "--format",
+            "{{json .NetworkSettings.Ports}}",
+            &self.id,
+        ])?;
+        parse_published(out.trim())
+    }
+
     /// The container's address on its first network.
     fn ip_address(&self) -> Option<String> {
         let out = self.cli.capture_ok(&[
@@ -281,6 +296,7 @@ impl<F: Flavor> CliContainer<F> {
 mod tests {
     use super::*;
     use crate::host::fake::{FakeHost, Reply};
+    use crate::runtime::Env as _;
     use crate::runtime::cli::{Docker, DockerFlavor};
     use std::sync::Arc;
 
@@ -405,5 +421,24 @@ mod tests {
         assert!(compose_service_matches("proj_db_1", "db"));
         assert!(!compose_service_matches("proj-db", "db"));
         assert!(!compose_service_matches("proj-mydb-1", "db"));
+    }
+
+    #[test]
+    fn published_ports_are_read_from_inspect_and_a_wildcard_binding_is_reached_on_loopback() {
+        let json = r#"{"3000/tcp":[{"HostIp":"0.0.0.0","HostPort":"3000"}],
+                       "8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"18080"}],
+                       "53/udp":[{"HostIp":"","HostPort":"53"}],
+                       "9000/tcp":null, "9001/tcp":[]}"#;
+        let ports = parse_published(json).unwrap();
+        assert_eq!(
+            ports.into_iter().collect::<Vec<_>>(),
+            [
+                (3000, "127.0.0.1:3000".to_string()),
+                (8080, "127.0.0.1:18080".to_string())
+            ]
+        );
+        // Nothing published is an answer ("null"), not a failure to ask.
+        assert_eq!(parse_published("null").unwrap().len(), 0);
+        assert!(parse_published("not json").is_none());
     }
 }

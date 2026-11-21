@@ -1280,3 +1280,85 @@ fn remote_mode_works_against_a_real_ssh_server() {
         "the tunnel isn't listening here"
     );
 }
+
+/// A plain host: lodge injects into the machine itself, as the user, and never
+/// overwrites that user's own files.
+fn plain_host_round_trip(sb: &Sandbox, remote: Option<&str>) {
+    let home = sb.root().join("home");
+    let work = sb.root().join("work");
+    std::fs::create_dir_all(home.join(".config")).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    // The user's own file, where a bundle would put a config.
+    std::fs::write(home.join(".config/cfg"), "mine").unwrap();
+    let cfg = sb.root().join("cfg-src");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join("rc"), "from the bundle").unwrap();
+    sb.config(&format!(
+        "[[inject]]\nname = \"hostsh\"\nbinary = \"/bin/sh\"\n\
+         [[inject]]\nname = \"cfg\"\nconfig = \"{}\"\ntarget_config = \"~/.config/cfg\"\n",
+        cfg.display()
+    ));
+    let work_path = work.to_string_lossy().into_owned();
+    let mut base = vec!["--target", "host"];
+    if let Some(remote) = remote {
+        base.extend(["--remote", remote]);
+    }
+    let run = |sub: &[&str]| {
+        let mut args = base.clone();
+        args.extend(sub);
+        args.push(&work_path);
+        sb.run_with_home(&home, &args)
+    };
+
+    let up = run(&["up", "--no-attach"]);
+    assert!(up.ok, "{}", up.tail(15));
+    assert!(up.has("leaving it as it is"), "{}", up.tail(15));
+    assert_eq!(
+        std::fs::read_to_string(home.join(".config/cfg")).unwrap(),
+        "mine",
+        "the user's own file was overwritten"
+    );
+    let tool = home.join(".local/share/lodge/bin/hostsh");
+    let echoed = std::process::Command::new(&tool)
+        .args(["-c", "echo ok"])
+        .output()
+        .expect("running the injected tool");
+    assert_eq!(String::from_utf8_lossy(&echoed.stdout).trim(), "ok");
+
+    let again = run(&["up", "--no-attach"]);
+    assert!(again.ok && !again.has("injecting"), "{}", again.tail(10));
+    let status = run(&["status"]);
+    assert!(status.ok && status.has("bundle"), "{}", status.tail(10));
+
+    // Nothing to stop or remove on a machine.
+    assert!(run(&["down"]).has("nothing to stop"));
+    assert!(run(&["rm"]).has("ldg clean"));
+
+    let clean = run(&["clean"]);
+    assert!(clean.ok, "{}", clean.tail(10));
+    assert!(
+        !home.join(".local/share/lodge").exists(),
+        "the prefix stays"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join(".config/cfg")).unwrap(),
+        "mine"
+    );
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn a_plain_host_is_injected_kept_safe_and_cleaned() {
+    require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
+    let sb = Sandbox::new();
+    plain_host_round_trip(&sb, None);
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn a_plain_host_over_ssh_is_the_same() {
+    require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
+    let mut sb = Sandbox::new();
+    sb.use_fake_ssh();
+    plain_host_round_trip(&sb, Some("fakehost"));
+}

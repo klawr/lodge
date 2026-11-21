@@ -148,12 +148,25 @@ This is covered by an integration test, so it keeps working.
 | ------------------ | ------- | ------- |
 | `safe_directories` | `["*"]` | directories registered as git `safe.directory` for the container user; `[]` disables it |
 
-## `engine`
+## `target`
 
-A top-level `engine = "docker"` names the container engine lodge drives: `docker` or
-`podman`. `--engine` on the command line overrides it, and without either it is
-`docker`. The engine runs on the machine `--remote` names, or on this one. A value
-that is not an engine is an error.
+A top-level `target = "docker"` says where lodge works: a devcontainer on `docker` or
+`podman`, or `host` for the machine itself (see below). `--target` on the command line
+overrides it, and without either it is `docker`. It is on the machine `--remote`
+names, or on this one. A value that is not a target is an error.
+
+Which engine to talk to, when you have several, is a setting of the target:
+
+```toml
+[targets.docker]
+context = "colima"      # docker --context colima …
+
+[targets.podman]
+connection = "vm"       # podman --connection vm …
+```
+
+Both are optional; without them the engine's own default is used. Only the table of
+the chosen target is read.
 
 With `podman`, lodge runs `podman` the way it runs `docker`, and adds what a
 project bind-mounted into a Podman container needs: `--userns=keep-id` when
@@ -165,9 +178,32 @@ differs from docker:
 - Compose needs a provider that `podman compose` finds (docker-compose or
   podman-compose). lodge adds no user-namespace flag to a compose project; set
   `userns_mode` in the compose file if you need one.
-- Without root, a container's address is not reachable from the host, so ports
-  are not forwarded automatically: publish them with `appPort`. With root, or on
+- Without root, a container's address is not reachable from the host, so only the
+  ports it publishes (`appPort`) are forwarded. With root, or on
   another machine through `--remote` with a rootful Podman, it works as with docker.
+
+### `host`: no container
+
+`target = "host"` (or `--target host`) makes lodge work on the machine itself:
+this one, or another through `--remote`. There is no devcontainer and no engine.
+`ldg up [PATH]` injects your bundle into the user's prefix on that machine, delivers
+secrets, and opens a session in `PATH` (the machine's login directory if you
+leave it out over `--remote`).
+
+Because it is a real machine, lodge is careful with it:
+
+- It acts as the user the machine connects as, and cannot act as another (`root` or a
+  named user is refused).
+- A config lodge did not place is **left as it is**, with a warning, instead of
+  replaced: `ldg up` never overwrites your own dotfiles. One it placed earlier is
+  updated.
+- git's `safe.directory = *` is not set. List folders in `[git] safe_directories`
+  if you want some.
+- The machine must be Linux, and have `tar`. The bundle holds Linux binaries.
+- Nothing is created, so `down` and `rm` say so; `ls` has nothing to list;
+  `ldg clean` removes the prefix and the wrappers, as for a container.
+- Ports listening on a remote machine are forwarded through ssh to this one, as
+  for a container; on this machine there is nothing to forward.
 
 ## `bundle`
 

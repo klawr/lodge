@@ -42,14 +42,20 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
     let mut checks = Vec::new();
     let remote = ctx.host.label();
 
-    let engine = ctx.rt.version();
+    // A plain host has no engine to check.
+    let engine = ctx.endpoints.engine().map(|rt| rt.version());
     checks.push(match &engine {
-        Ok(v) => Check::new(
+        Some(Ok(v)) => Check::new(
             "container engine",
             Level::Ok,
             format!("{v}{}", ctx.host.on_host()),
         ),
-        Err(e) => Check::new("container engine", Level::Missing, e.to_string()),
+        Some(Err(e)) => Check::new("container engine", Level::Missing, e.to_string()),
+        None => Check::new(
+            "container engine",
+            Level::Optional,
+            format!("none: working on the machine itself{}", ctx.host.on_host()),
+        ),
     });
 
     // The devcontainer here (if any) decides whether compose and oras matter.
@@ -67,8 +73,12 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
     });
     let needs_compose = needs.as_ref().is_ok_and(|n| n.compose);
     let needs_oras = needs.as_ref().is_ok_and(|n| n.registry_features);
-    if engine.is_ok() {
-        checks.push(match ctx.rt.compose().and_then(|c| c.version()) {
+    if let Some(rt) = ctx
+        .endpoints
+        .engine()
+        .filter(|_| engine.as_ref().is_some_and(|e| e.is_ok()))
+    {
+        checks.push(match rt.compose().and_then(|c| c.version()) {
             Ok(v) => Check::new("compose", Level::Ok, v),
             Err(e) if needs_compose => Check::new("compose", Level::Missing, format!("{e:#}")),
             Err(_) => Check::new(

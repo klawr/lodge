@@ -23,6 +23,7 @@ mod inject;
 mod layout;
 mod local;
 mod output;
+mod plain_host;
 mod port;
 mod provision;
 mod runtime;
@@ -33,11 +34,10 @@ mod tmpfile;
 mod tools;
 mod tree;
 
-use clap::Parser;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let cli = cli::Cli::parse();
+    let cli = cmd::parse();
     output::set_verbosity(cli.verbose);
     match cmd::run(cli) {
         Ok(code) => code,
