@@ -172,7 +172,7 @@ impl Drop for SshHost {
 /// Private config and data directories, and an optional fake `ssh`.
 pub struct Sandbox {
     root: PathBuf,
-    fake_ssh: bool,
+    bin_on_path: bool,
 }
 
 impl Sandbox {
@@ -194,7 +194,7 @@ impl Sandbox {
         std::fs::create_dir_all(root.join("cache")).expect("creating sandbox");
         let sb = Self {
             root,
-            fake_ssh: false,
+            bin_on_path: false,
         };
         sb.config("");
         sb
@@ -227,7 +227,28 @@ impl Sandbox {
         std::fs::write(&path, script).expect("writing fake ssh");
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        self.fake_ssh = true;
+        self.bin_on_path = true;
+    }
+
+    /// Puts a `kubectl` on `PATH` for a cluster that is a docker engine: a pod is
+    /// a running container of that name, `exec` is `docker exec`, and
+    /// `port-forward` is a small relay to the container's address. Every call is
+    /// appended to `kubectl.log` in the sandbox, so a test can see which flags
+    /// lodge passed. Needs `python3` for the relay.
+    pub fn use_fake_kubectl(&mut self) {
+        let bin = self.root.join("bin");
+        std::fs::create_dir_all(&bin).expect("creating bin");
+        let script = include_str!("fake-kubectl.sh");
+        let path = bin.join("kubectl");
+        std::fs::write(&path, script).expect("writing fake kubectl");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        self.bin_on_path = true;
+    }
+
+    /// What the fake `kubectl` was called with, a line per call.
+    pub fn kubectl_calls(&self) -> String {
+        std::fs::read_to_string(self.root.join("bin/kubectl.log")).unwrap_or_default()
     }
 
     /// Starts a real OpenSSH server (a container with the docker CLI, talking to
@@ -326,7 +347,7 @@ impl Sandbox {
         .expect("writing the ssh wrapper");
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        self.fake_ssh = true;
+        self.bin_on_path = true;
 
         // Wait until sshd answers.
         for _ in 0..50 {
@@ -353,7 +374,7 @@ impl Sandbox {
             // Scratch files and ssh control sockets land here, not in /tmp, and go
             // away with the sandbox.
             .env("TMPDIR", self.root.join("tmp"));
-        if self.fake_ssh {
+        if self.bin_on_path {
             let mut paths = vec![self.root.join("bin")];
             paths.extend(std::env::split_paths(
                 &std::env::var_os("PATH").unwrap_or_default(),
@@ -361,6 +382,54 @@ impl Sandbox {
             cmd.env("PATH", std::env::join_paths(paths).expect("joining PATH"));
         }
         cmd
+    }
+
+    /// Runs `ldg <args>` on a pseudo-terminal, as a person would, feeding it
+    /// `input` (which should end with `exit` if a session opens); the whole run is
+    /// cut off after 90 s. Output includes what the session printed, with `\r\n`
+    /// line ends.
+    pub fn session(&self, args: &[&str], host_env: &[(&str, &str)], input: &str) -> Out {
+        use std::io::Write as _;
+        fn quote(s: &str) -> String {
+            format!("'{}'", s.replace('\'', "'\\''"))
+        }
+        let ldg = self.command();
+        let mut line = format!(
+            "exec timeout 90 {}",
+            quote(&ldg.get_program().to_string_lossy())
+        );
+        for a in args {
+            line.push(' ');
+            line.push_str(&quote(a));
+        }
+        let mut cmd = Command::new("script");
+        cmd.args(["-qec", &line, "/dev/null"]);
+        for (k, v) in ldg.get_envs() {
+            match v {
+                Some(v) => cmd.env(k, v),
+                None => cmd.env_remove(k),
+            };
+        }
+        cmd.envs(host_env.iter().copied());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawning script");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(input.as_bytes())
+            .expect("feeding the session");
+        let out = child.wait_with_output().expect("waiting for script");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let mut text = stdout.clone();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        Out {
+            ok: out.status.success(),
+            text,
+            stdout,
+        }
     }
 
     /// Runs `ldg <args>`.
@@ -515,49 +584,18 @@ impl Project<'_> {
     /// end with `exit`; the whole run is cut off after 90 s. Output includes
     /// what the session printed, with `\r\n` line ends.
     pub fn attach(&self, flags: &[&str], host_env: &[(&str, &str)], input: &str) -> Out {
-        use std::io::Write as _;
-        fn quote(s: &str) -> String {
-            format!("'{}'", s.replace('\'', "'\\''"))
-        }
-        let ldg = self.sb.command();
-        let mut line = format!(
-            "exec timeout 90 {}",
-            quote(&ldg.get_program().to_string_lossy())
-        );
-        for f in flags {
-            line.push(' ');
-            line.push_str(&quote(f));
-        }
-        line.push_str(&format!(" up {}", quote(&self.dir.to_string_lossy())));
-        let mut cmd = Command::new("script");
-        cmd.args(["-qec", &line, "/dev/null"]);
-        for (k, v) in ldg.get_envs() {
-            match v {
-                Some(v) => cmd.env(k, v),
-                None => cmd.env_remove(k),
-            };
-        }
-        cmd.envs(host_env.iter().copied());
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd.spawn().expect("spawning script");
-        child
-            .stdin
-            .take()
-            .expect("stdin")
-            .write_all(input.as_bytes())
-            .expect("feeding the session");
-        let out = child.wait_with_output().expect("waiting for script");
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        let mut text = stdout.clone();
-        text.push_str(&String::from_utf8_lossy(&out.stderr));
-        *self.last.borrow_mut() = text.lines().rev().take(15).collect::<Vec<_>>().join("\n");
-        Out {
-            ok: out.status.success(),
-            text,
-            stdout,
-        }
+        let dir = self.dir.to_string_lossy().into_owned();
+        let mut args = flags.to_vec();
+        args.extend(["up", dir.as_str()]);
+        let out = self.sb.session(&args, host_env, input);
+        *self.last.borrow_mut() = out
+            .text
+            .lines()
+            .rev()
+            .take(15)
+            .collect::<Vec<_>>()
+            .join("\n");
+        out
     }
 
     /// The name of this project's container (the first, for compose).

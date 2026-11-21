@@ -25,10 +25,10 @@ mod inside;
 pub(crate) mod tarball;
 mod user;
 
-pub use inside::Inside;
+pub use inside::{Inside, in_dir_with_env};
 #[cfg(test)]
 pub(crate) use user::PROBE_SCRIPT;
-pub use user::{ContainerUser, User};
+pub use user::{ContainerUser, LoginOnly, User};
 
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
@@ -365,6 +365,18 @@ pub trait Container: Env {
     /// again over time, because a restarted container may come back elsewhere.
     fn reach(&self, peer: Option<&str>) -> Option<Reach>;
 
+    /// Starts the process behind [`Reach::Relayed`]: on the engine's host, listening
+    /// on loopback port `local` and relaying to `port` of the container, until it
+    /// is killed. `None` for a container whose way in is not a relay.
+    fn relay(
+        &self,
+        _local: u16,
+        _port: u16,
+        _chatter: crate::host::Stream,
+    ) -> Option<std::io::Result<Box<dyn crate::host::Child>>> {
+        None
+    }
+
     /// The name to show for it: its name, or its id when it has none.
     fn display_name(&self) -> String {
         self.name().unwrap_or_else(|| self.id().to_string())
@@ -373,9 +385,7 @@ pub trait Container: Env {
 
 /// How the ports of a container can be reached from the host that runs its
 /// engine. What a forward does with it (the built-in proxy, or the host's own
-/// tunnel) is decided from the host, not from the answer. A way that is a
-/// *process* (`kubectl port-forward`) is not an address at all and would be
-/// another variant, with the `Host` hook that starts it, when an engine needs it.
+/// tunnel) is decided from the host, not from the answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reach {
     /// Every port the container listens on is open at this address (an IP on
@@ -385,16 +395,29 @@ pub enum Reach {
     /// the engine's host has for it (a rootless engine, whose containers have an
     /// address the host cannot connect to). Container port to `host:port`.
     Published(BTreeMap<u16, String>),
+    /// A way in that is a *process* (`kubectl port-forward`): every port is
+    /// reachable once [`Container::relay`] has started a process on the engine's
+    /// host that listens there, on loopback, for it.
+    Relayed,
 }
 
 impl Reach {
     /// `host:port` to connect to for `port` of the container, `None` when this
     /// way of reaching it does not reach that port (one that is not published).
-    pub fn destination(&self, port: u16) -> Option<String> {
+    /// `local` is the port the caller wants it on: a relay is made to listen on
+    /// that one, so it is where the forward connects.
+    pub fn destination(&self, local: u16, port: u16) -> Option<String> {
         match self {
             Reach::Address(ip) => Some(format!("{ip}:{port}")),
             Reach::Published(ports) => ports.get(&port).cloned(),
+            Reach::Relayed => Some(format!("127.0.0.1:{local}")),
         }
+    }
+
+    /// Whether a port has to be relayed by [`Container::relay`] before it can be
+    /// connected to.
+    pub fn needs_relay(&self) -> bool {
+        matches!(self, Reach::Relayed)
     }
 }
 
@@ -406,6 +429,7 @@ impl std::fmt::Display for Reach {
                 let shown: Vec<String> = ports.keys().map(u16::to_string).collect();
                 write!(f, "published ports [{}]", shown.join(", "))
             }
+            Reach::Relayed => f.write_str("a relay per port"),
         }
     }
 }
@@ -529,10 +553,19 @@ mod tests {
     #[test]
     fn a_way_in_gives_the_destination_of_each_port_it_reaches() {
         let address = Reach::Address("10.0.0.2".into());
-        assert_eq!(address.destination(80).as_deref(), Some("10.0.0.2:80"));
+        assert_eq!(address.destination(80, 80).as_deref(), Some("10.0.0.2:80"));
         let published = Reach::Published([(80, "127.0.0.1:8080".to_string())].into());
-        assert_eq!(published.destination(80).as_deref(), Some("127.0.0.1:8080"));
-        assert_eq!(published.destination(443), None, "not published");
+        assert_eq!(
+            published.destination(80, 80).as_deref(),
+            Some("127.0.0.1:8080")
+        );
+        assert_eq!(published.destination(443, 443), None, "not published");
+        // A relay listens on the local port asked for, whatever the container's.
+        assert_eq!(
+            Reach::Relayed.destination(9000, 80).as_deref(),
+            Some("127.0.0.1:9000")
+        );
+        assert!(Reach::Relayed.needs_relay() && !address.needs_relay());
         assert_eq!(address.to_string(), "10.0.0.2");
         assert_eq!(published.to_string(), "published ports [80]");
     }

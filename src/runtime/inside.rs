@@ -20,6 +20,7 @@ use std::process::ExitStatus;
 
 use super::{ContainerUser, Env, ExecOpts, Output, User, tarball};
 use crate::host::{HostRef, Input, Job, Repeat};
+use crate::shell::shell_quote;
 
 /// What is particular to reaching inside one endpoint.
 pub trait Inside {
@@ -46,6 +47,35 @@ pub trait Inside {
     fn disposable(&self) -> bool {
         true
     }
+}
+
+/// The `sh -c` script that runs `argv` from `opts`'s directory with its extra
+/// environment, for an endpoint whose command line has no flag for either; `None`
+/// when `opts` asks for neither, so the command can be run as it is.
+pub fn in_dir_with_env(argv: &[&str], opts: &ExecOpts) -> Option<String> {
+    if opts.workdir.is_none() && opts.env.is_empty() {
+        return None;
+    }
+    let mut script = String::new();
+    if let Some(dir) = opts.workdir {
+        script.push_str(&format!("cd {} && ", shell_quote(dir)));
+    }
+    script.push_str("exec ");
+    if !opts.env.is_empty() {
+        script.push_str("env");
+        for (k, v) in opts.env {
+            script.push_str(&format!(" {}", shell_quote(&format!("{k}={v}"))));
+        }
+        script.push(' ');
+    }
+    script.push_str(
+        &argv
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    Some(script)
 }
 
 impl<T: Inside> Env for T {

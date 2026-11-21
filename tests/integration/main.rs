@@ -1362,3 +1362,149 @@ fn a_plain_host_over_ssh_is_the_same() {
     sb.use_fake_ssh();
     plain_host_round_trip(&sb, Some("fakehost"));
 }
+
+/// A running container that stands in for a pod, removed when dropped.
+struct Pod(String);
+
+impl Pod {
+    /// A pod that listens on `port` (a one-line greeter, in the perl the image
+    /// has) once it is up.
+    fn greeting_on(port: u16) -> Self {
+        let name = format!("ldg-it-pod-{}-{port}", std::process::id());
+        let greeter = format!(
+            "perl -MIO::Socket::INET -e '$s = IO::Socket::INET->new(Listen => 5, \
+             LocalPort => {port}, ReuseAddr => 1) or die; \
+             while ($c = $s->accept) {{ print $c \"hello from the pod\\n\"; close $c }}'"
+        );
+        docker(&["run", "-d", "--name", &name, IMAGE, "sh", "-c", &greeter]);
+        Pod(name)
+    }
+
+    fn exec(&self, script: &str) -> String {
+        docker(&["exec", &self.0, "sh", "-c", script])
+    }
+}
+
+impl Drop for Pod {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", &self.0])
+            .output();
+    }
+}
+
+/// What the greeter in the pod says to whoever connects to `port` here.
+fn greeting_from(port: u16) -> Option<String> {
+    use std::io::Read as _;
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok()?;
+    let mut said = String::new();
+    stream.read_to_string(&mut said).ok()?;
+    Some(said)
+}
+
+/// A pod: lodge injects into it with `kubectl exec`, keeps to the user the pod runs
+/// as, opens a session in it, and forwards its ports with `kubectl port-forward`.
+#[test]
+#[ignore = "needs docker"]
+fn a_pod_is_injected_entered_and_its_ports_forwarded_through_kubectl() {
+    require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
+    require_tool(
+        "python3",
+        "the fake kubectl's port-forward is a python script",
+    );
+    let mut sb = Sandbox::new();
+    sb.use_fake_kubectl();
+    let port = free_port();
+    let pod = Pod::greeting_on(port);
+    let home = sb.root().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    sb.config(&format!(
+        "[[inject]]\nname = \"hostsh\"\nbinary = \"/bin/sh\"\n\
+         [targets.kubernetes]\npod = \"{}\"\ncontext = \"test\"\nnamespace = \"work\"\n\
+         workdir = \"/tmp\"\n",
+        pod.0
+    ));
+    let run = |sub: &[&str]| {
+        let mut args = vec!["--target", "kubernetes"];
+        args.extend(sub);
+        sb.run_with_home(&home, &args)
+    };
+
+    let up = run(&["up", "--no-attach"]);
+    assert!(up.ok, "{}", up.tail(15));
+    assert_eq!(
+        pod.exec(&format!("{} -c 'echo ok'", root_tool("hostsh"))),
+        "ok",
+        "the tool is in the pod and runs there"
+    );
+    let calls = sb.kubectl_calls();
+    assert!(
+        calls.contains("--context test --namespace work exec"),
+        "the cluster's flags go in front of every command:\n{calls}"
+    );
+    let again = run(&["up", "--no-attach"]);
+    assert!(again.ok && !again.has("injecting"), "{}", again.tail(10));
+    let status = run(&["status"]);
+    assert!(status.ok && status.has("running"), "{}", status.tail(10));
+
+    // The pod's port is forwarded here, on loopback only, and it answers.
+    let mut waited = 0;
+    while greeting_from(port).is_none() && waited < 100 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        waited += 1;
+    }
+    assert_eq!(
+        greeting_from(port).as_deref(),
+        Some("hello from the pod\n"),
+        "the forwarded port reaches the pod;\n{}",
+        run(&["logs"]).tail(15)
+    );
+    assert!(
+        listeners(port).iter().all(|a| a == "0100007F"),
+        "exposed beyond loopback: {:?}",
+        listeners(port)
+    );
+    assert!(sb.kubectl_calls().contains(&format!(
+        "port-forward --address 127.0.0.1 pod/{} {port}:{port}",
+        pod.0
+    )));
+
+    // A session is a shell in the workdir, in the pod.
+    let session = sb.session(
+        &["--target", "kubernetes", "up"],
+        &[("HOME", &home.to_string_lossy())],
+        "pwd; echo marker-$((20 + 22))\nexit\n",
+    );
+    assert!(
+        session.has("marker-42") && session.has("/tmp"),
+        "{}",
+        session.tail(15)
+    );
+
+    // Nothing to stop or remove: the pod was there before lodge.
+    assert!(run(&["down"]).has("nothing to stop"));
+    assert!(run(&["rm"]).has("ldg clean"));
+    let clean = run(&["clean"]);
+    assert!(clean.ok, "{}", clean.tail(10));
+    assert_eq!(
+        pod.exec("test -e /root/.local/share/lodge && echo left || echo gone"),
+        "gone"
+    );
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn a_pod_that_is_not_there_is_refused_before_anything_is_changed() {
+    let mut sb = Sandbox::new();
+    sb.use_fake_kubectl();
+    sb.config("[targets.kubernetes]\npod = \"no-such-pod\"\n");
+    let up = sb.run(&["--target", "kubernetes", "up", "--no-attach"]);
+    assert!(!up.ok && up.has("no pod no-such-pod"), "{}", up.tail(10));
+    // And a config without a pod says what to set.
+    sb.config("");
+    let up = sb.run(&["--target", "kubernetes", "up", "--no-attach"]);
+    assert!(!up.ok && up.has("set `pod`"), "{}", up.tail(10));
+}

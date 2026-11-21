@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
-use super::{FirstFile, Host, Job, Line, Ran, ScratchFile, run_interactive, run_process};
+use super::{
+    Child, FirstFile, Host, Job, Line, Ran, ScratchFile, Stream, run_interactive, run_process,
+    start_process,
+};
 use crate::tmpfile::TempFile;
 
 /// This machine: commands run as child processes and files are read directly.
@@ -55,6 +58,11 @@ impl Host for LocalHost {
     fn interactive(&self, argv: &[&str]) -> std::io::Result<ExitStatus> {
         let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
         run_interactive(command(&Line::Argv(argv), None))
+    }
+
+    fn spawn(&self, argv: &[&str], chatter: Stream) -> std::io::Result<Box<dyn Child>> {
+        let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+        start_process(command(&Line::Argv(argv), None), chatter)
     }
 
     fn write_scratch(&self, name: &str, content: &str) -> Result<ScratchFile<'_>> {
@@ -152,6 +160,23 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "a: 1\n");
         drop(f);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_spawned_process_keeps_running_until_it_is_killed() {
+        let mut child = LocalHost
+            .spawn(&["sleep", "30"], crate::host::Stream::Null)
+            .unwrap();
+        assert!(child.try_wait().unwrap().is_none(), "still running");
+        child.kill().unwrap();
+        // Killed, it is reaped soon after.
+        for _ in 0..100 {
+            if child.try_wait().unwrap().is_some() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("the process outlived its kill");
     }
 
     #[test]

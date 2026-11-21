@@ -346,9 +346,9 @@ endpoint, through methods with a default that an implementation may override:
 | Question | Where | Docker's answer (a plain host's differs where noted) |
 |---|---|---|
 | Can this user write and run a program in a directory? (`inject/prefix` picks the home, else a private `/tmp` directory) | `Env::can_run_in`, by default a probe script run as that user | the default |
-| How do I reach the container's ports, or a peer's, from the engine's host? (the forwarder) | `Container::reach` -> `Reach`: `Address` (an IP on the container network, every port) or `Published` (a rootless engine: only the published ports, each at the address the host has for it; `destination(port)` is `None` for the rest, which the forwarder says once and skips). Either way the forwarder uses the host's tunnel or the built-in proxy, and does not proxy a port over itself when it is already on this machine | its first network's IP; a peer by container DNS, else by network (rootless Podman: its published ports) |
+| How do I reach the container's ports, or a peer's, from the engine's host? (the forwarder) | `Container::reach` -> `Reach`: `Address` (an IP on the container network, every port), `Published` (a rootless engine: only the published ports, each at the address the host has for it; `destination(local, port)` is `None` for the rest, which the forwarder says once and skips) or `Relayed` (a way in that is a process: the forwarder first asks `Container::relay` to start it on the engine's host, listening on loopback at the local port, and forwards to that; the relay lives and dies with its forward, and one aimed at another container port is a new one). Either way the forwarder uses the host's tunnel or the built-in proxy, and does not proxy a port over itself when it is already on this machine | its first network's IP; a peer by container DNS, else by network (rootless Podman: its published ports); a pod: `Relayed` by `kubectl port-forward`, no peers |
 | How do files get in? | `Env::put`, below | an in-process tar to `docker cp`; a plain host feeds the same tar to its own `tar -x` |
-| Is this place thrown away, so replacing what is there is fine? (injection replaces a config lodge did not place, sets git's `safe.directory = *`, and does not check the OS) | `Env::is_disposable`, default `true` | `true`; **a plain host answers `false`**: a config it did not place is left alone, the `*` wildcard is not set, and `uname -s` must say Linux |
+| Is this place thrown away, so replacing what is there is fine? (injection replaces a config lodge did not place, sets git's `safe.directory = *`, and does not check the OS) | `Env::is_disposable`, default `true` | `true`; **a plain host and a pod answer `false`**: a config it did not place is left alone, the `*` wildcard is not set, and `uname -s` must say Linux |
 
 Uid mapping and mount labels are decided when a container is *provisioned*
 (`Runtime::run_detached` arguments, `PodmanFlavor`, `devcontainer/uid.rs`); no
@@ -373,8 +373,10 @@ records commands and keeps a virtual filesystem, which is what the injection
 tests run against; `FakeRuntime` is an engine (with compose) that keeps its
 containers by name, each in its own `FakeEnv`, and refuses to act on one that
 doesn't exist, which is what `start`'s create / reuse / recreate decisions are
-tested against. Another engine (Podman, kubectl), or a plain host with no engine at all, would
-implement the same traits.
+tested against. Another engine, or a plain host or a pod with no engine at all
+(`plain_host.rs`, `kube.rs`: each an `Inside` that spells how to run, unpack and open
+a terminal, and the same `LoginOnly` rule that only the user it connects as can be
+acted as), implement the same traits.
 
 Backends (`devcontainer/backend.rs`) are plain data: the `Runtime` is passed in
 rather than stored.
@@ -391,20 +393,22 @@ just how it is done.
 
 | Dependency | Interface | Implementations |
 | --- | --- | --- |
-| How a machine is reached | `host::Host` | `LocalHost`, `SshHost`, and `FakeHost` for tests; anything else that can run a command implements `run`, `interactive` and `tunnel` |
+| How a machine is reached | `host::Host` | `LocalHost`, `SshHost`, and `FakeHost` for tests; anything else that can run a command implements `run`, `interactive`, `tunnel` and `spawn` |
 | The machine lodge runs on | `local::Local` | `SystemLocal` (environment, files a secret names, a local shell); `FakeLocal` for tests |
 | The container engine | `runtime::Runtime`, `Compose`, `Container`, `Env` | `runtime::cli`, and the in-memory `FakeRuntime` for tests |
 | The build-time helpers | `tools::DepReader`, `ElfEditor`, `OciFetcher` (a `Toolchain`) | `Ldd`, `Patchelf`, `Oras`; a test passes fakes |
-| Making an endpoint ready, and finding it again | `provision::Endpoints` | `devcontainer::Devcontainer` (a devcontainer on an engine), `plain_host::PlainHostEndpoints` (the machine itself) |
+| Making an endpoint ready, and finding it again | `provision::Endpoints` | `devcontainer::Devcontainer` (a devcontainer on an engine), `plain_host::PlainHostEndpoints` (the machine itself), `kube::KubeEndpoints` (a running pod, through `kubectl` on a `Host`) |
 | Port forwarding for a container | `forward::ForwardDaemon` (and `Forwarders` for one tunnel) | `DetachedDaemon`, `HostForwarders`; a test passes fakes |
 | What is injected | `[[inject]]` data | multiplexers and other tools are injected like any other, never named in code |
 
 The pieces compose instead of branching. The engine is built *on* a host
 (`Docker::new(host)`, `Podman::new(host)`), so "docker over ssh" is the same engine with a different
 host, not a third case; a remote Podman would be a second engine on the same
-host. `Host` has three primitives, `run` (one `Job`: the command, its directory, what
+host. `Host` has four primitives, `run` (one `Job`: the command, its directory, what
 it reads on stdin and what happens to its output and errors), `interactive` (a
-command with a terminal) and `tunnel`, plus the connection hooks (`connect`,
+command with a terminal), `tunnel` (`ssh -L`) and `spawn` (a process that keeps
+running until killed, which is what a relay is; over ssh it gets a terminal so it
+hangs up with the connection), plus the connection hooks (`connect`,
 `link_lost`, `reset_link`, `retry_policy`, `pty_denied`); everything else (`sh_output`, `run_in`, `canonical_dir`, `read_first`,
 `read_file`, `fetch_dir`, `write_scratch`, `remove_file`, `uid_gid`) is provided on
 top of them, so an implementation gets it by writing the primitives and
@@ -433,7 +437,8 @@ post-attach hook. `cmd::attach::up` calls `ctx.endpoints.provision`;
 `attach` is tested with a fake container and a recording `ForwardDaemon`, with no
 devcontainer involved. Which `Endpoints` a run uses is chosen once, in
 `cmd::build_endpoints`, from `--target`: `docker` and `podman` build a
-`Devcontainer` on that engine, `host` builds `PlainHostEndpoints`; every command
+`Devcontainer` on that engine, `host` builds `PlainHostEndpoints`, `kubernetes`
+builds `KubeEndpoints`; every command
 that is about the project's container (`up`, `down`, `status`, `rm`, `ls`,
 `ports`, `logs`, `clean`, the forward daemon) asks the `Endpoints`, so none of them
 knows which it is.

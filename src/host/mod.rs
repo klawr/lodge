@@ -8,9 +8,9 @@
 //! machine is a new implementation, handed in where the command layer builds the
 //! rest (`cmd/`); no other file changes.
 //!
-//! A host has three small primitives: [`Host::run`] (one [`Job`] on the host,
+//! A host has four small primitives: [`Host::run`] (one [`Job`] on the host,
 //! with the streams the caller asks for), [`Host::interactive`] (a command with a
-//! terminal) and [`Host::tunnel`]. No process type crosses the seam, so a host
+//! terminal), [`Host::tunnel`] and [`Host::spawn`] (a process that stays up). No process type crosses the seam, so a host
 //! need not be a local process at all, and `fake::FakeHost` stands in for one in
 //! tests. Everything else here (running a script, reading a file, resolving a
 //! folder, making a scratch file) is provided on top of them, so an
@@ -405,6 +405,17 @@ pub trait Host: Send + Sync {
         _chatter: Stream,
     ) -> Option<std::io::Result<Box<dyn Child>>> {
         None
+    }
+
+    /// Starts `argv` on the host as a process that keeps running until killed (a
+    /// relay such as `kubectl port-forward`), with its errors going where
+    /// `chatter` says. Like [`tunnel`](Self::tunnel) it cannot prompt. A host that
+    /// cannot keep a process running says so.
+    fn spawn(&self, _argv: &[&str], _chatter: Stream) -> std::io::Result<Box<dyn Child>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this host cannot keep a process running",
+        ))
     }
 
     /// Establishes the connection while the terminal is ours, so a password or a

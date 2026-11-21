@@ -9,16 +9,17 @@
 //! never loosens git's ownership check), and there is nothing to create, stop or
 //! remove.
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use std::path::Path;
 use std::process::ExitStatus;
-use std::sync::OnceLock;
 
 use crate::fingerprint::content_hash;
 use crate::host::{HostRef, Job};
 use crate::port::PortForward;
 use crate::provision::{Attached, Endpoints, Found, Lifecycle, Status};
-use crate::runtime::{Container, ContainerUser, ExecOpts, Inside, Reach, Runtime, User};
+use crate::runtime::{
+    Container, ExecOpts, Inside, LoginOnly, Reach, Runtime, User, in_dir_with_env,
+};
 use crate::shell::shell_quote;
 
 /// A reachable machine, seen as an endpoint.
@@ -27,8 +28,8 @@ pub struct PlainHost {
     /// What identifies this machine in lodge's own state (the forwarding
     /// daemon's files): a short, file-name-safe tag of how the host is reached.
     id: String,
-    /// Who the host connects as, asked once: only that user can be acted as.
-    login: OnceLock<Option<ContainerUser>>,
+    /// Only the user the host connects as can be acted as.
+    acting: LoginOnly,
 }
 
 impl PlainHost {
@@ -37,44 +38,8 @@ impl PlainHost {
         Self {
             id: format!("host-{}", &content_hash(label.as_bytes())[..7]),
             host,
-            login: OnceLock::new(),
+            acting: LoginOnly::new("a plain host"),
         }
-    }
-
-    /// The user the host connects as, `None` if that could not be found out.
-    fn login(&self) -> Option<&ContainerUser> {
-        self.login
-            .get_or_init(|| ContainerUser::resolve(self, None).ok())
-            .as_ref()
-    }
-
-    /// Fails unless `user` is the one this machine lets lodge act as: the user
-    /// the host connects as, or nobody in particular. Root only if that is who
-    /// connects.
-    fn check(&self, user: User) -> Result<()> {
-        if matches!(user, User::Default) {
-            return Ok(());
-        }
-        let login = self.login().context(
-            "could not tell which user this machine connects as, so cannot act as another",
-        )?;
-        let allowed = match user {
-            User::Default => true,
-            User::Root => login.is_root(),
-            User::Named(name) => name == login.name || login.requested.as_deref() == Some(name),
-        };
-        if !allowed {
-            bail!(
-                "a plain host is acted on as the user it connects as ({}), not as {}",
-                login.name,
-                match user {
-                    User::Root => "root",
-                    User::Named(name) => name,
-                    User::Default => "the default user",
-                }
-            );
-        }
-        Ok(())
     }
 }
 
@@ -92,30 +57,11 @@ impl Inside for PlainHost {
     }
 
     fn command<'a>(&self, argv: &[&str], opts: &ExecOpts, _stdin: bool) -> Result<Job<'a>> {
-        self.check(opts.user)?;
-        if opts.workdir.is_none() && opts.env.is_empty() {
-            return Ok(Job::argv(argv));
-        }
-        let mut script = String::new();
-        if let Some(dir) = opts.workdir {
-            script.push_str(&format!("cd {} && ", shell_quote(dir)));
-        }
-        script.push_str("exec ");
-        if !opts.env.is_empty() {
-            script.push_str("env");
-            for (k, v) in opts.env {
-                script.push_str(&format!(" {}", shell_quote(&format!("{k}={v}"))));
-            }
-            script.push(' ');
-        }
-        script.push_str(
-            &argv
-                .iter()
-                .map(|a| shell_quote(a))
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
-        Ok(Job::shell(&script))
+        self.acting.check(self, opts.user)?;
+        Ok(match in_dir_with_env(argv, opts) {
+            Some(script) => Job::shell(&script),
+            None => Job::argv(argv),
+        })
     }
 
     /// The host's own `tar`, which owns what it unpacks as the user it runs as (for
@@ -125,7 +71,9 @@ impl Inside for PlainHost {
     }
 
     fn session(&self, user: User, workdir: &str, inner: &str) -> std::io::Result<ExitStatus> {
-        self.check(user).map_err(std::io::Error::other)?;
+        self.acting
+            .check(self, user)
+            .map_err(std::io::Error::other)?;
         let script = format!("cd {} && {inner}", shell_quote(workdir));
         self.host.interactive(&["sh", "-c", &script])
     }
@@ -241,7 +189,7 @@ impl Endpoints for PlainHostEndpoints {
 mod tests {
     use super::*;
     use crate::host::fake::{FakeHost, Reply};
-    use crate::runtime::Env as _;
+    use crate::runtime::{ContainerUser, Env as _};
     use std::sync::Arc;
 
     const PROBE: [&str; 3] = ["sh", "-c", crate::runtime::PROBE_SCRIPT];

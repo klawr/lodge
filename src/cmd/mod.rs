@@ -344,7 +344,7 @@ mod tests {
         let err = choose_target(None, &ls, &bad).unwrap_err();
         let text = format!("{err:#}");
         assert!(
-            text.contains("invalid `target`") && text.contains("docker, podman, host"),
+            text.contains("invalid `target`") && text.contains("docker, podman, host, kubernetes"),
             "{text}"
         );
         // Commands that never use a target don't read it, so `init` can fix it.

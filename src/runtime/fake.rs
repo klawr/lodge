@@ -26,11 +26,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{
     BuildSpec, Compose, Container, ContainerUser, Containers, Env, ExecOpts, Listed, Output, Reach,
     RunSpec, Runtime, User,
 };
+use crate::host::{Child, Stream};
 use crate::tree::{self, Denied, Links};
 
 /// Who a recorded command ran as ([`User`] without the borrow).
@@ -65,6 +68,27 @@ pub struct FakeEnv {
     reach: HashMap<Option<String>, Reach>,
     /// Whether this stands in for a machine that is not thrown away.
     shared: bool,
+    /// The relays [`Container::relay`] started: local port, container port, and
+    /// whether each was stopped.
+    relays: RefCell<Vec<(u16, u16, Arc<AtomicBool>)>>,
+}
+
+/// A relay process that is only a flag: stopped when killed.
+struct FakeRelay(Arc<AtomicBool>);
+
+impl Child for FakeRelay {
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.0.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        use std::os::unix::process::ExitStatusExt as _;
+        Ok(self
+            .0
+            .load(Ordering::Relaxed)
+            .then(|| std::process::ExitStatus::from_raw(0)))
+    }
 }
 
 impl FakeEnv {
@@ -79,7 +103,22 @@ impl FakeEnv {
             calls: RefCell::default(),
             reach: HashMap::new(),
             shared: false,
+            relays: RefCell::default(),
         }
+    }
+
+    /// The relays started so far, as (local port, container port, stopped).
+    pub fn relays(&self) -> Vec<(u16, u16, bool)> {
+        self.relays
+            .borrow()
+            .iter()
+            .map(|(l, p, stopped)| (*l, *p, stopped.load(Ordering::Relaxed)))
+            .collect()
+    }
+
+    /// Ends the relay started `index`th, as a process that died would.
+    pub fn end_relay(&self, index: usize) {
+        self.relays.borrow()[index].2.store(true, Ordering::Relaxed);
     }
 
     /// Stands in for a real machine, which injection treats with more care.
@@ -414,6 +453,16 @@ impl FakeRuntime {
         Ok(())
     }
 
+    /// The relays started for container `name`; see [`FakeEnv::relays`].
+    pub fn relays(&self, name: &str) -> Vec<(u16, u16, bool)> {
+        self.containers.borrow()[name].env.relays()
+    }
+
+    /// Ends the `index`th relay of container `name`, as a process that died would.
+    pub fn end_relay(&self, name: &str, index: usize) {
+        self.containers.borrow()[name].env.end_relay(index);
+    }
+
     /// What each container created so far was asked to be.
     pub fn runs(&self) -> Vec<RunSpec> {
         self.runs.borrow().clone()
@@ -705,6 +754,21 @@ impl Container for FakeContainer {
 
     fn reach(&self, peer: Option<&str>) -> Option<Reach> {
         self.fake.env.reach.get(&peer.map(str::to_string)).cloned()
+    }
+
+    fn relay(
+        &self,
+        local: u16,
+        port: u16,
+        _chatter: Stream,
+    ) -> Option<std::io::Result<Box<dyn Child>>> {
+        let stopped = Arc::new(AtomicBool::new(false));
+        self.fake
+            .env
+            .relays
+            .borrow_mut()
+            .push((local, port, stopped.clone()));
+        Some(Ok(Box::new(FakeRelay(stopped))))
     }
 }
 

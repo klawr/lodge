@@ -108,7 +108,8 @@ Dynamic forwarding needs the container's bridge IP to be reachable from the
 engine's host: Linux with Docker Engine, or any engine with `--remote`. Rootless
 Podman has no such address: there, the ports the container publishes
 (`appPort`) are forwarded, and the others are not. Docker
-Desktop on macOS/Windows doesn't expose container IPs.
+Desktop on macOS/Windows doesn't expose container IPs. A pod (`--target kubernetes`)
+needs neither: each port is relayed by `kubectl port-forward`.
 
 ## Read and ignored
 

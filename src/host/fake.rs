@@ -263,6 +263,18 @@ impl Host for FakeHost {
         Some(Ok(Box::new(FakeChild { stopped: false })))
     }
 
+    fn spawn(&self, argv: &[&str], _chatter: Stream) -> std::io::Result<Box<dyn Child>> {
+        let argv: Vec<String> = std::iter::once("spawn".to_string())
+            .chain(argv.iter().map(|a| a.to_string()))
+            .collect();
+        self.state.lock().unwrap().calls.push(Call {
+            argv,
+            dir: None,
+            fed: vec![],
+        });
+        Ok(Box::new(FakeChild { stopped: false }))
+    }
+
     fn write_scratch(&self, name: &str, content: &str) -> Result<ScratchFile<'_>> {
         let path = {
             let mut state = self.state.lock().unwrap();

@@ -42,7 +42,8 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
     let mut checks = Vec::new();
     let remote = ctx.host.label();
 
-    // A plain host has no engine to check.
+    // A plain host or a pod has no engine to check (and nothing here checks
+    // `kubectl` or the pod: `up` says what is missing).
     let engine = ctx.endpoints.engine().map(|rt| rt.version());
     checks.push(match &engine {
         Some(Ok(v)) => Check::new(
@@ -54,7 +55,10 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
         None => Check::new(
             "container engine",
             Level::Optional,
-            format!("none: working on the machine itself{}", ctx.host.on_host()),
+            format!(
+                "none: this target has no container engine{}",
+                ctx.host.on_host()
+            ),
         ),
     });
 

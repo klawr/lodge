@@ -1,6 +1,7 @@
 //! Who commands run as, and who the session user is.
 
 use anyhow::{Context, Result, bail};
+use std::sync::OnceLock;
 
 use super::{Container, Env, ExecOpts};
 
@@ -164,6 +165,60 @@ impl ContainerUser {
         } else {
             path.to_string()
         }
+    }
+}
+
+/// What an endpoint that cannot switch user (a plain host, a pod: no `-u`) lets
+/// lodge act as: the user it connects as, and nobody else. It asks who that is
+/// once, the first time anyone else is named.
+pub struct LoginOnly {
+    /// What the endpoint is called in a message: "a plain host".
+    what: &'static str,
+    login: OnceLock<Option<ContainerUser>>,
+}
+
+impl LoginOnly {
+    pub fn new(what: &'static str) -> Self {
+        Self {
+            what,
+            login: OnceLock::new(),
+        }
+    }
+
+    /// Fails unless `user` is the one `env` lets lodge act as: the user it
+    /// connects as, or nobody in particular. Root only if that is who connects.
+    pub fn check(&self, env: &dyn Env, user: User) -> Result<()> {
+        if matches!(user, User::Default) {
+            return Ok(());
+        }
+        let login = self
+            .login
+            .get_or_init(|| ContainerUser::resolve(env, None).ok())
+            .as_ref()
+            .with_context(|| {
+                format!(
+                    "could not tell which user {} connects as, so cannot act as another",
+                    self.what
+                )
+            })?;
+        let allowed = match user {
+            User::Default => true,
+            User::Root => login.is_root(),
+            User::Named(name) => name == login.name || login.requested.as_deref() == Some(name),
+        };
+        if !allowed {
+            bail!(
+                "{} is acted on as the user it connects as ({}), not as {}",
+                self.what,
+                login.name,
+                match user {
+                    User::Root => "root",
+                    User::Named(name) => name,
+                    User::Default => "the default user",
+                }
+            );
+        }
+        Ok(())
     }
 }
 

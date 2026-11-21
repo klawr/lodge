@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use super::tunnel::{Forward, Forwarders};
+use super::tunnel::{Forward, Forwarders, Relayed, chatter};
 use super::{acquire_lock, lock_path, ports_path, truncate_log, write_ports};
 use crate::port::PortForward;
 use crate::provision::Endpoints;
@@ -154,8 +154,16 @@ impl Cooldown {
     }
 }
 
+/// How one wanted port is reached: where the forward connects, and the container
+/// port a relay has to be started for first, if the way in is a relay.
+struct Way {
+    dest: String,
+    relay: Option<u16>,
+}
+
 /// The forwarders kept for one container, and the ports file that reports them.
 struct Forwards<'a> {
+    container: &'a dyn Container,
     forwarders: &'a dyn Forwarders,
     addresses: Addresses<'a>,
     active: HashMap<u16, Box<dyn Forward>>,
@@ -182,6 +190,7 @@ impl<'a> Forwards<'a> {
     ) -> Self {
         let lookup = move |peer: Option<&str>| container.reach(peer);
         Self {
+            container,
             forwarders,
             addresses: Addresses::new(Box::new(lookup), REFRESH),
             active: HashMap::new(),
@@ -200,9 +209,10 @@ impl<'a> Forwards<'a> {
         let mut dests = HashMap::new();
         for (&local, f) in &wanted {
             if let Some(reach) = self.addresses.get(f.host.as_deref()) {
-                match reach.destination(f.port) {
+                match reach.destination(local, f.port) {
                     Some(dest) => {
-                        dests.insert(local, dest);
+                        let relay = reach.needs_relay().then_some(f.port);
+                        dests.insert(local, Way { dest, relay });
                     }
                     // Said once per port, not every 2 s.
                     None if self.unreachable_ports.insert(f.port) => {
@@ -218,7 +228,10 @@ impl<'a> Forwards<'a> {
         let cooling = &mut self.cooling;
         self.active.retain(|&local, fwd| {
             let alive = fwd.is_alive();
-            let keep = alive && dests.get(&local).is_some_and(|d| d == fwd.dest());
+            let keep = alive
+                && dests
+                    .get(&local)
+                    .is_some_and(|w| w.dest == fwd.dest() && w.relay == fwd.relays());
             if !keep {
                 log!("stopped forwarding port {local}");
             }
@@ -232,29 +245,63 @@ impl<'a> Forwards<'a> {
             }
             keep
         });
-        for (local, dest) in dests {
+        for (local, way) in dests {
             if !self.active.contains_key(&local) {
-                self.start(local, dest);
+                self.start(local, way);
             }
         }
         self.publish();
     }
 
-    fn start(&mut self, local: u16, dest: String) {
+    fn start(&mut self, local: u16, way: Way) {
         if self.cooling.get(&local).is_some_and(|c| !c.over()) {
             return;
         }
-        match self.forwarders.start(local, &dest) {
+        // A relay is a process on the engine's host; the forward then connects to
+        // where it listens.
+        let relay = match way.relay {
+            None => None,
+            Some(port) => match self.container.relay(local, port, chatter()) {
+                Some(Ok(child)) => {
+                    log!("port {local} — relay to port {port} of the container");
+                    Some((child, port))
+                }
+                Some(Err(e)) => return self.failed_to_start(local, e),
+                None => {
+                    return self.failed_to_start(
+                        local,
+                        std::io::Error::other("the container has no way to relay a port"),
+                    );
+                }
+            },
+        };
+        match self.forwarders.start(local, &way.dest) {
             Ok(fw) => {
                 log!("forwarding port {local}");
+                let fw: Box<dyn Forward> = match relay {
+                    Some((child, port)) => Box::new(Relayed::new(child, port, fw)),
+                    None => fw,
+                };
                 self.active.insert(local, fw);
                 self.failed.remove(&local);
             }
             Err(e) => {
-                if self.failed.insert(local) {
-                    log!("could not forward port {local}: {e}");
+                if let Some((mut child, _)) = relay {
+                    #[allow(
+                        clippy::let_underscore_must_use,
+                        reason = "the relay may already have exited"
+                    )]
+                    let _ = child.kill();
                 }
+                self.failed_to_start(local, e);
             }
+        }
+    }
+
+    /// Said once per port, not every 2 s.
+    fn failed_to_start(&mut self, local: u16, error: std::io::Error) {
+        if self.failed.insert(local) {
+            log!("could not forward port {local}: {error}");
         }
     }
 
@@ -449,13 +496,13 @@ mod tests {
             .addresses
             .get(None)
             .unwrap()
-            .destination(8080)
+            .destination(8080, 8080)
             .unwrap();
         let peer = forwards
             .addresses
             .get(Some("db"))
             .unwrap()
-            .destination(5432)
+            .destination(5432, 5432)
             .unwrap();
         assert_eq!(
             (own.as_str(), peer.as_str()),
@@ -612,6 +659,113 @@ mod tests {
         forwards.update(wanted_ports(&[3000, 4000]));
         assert_eq!(fake.starts(), [(3000, "127.0.0.1:13000".to_string())]);
         assert_eq!(forwards.unreachable_ports.len(), 1);
+    }
+
+    fn pod() -> FakeRuntime {
+        FakeRuntime::new(FakeEnv::new)
+            .with_container("pod", FakeEnv::new().with_reach(None, Reach::Relayed))
+    }
+
+    #[test]
+    fn a_relayed_port_starts_a_relay_first_and_forwards_to_where_it_listens() {
+        let (rt, fake, dir) = (
+            pod(),
+            FakeForwarders::default(),
+            crate::tmpfile::TempDir::new("fwd").unwrap(),
+        );
+        let container = rt.container("pod");
+        let mut forwards = daemon_state(container.as_ref(), &fake, &dir);
+        // Declared as local 9000 to container port 80.
+        let declared = PortForward {
+            local: 9000,
+            host: None,
+            port: 80,
+        };
+        forwards.update(HashMap::from([(9000, declared)]));
+        forwards.update(wanted_ports(&[]));
+        assert_eq!(rt.relays("pod"), [(9000, 80, true)], "and stopped with it");
+        forwards.update(HashMap::from([(
+            9000,
+            PortForward {
+                local: 9000,
+                host: None,
+                port: 80,
+            },
+        )]));
+        assert_eq!(rt.relays("pod").len(), 2, "started again, once");
+        assert_eq!(
+            fake.starts(),
+            [
+                (9000, "127.0.0.1:9000".to_string()),
+                (9000, "127.0.0.1:9000".to_string())
+            ]
+        );
+        assert!(
+            std::fs::read_to_string(dir.path().join("ports"))
+                .unwrap()
+                .contains("9000\t127.0.0.1:9000")
+        );
+    }
+
+    #[test]
+    fn a_relay_that_died_takes_its_forward_with_it_and_is_started_again_after_the_cooldown() {
+        let (rt, fake, dir) = (
+            pod(),
+            FakeForwarders::default(),
+            crate::tmpfile::TempDir::new("fwd").unwrap(),
+        );
+        let container = rt.container("pod");
+        let mut forwards = daemon_state(container.as_ref(), &fake, &dir);
+        forwards.update(wanted_ports(&[8080]));
+        rt.end_relay("pod", 0);
+        forwards.update(wanted_ports(&[8080]));
+        assert!(fake.started.borrow()[0].3.get(), "the forward was dropped");
+        assert_eq!(rt.relays("pod").len(), 1, "cooling down, not hammered");
+
+        forwards.cooling.get_mut(&8080).unwrap().until = std::time::Instant::now();
+        forwards.update(wanted_ports(&[8080]));
+        assert_eq!(rt.relays("pod").len(), 2);
+        assert_eq!(fake.starts().len(), 2);
+    }
+
+    #[test]
+    fn a_forward_aimed_at_another_container_port_gets_a_new_relay() {
+        let (rt, fake, dir) = (
+            pod(),
+            FakeForwarders::default(),
+            crate::tmpfile::TempDir::new("fwd").unwrap(),
+        );
+        let container = rt.container("pod");
+        let mut forwards = daemon_state(container.as_ref(), &fake, &dir);
+        let to = |port| {
+            HashMap::from([(
+                8080,
+                PortForward {
+                    local: 8080,
+                    host: None,
+                    port,
+                },
+            )])
+        };
+        forwards.update(to(80));
+        forwards.update(to(90));
+        // The destination on the host is the same, but the relay behind it is not.
+        assert_eq!(rt.relays("pod"), [(8080, 80, true), (8080, 90, false)]);
+    }
+
+    #[test]
+    fn a_relay_is_stopped_when_its_forward_cannot_start() {
+        let (rt, fake, dir) = (
+            pod(),
+            FakeForwarders::default(),
+            crate::tmpfile::TempDir::new("fwd").unwrap(),
+        );
+        fake.refuse.borrow_mut().insert(8080);
+        let container = rt.container("pod");
+        let mut forwards = daemon_state(container.as_ref(), &fake, &dir);
+        forwards.update(wanted_ports(&[8080]));
+        assert_eq!(rt.relays("pod"), [(8080, 8080, true)]);
+        assert!(forwards.failed.contains(&8080));
     }
 
     #[test]

@@ -74,7 +74,7 @@ for where to put them). Man page: `ldg man | man -l -`.
 
 Global flags, on every command: `-r/--remote HOST` runs against an engine on
 another machine over SSH, `--target docker` picks the container engine (also
-`target = "docker"` in the config; `docker`, `podman`, or `host` for no container at all, docker by default), `-c/--config FILE` uses another config
+`target = "docker"` in the config; `docker`, `podman`, `kubernetes` for a running pod, or `host` for no container at all, docker by default), `-c/--config FILE` uses another config
 file, and `-v/--verbose` prints
 every docker/ssh command lodge runs (`-vv`, `-vvv` add ssh's own debug output).
 `status`, `ls`, `ports` and `doctor` take `--json`.
@@ -88,6 +88,8 @@ On the host:
 - `ldd` and `patchelf`, **only to pack** your tools (that is, when your config
   lists `[[inject]]` entries). Injecting from a bundle needs neither.
 - `oras`, only for devcontainer features from a registry.
+- `kubectl`, only for `--target kubernetes` (on the `--remote` host, with it);
+  `ldg doctor` does not check it.
 
 `ldg doctor` checks all of this, and says what each missing piece would break.
 
@@ -141,6 +143,10 @@ linked binaries are copied as they are.
 - The engines are docker and podman, or no engine at all (`--target host`, below).
   With rootless Podman a container has no address the host can reach, so only the
   ports it publishes (`appPort`) are forwarded.
+- `--target kubernetes` injects into a running pod (`kubectl exec`, run on this
+  machine or on the `--remote` one): you name the pod in `[targets.kubernetes]`, and
+  its ports are forwarded with `kubectl port-forward`. See
+  [Configuration](docs/configuration.md#kubernetes-a-running-pod).
 - `--target host` injects into a machine itself (this one, or another over
   `--remote`) as the user you connect as: your tools in `~/.local/share/lodge`,
   your configs where you said, and a session. It is a real machine, not a

@@ -151,7 +151,7 @@ This is covered by an integration test, so it keeps working.
 ## `target`
 
 A top-level `target = "docker"` says where lodge works: a devcontainer on `docker` or
-`podman`, or `host` for the machine itself (see below). `--target` on the command line
+`podman`, a running pod (`kubernetes`), or `host` for the machine itself (see below). `--target` on the command line
 overrides it, and without either it is `docker`. It is on the machine `--remote`
 names, or on this one. A value that is not a target is an error.
 
@@ -204,6 +204,42 @@ Because it is a real machine, lodge is careful with it:
   `ldg clean` removes the prefix and the wrappers, as for a container.
 - Ports listening on a remote machine are forwarded through ssh to this one, as
   for a container; on this machine there is nothing to forward.
+
+### `kubernetes`: a running pod
+
+`target = "kubernetes"` (or `--target kubernetes`) makes lodge work in a pod that is
+already running, through `kubectl`. It is run on the machine `--remote` names, or on
+this one, so that machine needs `kubectl` and the cluster's credentials. Which pod
+is a setting of the target:
+
+```toml
+[targets.kubernetes]
+pod = "dev-0"            # required: kubectl exec dev-0 …
+container = "main"       # kubectl exec -c main (default: kubectl's own pick)
+namespace = "work"       # kubectl --namespace work (default: the context's)
+context = "staging"      # kubectl --context staging (default: the current one)
+workdir = "/srv/app"     # where a session starts (default: the user's home)
+```
+
+Only `pod` is needed. The project path of `ldg up [PATH]` is a folder on the host, so
+it plays no part: use `workdir`. `ldg up` checks that the pod is `Running`, injects
+your bundle into the home of the user the pod runs as, delivers secrets, and opens a
+session. A pod is someone's workload, so, as for `host`:
+
+- It acts as the user the pod runs as, and cannot act as another: `kubectl exec` has
+  no way to switch user, so `root` or a named user is refused.
+- A config lodge did not place is left as it is, with a warning, and git's
+  `safe.directory = *` is not set.
+- The image needs `sh` and `tar`, and `cat` for the forwarder to see which ports
+  listen. The bundle holds Linux binaries, so the pod's architecture must be one it
+  was packed for.
+- Nothing is created, so `down` and `rm` say so, and `ls` has nothing to list. A
+  pod's files are lost when it is replaced: `ldg up` injects again into a new one.
+  `--build` has nothing to rebuild and is ignored.
+- Ports listening in the pod are forwarded to the same ports here with
+  `kubectl port-forward`, one per port, started by the forward daemon and stopped
+  with it. Ports of other pods (peers) are not forwarded. A port that is already in
+  use here fails to forward, which the daemon's log (`ldg logs`) says.
 
 ## `bundle`
 

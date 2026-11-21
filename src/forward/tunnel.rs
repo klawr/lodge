@@ -49,6 +49,12 @@ pub trait Forward {
     /// Whether it still forwards. One that can't be asked counts as dead, so it
     /// is replaced.
     fn is_alive(&mut self) -> bool;
+
+    /// The container port a relay behind it forwards to, `None` when there is no
+    /// relay: a forward whose relay aims elsewhere is not the one that is wanted.
+    fn relays(&self) -> Option<u16> {
+        None
+    }
 }
 
 /// Starts forwards from a local port to an address on the engine's network.
@@ -60,6 +66,72 @@ pub trait Forwarders {
     /// `" on <host>"` for a forward that runs on another machine, for the log.
     fn on_host(&self) -> String {
         String::new()
+    }
+}
+
+/// Where a host's own processes put their errors: in the daemon log with
+/// `--verbose`, nowhere otherwise.
+pub fn chatter() -> Stream {
+    if crate::output::is_verbose() {
+        Stream::Inherit
+    } else {
+        Stream::Null
+    }
+}
+
+/// A forward in front of a relay process the container's engine host runs for the
+/// port (`kubectl port-forward`): it is alive while both are, and stopping it
+/// stops both.
+pub struct Relayed {
+    relay: Box<dyn Child>,
+    port: u16,
+    inner: Box<dyn Forward>,
+    /// When the relay was started, as for a tunnel.
+    since: Instant,
+}
+
+impl Relayed {
+    /// `inner` forwards to where `relay` listens; `relay` relays to `port` of the
+    /// container.
+    pub fn new(relay: Box<dyn Child>, port: u16, inner: Box<dyn Forward>) -> Self {
+        Self {
+            relay,
+            port,
+            inner,
+            since: Instant::now(),
+        }
+    }
+}
+
+impl Forward for Relayed {
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+
+    fn dest(&self) -> &str {
+        self.inner.dest()
+    }
+
+    fn ran_for(&self) -> Option<Duration> {
+        Some(self.since.elapsed())
+    }
+
+    fn is_alive(&mut self) -> bool {
+        self.relay.try_wait().map(|s| s.is_none()).unwrap_or(false) && self.inner.is_alive()
+    }
+
+    fn relays(&self) -> Option<u16> {
+        Some(self.port)
+    }
+}
+
+impl Drop for Relayed {
+    fn drop(&mut self) {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "the relay may already have exited"
+        )]
+        let _ = self.relay.kill();
     }
 }
 
@@ -78,11 +150,7 @@ impl<'a> HostForwarders<'a> {
 impl Forwarders for HostForwarders<'_> {
     fn start(&self, local: u16, dest: &str) -> std::io::Result<Box<dyn Forward>> {
         // With --verbose, the tunnel's own chatter lands in the daemon log.
-        let chatter = if crate::output::is_verbose() {
-            Stream::Inherit
-        } else {
-            Stream::Null
-        };
+        let chatter = chatter();
         let forward = if let Some(child) = self.host.tunnel(local, dest, chatter) {
             log!("port {local} — tunnel to {dest}{}", self.on_host());
             Forwarder::tunnel(child?, local, dest)

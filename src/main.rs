@@ -20,6 +20,7 @@ mod forward;
 mod host;
 mod host_tools;
 mod inject;
+mod kube;
 mod layout;
 mod local;
 mod output;

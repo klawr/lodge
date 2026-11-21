@@ -147,6 +147,18 @@ fn tunnel(remote: &str, local: u16, to: &str) -> Command {
     c
 }
 
+/// A command that keeps `remote_command` running on `remote` until killed. A
+/// terminal is forced (`-tt`) so that killing this ssh hangs up the remote
+/// command too, instead of leaving it behind. It never prompts (`BatchMode`),
+/// like [`tunnel`].
+fn keep_running(remote: &str, remote_command: &str) -> Command {
+    let (mut c, dest) = base(remote);
+    c.args(["-tt", "-o", "BatchMode=yes"])
+        .arg(dest)
+        .arg(remote_command);
+    c
+}
+
 /// How often and how fast a lost connection is retried: a link that goes quiet
 /// is declared dead by `ServerAlive*` after about 45 s, then a step is tried up
 /// to three times, waiting 1 s, then 2 s.
@@ -320,6 +332,15 @@ impl Host for SshHost {
         Some(start_process(tunnel(&self.remote, local, to), chatter))
     }
 
+    fn spawn(&self, argv: &[&str], chatter: Stream) -> std::io::Result<Box<dyn Child>> {
+        let line = argv
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        start_process(keep_running(&self.remote, &line), chatter)
+    }
+
     fn connect(&self) -> anyhow::Result<()> {
         connect(&self.remote)
     }
@@ -408,6 +429,18 @@ mod tests {
         assert_eq!(a[l + 1], "8080:172.18.0.5:80");
         assert_eq!(a.last().unwrap(), "host", "the destination comes last");
         assert!(a.contains(&"ExitOnForwardFailure=yes".to_string()));
+    }
+
+    #[test]
+    fn a_process_kept_running_has_a_terminal_so_it_hangs_up_with_the_connection_and_never_prompts()
+    {
+        let a = args(&keep_running("user@host", "'kubectl' 'port-forward' 'x'"));
+        assert!(a.contains(&"-tt".to_string()), "{a:?}");
+        assert!(a.contains(&"ControlMaster=auto".to_string()), "{a:?}");
+        assert_eq!(
+            &a[a.len() - 3..],
+            ["BatchMode=yes", "user@host", "'kubectl' 'port-forward' 'x'"]
+        );
     }
 
     #[test]

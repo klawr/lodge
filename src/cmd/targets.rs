@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use super::prompt;
 use crate::devcontainer::Devcontainer;
+use crate::kube::{KubeEndpoints, KubeOptions};
 use crate::plain_host::PlainHostEndpoints;
 #[cfg(test)]
 use crate::provision::Made;
@@ -25,6 +26,7 @@ pub fn all() -> Vec<Box<dyn TargetKind>> {
         Box::new(DockerTarget),
         Box::new(PodmanTarget),
         Box::new(HostTarget),
+        Box::new(KubeTarget),
     ]
 }
 
@@ -178,6 +180,36 @@ impl TargetKind for HostTarget {
     }
 }
 
+struct KubeTarget;
+
+impl TargetKind for KubeTarget {
+    fn name(&self) -> &'static str {
+        "kubernetes"
+    }
+
+    fn about(&self) -> &'static str {
+        "a running Kubernetes pod, through kubectl"
+    }
+
+    fn build(&self, with: Wiring, settings: &toml::Table) -> Result<Box<dyn Endpoints>> {
+        let options: KubeOptions = settings_as(settings, self.name())?;
+        Ok(Box::new(KubeEndpoints::new(with.host, options)))
+    }
+
+    #[cfg(test)]
+    fn made_of(&self) -> Made {
+        Made {
+            types: &["KubePod", "KubeEndpoints", "KubeOptions"],
+            home: &["kube.rs"],
+        }
+    }
+
+    #[cfg(test)]
+    fn settings_schema(&self) -> Option<schemars::Schema> {
+        Some(schemars::schema_for!(KubeOptions))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,11 +231,11 @@ mod tests {
 
     #[test]
     fn the_targets_are_listed_once_and_docker_is_the_default() {
-        assert_eq!(names(), ["docker", "podman", "host"]);
+        assert_eq!(names(), ["docker", "podman", "host", "kubernetes"]);
         assert_eq!(default_name(), "docker");
         assert!(find("podman").is_some() && find("nonesuch").is_none());
         let err = check("dockr").unwrap_err().to_string();
-        assert!(err.contains("docker, podman, host"), "{err}");
+        assert!(err.contains("docker, podman, host, kubernetes"), "{err}");
     }
 
     #[test]

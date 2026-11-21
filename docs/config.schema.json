@@ -201,6 +201,7 @@
         "docker",
         "podman",
         "host",
+        "kubernetes",
         null
       ],
       "type": [
@@ -231,6 +232,54 @@
         },
         "host": {
           "additionalProperties": false,
+          "type": "object"
+        },
+        "kubernetes": {
+          "additionalProperties": false,
+          "description": "What the user can say about Kubernetes, under `[targets.kubernetes]` in the\nconfig.",
+          "properties": {
+            "container": {
+              "default": null,
+              "description": "The container of the pod to work in (`kubectl exec -c NAME`). Default: the\none kubectl picks, as for `kubectl exec`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "context": {
+              "default": null,
+              "description": "The kubectl context to use (`kubectl --context NAME`): which cluster to\ntalk to when you have several. Default: the current one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "namespace": {
+              "default": null,
+              "description": "The namespace of the pod (`kubectl --namespace NAME`). Default: the\ncontext's.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pod": {
+              "default": null,
+              "description": "The pod to work in (`kubectl exec POD`). Required by every command that\nuses the target.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workdir": {
+              "default": null,
+              "description": "The directory in the pod a session starts in. Default: the home of the\nuser the pod runs as. The project path of `ldg up` is a folder on the host,\nso it plays no part here.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "title": "KubeOptions",
           "type": "object"
         },
         "podman": {

@@ -65,6 +65,7 @@ fn docker_is_run_through_a_host_and_named_only_by_the_docker_runtime() {
     // `docker …`, so it works the same on every host.
     assert_eq!(spawners("docker"), Vec::<String>::new());
     assert_eq!(spawners("podman"), Vec::<String>::new());
+    assert_eq!(spawners("kubectl"), Vec::<String>::new());
     assert_eq!(
         // `cmd/targets.rs` spells them as the names a user types, not as programs
         // it starts.
@@ -72,6 +73,16 @@ fn docker_is_run_through_a_host_and_named_only_by_the_docker_runtime() {
             &["\"docker\"", "\"podman\""],
             &["runtime/cli/", "cmd/targets.rs"]
         ),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn kubectl_is_run_through_a_host_and_spelled_only_by_the_pod_endpoint() {
+    // `cmd/targets.rs` spells it as the name a user types (`kubernetes`), which
+    // does not contain the program's name.
+    assert_eq!(
+        files_containing(&["\"kubectl\""], &["kube.rs"]),
         Vec::<String>::new()
     );
 }
