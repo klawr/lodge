@@ -61,7 +61,7 @@ every subcommand.
 | `cmd/` | One file per group of commands (`attach`: up/exec, `project`: down/status/rm/ls/ports/logs/clean, `doctor`, `init`, `bundle`: pack/bundle/cache), plus `prompt`, the terminal side of `devcontainer::Prompt`. The only layer that loads the config, prints reports and reads the terminal. |
 | `config/` | The user's `config.toml`: `[[inject]]`, `[session]`, `[git]`, `[[secret]]` (its declaration types are in `config/secret.rs`: `RawSecret` as written, `SecretDecl` once checked), `bundle`, `target` and `targets`, a table of settings per target (`[targets.docker]`, `[targets.podman]`; the chosen one is also readable on its own with `target_setting` and `target_settings`, because the target is built before a command loads the config; what is in a table is checked by its target). Unknown keys and wrong types are errors (with a "did you mean"); past those, every problem, secrets included, is reported at once. A relative `bundle =` resolves against the file's folder. The JSON schema in `docs/config.schema.json` is generated from these types. |
 | `devcontainer/` | Everything about running a `devcontainer.json` (see below). |
-| `bundle/` | A bundle is a portable tar of relinked binaries, their libraries and configs, with a manifest, and is tied to no install prefix (see "Injection"). `manifest` defines and validates it (paths derive from names, so a bundle can't point outside itself), `archive` writes, reads and verifies the tar, `pack` builds one from the config (the only step needing a relinker; `deps` asks a `DepReader` once per binary however often the answer is needed, `elf` reads a binary's architecture, as an `arch::Arch`, the one name for a CPU that bundles, binaries and machines are compared by, and `Arch::host()` is this machine's, and writes the interpreter of a dynamic binary in place), `source` readies a bundle *directory* to inject from (extracted from a file, or packed live), keyed by the file's hash or a fingerprint of the live inputs, and `cache` keeps those directories under `~/.cache/lodge/bundles/`. `hash` is the content hash of a file or tree. |
+| `bundle/` | A bundle is a portable tar of relinked binaries, their libraries and configs, with a manifest, and is tied to no install prefix (see "Injection"). `manifest` defines and validates it (paths derive from names, so a bundle can't point outside itself), `archive` writes, reads and verifies the tar, `pack` builds one from the config (the only step needing a relinker; `deps` asks a `DepReader` once per binary however often the answer is needed, `elf` reads a binary's architecture, as an `Arch` (see `arch.rs`), and writes the interpreter of a dynamic binary in place), `source` readies a bundle *directory* to inject from (extracted from a file, or packed live), keyed by the file's hash or a fingerprint of the live inputs, and `cache` keeps those directories under `~/.cache/lodge/bundles/`. `hash` is the content hash of a file or tree. |
 | `inject/` | Copies a bundle's binaries, libraries and configs into a container for one `ContainerUser`, reading only from the bundle directory and acting *as that user* (through `runtime::Acting`), so it never needs root: `prefix` (chooses and checks the prefix: the user's home, else a private `/tmp` directory; `installed`, in `state`, finds where it was installed), `binary` (rewrites a dynamic binary's interpreter for the prefix, and writes the wrapper a config asked for), `libs` (tracked by content hash), `config_files`, `git` (`safe.directory`), `installed` (a hash and the destination per installed piece; a record that can't be read means that piece is installed again, and the list of records `ldg clean` works from is an error when it can't be read, not "nothing installed"), `state` (the installed bundle id, and `installed`, which finds what was injected and where), `remove` (`ldg clean`; placed secrets are removed by `secret::place::clear`). |
 | `layout.rs` | Every path lodge writes inside a container: `Layout`, the paths inside the user's prefix (the table under "What lives where"); the provisioning state, which is the devcontainer's own and root-owned; and the secrets directory. Nothing else spells these paths out. |
 | `secret/` | Secrets that must not be in a bundle. Their `[[secret]]` declarations are config (`config/secret.rs`: validated; names reach shell scripts). `mod` is the `Secret` value type (redacted `Debug`, no `Display`), matching `targets` globs, and `resolve` (env, file or a command run on *this* machine with a timeout, with errors that never contain the value). `place` writes values into a container under `/dev/shm/lodge-secrets-<uid>/` and builds the session lines that export them; `clear` removes the user's (`ldg clean`). `deliver` picks the secrets whose `targets` match, resolves and places them (or clears them when none are declared), and prints names only. |
@@ -70,12 +70,13 @@ every subcommand.
 | `provision.rs` | `TargetKind` (one kind of endpoint the user can name: its name, its one-line description, and how to build its `Endpoints` from the `Wiring` and the `[targets.<name>]` settings it was given; the whole of what is particular to a target outside its endpoint) and the seam between making an endpoint and working in one: `Endpoints` (provision a project's endpoint, find it, its status, hand out a handle by id for the forward daemon, which engine is behind it, whether `--remote` needs a project path, and an optional `Lifecycle`) returns `Attached` (the endpoint, its user, workdir, forward ports, whether it was just created, and the post-attach hook). `cmd::attach::up` is `provision` then `attach`, and `attach` takes only an `Attached`, so it is tested with a fake container and no provisioner. |
 | `plain_host.rs` | A machine you can reach as an endpoint (`--target host`): `PlainHost` is an `Env` and `Container` built on a `Host` only (commands and `tar` through `Host::exec`, secrets on stdin, the session through `Host::interactive`), acting as the user the host connects as and not [disposable](#capabilities); `PlainHostEndpoints` is its `Endpoints`: nothing to create, so it has no `Lifecycle` (`down`, `rm` and `ls` say so). |
 | `port.rs` | `PortForward`, a port to forward: what the devcontainer spec declares and the daemon carries out, so neither depends on the other. |
-| `tools/` | The build-time helpers behind interfaces: `DepReader` (which libraries a binary needs), `ElfEditor` (relink a copy of a binary for the bundle's prefix) and `OciFetcher` (pull a feature's layer), bundled as a `Toolchain` that `cmd::run` builds. `external` has the implementations that run the programs (`Ldd`, `Patchelf`, `Oras`, parsing `ldd`'s output); a native one is one more type. Packing, the bundle cache and feature fetching take the interfaces and are tested with fakes. |
-| `host_tools.rs` | The helper programs lodge may run here (`ssh`, `ldd`, `patchelf`, `oras`): what each is needed for (a `Need`, which decides when `doctor` requires it) and how to get it. `doctor` reports from this table and each tool is started only through it (the `tools` implementations and `host/ssh.rs`). |
+| `tools/` | The build-time helpers behind interfaces: `DepReader` (which libraries a binary needs), `ElfEditor` (relink a copy of a binary for the bundle's prefix) and `OciFetcher` (pull an artifact's layers from a registry), bundled as a `Toolchain` that `cmd::run` builds. `external` runs the programs (`Ldd`, `Patchelf`, parsing `ldd`'s output); `oci/` is the in-process registry client (see [`tools/oci/`](#toolsoci)). Packing, the bundle cache and feature fetching take the interfaces and are tested with fakes. |
+| `host_tools.rs` | The helper programs lodge may run here (`ssh`, `ldd`, `patchelf`): what each is needed for (a `Need`, which decides when `doctor` requires it) and how to get it. `doctor` reports from this table and each tool is started only through it (the `tools` implementations and `host/ssh.rs`). |
 | `local.rs` | `Local`: the machine lodge runs on (environment variables, files a secret names, a local shell for a secret's `command`), with `SystemLocal` and, in tests, `FakeLocal`. Built once in `cmd/` and handed down, so nothing else asks the process. |
 | `host/` | How a machine is reached. `mod` is the `Host` trait (`run` one `Job` with the streams the caller asks for, `interactive`, `tunnel`, the connection hooks; no process type crosses it) with everything built on those provided (`exec` runs a job and retries it after a lost connection if it is `Repeat::Safe`): running a script, `read_first` (finds files by pattern and reads the first in one round trip), `read_file`, `canonical_dir`, `fetch_dir` (copies a folder from the project's host), `write_scratch`, `uid_gid`; and `attempt`, which reruns a step after a lost connection if it is marked `Repeat::Safe`. `fake` (tests) is `FakeHost`: it records every job and answers from a script, with files in memory, so everything that only uses a host is tested without a process. `local` is `LocalHost`, this machine. `ssh` is `SshHost`: `--remote` destination parsing, the shared connection (`connect` opens it up front with the terminal available, `ControlMaster` multiplexes everything after), and the few ssh invocations lodge needs, all built from one private `base`. |
 | `runtime/` | The seam to whatever runs the workload: the `Env`, `Container`, `Runtime` and `Compose` traits (see below), `User` (who a command runs as) and `ContainerUser` (the session user's name, uid, gid and home, looked up once), `Acting` (an `Env` seen as one user, below), `inside` (`Inside`: what is particular to reaching inside one endpoint, five small methods, and the `Env` every endpoint needs built on it once), `tarball` (packs files as a tar owned by a user), the docker-compatible CLI implementation (`cli/`, for `docker` and `podman`: the engine, which runs on a `Host` it is given, the per-container `Inside` and the copy out of a container; `Docker` and `Podman` are two engines, each a `CliEngine` of its own `Flavor` (`docker.rs`, `podman.rs`), which holds what is its own: the program, the `[targets.docker]`/`[targets.podman]` settings (a context or connection, as arguments on every command), `cp`'s flags and wording, extra `run` flags, how compose is asked, and whether a container's address is reachable (not for rootless Podman). The plumbing is shared and asks the flavor; it never checks which engine it is), and strict in-memory fakes for tests (`FakeEnv`, and `FakeRuntime`, whose containers each run in one). |
 | `shell.rs` | POSIX `shell_quote`, which everything that builds a command string goes through; `script_argv`, how every script with arguments is started (`sh -c <script> sh <args…>`, so arguments are `$1`, `$2`, …); the rules for names written into scripts unquoted (`is_plain_name`, `is_var_name`) and for destinations in a container (`container_path_problem`); `slug` for container names; and `CmdLine`, a command as `sh -c` script or argv. |
+| `arch.rs` | `Arch`, the one name for a CPU that bundles, binaries, machines and registry platforms are compared by. A foundation module, so `tools/` (the registry client picks an index entry by it) and `bundle/` can both use it. |
 | `fingerprint.rs` | The small content hash used to notice changes (devcontainer inputs, updated libraries, bundle contents), as a `Fingerprint` builder. Its values are stored, so a test pins them. |
 | `tmpfile.rs` | Self-deleting staging files for `docker cp`. |
 | `tree.rs` | Walking a file tree on this machine in one stable order (name order, a directory before its contents), with an explicit choice about symlinks (a followed link loop is entered once) and unreadable directories. Every hash, fingerprint and copy of a tree goes through it. |
@@ -92,7 +93,7 @@ every subcommand.
 | `spec.rs` | Find the config on the project's host (through `Host`, so every host shares one lookup order); parse `devcontainer.json` (JSONC) into a backend-agnostic `Spec`; derive the session name. |
 | `backend.rs` | Picks and builds the backend from the parsed config (with the stable container name, and the files besides the config that count toward drift: a Dockerfile, compose files). The `Backend` trait with two implementations: `ComposeBackend` (`docker compose`, run on the project's host) and `ContainerBackend` (`docker run` of an image or a local build). Both label the container `dev.lodge.project=<path>`. |
 | `create.rs` | `CreateSettings`, how a container is created (privileged, capabilities, mounts, published `appPort`s, …), from devcontainer.json and from features alike, applied to a `runtime::RunSpec` (the engine-neutral description of a container; `runtime/cli` renders it as `docker run` flags, and a devcontainer's `runArgs` ride along in `engine_args`, last, because the spec defines them as the engine's own flags) or rendered as a compose override (compose-file YAML, which is not docker's). |
-| `features/` | Devcontainer *features*: `fetch` (OCI with `oras`, or a local folder from the project's host; a feature's `id` must be a plain name, since it names a folder), and in `mod.rs` `resolve` (adds what `dependsOn` names, once each, and drops a feature whose dependency is unavailable), the order (`dependsOn` and `installsAfter`, then `overrideFeatureInstallOrder`, then the reference; a circle is warned about), the creation settings they ask for, and the install (as root, told `_REMOTE_USER`), with one env profile per feature. |
+| `features/` | Devcontainer *features*: `fetch` (OCI through the `OciFetcher`, or a local folder from the project's host; a feature's `id` must be a plain name, since it names a folder), and in `mod.rs` `resolve` (adds what `dependsOn` names, once each, and drops a feature whose dependency is unavailable), the order (`dependsOn` and `installsAfter`, then `overrideFeatureInstallOrder`, then the reference; a circle is warned about), the creation settings they ask for, and the install (as root, told `_REMOTE_USER`), with one env profile per feature. |
 | `lifecycle.rs` | The `Hook` type (string / argv / named map, all run as the same steps), running hooks on the host or in the container (as `remoteUser`), and the create-time hooks that run once successfully (`run_create_hooks`). |
 | `profile.rs` | The env profiles written into the container (`containerEnv`/`remoteEnv`, and what features add): literals quoted, variable references left for the login shell. |
 | `markers.rs` | One-shot markers: which create-time hooks and feature installs already succeeded. |
@@ -106,6 +107,46 @@ find an existing container and how to create or start one. `up` is handed what
 `existing` found, so the image backend doesn't look again; compose finds its own
 container (and is asked for its id after `up` anyway). Hashing, env, features
 and hooks all work from the resulting container id.
+
+### `tools/oci/`
+
+`NativeOci` is the `OciFetcher` that talks to a registry itself, with no helper
+program. It knows registries and nothing about what an artifact holds, so
+devcontainer features use it today and anything else stored as an OCI artifact
+(a bundle, later) can use it unchanged. `pull(reference, arch, into)` resolves the
+reference, picks the image for `arch` out of an index, and writes each layer to
+`into` as a file named after its digest.
+
+| File | Responsibility |
+| --- | --- |
+| `mod.rs` | `NativeOci`: the order of a pull (manifest, then the image an index names, then each layer). Built from the two interfaces below, by `cmd::run`. |
+| `http.rs` | `Http`, the transport: one `GET`, any status returned as an answer, redirects followed without ever sending the request's headers to another host. `UreqHttp` is the real one and the only file that names the HTTP crate; `FakeHttp` (tests) answers each URL from a script and records what it was sent. |
+| `credentials.rs` | `Credentials`, where a login comes from. `DockerConfig` reads what `docker login` stored in the config file itself (`$DOCKER_CONFIG` or `~/.docker`), through `Local`. A login kept by a credential helper is not asked for: that registry is reached anonymously. A helper would be one more implementation; `Login` never prints its password. |
+| `registry.rs` | One repository on one registry: the calls, and the handshake that lets them through. |
+| `reference.rs` | Splits `ghcr.io/owner/name:1` (or `@sha256:…`) into registry, repository and tag or digest, and refuses anything that would break a URL. Pure. |
+| `manifest.rs` | Reads a manifest as an image (layers) or an index (images per platform), and picks the entry for an architecture. Pure. |
+| `auth.rs` | Reads a `WWW-Authenticate` challenge and builds what answers it. Pure. |
+| `digest.rs` | `Digest`, and copying a stream while checking its size and hash. The only file that names the hash crate. |
+
+How a pull stays safe:
+
+- **Everything is checked.** A manifest asked for by digest must hash to it, and a
+  layer must be exactly the size the manifest declares and hash to its digest.
+  Nothing past the declared size is read, and a download that fails a check leaves
+  no file behind.
+- **The handshake.** A 401 is answered once: with a bearer token (the scope the
+  registry names, else a pull of this repository) fetched from the token service,
+  or with basic auth, using a login if there is one and anonymously if not. A
+  token that goes stale mid-pull is renewed the same way; a second 401 is the
+  registry's answer, and the error says how a login is found.
+- **Logins stay put.** A login is only sent to a token service over TLS, and never
+  to another host when a request is redirected (a registry sends a blob to a CDN).
+- **Local registries are spoken to without TLS**, as docker does: `localhost`,
+  `127.0.0.1` and `[::1]`.
+- **A stall is an error, not a hang.** There is a timeout for connecting, for the
+  response and for each read, and none for the whole download: a blob can be large.
+
+What is not there: retries (a 429 or 5xx is an error), a credential helper, a push.
 
 ## What `ldg up` does, step by step
 
@@ -408,7 +449,7 @@ just how it is done.
 | How a machine is reached | `host::Host` | `LocalHost`, `SshHost`, and `FakeHost` for tests; anything else that can run a command implements `run`, `interactive`, `tunnel` and `spawn` |
 | The machine lodge runs on | `local::Local` | `SystemLocal` (environment, files a secret names, a local shell); `FakeLocal` for tests |
 | The container engine | `runtime::Runtime`, `Compose`, `Container`, `Env` | `runtime::cli`, and the in-memory `FakeRuntime` for tests |
-| The build-time helpers | `tools::DepReader`, `ElfEditor`, `OciFetcher` (a `Toolchain`) | `Ldd`, `Patchelf`, `Oras`; a test passes fakes |
+| The build-time helpers | `tools::DepReader`, `ElfEditor`, `OciFetcher` (a `Toolchain`) | `Ldd`, `Patchelf`, `NativeOci` (on `Http` and `Credentials`: `UreqHttp`, `DockerConfig`); a test passes fakes |
 | Making an endpoint ready, and finding it again | `provision::Endpoints` | `devcontainer::Devcontainer` (a devcontainer on an engine), `plain_host::PlainHostEndpoints` (the machine itself), `kube::KubeEndpoints` (a running pod, through `kubectl` on a `Host`) |
 | Port forwarding for a container | `forward::ForwardDaemon` (and `Forwarders` for one tunnel) | `DetachedDaemon`, `HostForwarders`; a test passes fakes |
 | What is injected | `[[inject]]` data | multiplexers and other tools are injected like any other, never named in code |
@@ -479,9 +520,9 @@ concrete types and the modules that may name them, which `conventions.rs` turns 
 a guard, so a new target cannot leave itself unguarded). That list is the only place that says
 which targets exist: the `--target` values and their help, the `target` in the
 config, the settings tables and the schema are all read from it, and `attach` and
-every other command are unchanged. To replace a helper tool (a native OCI client, a built-in ELF
-writer), implement `OciFetcher` or `ElfEditor` in `tools/` and swap it in the
-`Toolchain` that `cmd::run` builds. Nothing else changes, and
+every other command are unchanged. To replace a helper tool (a built-in ELF
+writer, another registry client), implement `OciFetcher` or `ElfEditor` in
+`tools/` and swap it in the `Toolchain` that `cmd::run` builds. Nothing else changes, and
 `conventions.rs` fails if anything else starts to name the new type.
 
 ## Conventions
@@ -516,8 +557,10 @@ erode.
   and no other module spells it out; a local `sh` only in `host/local.rs` (scripts
   on this machine as the project's host) and `local.rs` (a secret's `command`
   source, which is on this machine whatever the host); and the helper tools
-  (`ldd`, `patchelf`, `oras`) only in `tools/external.rs`, through `host_tools`,
-  behind `DepReader`, `ElfEditor` and `OciFetcher`. lodge never runs a local
+  (`ldd`, `patchelf`) only in `tools/external.rs`, through `host_tools`,
+  behind `DepReader` and `ElfEditor`. The registry is spoken to in-process
+  (`tools/oci/`, behind `OciFetcher`): the HTTP crate is named only in
+  `http.rs` and the hash crate only in `digest.rs`. lodge never runs a local
   `tar`; tar streams are built and unpacked in-process. `host/ssh.rs` builds
   every `ssh` command from one private `base`. *Enforced:* the tests in
   `conventions.rs`.

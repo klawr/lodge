@@ -13,7 +13,7 @@ mod fetch;
 use super::create::{CreateSettings, Mount};
 use super::markers;
 use crate::host::Host;
-use crate::output::{info, plural, warning};
+use crate::output::{info, warning};
 use crate::runtime::{ContainerUser, Env, ExecOpts, User};
 use crate::tmpfile::TempDir;
 use crate::tools::OciFetcher;
@@ -194,22 +194,13 @@ impl Plan {
 
 /// Fetches and orders the given features (pulling OCI artifacts through
 /// `ctx.oci`, reading local-path features from the project's host). Returns an
-/// empty plan if there's nothing to do or the registry tool is needed but missing.
+/// empty plan if there's nothing to do.
 pub fn resolve(
     ctx: &Context,
     features: &[FeatureRequest],
     override_order: &[String],
 ) -> Result<Plan> {
     if features.is_empty() {
-        return Ok(Plan::default());
-    }
-    if features.iter().any(|f| !is_local_ref(&f.reference))
-        && let Err(e) = ctx.oci.check()
-    {
-        warning!(
-            "{e:#}; skipping {}",
-            plural(features.len(), "feature", "features")
-        );
         return Ok(Plan::default());
     }
 

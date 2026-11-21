@@ -343,8 +343,6 @@ pub struct Needs {
     pub config_path: std::path::PathBuf,
     /// It uses `dockerComposeFile`.
     pub compose: bool,
-    /// It uses features from a registry (so `oras`).
-    pub registry_features: bool,
 }
 
 /// What the devcontainer in `project_path` needs. An error when there is no
@@ -353,10 +351,6 @@ pub fn needs(project_path: &Path, host: &HostRef, local: &dyn Local) -> Result<N
     let spec = load_spec(project_path, host, local)?;
     Ok(Needs {
         compose: spec.backend.uses_compose(),
-        registry_features: spec
-            .features
-            .iter()
-            .any(|f| !features::is_local_ref(&f.reference)),
         config_path: spec.config_path,
     })
 }

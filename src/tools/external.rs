@@ -1,12 +1,12 @@
-//! The tools as the programs themselves: `ldd`, `patchelf` and `oras`, started
+//! The tools as the programs themselves: `ldd` and `patchelf`, started
 //! through the `host_tools` registry.
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use super::{DepReader, Deps, ElfEditor, OciFetcher};
-use crate::host_tools::{LDD, ORAS, PATCHELF};
+use super::{DepReader, Deps, ElfEditor};
+use crate::host_tools::{LDD, PATCHELF};
 use crate::output::warning;
 
 /// `ldd`.
@@ -78,29 +78,6 @@ impl ElfEditor for Patchelf {
         })?;
         if !status.success() {
             bail!("patchelf failed to patch {}", file.display());
-        }
-        Ok(())
-    }
-}
-
-/// `oras`, which pulls an artifact's layer as a file into the working directory.
-pub struct Oras;
-
-impl OciFetcher for Oras {
-    fn check(&self) -> Result<()> {
-        if ORAS.find().is_none() {
-            bail!("devcontainer features need `oras` (https://oras.land)");
-        }
-        Ok(())
-    }
-
-    fn pull(&self, reference: &str, into: &Path) -> Result<()> {
-        let mut cmd = ORAS.command();
-        cmd.args(["pull", reference]).current_dir(into);
-        crate::output::trace(&cmd);
-        let status = cmd.status().context("running oras pull")?;
-        if !status.success() {
-            bail!("oras pull failed for {reference}");
         }
         Ok(())
     }

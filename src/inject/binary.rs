@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use crate::bundle::arch::Arch;
+use crate::arch::Arch;
 use crate::bundle::elf;
 use crate::bundle::manifest::{BIN_DIR, Binary, Manifest, Tool};
 use crate::bundle::source::Prepared;

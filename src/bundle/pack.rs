@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use super::arch::Arch;
 use super::archive;
 use super::deps;
 use super::elf;
@@ -15,6 +14,7 @@ use super::manifest::{
     BIN_DIR, Binary, CONFIG_DIR, ConfigTree, LIB_DIR, Lib, MANIFEST_FILE, Manifest, ORIGIN_RPATH,
     Tool,
 };
+use crate::arch::Arch;
 use crate::config::{Config, Injectable};
 use crate::layout;
 use crate::output::warning;

@@ -47,11 +47,20 @@ named commands. A failing hook is reported but never locks you out.
 
 ## Features
 
-`features` are pulled with `oras` (registry references) or read from the
-project (`./local-feature`; with `--remote`, from the remote host). Their
-`install.sh` runs in the container, as root, when it is created: options become
-environment variables, `_REMOTE_USER` / `_CONTAINER_USER` and their homes are
-set, and `containerEnv` is written to `/etc/profile.d` so login shells pick it up.
+A feature is either a registry reference (`ghcr.io/devcontainers/features/node:1`)
+or a folder in the project (`./local-feature`; with `--remote`, on the remote
+host). Their `install.sh` runs in the container, as root, when it is created:
+options become environment variables, `_REMOTE_USER` / `_CONTAINER_USER` and
+their homes are set, and `containerEnv` is written to `/etc/profile.d` so login
+shells pick it up.
+
+Registry features are pulled by lodge itself, so there is nothing to install. The
+pull is anonymous unless you have run `docker login` for that registry: lodge
+reads the login from docker's config file (`~/.docker/config.json`, or
+`$DOCKER_CONFIG`), but not from a credential helper (`credsStore`), so a private
+registry whose login lives in a helper is not reachable yet. Everything pulled is
+checked against its digest. If a pull fails, see
+[Troubleshooting](troubleshooting.md#a-feature-cannot-be-pulled).
 
 Order: `dependsOn` features are installed too (with the options it gives, unless
 you list the feature yourself), and before the feature that needs them; one that

@@ -16,8 +16,6 @@ pub enum Need {
     Remote,
     /// Packing a bundle from the config.
     Pack,
-    /// Devcontainer features from a registry.
-    RegistryFeatures,
 }
 
 pub struct Tool {
@@ -62,12 +60,5 @@ pub const PATCHELF: Tool = Tool {
     hint: "install patchelf (pacman -S patchelf / apt install patchelf)",
 };
 
-pub const ORAS: Tool = Tool {
-    name: "oras",
-    need: Need::RegistryFeatures,
-    needed_for: "needed for devcontainer features from a registry",
-    hint: "install oras from https://oras.land",
-};
-
 /// Every tool, in the order `ldg doctor` lists them.
-pub const ALL: [&Tool; 4] = [&SSH, &LDD, &PATCHELF, &ORAS];
+pub const ALL: [&Tool; 3] = [&SSH, &LDD, &PATCHELF];

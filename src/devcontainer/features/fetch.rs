@@ -50,15 +50,22 @@ fn read_meta(dir: &Path) -> Result<FeatureMeta> {
 /// into `work`; unpack it and return the directory holding `install.sh`.
 fn pull(oci: &dyn OciFetcher, reference: &str, work: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(work)?;
-    oci.pull(reference, work)
+    oci.pull(reference, None, work)
         .with_context(|| format!("pulling feature {reference}"))?;
 
-    let layer = std::fs::read_dir(work)?
+    let files: Vec<PathBuf> = std::fs::read_dir(work)?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.is_file())
-        .with_context(|| format!("pulling {reference} produced no artifact"))?;
+        .filter(|p| p.is_file())
+        .collect();
+    // The features spec has one layer; another shape is not guessed at.
+    let [layer] = files.as_slice() else {
+        bail!(
+            "{reference} has {} layers, a feature has exactly one",
+            files.len()
+        );
+    };
     let content = work.join("content");
-    unpack(&layer, &content).with_context(|| format!("unpacking feature {reference}"))?;
+    unpack(layer, &content).with_context(|| format!("unpacking feature {reference}"))?;
     Ok(content)
 }
 
@@ -76,16 +83,13 @@ fn unpack(layer: &Path, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::Arch;
 
     /// A registry that holds one feature, as a plain-tar layer.
     struct OneFeature;
 
     impl OciFetcher for OneFeature {
-        fn check(&self) -> Result<()> {
-            Ok(())
-        }
-
-        fn pull(&self, reference: &str, into: &Path) -> Result<()> {
+        fn pull(&self, reference: &str, _arch: Option<Arch>, into: &Path) -> Result<()> {
             assert_eq!(reference, "ghcr.io/x/feat:1");
             let mut layer = tar::Builder::new(Vec::new());
             let mut add = |name: &str, body: &str| {
@@ -116,6 +120,31 @@ mod tests {
         let (meta, dir) = fetch(&ctx, "ghcr.io/x/feat:1", &work.path().join("0")).unwrap();
         assert_eq!(meta.id, "feat");
         assert!(dir.join("install.sh").is_file());
+    }
+
+    /// An artifact with two layers, which is not a feature.
+    struct TwoLayers;
+
+    impl OciFetcher for TwoLayers {
+        fn pull(&self, _reference: &str, _arch: Option<Arch>, into: &Path) -> Result<()> {
+            std::fs::write(into.join("sha256-a"), b"")?;
+            std::fs::write(into.join("sha256-b"), b"")?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_artifact_with_more_than_one_layer_is_not_a_feature() {
+        let work = crate::tmpfile::TempDir::new("pull-two").unwrap();
+        let ctx = Context {
+            base_dir: Path::new("/p/.devcontainer"),
+            host: &crate::host::fake::FakeHost::new(),
+            oci: &TwoLayers,
+        };
+        let err = fetch(&ctx, "ghcr.io/x/feat:1", &work.path().join("0"))
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("2 layers"), "{err:#}");
     }
 
     #[test]

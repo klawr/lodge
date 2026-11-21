@@ -78,6 +78,32 @@ Hooks and features are reported and skipped, never fatal, and a failed
 create-time hook or feature is retried on the next `ldg up`. Hooks run as
 `remoteUser`, feature scripts as root. Run `ldg up -v` to see the exact command.
 
+## A feature cannot be pulled
+
+A feature from a registry is pulled by lodge itself (see
+[Devcontainers](devcontainers.md#features)), and the error names the step that
+failed:
+
+- `not found: ghcr.io/owner/name`: the registry has no such repository or tag.
+  Check the reference, including the tag.
+- `… refused owner/name (401)`: the repository is private, or needs a login. Run
+  `docker login <registry>`. lodge reads that login only if docker stored it in
+  its config file; if `credsStore` or `credHelpers` is set there, the login lives
+  in a helper that lodge does not ask, and the registry is reached anonymously.
+  `the token service refused (…)` is the same thing one step earlier.
+- `… needs a login (docker login <registry>)`: the registry asks for basic auth and
+  there is no login.
+- `content is sha256:…, expected sha256:…`, or `is N bytes, the manifest says M`:
+  what came is not what the registry's manifest promised (a broken proxy or
+  mirror). Nothing is kept; retry, or check what sits between you and the registry.
+- `has N layers, a feature has exactly one`: the reference is not a feature.
+- A pull that stops moving fails after 30 seconds without data. Every other
+  failure to connect or answer is reported as it came (`requesting <url>`).
+
+`ldg up -v` prints each registry request as `GET <url>`. A failed request is not
+retried, so on a flaky connection run `ldg up` again: a feature that was already
+installed is not installed twice.
+
 ## A plain host
 
 `ldg --target host up` works on the machine itself, as the user you connect as. If

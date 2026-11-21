@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-use crate::bundle::arch::Arch;
+use crate::arch::Arch;
 use crate::fingerprint::content_hash;
 use crate::shell::{container_path_problem, is_plain_name};
 

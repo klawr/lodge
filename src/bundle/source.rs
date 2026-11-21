@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use super::hash::hash_path;
 use super::manifest::{BIN_DIR, CONFIG_DIR, LIB_DIR, Manifest};
 use super::{archive, cache, deps, elf, pack};
-use crate::bundle::arch::Arch;
+use crate::arch::Arch;
 use crate::config::Config;
 use crate::fingerprint::Fingerprint;
 use crate::output::{info, warning};

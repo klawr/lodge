@@ -62,7 +62,7 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
         ),
     });
 
-    // The devcontainer here (if any) decides whether compose and oras matter.
+    // The devcontainer here (if any) decides whether compose matters.
     let needs = ctx
         .project(path)
         .and_then(|p| crate::devcontainer::needs(&p, &ctx.host, ctx.local.as_ref()));
@@ -76,7 +76,6 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
         Err(e) => Check::new("devcontainer", Level::Optional, format!("{e:#}")),
     });
     let needs_compose = needs.as_ref().is_ok_and(|n| n.compose);
-    let needs_oras = needs.as_ref().is_ok_and(|n| n.registry_features);
     if let Some(rt) = ctx
         .endpoints
         .engine()
@@ -106,7 +105,6 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
         let (shown, required) = match tool.need {
             Need::Remote => (remote.is_some(), remote.is_some()),
             Need::Pack => (true, packs_live),
-            Need::RegistryFeatures => (true, needs_oras),
         };
         if shown {
             checks.push(tool_check(tool, required));

@@ -30,7 +30,7 @@ use crate::forward::{DetachedDaemon, ForwardDaemon};
 use crate::host::{HostRef, LocalHost, SshHost};
 use crate::local::{Local, SystemLocal};
 use crate::provision::{Endpoints, Wiring};
-use crate::tools::{Ldd, Oras, Patchelf, Toolchain};
+use crate::tools::{DockerConfig, Ldd, NativeOci, Patchelf, Toolchain, UreqHttp};
 
 /// Whether a command works in a target at all. `init` and the generated
 /// completions and man page do not, so a bad value in the config can't stop
@@ -167,7 +167,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
     // The composition root: the one place that picks how the project's machine
     // is reached and which target is worked in on it. Each is an interface everything
     // else takes; a new way of reaching a machine or a new target is one more arm.
-    // The helper tools (`ldd`, `patchelf`, `oras`) are chosen here too.
+    // The helper tools (`ldd`, `patchelf`, the registry client) are chosen here too.
     let remote = cli.remote.clone();
     // The forward daemon has no terminal, so its ssh commands must never prompt.
     let daemon = matches!(cli.command, Command::Forward { .. });
@@ -188,7 +188,10 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
     let tools = Toolchain {
         deps: Box::new(Ldd),
         elf: Box::new(Patchelf),
-        oci: Arc::new(Oras),
+        oci: Arc::new(NativeOci::new(
+            Box::new(UreqHttp::new()),
+            Box::new(DockerConfig::new(local.clone())),
+        )),
     };
     let endpoints = build_endpoints(
         target,

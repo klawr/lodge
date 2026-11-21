@@ -39,7 +39,7 @@ impl Arch {
     }
 
     /// The architecture an ELF `e_machine` value names.
-    pub(super) fn from_machine(e_machine: u16) -> Option<Self> {
+    pub fn from_machine(e_machine: u16) -> Option<Self> {
         Some(match e_machine {
             0x03 => Self::X86,
             0x3E => Self::X86_64,

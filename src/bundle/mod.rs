@@ -10,12 +10,10 @@
 //! - [`archive`]: writing, reading and verifying the tar
 //! - [`pack`]: building a bundle from the user's config (`deps` remembers what a `DepReader` said,
 //!   `elf` reads a binary's architecture)
-//! - [`arch`]: CPU architectures, as bundles, binaries and machines name them
 //! - [`source`]: readying a bundle directory to inject from
 //! - [`cache`]: where readied bundle directories are kept
 //! - `hash`: the content hash of a file or tree, used throughout
 
-pub mod arch;
 pub mod archive;
 pub mod cache;
 pub mod deps;
@@ -33,7 +31,7 @@ use manifest::Manifest;
 /// The file name `ldg pack` uses when none is given: `lodge-<arch>.tar`, with
 /// the architecture named as the manifest names it.
 pub fn default_file_name() -> Result<String> {
-    Ok(format!("lodge-{}.tar", arch::Arch::host()?))
+    Ok(format!("lodge-{}.tar", crate::arch::Arch::host()?))
 }
 
 /// Checks that the bundle at `file` is intact: every file the manifest lists is

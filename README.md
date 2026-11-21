@@ -87,7 +87,6 @@ On the host:
   `--remote`, docker runs on the *remote* host and locally you only need `ssh`.
 - `ldd` and `patchelf`, **only to pack** your tools (that is, when your config
   lists `[[inject]]` entries). Injecting from a bundle needs neither.
-- `oras`, only for devcontainer features from a registry.
 - `kubectl`, only for `--target kubernetes` (on the `--remote` host, with it);
   `ldg doctor` does not check it.
 

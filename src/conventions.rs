@@ -127,9 +127,29 @@ fn only_the_command_layer_chooses_implementations() {
     // The helper tools, likewise: packing and feature fetching take `DepReader`,
     // `ElfEditor` and `OciFetcher`, never the programs behind them.
     assert_eq!(
-        files_containing(&["Ldd", "Patchelf", "Oras"], &["tools/", "cmd/"]),
+        files_containing(
+            &["Ldd", "Patchelf", "NativeOci", "UreqHttp", "DockerConfig"],
+            &["tools/", "cmd/"]
+        ),
         Vec::<String>::new()
     );
+}
+
+#[test]
+fn the_registry_client_names_its_crates_in_one_file_each() {
+    // The network and the hash are dependencies like any other: the HTTP crate is
+    // named only in the `Http` implementation, the hash crate only where digests
+    // are made, and the rest of the client goes through those.
+    assert_eq!(
+        files_containing(&["ureq::"], &["tools/oci/http.rs"]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        files_containing(&["sha2::"], &["tools/oci/digest.rs"]),
+        Vec::<String>::new()
+    );
+    // And no program is run for a registry any more.
+    assert_eq!(files_containing(&["\"oras\""], &[]), Vec::<String>::new());
 }
 
 #[test]
@@ -268,6 +288,7 @@ fn dependencies() -> Vec<(String, String, String)> {
 /// What everything else is built on: running things, quoting, paths, output.
 /// None of it knows about lodge's features.
 const FOUNDATION: &[&str] = &[
+    "arch",
     "fingerprint",
     "host",
     "host_tools",

@@ -6,6 +6,7 @@
 // Ignoring a `Result` must be a decision: handle it, or say why in an `#[allow]`.
 #![cfg_attr(not(test), deny(clippy::let_underscore_must_use))]
 
+mod arch;
 mod bundle;
 mod cli;
 mod cmd;

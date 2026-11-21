@@ -213,7 +213,7 @@ pub enum Command {
         long_about = "Check the host: that the container engine and compose are reachable, \
             which helper tools are installed and what each is needed for, and that your \
             config and the binaries it lists are usable. Looks at the devcontainer in PATH \
-            (default: current directory) to tell whether `oras` is needed. With --remote, \
+            (default: current directory) to tell whether compose is needed. With --remote, \
             checks the remote engine. Exits non-zero if something required is missing."
     )]
     Doctor {

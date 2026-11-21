@@ -4,18 +4,21 @@
 //! What lodge needs from them is small: which libraries a binary needs
 //! ([`DepReader`]), relinking a copy of a binary for the bundle's prefix
 //! ([`ElfEditor`]), and pulling an OCI artifact ([`OciFetcher`]). Packing and
-//! feature fetching take those interfaces, so a native implementation (one that
-//! needs no `patchelf` or `oras`) is one new type handed in where `cmd/` builds
-//! the [`Toolchain`], and a test hands in a fake. The implementations in
-//! [`external`] run the programs, started through the `host_tools` registry.
+//! feature fetching take those interfaces, so an implementation is one new type
+//! handed in where `cmd/` builds the [`Toolchain`], and a test hands in a fake.
+//! The implementations in [`external`] run the programs, started through the
+//! `host_tools` registry; [`oci`] pulls from a registry in-process.
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod external;
+mod oci;
 
-pub use external::{Ldd, Oras, Patchelf};
+pub use crate::arch::Arch;
+pub use external::{Ldd, Patchelf};
+pub use oci::{DockerConfig, NativeOci, UreqHttp};
 
 /// What a dynamically linked binary needs.
 #[derive(Clone)]
@@ -47,14 +50,15 @@ pub trait ElfEditor {
     fn relink(&self, file: &Path, interpreter: &str, rpath: &str) -> Result<()>;
 }
 
-/// Pulls artifacts from an OCI registry.
+/// Pulls artifacts from an OCI registry. It knows registries, not what an
+/// artifact holds.
 pub trait OciFetcher {
-    /// Whether this can pull at all: an error saying what is missing if not.
-    fn check(&self) -> Result<()>;
-
     /// Pulls the artifact `reference` into the directory `into`, which exists:
-    /// its layer ends up there as a file.
-    fn pull(&self, reference: &str, into: &Path) -> Result<()>;
+    /// each layer ends up there as a file named after its digest, checked
+    /// against it. When the reference is an index of images for several
+    /// machines, `arch` picks one (for Linux); without it the index must hold
+    /// only one image.
+    fn pull(&self, reference: &str, arch: Option<Arch>, into: &Path) -> Result<()>;
 }
 
 /// The tools lodge uses on this machine. Built once, in `cmd/`.
@@ -70,11 +74,7 @@ pub(crate) struct NoRegistry;
 
 #[cfg(test)]
 impl OciFetcher for NoRegistry {
-    fn check(&self) -> Result<()> {
-        anyhow::bail!("no registry in this test")
-    }
-
-    fn pull(&self, reference: &str, _into: &Path) -> Result<()> {
+    fn pull(&self, reference: &str, _arch: Option<Arch>, _into: &Path) -> Result<()> {
         anyhow::bail!("no registry in this test (pulling {reference})")
     }
 }

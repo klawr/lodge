@@ -15,7 +15,7 @@ use std::io::Read;
 use std::ops::Range;
 use std::path::Path;
 
-use super::arch::Arch;
+use crate::arch::Arch;
 
 /// Bytes reserved for the interpreter path of a packed binary, counting the
 /// terminating NUL. A path may use all but one of them.
