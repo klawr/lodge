@@ -63,7 +63,8 @@ pub trait OciFetcher {
     /// What `reference` points at right now, named by its content: pulling the
     /// pinned reference gets the same bytes whatever the tag is moved to later,
     /// and the digest changes exactly when the content does. For an index it is
-    /// the image for `arch`, so it holds one machine's artifact.
+    /// the image for `arch`, so it holds one machine's artifact. A registry that
+    /// cannot be reached at all is an error that [`Unreachable`] marks.
     fn pin(&self, reference: &str, arch: Option<Arch>) -> Result<Pinned>;
 }
 
@@ -90,6 +91,20 @@ pub trait OciPusher {
     /// that was written, by digest.
     fn push(&self, reference: &str, artifact: &Artifact) -> Result<Pinned>;
 }
+
+/// Marks an error as the registry not having been reached at all (no connection,
+/// no answer), as opposed to it refusing, or not having what was asked for. A
+/// caller that already holds the content may carry on without the registry.
+#[derive(Debug)]
+pub struct Unreachable;
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the registry could not be reached")
+    }
+}
+
+impl std::error::Error for Unreachable {}
 
 /// A reference and the content it named when it was pinned.
 #[derive(Debug, Clone, PartialEq, Eq)]

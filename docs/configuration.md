@@ -182,6 +182,23 @@ differs from docker:
   ports it publishes (`appPort`) are forwarded. With root, or on
   another machine through `--remote` with a rootful Podman, it works as with docker.
 
+### Attaching to a container lodge did not make
+
+`ldg attach CONTAINER` (a name or an id) works in a running container that something
+else started, on the engine of the target (`--target docker|podman`, and `--remote`).
+It injects, delivers secrets and opens a shell as `up` does, in the user's home or
+`--workdir DIR`, but treats the container as somebody's workload, as `host` and
+`kubernetes` do:
+
+- Nothing is created, started or stopped: a container that is not running is refused.
+- It acts as the user the container runs as.
+- A config lodge did not place is left as it is, with a warning, and git's
+  `safe.directory = *` is not set.
+- Ports it listens on are forwarded as for any container.
+
+`ldg clean --container CONTAINER` removes what was injected. A project's `up`, `down`
+and `rm` do not know about it: it belongs to whoever made it.
+
 ### `host`: no container
 
 `target = "host"` (or `--target host`) makes lodge work on the machine itself:
@@ -214,14 +231,20 @@ is a setting of the target:
 
 ```toml
 [targets.kubernetes]
-pod = "dev-0"            # required: kubectl exec dev-0 …
+pod = "dev-0"            # kubectl exec dev-0 … (this or `selector`)
+selector = "app=api"     # instead of `pod`: the one running pod with this label
 container = "main"       # kubectl exec -c main (default: kubectl's own pick)
 namespace = "work"       # kubectl --namespace work (default: the context's)
 context = "staging"      # kubectl --context staging (default: the current one)
 workdir = "/srv/app"     # where a session starts (default: the user's home)
 ```
 
-Only `pod` is needed. The project path of `ldg up [PATH]` is a folder on the host, so
+Only `pod` or `selector` is needed, not both. A selector (`kubectl get pods -l`) is
+for pods whose names change: it must match **exactly one running pod**, and more than
+one is an error that lists them, because lodge does not choose which workload to
+inject into. The pod is looked up once per `ldg` run (so the background port
+forwarder, which keeps running, keeps the pod it found: run `ldg up` again after the
+pod is replaced). The project path of `ldg up [PATH]` is a folder on the host, so
 it plays no part: use `workdir`. `ldg up` checks that the pod is `Running`, injects
 your bundle into the home of the user the pod runs as, delivers secrets, and opens a
 session. A pod is someone's workload, so, as for `host`:

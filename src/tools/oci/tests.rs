@@ -503,6 +503,27 @@ fn live_a_public_feature_is_pulled_from_ghcr_anonymously() {
 }
 
 #[test]
+fn only_a_network_that_fails_is_marked_unreachable_not_a_registry_that_answers() {
+    use crate::tools::Unreachable;
+    let url = format!("{REPO}/manifests/1");
+    let pin = |http: FakeHttp| {
+        oci(&Arc::new(http), FakeCredentials::new())
+            .pin("ghcr.io/x/feat:1", None)
+            .unwrap_err()
+    };
+    let down = pin(FakeHttp::new().break_on(http::Method::Get, &url));
+    assert!(down.downcast_ref::<Unreachable>().is_some(), "{down:#}");
+    // It said no, or had nothing, or failed: all answers, so all the registry's own.
+    for status in [401, 403, 404, 500] {
+        let said = pin(FakeHttp::new().answer(&url, status, &[], b""));
+        assert!(
+            said.downcast_ref::<Unreachable>().is_none(),
+            "{status}: {said:#}"
+        );
+    }
+}
+
+#[test]
 fn a_tag_is_pinned_to_the_digest_of_its_image() {
     let l = layer();
     let manifest = image(&l.0, l.1.len());

@@ -17,12 +17,12 @@
 //! So the live path and the stored-bundle path end in the same place, and there is
 //! a single injector.
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use super::manifest::{BIN_DIR, CONFIG_DIR, LIB_DIR, Manifest};
-use super::store::Stores;
+use super::store::{Stores, Unreachable};
 use super::{archive, cache, deps, elf, pack};
 use crate::arch::Arch;
 use crate::config::Config;
@@ -106,9 +106,29 @@ pub(crate) fn prepare_in(
 pub(crate) fn from_store(root: &Path, stores: &Stores, reference: &str) -> Result<Prepared> {
     let store = stores.find(reference)?;
     // A CPU lodge does not know cannot pick an image, but can read a file.
-    let identity = store.identify(reference, Arch::host().ok())?;
+    let arch = Arch::host().ok();
+    let identity = match store.identify(reference, arch) {
+        Ok(identity) => identity,
+        // A place that cannot be reached at all is answered from the cache, with
+        // what the reference named the last time it could be asked. Nothing else
+        // is: a place that refuses or has no such bundle is the answer.
+        Err(e) if e.downcast_ref::<Unreachable>().is_some() => {
+            let Some(key) = cache::recall(root, reference, arch) else {
+                return Err(e.context(format!(
+                    "{reference} is not in the cache either, so there is nothing to use offline"
+                )));
+            };
+            warning!(
+                "cannot reach {reference} ({}); using the bundle it named last time ({key})",
+                short(&e)
+            );
+            return cached(root, &key);
+        }
+        Err(e) => return Err(e),
+    };
     let dir = root.join(&identity.key);
     if let Some(manifest) = cache::load(&dir) {
+        cache::remember(root, reference, arch, &identity.key);
         return Ok(Prepared {
             dir,
             manifest,
@@ -119,11 +139,29 @@ pub(crate) fn from_store(root: &Path, stores: &Stores, reference: &str) -> Resul
     let tar = store.fetch(&identity, fetched.path())?;
     let staging = cache::staging(root, "extract")?;
     let manifest = archive::extract(&tar, staging.path())?;
+    let dir = cache::install(staging, &dir)?;
+    cache::remember(root, reference, arch, &identity.key);
     Ok(Prepared {
-        dir: cache::install(staging, &dir)?,
+        dir,
         manifest,
         origin: Origin::Extracted,
     })
+}
+
+/// The bundle in the cache under `key`.
+fn cached(root: &Path, key: &str) -> Result<Prepared> {
+    let dir = root.join(key);
+    let manifest = cache::load(&dir).with_context(|| format!("the cached bundle {key} is gone"))?;
+    Ok(Prepared {
+        dir,
+        manifest,
+        origin: Origin::Cached,
+    })
+}
+
+/// The first line of what went wrong, for a warning.
+fn short(e: &anyhow::Error) -> String {
+    e.root_cause().to_string()
 }
 
 fn live(root: &Path, config: &Config, tools: &Toolchain) -> Result<Prepared> {
@@ -496,12 +534,130 @@ mod tests {
         .unwrap();
         assert_eq!(second.origin, Origin::Cached);
         assert_eq!(fetched.lock().unwrap().len(), 1);
-        // Nothing is left from fetching.
-        let names: Vec<_> = std::fs::read_dir(cache.path())
+        // Nothing is left from fetching: the bundle, and the note of what the
+        // reference named.
+        let mut names: Vec<_> = std::fs::read_dir(cache.path())
             .unwrap()
-            .map(|e| e.unwrap().file_name())
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names.len(), 1, "{names:?}");
+        names.sort();
+        assert_eq!(names, ["tags.json", "x-1"]);
+    }
+
+    /// Prepares `fake://a` from `stores` into `cache`.
+    fn prepare_a(cache: &TempDir, stores: &Stores) -> Result<Prepared> {
+        prepare_in(
+            cache.path(),
+            &config(vec![]),
+            Some("fake://a"),
+            stores,
+            &tools::external(),
+        )
+    }
+
+    #[test]
+    fn a_place_that_cannot_be_reached_is_answered_from_the_cache_with_what_it_named_last() {
+        let work = TempDir::new("offline1").unwrap();
+        let cache = TempDir::new("cache-off1").unwrap();
+        let online = Stores::new(vec![Box::new(FakeStore::new().with(
+            "a",
+            "x-1",
+            bundle_tar(work.path(), "#!/bin/sh\n"),
+        ))]);
+        assert_eq!(
+            prepare_a(&cache, &online).unwrap().origin,
+            Origin::Extracted
+        );
+
+        let offline = FakeStore::new().unreachable();
+        let fetched = offline.fetched();
+        let offline = Stores::new(vec![Box::new(offline)]);
+        let again = prepare_a(&cache, &offline).unwrap();
+        assert_eq!(again.origin, Origin::Cached);
+        assert!(again.dir.ends_with("x-1"), "{}", again.dir.display());
+        assert!(again.bin("t").exists());
+        assert!(
+            fetched.lock().unwrap().is_empty(),
+            "nothing is fetched offline"
+        );
+    }
+
+    #[test]
+    fn offline_with_nothing_remembered_or_nothing_cached_is_an_error_that_says_so() {
+        let work = TempDir::new("offline2").unwrap();
+        let offline = Stores::new(vec![Box::new(FakeStore::new().unreachable())]);
+        let err = prepare_a(&TempDir::new("cache-off2").unwrap(), &offline)
+            .err()
+            .unwrap();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("not in the cache either") && text.contains("no route to host"),
+            "{text}"
+        );
+
+        // Remembered, but pruned since: also nothing to use.
+        let cache = TempDir::new("cache-off3").unwrap();
+        let online = Stores::new(vec![Box::new(FakeStore::new().with(
+            "a",
+            "x-1",
+            bundle_tar(work.path(), "#!/bin/sh\n"),
+        ))]);
+        prepare_a(&cache, &online).unwrap();
+        std::fs::remove_dir_all(cache.path().join("x-1")).unwrap();
+        assert!(prepare_a(&cache, &offline).is_err());
+    }
+
+    #[test]
+    fn a_place_that_answers_no_is_not_overruled_by_the_cache() {
+        let work = TempDir::new("offline3").unwrap();
+        let cache = TempDir::new("cache-off4").unwrap();
+        let online = Stores::new(vec![Box::new(FakeStore::new().with(
+            "a",
+            "x-1",
+            bundle_tar(work.path(), "#!/bin/sh\n"),
+        ))]);
+        prepare_a(&cache, &online).unwrap();
+        // Reachable, and it has no such bundle (as a 404 or a refusal says).
+        let refusing = Stores::new(vec![Box::new(FakeStore::new())]);
+        let err = prepare_a(&cache, &refusing).err().unwrap();
+        assert!(err.to_string().contains("no such fake bundle"), "{err}");
+    }
+
+    #[test]
+    fn the_same_reference_for_another_architecture_is_remembered_apart() {
+        let root = TempDir::new("tags").unwrap();
+        std::fs::create_dir(root.path().join("o-a")).unwrap();
+        std::fs::create_dir(root.path().join("o-b")).unwrap();
+        cache::remember(root.path(), "oci://x/y:1", Some(Arch::X86_64), "o-a");
+        cache::remember(root.path(), "oci://x/y:1", Some(Arch::Aarch64), "o-b");
+        // `recall` needs a real bundle in the entry.
+        let manifest = Manifest {
+            lodge_version: "0".into(),
+            created: 0,
+            arch: "x86_64".into(),
+            linker: None,
+            libs: vec![],
+            tools: vec![],
+            git_safe_directories: vec![],
+        };
+        for key in ["o-a", "o-b"] {
+            std::fs::write(
+                root.path()
+                    .join(key)
+                    .join(crate::bundle::manifest::MANIFEST_FILE),
+                manifest.to_json().unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            cache::recall(root.path(), "oci://x/y:1", Some(Arch::Aarch64)).as_deref(),
+            Some("o-b")
+        );
+        assert_eq!(
+            cache::recall(root.path(), "oci://x/y:1", Some(Arch::X86_64)).as_deref(),
+            Some("o-a")
+        );
+        assert_eq!(cache::recall(root.path(), "oci://x/y:2", None), None);
     }
 
     #[test]

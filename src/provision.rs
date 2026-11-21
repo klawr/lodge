@@ -166,4 +166,18 @@ pub trait Endpoints {
     /// Whether `--remote` has to be told which folder the project is: an endpoint
     /// that is a place to work in anywhere (a plain host) does not.
     fn needs_project_path(&self) -> bool;
+
+    /// What `doctor` should check about this endpoint beyond the engine: the
+    /// programs it needs, and that what it points at is there. Nothing, for one
+    /// that needs nothing it can check.
+    fn checks(&self) -> Vec<Probe> {
+        Vec::new()
+    }
+}
+
+/// One thing `doctor` checked about an endpoint.
+pub struct Probe {
+    pub name: String,
+    /// What is good about it, or what is wrong.
+    pub outcome: std::result::Result<String, String>,
 }

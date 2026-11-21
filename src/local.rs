@@ -24,6 +24,27 @@ pub trait Local: Send + Sync {
     /// terminal for its errors, and returns what it printed. An error when it
     /// exits non-zero or does not finish within `timeout`.
     fn run_sh(&self, script: &str, timeout: Duration) -> Result<Vec<u8>>;
+
+    /// Runs `program` (found on `PATH`) with `args`, feeds it `input` and reads
+    /// what it prints. A program that exits non-zero is an answer
+    /// ([`ProgramOutput::success`]), not an error: some say what they mean on
+    /// the way out. An error when it cannot be started or does not finish within
+    /// `timeout`.
+    fn run_program(
+        &self,
+        program: &str,
+        args: &[&str],
+        input: &[u8],
+        timeout: Duration,
+    ) -> Result<ProgramOutput>;
+}
+
+/// What a program printed and whether it succeeded.
+// No `Debug`: stdout may hold a secret.
+pub struct ProgramOutput {
+    pub success: bool,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 /// This machine, for real.
@@ -42,40 +63,90 @@ impl Local for SystemLocal {
     /// host is (`pass show x`), so this is deliberately not a
     /// [`Host`](crate::host::Host) command, which runs on the project's host.
     fn run_sh(&self, script: &str, timeout: Duration) -> Result<Vec<u8>> {
-        use std::io::Read;
         let mut cmd = Command::new("sh");
-        cmd.args(["-c", script])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        crate::output::trace(&cmd);
-        let mut child = cmd.spawn().context("running sh")?;
-        let mut pipe = child.stdout.take().context("capturing stdout")?;
-        // Drain on a thread so a chatty child can't block on a full pipe.
-        let reader = std::thread::spawn(move || {
+        cmd.args(["-c", script]);
+        let out = run(cmd, &[], Stdio::inherit(), timeout)?;
+        if !out.success {
+            bail!("{}", out.status);
+        }
+        Ok(out.stdout)
+    }
+
+    fn run_program(
+        &self,
+        program: &str,
+        args: &[&str],
+        input: &[u8],
+        timeout: Duration,
+    ) -> Result<ProgramOutput> {
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        let out = run(cmd, input, Stdio::piped(), timeout)
+            .with_context(|| format!("running {program}"))?;
+        Ok(ProgramOutput {
+            success: out.success,
+            stdout: out.stdout,
+            stderr: out.stderr,
+        })
+    }
+}
+
+struct Finished {
+    success: bool,
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Starts `cmd`, feeds it `input`, and collects its output within `timeout`.
+fn run(mut cmd: Command, input: &[u8], stderr: Stdio, timeout: Duration) -> Result<Finished> {
+    use std::io::{Read, Write};
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(stderr);
+    crate::output::trace(&cmd);
+    let mut child = cmd.spawn().context("starting it")?;
+    // Written and drained on threads, so a child that fills a pipe or does not
+    // read its input cannot block us past the deadline.
+    let mut stdin = child.stdin.take().context("opening its input")?;
+    let input = input.to_vec();
+    let writer = std::thread::spawn(move || {
+        stdin.write_all(&input).ok();
+    });
+    let mut out_pipe = child.stdout.take().context("capturing stdout")?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        out_pipe.read_to_end(&mut buf).ok();
+        buf
+    });
+    let err_reader = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
             let mut buf = Vec::new();
             pipe.read_to_end(&mut buf).ok();
             buf
-        });
-        let deadline = Instant::now() + timeout;
-        let status = loop {
-            if let Some(status) = child.try_wait().context("waiting for command")? {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                child.kill().ok();
-                child.wait().ok();
-                reader.join().ok();
-                bail!("timed out after {}s", timeout.as_secs());
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        let stdout = reader.join().unwrap_or_default();
-        if !status.success() {
-            bail!("{status}");
+        })
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("waiting for command")? {
+            break status;
         }
-        Ok(stdout)
-    }
+        if Instant::now() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            bail!("timed out after {}s", timeout.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    writer.join().ok();
+    Ok(Finished {
+        success: status.success(),
+        status,
+        stdout: reader.join().unwrap_or_default(),
+        stderr: err_reader
+            .map(|r| r.join().unwrap_or_default())
+            .unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
@@ -90,6 +161,9 @@ pub mod fake {
         vars: BTreeMap<String, OsString>,
         files: BTreeMap<std::path::PathBuf, Vec<u8>>,
         scripts: BTreeMap<String, std::result::Result<Vec<u8>, String>>,
+        programs: BTreeMap<String, (bool, Vec<u8>)>,
+        /// What each program was asked, and fed.
+        pub asked: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     }
 
     impl FakeLocal {
@@ -113,6 +187,13 @@ pub mod fake {
             self
         }
 
+        /// `program args…` (joined by spaces) answers with `stdout`, and succeeds or not.
+        pub fn with_program(mut self, command: &str, success: bool, stdout: &[u8]) -> Self {
+            self.programs
+                .insert(command.into(), (success, stdout.to_vec()));
+            self
+        }
+
         /// `script` fails with `message`.
         pub fn with_failing_script(mut self, script: &str, message: &str) -> Self {
             self.scripts.insert(script.into(), Err(message.into()));
@@ -130,6 +211,31 @@ pub mod fake {
                 .get(path)
                 .cloned()
                 .ok_or_else(|| std::io::ErrorKind::NotFound.into())
+        }
+
+        fn run_program(
+            &self,
+            program: &str,
+            args: &[&str],
+            input: &[u8],
+            _timeout: Duration,
+        ) -> Result<ProgramOutput> {
+            let command = std::iter::once(program)
+                .chain(args.iter().copied())
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.asked
+                .lock()
+                .unwrap()
+                .push((command.clone(), input.to_vec()));
+            match self.programs.get(&command) {
+                Some((success, stdout)) => Ok(ProgramOutput {
+                    success: *success,
+                    stdout: stdout.clone(),
+                    stderr: Vec::new(),
+                }),
+                None => bail!("{program} was not found"),
+            }
         }
 
         fn run_sh(&self, script: &str, _timeout: Duration) -> Result<Vec<u8>> {
@@ -159,6 +265,40 @@ mod tests {
             .run_sh("sleep 5", Duration::from_millis(100))
             .unwrap_err();
         assert!(slow.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn a_program_is_fed_its_input_and_a_failure_is_an_answer() {
+        let local = SystemLocal;
+        let out = local
+            .run_program("cat", &[], b"hello", Duration::from_secs(5))
+            .unwrap();
+        assert!(out.success);
+        assert_eq!(out.stdout, b"hello");
+        let failed = local
+            .run_program(
+                "sh",
+                &["-c", "echo no >&2; echo out; exit 1"],
+                b"",
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert!(!failed.success);
+        assert_eq!(failed.stdout, b"out\n");
+        assert_eq!(failed.stderr, b"no\n");
+        let missing = local
+            .run_program("lodge-no-such-program", &[], b"", Duration::from_secs(5))
+            .err()
+            .unwrap();
+        assert!(
+            format!("{missing:#}").contains("lodge-no-such-program"),
+            "{missing:#}"
+        );
+        let slow = local
+            .run_program("sleep", &["5"], b"", Duration::from_millis(100))
+            .err()
+            .unwrap();
+        assert!(format!("{slow:#}").contains("timed out"));
     }
 
     #[test]

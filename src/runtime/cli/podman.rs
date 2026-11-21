@@ -167,6 +167,7 @@ mod tests {
         let c = CliContainer {
             cli: Podman::new(host.clone()),
             id: "abc".into(),
+            disposable: true,
         };
         assert_eq!(
             c.reach(None),
@@ -184,6 +185,7 @@ mod tests {
         let c = CliContainer {
             cli: Podman::new(rootful),
             id: "abc".into(),
+            disposable: true,
         };
         assert_eq!(c.reach(None), Some(Reach::Address("10.88.0.4".into())));
     }

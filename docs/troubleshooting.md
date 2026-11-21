@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Start with `ldg doctor` (it checks the engine, compose, helper tools, your config,
+Start with `ldg doctor` (it checks the engine (for a pod: `kubectl` and the pod), compose, helper tools, your config,
 each listed binary and each secret's source), and re-run the failing command
 with `-v` to see every docker/ssh command lodge runs.
 
@@ -97,10 +97,21 @@ names the step that failed:
 - `content is sha256:…, expected sha256:…`, or `is N bytes, the manifest says M`:
   what came is not what the registry's manifest promised (a broken proxy or
   mirror). Nothing is kept; retry, or check what sits between you and the registry.
+- `cannot reach oci://… (…); using the bundle it named last time`: the registry
+  could not be reached, so the bundle this tag named when it last could be was used
+  from the cache. It may be out of date; `ldg up --reinject` takes the new one once
+  you are online. `… is not in the cache either, so there is nothing to use
+  offline`: this tag was never fetched on this machine; use a file, or get online.
 - `… refused to write <repository> (401)`, when publishing with `ldg pack -o
   oci://…`: run `docker login <registry>` with an account that may write there.
-  As for a pull, the login is read only from docker's config file, not from a
-  credential helper.
+  As for a pull, the login is read from docker's config file, or from the
+  credential helper it names (`credsStore`, `credHelpers`).
+- `docker-credential-<name> get for <registry> failed: …` or `asking
+  docker-credential-<name> …`: the helper the config names is not installed, or it
+  failed (a locked keyring). Fix it, or `docker login` again. A helper that holds
+  an identity token (`<token>`, as some cloud logins do) cannot be used: log in with
+  a user name and an access token. A helper with nothing for the registry means an
+  anonymous request.
 - `the registry stored <digest>, not the <digest> that was sent`: the registry
   changed the content it was given (a proxy in between). Nothing is usable under
   that tag; publish again, or find what sits between you and the registry.

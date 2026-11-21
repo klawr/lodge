@@ -27,15 +27,16 @@ ldg up [PATH]        Endpoints::provision (devcontainer::Devcontainer, or plain_
                      → inject::installed (skipped for a new container or --reinject)
                      → inject::resolve_layout → inject::run (only when nothing is injected)
                      → Attached::run_post_attach → secret::deliver → session::enter
+ldg attach NAME      Runtime::existing (a handle that is not disposable) → is_running (never started) → the same attach as `up`, with `created: false`
 ldg down [PATH]      Lifecycle::stop (devcontainer::stop; an error for a target with no lifecycle, a plain host)
 ldg status [PATH]    Endpoints::status (state, drift) + installed bundle + placed secrets
 ldg rm [PATH]        Lifecycle::remove (container, and the compose project)
 ldg ls               Lifecycle::list (every container with lodge's project label)
 ldg ports [PATH]     forward::active_ports (what the daemon reports)
 ldg logs [PATH]      the daemon's log file
-ldg clean [PATH]     ForwardDaemon::stop → ContainerUser::resolve → inject::installed → inject::remove
+ldg clean [PATH|--container NAME]   ForwardDaemon::stop → ContainerUser::resolve → inject::installed → inject::remove
 ldg init             a commented config from the tools found on PATH
-ldg doctor [PATH]    host tools, engine, compose, config, binaries, secrets
+ldg doctor [PATH]    host tools, engine (a pod: kubectl and the pod), compose, config, binaries, secrets
 ldg pack             bundle::pack::pack_to_file (config → bundle tar)
 ldg bundle inspect|verify FILE   bundle::inspect / bundle::verify_file
 ldg cache [clear]    bundle::cache::entries / clear
@@ -72,7 +73,7 @@ every subcommand.
 | `port.rs` | `PortForward`, a port to forward: what the devcontainer spec declares and the daemon carries out, so neither depends on the other. |
 | `tools/` | The build-time helpers behind interfaces: `DepReader` (which libraries a binary needs), `ElfEditor` (relink a copy of a binary for the bundle's prefix) and `OciFetcher` (pull an artifact's layers from a registry), bundled as a `Toolchain` that `cmd::run` builds. `external` runs the programs (`Ldd`, `Patchelf`, parsing `ldd`'s output); `oci/` is the in-process registry client (see [`tools/oci/`](#toolsoci)). Packing, the bundle cache and feature fetching take the interfaces and are tested with fakes. |
 | `host_tools.rs` | The helper programs lodge may run here (`ssh`, `ldd`, `patchelf`): what each is needed for (a `Need`, which decides when `doctor` requires it) and how to get it. `doctor` reports from this table and each tool is started only through it (the `tools` implementations and `host/ssh.rs`). |
-| `local.rs` | `Local`: the machine lodge runs on (environment variables, files a secret names, a local shell for a secret's `command`), with `SystemLocal` and, in tests, `FakeLocal`. Built once in `cmd/` and handed down, so nothing else asks the process. |
+| `local.rs` | `Local`: the machine lodge runs on (environment variables, files a secret names, a local shell for a secret's `command`, a program fed some input, as a credential helper is), with `SystemLocal` and, in tests, `FakeLocal`. Built once in `cmd/` and handed down, so nothing else asks the process. |
 | `host/` | How a machine is reached. `mod` is the `Host` trait (`run` one `Job` with the streams the caller asks for, `interactive`, `tunnel`, the connection hooks; no process type crosses it) with everything built on those provided (`exec` runs a job and retries it after a lost connection if it is `Repeat::Safe`): running a script, `read_first` (finds files by pattern and reads the first in one round trip), `read_file`, `canonical_dir`, `fetch_dir` (copies a folder from the project's host), `write_scratch`, `uid_gid`; and `attempt`, which reruns a step after a lost connection if it is marked `Repeat::Safe`. `fake` (tests) is `FakeHost`: it records every job and answers from a script, with files in memory, so everything that only uses a host is tested without a process. `local` is `LocalHost`, this machine. `ssh` is `SshHost`: `--remote` destination parsing, the shared connection (`connect` opens it up front with the terminal available, `ControlMaster` multiplexes everything after), and the few ssh invocations lodge needs, all built from one private `base`. |
 | `runtime/` | The seam to whatever runs the workload: the `Env`, `Container`, `Runtime` and `Compose` traits (see below), `User` (who a command runs as) and `ContainerUser` (the session user's name, uid, gid and home, looked up once), `Acting` (an `Env` seen as one user, below), `inside` (`Inside`: what is particular to reaching inside one endpoint, five small methods, and the `Env` every endpoint needs built on it once), `tarball` (packs files as a tar owned by a user), the docker-compatible CLI implementation (`cli/`, for `docker` and `podman`: the engine, which runs on a `Host` it is given, the per-container `Inside` and the copy out of a container; `Docker` and `Podman` are two engines, each a `CliEngine` of its own `Flavor` (`docker.rs`, `podman.rs`), which holds what is its own: the program, the `[targets.docker]`/`[targets.podman]` settings (a context or connection, as arguments on every command), `cp`'s flags and wording, extra `run` flags, how compose is asked, and whether a container's address is reachable (not for rootless Podman). The plumbing is shared and asks the flavor; it never checks which engine it is), and strict in-memory fakes for tests (`FakeEnv`, and `FakeRuntime`, whose containers each run in one). |
 | `shell.rs` | POSIX `shell_quote`, which everything that builds a command string goes through; `script_argv`, how every script with arguments is started (`sh -c <script> sh <args…>`, so arguments are `$1`, `$2`, …); the rules for names written into scripts unquoted (`is_plain_name`, `is_var_name`) and for destinations in a container (`container_path_problem`); `slug` for container names; and `CmdLine`, a command as `sh -c` script or argv. |
@@ -124,7 +125,7 @@ is) under a tag.
 | --- | --- |
 | `mod.rs` | `NativeOci`: the order of a pull (manifest, then the image an index names, then each layer) and of a push (blobs, then the manifest). Built from the two interfaces below, by `cmd::run`, and handed to what reads and to what writes as the same value. |
 | `http.rs` | `Http`, the transport: one request (a method, headers, and a body that is nothing, bytes or a file, so it can be sent again) and one answer, any status returned, redirects followed without ever sending the request's headers to another host. `UreqHttp` is the real one and the only file that names the HTTP crate; `FakeHttp` (tests) answers each URL from a script and records what it was sent. |
-| `credentials.rs` | `Credentials`, where a login comes from. `DockerConfig` reads what `docker login` stored in the config file itself (`$DOCKER_CONFIG` or `~/.docker`), through `Local`. A login kept by a credential helper is not asked for: that registry is reached anonymously. A helper would be one more implementation; `Login` never prints its password. |
+| `credentials.rs` | `Credentials`, where a login comes from. `DockerConfig` reads what `docker login` stored in the config file (`$DOCKER_CONFIG` or `~/.docker`), through `Local`, and asks the credential helper the file names (`credHelpers` for the registry, else `credsStore`) as docker does: `docker-credential-<name> get`, the server on stdin, through `Local::run_program`. A helper with nothing for the registry leaves the file's own entry to answer; one that fails is an error that names it; an identity token is refused. `Login` never prints its password. |
 | `registry.rs` | One repository on one registry, for a pull or a push (`Access`, which decides the scope a token is asked for): the calls, and the handshake that lets them through. |
 | `reference.rs` | Splits `ghcr.io/owner/name:1` (or `@sha256:…`) into registry, repository and tag or digest, and refuses anything that would break a URL. Pure. |
 | `manifest.rs` | Reads a manifest as an image (layers) or an index (images per platform), picks the entry for an architecture, writes an image manifest, and merges one more image into a tag's index (same input, same bytes). Pure. |
@@ -177,7 +178,7 @@ How a push stays safe, and what it does:
   read as late as possible, but last write still wins when two machines publish at
   once. What a push returns is the digest of the image for this machine.
 
-What is not there: retries (a 429 or 5xx is an error) and a credential helper.
+What is not there: retries (a 429 or 5xx is an error).
 
 ### `bundle/store/`
 
@@ -524,7 +525,7 @@ just how it is done.
 | The machine lodge runs on | `local::Local` | `SystemLocal` (environment, files a secret names, a local shell); `FakeLocal` for tests |
 | The container engine | `runtime::Runtime`, `Compose`, `Container`, `Env` | `runtime::cli`, and the in-memory `FakeRuntime` for tests |
 | The build-time helpers | `tools::DepReader`, `ElfEditor`, `OciFetcher` (a `Toolchain`) | `Ldd`, `Patchelf`, `NativeOci` (on `Http` and `Credentials`: `UreqHttp`, `DockerConfig`); a test passes fakes |
-| Making an endpoint ready, and finding it again | `provision::Endpoints` | `devcontainer::Devcontainer` (a devcontainer on an engine), `plain_host::PlainHostEndpoints` (the machine itself), `kube::KubeEndpoints` (a running pod, through `kubectl` on a `Host`) |
+| Making an endpoint ready, and finding it again | `provision::Endpoints` | `devcontainer::Devcontainer` (a devcontainer on an engine), `plain_host::PlainHostEndpoints` (the machine itself), `kube::KubeEndpoints` (a running pod, found by name or by a label selector, through `kubectl` on a `Host`). An endpoint also says what `doctor` should check about it (`Endpoints::checks`: for a pod, `kubectl` and that the pod is there), so `doctor` never asks which kind it is |
 | Port forwarding for a container | `forward::ForwardDaemon` (and `Forwarders` for one tunnel) | `DetachedDaemon`, `HostForwarders`; a test passes fakes |
 | Where a bundle comes from, and goes to | `bundle::store::BundleStore` and `BundleSink` (the `Stores` and `Sinks` in `Ctx`) | `FileStore`/`FileSink`, `OciStore`/`OciSink` (on `OciFetcher` and `OciPusher`); fakes for tests; a new place is a type per direction and a line in `cmd::bundle_stores` and `bundle_sinks` |
 | What is injected | `[[inject]]` data | multiplexers and other tools are injected like any other, never named in code |

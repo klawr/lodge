@@ -151,6 +151,15 @@ impl Ctx {
         Ok(config)
     }
 
+    /// The container `name` (a name or an id) on the target's engine, one lodge
+    /// did not make.
+    pub fn existing_container(&self, name: &str) -> Result<Box<dyn crate::runtime::Container>> {
+        let engine = self.endpoints.engine().with_context(
+            || "this target has no container engine, so it has no containers to attach to",
+        )?;
+        Ok(engine.existing(name))
+    }
+
     /// The project folder: `path` or the current directory, made absolute and
     /// canonical on the project's host, so `ldg up`, `ldg up .` and
     /// `ldg up $PWD` (or `/p` and `/p/` with `--remote`) all name the same
@@ -249,13 +258,29 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
             no_attach,
             bundle.as_deref(),
         )?,
+        Command::Attach {
+            container,
+            workdir,
+            reinject,
+            no_attach,
+            bundle,
+        } => attach::attach_to(
+            &ctx,
+            &container,
+            workdir,
+            reinject,
+            no_attach,
+            bundle.as_deref(),
+        )?,
         Command::Down { project } => project::down(&ctx, project.path)?,
         Command::Status { project, json } => project::status(&ctx, project.path, json)?,
         Command::Rm { project } => project::rm(&ctx, project.path)?,
         Command::Ls { json } => project::ls(&ctx, json)?,
         Command::Ports { project, json } => project::ports(&ctx, project.path, json)?,
         Command::Logs { project, follow } => project::logs(&ctx, project.path, follow)?,
-        Command::Clean { project } => project::clean(&ctx, project.path)?,
+        Command::Clean { project, container } => {
+            project::clean(&ctx, project.path, container.as_deref())?
+        }
         Command::Pack { output } => bundle::pack(&ctx, output)?,
         Command::Bundle { command } => bundle::bundle(command)?,
         Command::Cache { command } => bundle::cache(command)?,

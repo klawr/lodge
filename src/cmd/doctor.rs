@@ -42,8 +42,8 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
     let mut checks = Vec::new();
     let remote = ctx.host.label();
 
-    // A plain host or a pod has no engine to check (and nothing here checks
-    // `kubectl` or the pod: `up` says what is missing).
+    // A plain host or a pod has no engine to check; what else the endpoint needs
+    // (a pod: `kubectl`, and that the pod is there) it says itself, below.
     let engine = ctx.endpoints.engine().map(|rt| rt.version());
     checks.push(match &engine {
         Some(Ok(v)) => Check::new(
@@ -61,6 +61,17 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
             ),
         ),
     });
+
+    for probe in ctx.endpoints.checks() {
+        checks.push(match probe.outcome {
+            Ok(detail) => Check::new(
+                probe.name,
+                Level::Ok,
+                format!("{detail}{}", ctx.host.on_host()),
+            ),
+            Err(why) => Check::new(probe.name, Level::Missing, why),
+        });
+    }
 
     // The devcontainer here (if any) decides whether compose matters.
     let needs = ctx

@@ -504,6 +504,14 @@ pub trait Runtime {
     /// A handle for the container with this id or name.
     fn container(&self, id: &str) -> Box<dyn Container>;
 
+    /// A handle for a container lodge did not make, by id or name: someone
+    /// else's, so it is not disposable (what is there is left alone and git's
+    /// ownership check stays as it is). An engine that makes no distinction hands
+    /// back what [`container`](Runtime::container) does.
+    fn existing(&self, id: &str) -> Box<dyn Container> {
+        self.container(id)
+    }
+
     /// The engine's server version; errors if the engine can't be reached.
     fn version(&self) -> Result<String>;
 

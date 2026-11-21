@@ -1,6 +1,6 @@
 #!/bin/bash
 # A kubectl for a "cluster" that is one docker engine: a pod is a running
-# container of that name. Only what lodge uses: get, exec and port-forward.
+# container of that name. Only what lodge uses: version, get, exec and port-forward.
 echo "$*" >> "$(dirname "$0")/kubectl.log"
 
 while [ $# -gt 0 ]; do
@@ -13,7 +13,15 @@ cmd=$1
 shift
 
 case "$cmd" in
-    get) # get pod NAME -o jsonpath=…
+    version) # version --client
+        echo "Client Version: v0.0.0-fake"
+        ;;
+    get)
+        if [ "$1" = pods ]; then # get pods -l SELECTOR --field-selector=… -o jsonpath=…
+            docker ps --filter "label=$3" --filter status=running --format '{{.Names}}' | tr '\n' ' '
+            exit 0
+        fi
+        # get pod NAME -o jsonpath=…
         name=$2
         state=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null) || {
             echo "Error from server (NotFound): pods \"$name\" not found" >&2

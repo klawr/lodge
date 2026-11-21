@@ -8,6 +8,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// A user name and password (or token) for a registry. Never printed.
 #[derive(Clone, PartialEq, Eq)]
@@ -31,9 +32,10 @@ pub trait Credentials: Send + Sync {
     fn login(&self, registry: &str) -> Result<Option<Login>>;
 }
 
-/// The logins `docker login` wrote into its config file (`$DOCKER_CONFIG` or
-/// `~/.docker`). Only a login stored in the file itself is read: one kept by a
-/// credential helper is not asked for, so that registry is reached anonymously.
+/// The logins `docker login` keeps: in its config file (`$DOCKER_CONFIG` or
+/// `~/.docker`), or, when the file names a credential helper for the registry
+/// (`credHelpers`) or for all (`credsStore`), in whatever that helper holds, which
+/// is asked as docker asks it (`docker-credential-<name> get`).
 pub struct DockerConfig {
     local: Arc<dyn Local>,
 }
@@ -56,6 +58,37 @@ impl DockerConfig {
 struct ConfigFile {
     #[serde(default)]
     auths: BTreeMap<String, Entry>,
+    /// A helper for every registry without one of its own.
+    #[serde(default, rename = "credsStore")]
+    creds_store: Option<String>,
+    /// A helper per registry.
+    #[serde(default, rename = "credHelpers")]
+    cred_helpers: BTreeMap<String, String>,
+}
+
+/// A helper may prompt (unlock a keyring), so it is given time; but not forever.
+const HELPER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// What a helper answers `get` with.
+#[derive(Deserialize)]
+struct HelperAnswer {
+    #[serde(rename = "Username")]
+    username: String,
+    #[serde(rename = "Secret")]
+    secret: String,
+}
+
+/// What a helper's `get` says when it has nothing for the registry, on stdout.
+const NOT_FOUND: &str = "credentials not found";
+
+/// What docker passes a helper as the server: Docker Hub under its historical
+/// name, anything else as the host.
+fn server_of(registry: &str) -> &str {
+    if registry == "registry-1.docker.io" {
+        "https://index.docker.io/v1/"
+    } else {
+        registry
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -84,6 +117,56 @@ fn names_of(registry: &str) -> Vec<&str> {
     }
 }
 
+impl DockerConfig {
+    /// Asks the helper `name` for the login of `registry`: `None` when it has none.
+    fn ask_helper(&self, name: &str, registry: &str) -> Result<Option<Login>> {
+        // The name becomes part of a program name, so it is a name and not a path.
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            anyhow::bail!("the credential helper name {name:?} is not a plain name");
+        }
+        let program = format!("docker-credential-{name}");
+        let out = self
+            .local
+            .run_program(
+                &program,
+                &["get"],
+                server_of(registry).as_bytes(),
+                HELPER_TIMEOUT,
+            )
+            .with_context(|| format!("asking {program} for the login of {registry}"))?;
+        if !out.success {
+            let said = String::from_utf8_lossy(&out.stdout);
+            if said.trim().contains(NOT_FOUND) {
+                return Ok(None);
+            }
+            let err = String::from_utf8_lossy(&out.stderr);
+            let detail = [said.trim(), err.trim()]
+                .into_iter()
+                .find(|s| !s.is_empty())
+                .unwrap_or("it failed");
+            anyhow::bail!("{program} get for {registry} failed: {detail}");
+        }
+        let answer: HelperAnswer = serde_json::from_slice(&out.stdout)
+            .with_context(|| format!("reading what {program} answered for {registry}"))?;
+        // An identity token is a refresh token for a token service's own login
+        // flow, which lodge does not speak.
+        if answer.username == "<token>" {
+            anyhow::bail!(
+                "{program} holds an identity token for {registry}, which lodge does not use; \
+                 log in with a user name and a password or access token"
+            );
+        }
+        Ok(Some(Login {
+            username: answer.username,
+            password: answer.secret,
+        }))
+    }
+}
+
 impl Credentials for DockerConfig {
     fn login(&self, registry: &str) -> Result<Option<Login>> {
         let Some(path) = self.path() else {
@@ -97,6 +180,18 @@ impl Credentials for DockerConfig {
         let config: ConfigFile =
             serde_json::from_slice(&raw).with_context(|| format!("parsing {}", path.display()))?;
         let names = names_of(registry);
+        // The way docker chooses: a helper for this registry, else the general
+        // one, else the file. A helper with nothing for the registry leaves the
+        // file's own entry, if any, to answer.
+        let helper = names
+            .iter()
+            .find_map(|n| config.cred_helpers.get(*n))
+            .or(config.creds_store.as_ref());
+        if let Some(helper) = helper
+            && let Some(login) = self.ask_helper(helper, registry)?
+        {
+            return Ok(Some(login));
+        }
         let Some(entry) = config
             .auths
             .iter()
@@ -213,11 +308,118 @@ mod tests {
     }
 
     #[test]
-    fn no_file_no_entry_or_a_helper_is_anonymous() {
+    fn no_file_or_no_entry_is_anonymous() {
         let none = DockerConfig::new(Arc::new(FakeLocal::new().with_var("HOME", "/h")));
         assert!(none.login("ghcr.io").unwrap().is_none());
-        let helper = config(r#"{"credsStore": "desktop", "auths": {"ghcr.io": {}}}"#);
-        assert!(helper.login("ghcr.io").unwrap().is_none());
+        assert!(
+            config(r#"{"auths": {}}"#)
+                .login("ghcr.io")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A machine whose config is `json` and whose helper `desktop` answers `get`.
+    fn with_helper(json: &str, success: bool, answer: &str) -> (DockerConfig, Arc<FakeLocal>) {
+        let local = Arc::new(
+            FakeLocal::new()
+                .with_var("HOME", "/home/me")
+                .with_file("/home/me/.docker/config.json", json.as_bytes())
+                .with_program("docker-credential-desktop get", success, answer.as_bytes()),
+        );
+        (DockerConfig::new(local.clone()), local)
+    }
+
+    const ANSWER: &str = r#"{"ServerURL": "ghcr.io", "Username": "kai", "Secret": "tok"}"#;
+
+    #[test]
+    fn a_helper_is_asked_with_the_server_on_its_input() {
+        let (c, local) = with_helper(r#"{"credsStore": "desktop"}"#, true, ANSWER);
+        let login = c.login("ghcr.io").unwrap().unwrap();
+        assert_eq!(
+            (login.username.as_str(), login.password.as_str()),
+            ("kai", "tok")
+        );
+        assert_eq!(
+            *local.asked.lock().unwrap(),
+            vec![(
+                "docker-credential-desktop get".to_string(),
+                b"ghcr.io".to_vec()
+            )]
+        );
+        // Docker Hub is asked for as docker asks for it.
+        let (c, local) = with_helper(r#"{"credsStore": "desktop"}"#, true, ANSWER);
+        c.login("registry-1.docker.io").unwrap();
+        assert_eq!(
+            local.asked.lock().unwrap()[0].1,
+            b"https://index.docker.io/v1/".to_vec()
+        );
+    }
+
+    #[test]
+    fn a_helper_for_one_registry_beats_the_general_one_and_the_file() {
+        let auth = STANDARD.encode("file:pw");
+        let json = format!(
+            r#"{{"credsStore": "other", "credHelpers": {{"ghcr.io": "desktop"}},
+                "auths": {{"ghcr.io": {{"auth": "{auth}"}}}}}}"#
+        );
+        let (c, _) = with_helper(&json, true, ANSWER);
+        assert_eq!(c.login("ghcr.io").unwrap().unwrap().username, "kai");
+    }
+
+    #[test]
+    fn a_helper_with_nothing_for_the_registry_leaves_the_file_to_answer() {
+        let auth = STANDARD.encode("file:pw");
+        let json =
+            format!(r#"{{"credsStore": "desktop", "auths": {{"ghcr.io": {{"auth": "{auth}"}}}}}}"#);
+        let (c, _) = with_helper(&json, false, "credentials not found in native keychain\n");
+        assert_eq!(c.login("ghcr.io").unwrap().unwrap().username, "file");
+        let (c, _) = with_helper(
+            r#"{"credsStore": "desktop"}"#,
+            false,
+            "credentials not found in native keychain\n",
+        );
+        assert!(c.login("ghcr.io").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_helper_that_fails_or_cannot_be_started_is_an_error_naming_it() {
+        let (c, _) = with_helper(
+            r#"{"credsStore": "desktop"}"#,
+            false,
+            "the keyring is locked",
+        );
+        let err = format!("{:#}", c.login("ghcr.io").unwrap_err());
+        assert!(
+            err.contains("docker-credential-desktop") && err.contains("locked"),
+            "{err}"
+        );
+        // Not installed: the fake has no such program.
+        let (c, _) = with_helper(r#"{"credsStore": "absent"}"#, true, ANSWER);
+        let err = format!("{:#}", c.login("ghcr.io").unwrap_err());
+        assert!(err.contains("docker-credential-absent"), "{err}");
+        // An identity token is not a login lodge can use.
+        let (c, _) = with_helper(
+            r#"{"credsStore": "desktop"}"#,
+            true,
+            r#"{"Username": "<token>", "Secret": "t"}"#,
+        );
+        let err = format!("{:#}", c.login("ghcr.io").unwrap_err());
+        assert!(err.contains("identity token"), "{err}");
+    }
+
+    #[test]
+    fn a_helper_name_is_never_a_path_or_a_command() {
+        for name in ["../evil", "a b", "x;rm", "", "/bin/sh"] {
+            let (c, local) = with_helper(
+                &format!(r#"{{"credsStore": {}}}"#, serde_json::json!(name)),
+                true,
+                ANSWER,
+            );
+            let err = format!("{:#}", c.login("ghcr.io").unwrap_err());
+            assert!(err.contains("not a plain name"), "{name}: {err}");
+            assert!(local.asked.lock().unwrap().is_empty(), "{name}");
+        }
     }
 
     #[test]

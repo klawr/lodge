@@ -13,6 +13,8 @@ use std::process::ExitStatus;
 pub struct CliContainer<F: Flavor> {
     pub(super) cli: CliEngine<F>,
     pub(super) id: String,
+    /// Whether lodge made it, so replacing what is in it is fine.
+    pub(super) disposable: bool,
 }
 
 impl<F: Flavor> CliContainer<F> {
@@ -134,6 +136,10 @@ impl<F: Flavor> Inside for CliContainer<F> {
     fn extract<'a>(&self, dir: &str) -> Job<'a> {
         let target = format!("{}:{dir}", self.id);
         self.cli.job(&self.cli.flavor.cp_in_args(&target))
+    }
+
+    fn disposable(&self) -> bool {
+        self.disposable
     }
 
     fn session(&self, user: User, workdir: &str, inner: &str) -> std::io::Result<ExitStatus> {
@@ -304,6 +310,7 @@ mod tests {
         CliContainer {
             cli: Docker::new(host),
             id: "abc".into(),
+            disposable: true,
         }
     }
 

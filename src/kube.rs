@@ -20,7 +20,7 @@ use std::process::ExitStatus;
 use crate::fingerprint::content_hash;
 use crate::host::{Child, HostRef, Job, Repeat, Stream};
 use crate::port::PortForward;
-use crate::provision::{Attached, Endpoints, Found, Lifecycle, Status};
+use crate::provision::{Attached, Endpoints, Found, Lifecycle, Probe, Status};
 use crate::runtime::{
     Container, ContainerUser, ExecOpts, Inside, LoginOnly, Reach, Runtime, User, in_dir_with_env,
 };
@@ -32,10 +32,16 @@ use crate::shell::shell_quote;
 #[serde(deny_unknown_fields)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct KubeOptions {
-    /// The pod to work in (`kubectl exec POD`). Required by every command that
-    /// uses the target.
+    /// The pod to work in (`kubectl exec POD`). Every command that uses the
+    /// target needs this or `selector`.
     #[serde(default)]
     pub pod: Option<String>,
+    /// A label selector (`kubectl get pods -l SELECTOR`, such as `app=api`) that
+    /// finds the pod instead of its name, for pods whose names change. It must
+    /// match exactly one running pod: lodge does not pick among several. The pod
+    /// is looked up once per run of `ldg`; use it instead of `pod`, not with it.
+    #[serde(default)]
+    pub selector: Option<String>,
     /// The container of the pod to work in (`kubectl exec -c NAME`). Default: the
     /// one kubectl picks, as for `kubectl exec`.
     #[serde(default)]
@@ -71,13 +77,35 @@ impl KubeOptions {
         }
         line
     }
+}
 
+/// Which pod the settings point at.
+enum Aim<'a> {
+    Named(&'a str),
+    Selected(&'a str),
+}
+
+impl KubeOptions {
     /// The pod, or what to do about it not being set.
-    fn pod(&self) -> Result<&str> {
-        self.pod
-            .as_deref()
-            .context("no pod to work in: set `pod` under [targets.kubernetes] in the config")
+    fn aim(&self) -> Result<Aim<'_>> {
+        match (&self.pod, &self.selector) {
+            (Some(pod), None) => Ok(Aim::Named(pod)),
+            (None, Some(selector)) => Ok(Aim::Selected(selector)),
+            (Some(_), Some(_)) => {
+                bail!("set `pod` or `selector` under [targets.kubernetes], not both")
+            }
+            (None, None) => bail!(
+                "no pod to work in: set `pod` (or `selector`) under [targets.kubernetes] in the config"
+            ),
+        }
     }
+}
+
+/// Which pod a selector found.
+enum Lookup {
+    Found(String),
+    /// No running pod matches; the words for it.
+    Nothing(String),
 }
 
 /// What the cluster says about the pod.
@@ -97,6 +125,9 @@ pub struct KubePod {
     id: String,
     /// Only the user the pod runs as can be acted as.
     acting: LoginOnly,
+    /// The pod a selector found, kept for the rest of the run: every command goes
+    /// to the same pod, whatever happens to the others.
+    selected: std::sync::Mutex<Option<String>>,
 }
 
 impl KubePod {
@@ -106,13 +137,86 @@ impl KubePod {
             host.label().unwrap_or_default(),
             options.context.as_deref().unwrap_or_default(),
             options.namespace.as_deref().unwrap_or_default(),
-            options.pod.as_deref().unwrap_or_default()
+            // A selector names the work, not one pod, so what the forwarding
+            // daemon keeps stays the same when the pod is replaced.
+            match (&options.pod, &options.selector) {
+                (Some(pod), _) => pod.clone(),
+                (None, Some(selector)) => format!("-l {selector}"),
+                (None, None) => String::new(),
+            }
         );
         Self {
             id: format!("kube-{}", &content_hash(name.as_bytes())[..7]),
             host,
             options,
             acting: LoginOnly::new("a pod"),
+            selected: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// What a selector found, if it has. A lock that a panic poisoned still holds
+    /// a name that is good.
+    fn selected(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.selected.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The pod to act on: the one named, or the one the selector finds.
+    fn lookup(&self) -> Result<Lookup> {
+        let selector = match self.options.aim()? {
+            Aim::Named(pod) => return Ok(Lookup::Found(pod.to_string())),
+            Aim::Selected(selector) => selector,
+        };
+        if let Some(pod) = self.selected().clone() {
+            return Ok(Lookup::Found(pod));
+        }
+        let mut line = self.options.kubectl();
+        line.extend(
+            [
+                "get",
+                "pods",
+                "-l",
+                selector,
+                "--field-selector=status.phase=Running",
+                "-o",
+                "jsonpath={.items[*].metadata.name}",
+            ]
+            .map(String::from),
+        );
+        let words: Vec<&str> = line.iter().map(String::as_str).collect();
+        let out = self
+            .host
+            .exec(Job::argv(&words).capture().repeat(Repeat::Safe))
+            .context("spawning kubectl get")?;
+        if !out.status.success() {
+            bail!(
+                "kubectl get pods -l {selector} failed: {}",
+                out.stderr_text().trim()
+            );
+        }
+        let text = out.stdout_text();
+        let names: Vec<&str> = text.split_whitespace().collect();
+        match names.as_slice() {
+            [] => Ok(Lookup::Nothing(format!(
+                "no running pod matches the selector {selector}"
+            ))),
+            [one] => {
+                *self.selected() = Some(one.to_string());
+                Ok(Lookup::Found(one.to_string()))
+            }
+            many => bail!(
+                "the selector {selector} matches {} running pods ({}): narrow it to one, or \
+                 name the pod",
+                many.len(),
+                many.iter().take(5).copied().collect::<Vec<_>>().join(", ")
+            ),
+        }
+    }
+
+    /// The pod to act on, or why there is none.
+    fn pod(&self) -> Result<String> {
+        match self.lookup()? {
+            Lookup::Found(pod) => Ok(pod),
+            Lookup::Nothing(why) => bail!("{why}"),
         }
     }
 
@@ -123,7 +227,7 @@ impl KubePod {
         line.push("exec".into());
         line.push("--quiet".into());
         line.extend(flags.iter().map(|f| f.to_string()));
-        line.push(self.options.pod()?.to_string());
+        line.push(self.pod()?);
         if let Some(container) = &self.options.container {
             line.push("-c".into());
             line.push(container.clone());
@@ -135,11 +239,15 @@ impl KubePod {
     /// What the cluster says about the pod. An error when it could not be asked,
     /// which is not "gone".
     fn seen(&self) -> Result<Seen> {
+        let pod = match self.lookup()? {
+            Lookup::Found(pod) => pod,
+            Lookup::Nothing(why) => return Ok(Seen::Gone(why)),
+        };
         let mut line = self.options.kubectl();
         line.extend([
             "get".into(),
             "pod".into(),
-            self.options.pod()?.to_string(),
+            pod,
             "-o".into(),
             "jsonpath={.status.phase}".into(),
         ]);
@@ -158,9 +266,13 @@ impl KubePod {
         bail!("kubectl get failed: {}", err.trim())
     }
 
-    /// The name of the pod, for a message.
-    fn pod_name(&self) -> &str {
-        self.options.pod.as_deref().unwrap_or("(no pod set)")
+    /// The pod, for a message.
+    fn pod_name(&self) -> String {
+        match self.options.aim() {
+            Ok(Aim::Named(pod)) => pod.to_string(),
+            Ok(Aim::Selected(selector)) => format!("selected by {selector}"),
+            Err(_) => "(no pod set)".to_string(),
+        }
     }
 }
 
@@ -233,7 +345,7 @@ impl Container for KubePod {
     }
 
     fn name(&self) -> Option<String> {
-        self.options.pod.clone()
+        self.options.pod.clone().or_else(|| self.selected().clone())
     }
 
     fn mounts(&self) -> Vec<String> {
@@ -268,9 +380,9 @@ impl Container for KubePod {
         port: u16,
         chatter: Stream,
     ) -> Option<std::io::Result<Box<dyn Child>>> {
-        let pod = match self.options.pod() {
+        let pod = match self.pod() {
             Ok(pod) => pod,
-            Err(e) => return Some(Err(std::io::Error::other(e.to_string()))),
+            Err(e) => return Some(Err(std::io::Error::other(format!("{e:#}")))),
         };
         let mut line = self.options.kubectl();
         line.extend([
@@ -313,7 +425,7 @@ impl Endpoints for KubeEndpoints {
     fn provision(&self, _project: &Path, _rebuild: bool) -> Result<Attached> {
         let pod = self.pod();
         match pod.seen()? {
-            Seen::Gone(why) => bail!("there is no pod {}: {why}", pod.pod_name()),
+            Seen::Gone(why) => bail!("there is no pod ({}): {why}", pod.pod_name()),
             Seen::Phase(phase) if phase != "Running" => {
                 bail!("the pod {} is {phase}, not Running", pod.pod_name())
             }
@@ -368,6 +480,51 @@ impl Endpoints for KubeEndpoints {
 
     fn needs_project_path(&self) -> bool {
         false
+    }
+
+    fn checks(&self) -> Vec<Probe> {
+        let mut line = self.options.kubectl();
+        line.extend(["version", "--client"].map(String::from));
+        let words: Vec<&str> = line.iter().map(String::as_str).collect();
+        let version = self.host.exec(Job::argv(&words).capture());
+        let kubectl = match version {
+            Ok(out) if out.status.success() => Ok(out
+                .stdout_text()
+                .lines()
+                .next()
+                .unwrap_or("kubectl")
+                .trim()
+                .to_string()),
+            Ok(out) => Err(format!(
+                "kubectl version failed: {}",
+                out.stderr_text().trim()
+            )),
+            Err(e) => Err(format!(
+                "kubectl cannot be run ({e:#}); install it (https://kubernetes.io/docs/tasks/tools/)"
+            )),
+        };
+        let usable = kubectl.is_ok();
+        let mut probes = vec![Probe {
+            name: "kubectl".into(),
+            outcome: kubectl,
+        }];
+        if usable {
+            let pod = self.pod();
+            probes.push(Probe {
+                name: "pod".into(),
+                outcome: match pod.seen() {
+                    Ok(Seen::Phase(phase)) if phase == "Running" => {
+                        Ok(format!("{} is Running", pod.pod_name()))
+                    }
+                    Ok(Seen::Phase(phase)) => {
+                        Err(format!("{} is {phase}, not Running", pod.pod_name()))
+                    }
+                    Ok(Seen::Gone(why)) => Err(format!("there is no pod: {why}")),
+                    Err(e) => Err(format!("{e:#}")),
+                },
+            });
+        }
+        probes
     }
 }
 
@@ -715,7 +872,7 @@ mod tests {
             .provision(Path::new("."), false)
             .err()
             .unwrap();
-        assert!(err.to_string().contains("no pod dev-0"), "{err}");
+        assert!(err.to_string().contains("no pod (dev-0)"), "{err}");
     }
 
     #[test]
@@ -738,5 +895,156 @@ mod tests {
         assert!(up.lifecycle().is_none() && up.engine().is_none());
         assert!(!up.needs_project_path());
         assert_eq!(up.container("whatever").id(), up.pod().id());
+    }
+
+    // ---- a pod found by a selector ----
+
+    const BY_LABEL: [&str; 8] = [
+        "kubectl",
+        "get",
+        "pods",
+        "-l",
+        "app=api",
+        "--field-selector=status.phase=Running",
+        "-o",
+        "jsonpath={.items[*].metadata.name}",
+    ];
+
+    fn selecting() -> KubeOptions {
+        KubeOptions {
+            selector: Some("app=api".into()),
+            ..KubeOptions::default()
+        }
+    }
+
+    #[test]
+    fn a_selector_finds_the_one_running_pod_and_every_command_goes_to_it_after_one_lookup() {
+        let host = Arc::new(FakeHost::new().reply(&BY_LABEL, Reply::ok("api-7d9f\n")));
+        let pod = pod_on(&host, selecting());
+        let _ = pod.exec(&["true"], &ExecOpts::default());
+        let _ = pod.exec(&["true"], &ExecOpts::default());
+        let argvs = host.argvs();
+        assert_eq!(
+            argvs
+                .iter()
+                .filter(|a| a.contains(&"pods".to_string()))
+                .count(),
+            1,
+            "looked up once: {argvs:?}"
+        );
+        for exec in argvs.iter().filter(|a| a.contains(&"exec".to_string())) {
+            assert!(exec.contains(&"api-7d9f".to_string()), "{exec:?}");
+        }
+        assert_eq!(pod.display_name(), "api-7d9f");
+    }
+
+    #[test]
+    fn a_selector_that_matches_many_or_none_or_fails_is_never_guessed_at() {
+        let many = Arc::new(FakeHost::new().reply(&BY_LABEL, Reply::ok("api-a api-b")));
+        let err = pod_on(&many, selecting())
+            .exec(&["true"], &ExecOpts::default())
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("matches 2 running pods (api-a, api-b)"),
+            "{err}"
+        );
+        assert_eq!(many.argvs().len(), 1, "nothing ran in either pod");
+
+        let none = Arc::new(FakeHost::new().reply(&BY_LABEL, Reply::ok("")));
+        let pod = pod_on(&none, selecting());
+        let err = pod.exec(&["true"], &ExecOpts::default()).unwrap_err();
+        assert!(err.to_string().contains("no running pod matches"), "{err}");
+        // Not there is an answer for `find`, not an error.
+        assert!(!pod.is_running().unwrap());
+
+        let broken = Arc::new(FakeHost::new().reply(&BY_LABEL, Reply::fail(1, "forbidden")));
+        let err = pod_on(&broken, selecting()).is_running().unwrap_err();
+        assert!(format!("{err:#}").contains("forbidden"), "{err:#}");
+    }
+
+    #[test]
+    fn a_pod_and_a_selector_together_are_refused_and_a_selector_is_one_identity_for_the_daemon() {
+        let both = KubeOptions {
+            pod: Some("dev-0".into()),
+            ..selecting()
+        };
+        let err = pod_on(&Arc::new(FakeHost::new()), both)
+            .exec(&["true"], &ExecOpts::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("not both"), "{err}");
+        let host = Arc::new(FakeHost::new());
+        let id = |options| pod_on(&host, options).id().to_string();
+        assert_eq!(id(selecting()), id(selecting()));
+        assert_ne!(id(selecting()), id(options()));
+    }
+
+    #[test]
+    fn the_relay_goes_to_the_selected_pod() {
+        let host = Arc::new(FakeHost::new().reply(&BY_LABEL, Reply::ok("api-7d9f")));
+        let relay = pod_on(&host, selecting())
+            .relay(9000, 80, Stream::Null)
+            .unwrap();
+        assert!(relay.is_ok());
+        assert!(
+            host.argvs()
+                .last()
+                .unwrap()
+                .contains(&"pod/api-7d9f".to_string())
+        );
+    }
+
+    // ---- what doctor checks ----
+
+    #[test]
+    fn doctor_checks_kubectl_and_then_the_pod() {
+        let version = ["kubectl", "version", "--client"];
+        let get = ["kubectl", "get", "pod", "dev-0"];
+        let ok = Arc::new(
+            FakeHost::new()
+                .reply(
+                    &version,
+                    Reply::ok("Client Version: v1.30.1\nKustomize Version: v5\n"),
+                )
+                .reply(&get, Reply::ok("Running")),
+        );
+        let probes = KubeEndpoints::new(ok, options()).checks();
+        let outcomes: Vec<_> = probes
+            .iter()
+            .map(|p| (p.name.as_str(), p.outcome.clone()))
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                ("kubectl", Ok("Client Version: v1.30.1".to_string())),
+                ("pod", Ok("dev-0 is Running".to_string())),
+            ]
+        );
+
+        let pending = Arc::new(
+            FakeHost::new()
+                .reply(&version, Reply::ok("Client Version: v1"))
+                .reply(&get, Reply::ok("Pending")),
+        );
+        let probes = KubeEndpoints::new(pending, options()).checks();
+        assert!(probes[1].outcome.as_ref().unwrap_err().contains("Pending"));
+
+        // No kubectl: the pod is not asked about at all.
+        let host = Arc::new(FakeHost::new().reply(&version, Reply::fail(127, "not found")));
+        let probes = KubeEndpoints::new(host.clone(), options()).checks();
+        assert_eq!(probes.len(), 1);
+        assert!(probes[0].outcome.is_err());
+        assert_eq!(host.argvs().len(), 1);
+
+        // Nothing set: said as a failed check, not a crash.
+        let host = Arc::new(FakeHost::new().reply(&version, Reply::ok("Client Version: v1")));
+        let probes = KubeEndpoints::new(host, KubeOptions::default()).checks();
+        assert!(
+            probes[1]
+                .outcome
+                .as_ref()
+                .unwrap_err()
+                .contains("no pod to work in")
+        );
     }
 }

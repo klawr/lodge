@@ -264,7 +264,15 @@
             },
             "pod": {
               "default": null,
-              "description": "The pod to work in (`kubectl exec POD`). Required by every command that\nuses the target.",
+              "description": "The pod to work in (`kubectl exec POD`). Every command that uses the\ntarget needs this or `selector`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "selector": {
+              "default": null,
+              "description": "A label selector (`kubectl get pods -l SELECTOR`, such as `app=api`) that\nfinds the pod instead of its name, for pods whose names change. It must\nmatch exactly one running pod: lodge does not pick among several. The pod\nis looked up once per run of `ldg`; use it instead of `pod`, not with it.",
               "type": [
                 "string",
                 "null"

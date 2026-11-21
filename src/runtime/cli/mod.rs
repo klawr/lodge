@@ -263,6 +263,15 @@ impl<F: Flavor> Runtime for CliEngine<F> {
         Box::new(CliContainer {
             cli: self.clone(),
             id: id.to_string(),
+            disposable: true,
+        })
+    }
+
+    fn existing(&self, id: &str) -> Box<dyn Container> {
+        Box::new(CliContainer {
+            cli: self.clone(),
+            id: id.to_string(),
+            disposable: false,
         })
     }
 

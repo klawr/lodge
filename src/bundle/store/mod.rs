@@ -26,6 +26,11 @@ pub use oci::{OciSink, OciStore};
 
 use crate::arch::Arch;
 use anyhow::{Result, bail};
+
+/// What a store marks an error from [`BundleStore::identify`] with when it could
+/// not reach the place at all (no connection), as opposed to the place refusing
+/// or not having the bundle: the bundle may be in the cache from the last time.
+pub use crate::tools::Unreachable;
 use std::path::{Path, PathBuf};
 
 /// What a reference points at right now.
@@ -49,7 +54,8 @@ pub trait BundleStore {
 
     /// What `reference` points at now. `arch` is the machine the bundle is for,
     /// `None` when it is not one lodge knows: a store with one bundle per machine
-    /// needs it, a file does not.
+    /// needs it, a file does not. A place that cannot be reached at all is an
+    /// error marked [`Unreachable`].
     fn identify(&self, reference: &str, arch: Option<Arch>) -> Result<Identity>;
 
     /// The bundle's tar. It may be placed under `into` (an empty directory the
@@ -155,6 +161,7 @@ pub mod fake {
     pub struct FakeStore {
         bundles: BTreeMap<String, (String, Vec<u8>)>,
         fetched: Arc<Mutex<Vec<String>>>,
+        offline: bool,
     }
 
     impl FakeStore {
@@ -165,6 +172,12 @@ pub mod fake {
         /// What gets fetched, for a test to read after the store is handed away.
         pub fn fetched(&self) -> Arc<Mutex<Vec<String>>> {
             self.fetched.clone()
+        }
+
+        /// A place that cannot be reached at all.
+        pub fn unreachable(mut self) -> Self {
+            self.offline = true;
+            self
         }
 
         /// `fake://name` is `tar`, whose key is `key`.
@@ -185,6 +198,9 @@ pub mod fake {
         }
 
         fn identify(&self, reference: &str, _arch: Option<Arch>) -> Result<Identity> {
+            if self.offline {
+                return Err(anyhow::anyhow!("no route to host").context(Unreachable));
+            }
             let (key, _) = self
                 .bundles
                 .get(reference)

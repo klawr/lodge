@@ -670,6 +670,33 @@ fn a_bundle_published_by_pack_is_used_by_up() {
         "expected one entry, replaced:\n{index_after}"
     );
 
+    // With the registry gone, the tag cannot be asked; what it named last time is
+    // used from the cache, with a warning.
+    let current = p.ldg("up", &["--no-attach", "--reinject", "--bundle", &reference]);
+    assert!(current.ok, "{}", current.tail(8));
+    drop(registry);
+    let offline = p.ldg("up", &["--no-attach", "--reinject", "--bundle", &reference]);
+    assert!(
+        offline.ok && offline.has("cannot reach") && offline.has("(cached)"),
+        "an unreachable registry falls back to the cache:\n{}",
+        offline.tail(10)
+    );
+    assert_eq!(p.exec(&[&root_tool("hello")]), "published again, longer");
+    // A tag never fetched here has nothing to fall back to.
+    let never = p.ldg(
+        "up",
+        &[
+            "--no-attach",
+            "--bundle",
+            &reference.replace(":1", ":never"),
+        ],
+    );
+    assert!(
+        !never.ok && never.has("not in the cache either"),
+        "{}",
+        never.tail(8)
+    );
+
     // A reference nobody writes to is refused before anything is packed.
     let refused = sb.run(&["pack", "-o", "ftp://host/b.tar"]);
     assert!(
@@ -1637,7 +1664,17 @@ impl Pod {
              LocalPort => {port}, ReuseAddr => 1) or die; \
              while ($c = $s->accept) {{ print $c \"hello from the pod\\n\"; close $c }}'"
         );
-        docker(&["run", "-d", "--name", &name, IMAGE, "sh", "-c", &greeter]);
+        let label = format!("app={name}");
+        docker(&[
+            "run", "-d", "--name", &name, "--label", &label, IMAGE, "sh", "-c", &greeter,
+        ]);
+        Pod(name)
+    }
+
+    /// A container that does nothing, started the way anyone would, not by lodge.
+    fn idle() -> Self {
+        let name = format!("ldg-it-idle-{}-{}", std::process::id(), free_port());
+        docker(&["run", "-d", "--name", &name, IMAGE, "sleep", "600"]);
         Pod(name)
     }
 
@@ -1710,6 +1747,39 @@ fn a_pod_is_injected_entered_and_its_ports_forwarded_through_kubectl() {
     assert!(again.ok && !again.has("injecting"), "{}", again.tail(10));
     let status = run(&["status"]);
     assert!(status.ok && status.has("running"), "{}", status.tail(10));
+    let doctor = run(&["doctor"]);
+    assert!(
+        doctor.has("kubectl") && doctor.has("Client Version") && doctor.has("is Running"),
+        "doctor checks kubectl and the pod:\n{}",
+        doctor.tail(15)
+    );
+
+    // The same pod, found by a label instead of its name, is the same pod: nothing
+    // is injected again, and the lookup asked for running pods with that label.
+    sb.config(&format!(
+        "[[inject]]\nname = \"hostsh\"\nbinary = \"/bin/sh\"\n\
+         [targets.kubernetes]\nselector = \"app={}\"\ncontext = \"test\"\nnamespace = \"work\"\n\
+         workdir = \"/tmp\"\n",
+        pod.0
+    ));
+    let selected = run(&["up", "--no-attach"]);
+    assert!(
+        selected.ok && !selected.has("injecting"),
+        "{}",
+        selected.tail(10)
+    );
+    assert!(
+        sb.kubectl_calls()
+            .contains(&format!("get pods -l app={}", pod.0)),
+        "{}",
+        sb.kubectl_calls()
+    );
+    sb.config(&format!(
+        "[[inject]]\nname = \"hostsh\"\nbinary = \"/bin/sh\"\n\
+         [targets.kubernetes]\npod = \"{}\"\ncontext = \"test\"\nnamespace = \"work\"\n\
+         workdir = \"/tmp\"\n",
+        pod.0
+    ));
 
     // The pod's port is forwarded here, on loopback only, and it answers.
     let mut waited = 0;
@@ -1756,6 +1826,69 @@ fn a_pod_is_injected_entered_and_its_ports_forwarded_through_kubectl() {
     );
 }
 
+/// `ldg attach` works in a container that something else started: it injects, leaves
+/// a config of the user's own alone, is repeat-safe, is cleaned by `clean --container`,
+/// and refuses (without starting anything) one that is not running.
+#[test]
+#[ignore = "needs docker"]
+fn a_container_lodge_did_not_make_is_attached_to_left_alone_and_cleaned() {
+    let sb = Sandbox::new();
+    let script = sb.root().join("hello-src");
+    std::fs::write(&script, "#!/bin/sh\necho attached\n").unwrap();
+    let config_dir = sb.root().join("hello-config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("rc"), "from lodge\n").unwrap();
+    sb.config(&format!(
+        "[[inject]]\nname = \"hello\"\nbinary = \"{}\"\ncopy_deps = false\n\
+         config = \"{}\"\ntarget_config = \"/root/.config/hello\"\n",
+        script.display(),
+        config_dir.display()
+    ));
+    let pod = Pod::idle();
+    // The container already has a config of its own where lodge would put one.
+    pod.exec("mkdir -p /root/.config/hello && echo mine > /root/.config/hello/rc");
+
+    let up = sb.run(&["attach", &pod.0, "--no-attach"]);
+    assert!(up.ok, "{}", up.tail(12));
+    assert_eq!(pod.exec(&root_tool("hello")), "attached");
+    assert_eq!(
+        pod.exec("cat /root/.config/hello/rc"),
+        "mine",
+        "somebody's own config is left as it is;\n{}",
+        up.tail(12)
+    );
+    assert!(up.has("already exists"), "and it says so:\n{}", up.tail(12));
+
+    let again = sb.run(&["attach", &pod.0, "--no-attach"]);
+    assert!(again.ok && !again.has("injecting"), "{}", again.tail(10));
+
+    let clean = sb.run(&["clean", "--container", &pod.0]);
+    assert!(clean.ok, "{}", clean.tail(10));
+    assert_eq!(
+        pod.exec("test -e /root/.local/share/lodge && echo left || echo gone"),
+        "gone"
+    );
+
+    // Not running: refused, and not started.
+    docker(&["stop", &pod.0]);
+    let stopped = sb.run(&["attach", &pod.0, "--no-attach"]);
+    assert!(
+        !stopped.ok && stopped.has("is not running"),
+        "{}",
+        stopped.tail(8)
+    );
+    assert_eq!(
+        docker(&["inspect", "-f", "{{.State.Running}}", &pod.0]),
+        "false"
+    );
+    let missing = sb.run(&["attach", "ldg-it-no-such-container", "--no-attach"]);
+    assert!(
+        !missing.ok && missing.has("did not make"),
+        "{}",
+        missing.tail(8)
+    );
+}
+
 #[test]
 #[ignore = "needs docker"]
 fn a_pod_that_is_not_there_is_refused_before_anything_is_changed() {
@@ -1763,7 +1896,7 @@ fn a_pod_that_is_not_there_is_refused_before_anything_is_changed() {
     sb.use_fake_kubectl();
     sb.config("[targets.kubernetes]\npod = \"no-such-pod\"\n");
     let up = sb.run(&["--target", "kubernetes", "up", "--no-attach"]);
-    assert!(!up.ok && up.has("no pod no-such-pod"), "{}", up.tail(10));
+    assert!(!up.ok && up.has("no pod (no-such-pod)"), "{}", up.tail(10));
     // And a config without a pod says what to set.
     sb.config("");
     let up = sb.run(&["--target", "kubernetes", "up", "--no-attach"]);

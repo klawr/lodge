@@ -58,13 +58,14 @@ for where to put them). Man page: `ldg man | man -l -`.
 | Command | What it does |
 | --- | --- |
 | `ldg up [PATH]` | Start the project's devcontainer and open a shell. The environment is injected when the container is created (or with `--reinject`). `--build` rebuilds and recreates; `--no-attach` sets up without a shell. |
+| `ldg attach CONTAINER` | Inject into a running container that something else made (a `docker run`, a compose service) and open a shell. Nothing is created or started; what is already in it is left alone. `ldg clean --container CONTAINER` takes lodge out again. |
 | `ldg down [PATH]` | Stop the project's container (resume later with `ldg up`). |
 | `ldg rm [PATH]` | Remove the project's container (the next `ldg up` starts fresh). |
 | `ldg status [PATH]` | The container's state, whether its config changed, the injected bundle, placed secrets. |
 | `ldg ls` | Every container lodge created, across projects. |
 | `ldg ports [PATH]` | The ports forwarded to this machine for the project's container. |
 | `ldg logs [PATH]` | The port-forwarding log (`-f` to follow). |
-| `ldg clean [PATH]` | Remove what lodge injected from the container (configs are kept and listed), and stop its port forwarding. |
+| `ldg clean [PATH]` | Remove what lodge injected from the container (configs are kept and listed), and stop its port forwarding. `--container NAME` for one that `ldg attach` worked in. |
 | `ldg init` | Write a starting config (`--print` to see it first). |
 | `ldg doctor [PATH]` | Check the host, the config, and what the project's devcontainer needs. |
 | `ldg pack [-o FILE\|oci://REF]` | Pack your tools and configs into a portable bundle: a file (`lodge-<arch>.tar`), or published to a registry. |

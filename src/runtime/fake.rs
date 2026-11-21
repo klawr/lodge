@@ -526,6 +526,25 @@ impl Runtime for FakeRuntime {
         })
     }
 
+    /// Like the engine, a container that is not there is a handle that is not
+    /// running.
+    fn existing(&self, id: &str) -> Box<dyn Container> {
+        let fake = self
+            .containers
+            .borrow()
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| {
+                let gone = self.create();
+                gone.running.set(false);
+                gone
+            });
+        Box::new(FakeContainer {
+            id: id.to_string(),
+            fake,
+        })
+    }
+
     fn version(&self) -> Result<String> {
         Ok("fake".into())
     }
@@ -592,6 +611,10 @@ impl Runtime for FakeRuntime {
 impl Runtime for Rc<FakeRuntime> {
     fn container(&self, id: &str) -> Box<dyn Container> {
         self.as_ref().container(id)
+    }
+
+    fn existing(&self, id: &str) -> Box<dyn Container> {
+        self.as_ref().existing(id)
     }
 
     fn version(&self) -> Result<String> {

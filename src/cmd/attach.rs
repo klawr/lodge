@@ -33,6 +33,44 @@ pub fn up(
     attach(ctx, &attached, &config, &prepared, reinject, no_attach)
 }
 
+/// Works in a container that is running and that lodge did not make: the same
+/// forwarding, injection, secrets and session as `up`, with nothing created
+/// first. The container is somebody's, so it is neither started nor changed
+/// beyond what is injected.
+pub fn attach_to(
+    ctx: &Ctx,
+    name: &str,
+    workdir: Option<String>,
+    reinject: bool,
+    no_attach: bool,
+    bundle: Option<&str>,
+) -> Result<()> {
+    let config = ctx.config()?;
+    let container = ctx.existing_container(name)?;
+    if !container.is_running()? {
+        anyhow::bail!(
+            "{name} is not running, or there is no such container; lodge does not start \
+             containers it did not make"
+        );
+    }
+    let prepared = bundle::source::prepare(&config, bundle, &ctx.bundles, &ctx.tools)?;
+    let workdir = match workdir {
+        Some(dir) => dir,
+        None => ContainerUser::resolve(container.as_ref(), None)?.home,
+    };
+    let attached = Attached {
+        container,
+        // Made by somebody else, so whether anything is injected is for the record
+        // in its prefix to say.
+        created: false,
+        workdir,
+        forward_ports: Vec::new(),
+        remote_user: None,
+        post_attach: None,
+    };
+    attach(ctx, &attached, &config, &prepared, reinject, no_attach)
+}
+
 /// Works in an endpoint that is up: forwards its ports, injects (unless that was
 /// done already), delivers the secrets and opens the session. Knows nothing of
 /// how the endpoint was made.
@@ -231,5 +269,58 @@ mod tests {
         let (forwarded, injected) = attach_to(FakeEnv::new().without_forwarding());
         assert!(forwarded.is_empty(), "{forwarded:?}");
         assert!(injected);
+    }
+
+    /// A context whose engine has the running container `c1` and no other, built
+    /// on `endpoints`.
+    fn ctx_with(endpoints: Box<dyn crate::provision::Endpoints>, dir: &TempDir) -> Ctx {
+        Ctx {
+            host: fake(),
+            local: Arc::new(FakeLocal::new()),
+            forwarder: Box::new(RecordingDaemon(Rc::default())),
+            endpoints,
+            tools: tools::external(),
+            bundles: crate::bundle::store::Stores::new(vec![]),
+            sinks: crate::bundle::store::Sinks::new(vec![]),
+            config_path: dir.path().join("config.toml"),
+        }
+    }
+
+    #[test]
+    fn a_container_that_is_stopped_or_not_there_is_refused_and_never_started() {
+        let dir = TempDir::new("attach-gone").unwrap();
+        let rt = Rc::new(FakeRuntime::new(FakeEnv::new).with_container("c1", FakeEnv::new()));
+        let ctx = ctx_with(
+            Box::new(Devcontainer::new(
+                fake(),
+                Arc::new(FakeLocal::new()),
+                Box::new(rt.clone()),
+                Arc::new(tools::NoRegistry),
+                Arc::new(NoQuestions),
+            )),
+            &dir,
+        );
+        let err = super::attach_to(&ctx, "nope", None, false, true, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("nope is not running") && err.contains("did not make"),
+            "{err}"
+        );
+        assert!(rt.ops().is_empty(), "nothing was started: {:?}", rt.ops());
+    }
+
+    #[test]
+    fn a_target_without_an_engine_has_nothing_to_attach_to() {
+        let dir = TempDir::new("attach-none").unwrap();
+        let ctx = ctx_with(
+            Box::new(crate::plain_host::PlainHostEndpoints::new(fake())),
+            &dir,
+        );
+        let err = super::attach_to(&ctx, "c1", None, false, true, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no container engine"), "{err}");
+        assert!(ctx.existing_container("c1").is_err());
     }
 }

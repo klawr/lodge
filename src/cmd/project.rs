@@ -275,11 +275,17 @@ pub fn logs(ctx: &Ctx, path: Option<PathBuf>, follow: bool) -> Result<()> {
     }
 }
 
-pub fn clean(ctx: &Ctx, path: Option<PathBuf>) -> Result<()> {
+pub fn clean(ctx: &Ctx, path: Option<PathBuf>, existing: Option<&str>) -> Result<()> {
     let Found {
         container,
         remote_user,
-    } = require(ctx, path)?;
+    } = match existing {
+        Some(name) => Found {
+            container: ctx.existing_container(name)?,
+            remote_user: None,
+        },
+        None => require(ctx, path)?,
+    };
     // Lodge's forwarding is part of what is taken out, and on a machine that is
     // always up nothing else would end it.
     ctx.forwarder.stop(container.id());

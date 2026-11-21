@@ -11,11 +11,58 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::manifest::{MANIFEST_FILE, Manifest};
+use crate::arch::Arch;
 use crate::tmpfile::{TempDir, discard_dir};
 use crate::tree::{self, Denied, Links};
 
 /// How many cached bundles to keep (the most recently used).
 pub const KEEP: usize = 4;
+
+/// The file, beside the entries, that remembers which bundle a reference named
+/// the last time its place could be asked.
+const TAGS_FILE: &str = "tags.json";
+
+type Tags = std::collections::BTreeMap<String, String>;
+
+fn tag_key(reference: &str, arch: Option<Arch>) -> String {
+    format!(
+        "{reference}\n{}",
+        arch.map(|a| a.to_string()).unwrap_or_default()
+    )
+}
+
+fn read_tags(root: &Path) -> Tags {
+    std::fs::read(root.join(TAGS_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Notes that `reference` (for `arch`) named the cached bundle `key`, so that a
+/// place which cannot be reached later can still be answered from the cache. Only
+/// a convenience: a failure to write it is a trace line, not an error.
+pub(super) fn remember(root: &Path, reference: &str, arch: Option<Arch>, key: &str) {
+    let write = || -> Result<()> {
+        let mut tags = read_tags(root);
+        // What was pruned from the cache cannot be answered from it.
+        tags.retain(|_, k| root.join(k).is_dir());
+        tags.insert(tag_key(reference, arch), key.to_string());
+        let partial = root.join(format!("{TAGS_FILE}.partial"));
+        std::fs::write(&partial, serde_json::to_vec_pretty(&tags)?)?;
+        std::fs::rename(&partial, root.join(TAGS_FILE))?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        crate::output::trace_line(&format!("not remembering {reference}: {e:#}"));
+    }
+}
+
+/// The key of the cached bundle `reference` (for `arch`) named last time, if that
+/// bundle is still in the cache.
+pub(super) fn recall(root: &Path, reference: &str, arch: Option<Arch>) -> Option<String> {
+    let key = read_tags(root).remove(&tag_key(reference, arch))?;
+    load(&root.join(&key)).map(|_| key)
+}
 
 /// Where prepared bundles are cached: `~/.cache/lodge/bundles`.
 pub fn root() -> Result<PathBuf> {
@@ -67,6 +114,8 @@ pub fn clear(root: &Path) -> (usize, u64) {
     for e in &all {
         discard_dir(&e.dir);
     }
+    // What the references named points at nothing now.
+    std::fs::remove_file(root.join(TAGS_FILE)).ok();
     (all.len(), size)
 }
 
@@ -131,7 +180,7 @@ pub(super) fn prune(root: &Path, keep: &Path) {
     for entry in read.filter_map(std::result::Result::ok) {
         let name = entry.file_name().to_string_lossy().into_owned();
         let modified = entry.metadata().and_then(|m| m.modified()).ok();
-        if name.starts_with("f-") || name.starts_with("p-") {
+        if name.starts_with("f-") || name.starts_with("o-") || name.starts_with("p-") {
             cached.push((modified, entry.path()));
         } else if name.starts_with("lodge-")
             && modified
@@ -146,5 +195,37 @@ pub(super) fn prune(root: &Path, keep: &Path) {
         if path != keep {
             discard_dir(&path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundles_from_a_registry_are_pruned_like_the_others() {
+        let root = TempDir::new("prune-o").unwrap();
+        for n in 0..KEEP + 2 {
+            let dir = root.path().join(format!("o-{n}"));
+            std::fs::create_dir(&dir).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            touch(&dir);
+        }
+        let keep = root.path().join("o-0");
+        prune(root.path(), &keep);
+        let left = std::fs::read_dir(root.path()).unwrap().count();
+        // The most recent ones stay, and so does the one in use, whatever its age.
+        assert_eq!(left, KEEP + 1, "{left}");
+        assert!(keep.exists());
+    }
+
+    #[test]
+    fn clearing_the_cache_forgets_what_the_references_named() {
+        let root = TempDir::new("clear-tags").unwrap();
+        std::fs::create_dir(root.path().join("o-a")).unwrap();
+        remember(root.path(), "oci://x/y:1", None, "o-a");
+        assert!(root.path().join(TAGS_FILE).exists());
+        clear(root.path());
+        assert!(!root.path().join(TAGS_FILE).exists());
     }
 }

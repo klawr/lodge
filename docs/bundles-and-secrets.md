@@ -82,14 +82,17 @@ keeps the others. If two machines publish at once the last one wins, and the
 other's entry may be lost: publish them one after the other. A tag that held a
 single image (not made by this lodge) is replaced.
 Publishing needs `docker login <registry>` with an account that may write there;
-lodge reads that login from docker's config file, not from a credential helper (see
+lodge reads that login from docker's config file or its credential helper (see
 [Troubleshooting](troubleshooting.md#a-bundle-or-a-feature-cannot-be-pulled-or-published)).
 
 **Using.** lodge asks the registry what the tag points at on every `up`, which is
 one small request, and downloads only when it changed: the bundle is cached under
-the digest, so an unchanged tag costs no download. Nothing is cached for the lookup
-itself, so a registry that cannot be reached fails the `up` (use a file when you
-are offline).
+the digest, so an unchanged tag costs no download. lodge also remembers which
+bundle the tag named the last time (in `tags.json` in the cache), so when the
+registry **cannot be reached at all** (no network, no answer), `up` warns and uses
+that bundle if it is still in the cache. A registry that answers and refuses, or
+has no such tag, is never overruled by the cache, and a tag that was never fetched
+on this machine has nothing to fall back to: that fails the `up` as before.
 
 **What is in the registry.** An image with an empty config and **one layer: the
 bundle's tar**, typed `application/vnd.lodge.bundle.v1` (the artifact) and

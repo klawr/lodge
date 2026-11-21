@@ -106,6 +106,33 @@ pub enum Command {
         #[arg(long, short, value_name = "FILE|oci://REF")]
         bundle: Option<String>,
     },
+    /// Work in a container lodge did not make
+    #[command(
+        long_about = "Inject your tools into a running container that was made some other \
+            way (a `docker run`, a compose service, someone else's), and open a shell in \
+            it. Nothing is created, started or stopped: the container must be running, \
+            and it is treated as somebody's workload, so a config that is already there \
+            is left as it is (with a warning) and git's ownership check is not loosened. \
+            It acts as the user the container runs as. Works on the engine of the target \
+            (`--target docker|podman`, and `--remote`). `ldg clean --container NAME` takes \
+            lodge out again."
+    )]
+    Attach {
+        /// The container's name or id
+        container: String,
+        /// The directory a session starts in (default: the user's home)
+        #[arg(long, value_name = "DIR")]
+        workdir: Option<String>,
+        /// Inject again even though something is already injected
+        #[arg(long)]
+        reinject: bool,
+        /// Set everything up, but don't open a shell (for scripts and CI)
+        #[arg(long)]
+        no_attach: bool,
+        /// Inject from this bundle instead of packing your config
+        #[arg(long, short, value_name = "FILE|oci://REF")]
+        bundle: Option<String>,
+    },
     /// Stop a project's devcontainer
     #[command(
         long_about = "Stop the container that `ldg up` started for the project. The \
@@ -168,6 +195,9 @@ pub enum Command {
     Clean {
         #[command(flatten)]
         project: ProjectArg,
+        /// Clean this container (one `ldg attach` worked in) instead of the project's
+        #[arg(long, value_name = "NAME|ID", conflicts_with = "path")]
+        container: Option<String>,
     },
     /// Pack your tools and configs into a portable bundle
     #[command(

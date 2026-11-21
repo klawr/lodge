@@ -9,6 +9,7 @@ use super::http::{Body, Http, Method, Request, Response};
 use super::manifest::Descriptor;
 use super::reference::Target;
 use crate::output::warning;
+use crate::tools::Unreachable;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
@@ -270,16 +271,15 @@ impl<'a> Registry<'a> {
     fn failure(&self, status: u16, url: &str) -> anyhow::Error {
         match (status, self.access) {
             (401 | 403, Access::Pull) => anyhow::anyhow!(
-                "{} refused {} ({status}); a private repository needs `docker login`, which \
-                 lodge reads only when the login is in docker's config file itself, not in a \
-                 credential helper",
+                "{} refused {} ({status}); a private repository needs `docker login`, whose \
+                 login lodge reads from docker's config file or its credential helper",
                 self.registry,
                 self.repository
             ),
             (401 | 403, Access::Push) => anyhow::anyhow!(
                 "{} refused to write {} ({status}); pushing needs `docker login {}` with an \
-                 account that may write there, which lodge reads only when the login is in \
-                 docker's config file itself, not in a credential helper",
+                 account that may write there, whose login lodge reads from docker's \
+                 config file or its credential helper",
                 self.registry,
                 self.repository,
                 self.registry
@@ -301,12 +301,15 @@ impl<'a> Registry<'a> {
         if let Some(a) = &self.authorization {
             all.push(("Authorization", a));
         }
-        self.http.send(Request {
-            method,
-            url,
-            headers: &all,
-            body,
-        })
+        // `Http` answers every status as a response, so an error is the network.
+        self.http
+            .send(Request {
+                method,
+                url,
+                headers: &all,
+                body,
+            })
+            .map_err(|e| e.context(Unreachable))
     }
 
     /// The `Authorization` value that answers a challenge.
@@ -361,7 +364,10 @@ impl<'a> Registry<'a> {
                     .map(|b| ("Authorization", b.as_str()))
                     .collect();
                 crate::output::trace_line(&format!("GET {url}"));
-                let response = self.http.get(&url, &headers)?;
+                let response = self
+                    .http
+                    .get(&url, &headers)
+                    .map_err(|e| e.context(Unreachable))?;
                 if response.status != 200 {
                     bail!("the token service refused ({})", response.status);
                 }
