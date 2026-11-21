@@ -91,11 +91,10 @@ outlives a disconnect, use a multiplexer: see
 
 ## Keeping a session alive
 
-A multiplexer (tmux, zellij, screen) is not a lodge feature, and lodge has no
-code for one. It is a tool like any other: inject it, and start it from your
-shell's rc file. The container keeps it running when you leave, so the next
-`ldg up` (or `ldg attach`) lands in the same session, with your editor as you
-left it. The same holds after a dropped `--remote` connection: `ldg` asks whether
+A multiplexer (tmux, zellij, screen) is a tool like any other: inject it, and
+start it from your shell's rc file. The container keeps it running when you
+leave, so the next `ldg up` (or `ldg attach`) lands in the same session, with
+your editor as you left it. The same holds after a dropped `--remote` connection: `ldg` asks whether
 to reconnect and open a new shell, which reads the rc file again and attaches.
 
 A tmux setup, with three `[[inject]]` entries:

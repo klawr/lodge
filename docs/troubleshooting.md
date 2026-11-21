@@ -20,6 +20,18 @@ The interactive shell needs a terminal on the remote side. Set `PermitTTY yes`
 in the server's `sshd_config`, remove any `restrict` or `no-pty` option on your
 key in `~/.ssh/authorized_keys`, and reload sshd. No client flag can override it.
 
+## "lost the connection to <host>"
+
+With `--remote`, lodge reconnects and reruns a step that is safe to repeat (up
+to three tries); you see `retrying (2/3)` and nothing else if it works. A step
+that is not safe to repeat (a lifecycle hook, a feature's `install.sh`) is not
+rerun: run the same command again, which picks up where it stopped. If the
+connection drops under your shell, `ldg` asks whether to reconnect and open a new
+one; to land back in your work, keep a multiplexer running in the container (see
+[Keeping a session alive](configuration.md#keeping-a-session-alive)).
+`cannot connect to <host>` after the retries means the host is down or refused
+the login: run with `-vv` for ssh's own output.
+
 ## Ports aren't forwarded
 
 - `ldg ports` shows what the forwarding daemon has set up, `ldg logs` (or

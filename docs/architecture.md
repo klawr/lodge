@@ -70,7 +70,7 @@ every subcommand.
 | `host_tools.rs` | The helper programs lodge may run here (`ssh`, `ldd`, `patchelf`, `oras`): what each is needed for (a `Need`, which decides when `doctor` requires it) and how to get it. `doctor` reports from this table and each tool is started only through it. |
 | `target.rs` | `Target` (`Local` or `Ssh(host)`): the one place that decides local vs remote, plus host-side file helpers (`read_first` finds files by pattern and reads the first in one round trip, `read_file` reads one, `fetch_dir` copies a folder from the project's host). |
 | `runtime/` | The seam to whatever runs the workload: the `Env`, `Container`, `Runtime` and `Compose` traits (see below), `User` (who a command runs as) and `ContainerUser` (the session user's name, uid, gid and home, looked up once), `Acting` (an `Env` seen as one user, below), `tarball` (packs files as a tar owned by a user), the docker CLI implementation (`docker/`: the engine, the per-container `Env`, and the file-copy streaming), and strict in-memory fakes for tests (`FakeEnv`, and `FakeRuntime`, whose containers each run in one). |
-| `ssh.rs` | `--remote` destination parsing, connection multiplexing, small SSH helpers. |
+| `ssh.rs` | `--remote` destination parsing; the shared connection (`connect` opens it up front with the terminal available, `ControlMaster` multiplexes everything after); `retry`, which reruns a step after a lost connection if it is marked `Repeat::Safe`; the few ssh invocations lodge needs. |
 | `shell.rs` | POSIX `shell_quote`, which everything that builds a command string goes through; `script_argv`, how every script with arguments is started (`sh -c <script> sh <args…>`, so arguments are `$1`, `$2`, …); the rules for names written into scripts unquoted (`is_plain_name`, `is_var_name`) and for destinations in a container (`container_path_problem`); `slug` for container names; and `CmdLine`, a command as `sh -c` script or argv. |
 | `fingerprint.rs` | The small content hash used to notice changes (devcontainer inputs, updated libraries, bundle contents), as a `Fingerprint` builder. Its values are stored, so a test pins them. |
 | `tmpfile.rs` | Self-deleting staging files for `docker cp`. |
@@ -262,9 +262,26 @@ local Docker is needed. Three things make that work:
   goes through `DockerCli::command_in`, which also `cd`s into the project
   directory *on the remote*.
 - **Connection reuse.** A single `ldg up` issues dozens of SSH calls.
-  `ssh::base_command` multiplexes them over one `ControlMaster` socket per
-  destination; without that, each call renegotiates and a flaky link silently
-  breaks random steps.
+  `ssh::connect` opens one connection first (a password or 2FA prompt is
+  answered once, with the terminal available) and `ssh::base` multiplexes
+  every later call over its `ControlMaster` socket, one per destination, with
+  `ServerAliveInterval=15` so a dead link fails in about 45 s instead of
+  hanging.
+- **Lost connections and repeat-safety.** ssh exiting 255 says the connection
+  failed, not whether the remote command ran, so a step is rerun only if it is
+  safe to run twice. Every remote step says which it is: `Repeat::Safe` (reads
+  and probes, `mkdir -p`, `rm -rf`, the tar copy, an atomic secret write,
+  `start`/`stop`/`rm -f`/`build`/`compose up|down`) or `Repeat::Never`, the
+  default (user hooks, a feature's `install.sh`, the uid change,
+  `initializeCommand`, scratch files, the interactive session). Exec steps set it
+  with `ExecOpts::repeatable()`, everything else goes through
+  `Target::attempt`; a safe step is retried up to three times, waiting 1 s then
+  2 s, after the dead master is dropped. A rejected login or host key is never
+  retried. `docker run` is not repeatable as such, so a retry first looks for the
+  container by name and starts what it finds. The forward daemon restarts a dead
+  `ssh -L` tunnel with a wait that doubles from 2 s to a minute. It has no
+  terminal, so its tunnels never prompt: they ride on the connection `connect`
+  opened, or on key or agent auth.
 - **Local bytes → container.** The remote docker can't see local paths, so
   `put` streams a tar to `docker cp -q -a - <id>:<dir>`, locally and over SSH alike,
   packed in-process (`runtime::tarball`), so no local `tar` is needed, none in the
@@ -362,8 +379,8 @@ erode.
   this machine whatever the target) and `session/` (launching the user's
   session), and the helper tools (`ldd`, `patchelf`, `oras`) only
   through `host_tools`. lodge never runs a local `tar`; tar streams are built and
-  unpacked in-process. `ssh.rs` offers `command`, `sh_output`, `write_scratch`,
-  `tunnel`, `pty_denied` and `interactive_line`, all built on one private
+  unpacked in-process. `ssh.rs` offers `connect`, `retry`, `command`, `sh_output`,
+  `write_scratch`, `tunnel`, `pty_denied` and `interactive_line`, all built on one private
   `base`; nothing else builds an `ssh` command. *Enforced:* the tests in
   `conventions.rs`.
 - **Dependencies point one way.** `cmd/` on top (the only layer that knows
