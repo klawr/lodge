@@ -33,6 +33,7 @@ pub fn up(
     // and `--engine`, and nothing below changes.
     let provisioner = Devcontainer {
         host: &ctx.host,
+        local: ctx.local.as_ref(),
         rt: ctx.rt.as_ref(),
         oci: ctx.tools.oci.as_ref(),
         prompt: &super::prompt::Terminal,
@@ -82,10 +83,17 @@ fn attach(
         return Ok(());
     }
     attached.run_post_attach();
-    let setup = secret::deliver::deliver(container, ctx.host.as_ref(), &user, &config.secret)?;
+    let setup = secret::deliver::deliver(
+        container,
+        ctx.host.as_ref(),
+        &user,
+        &config.secret,
+        ctx.local.as_ref(),
+    )?;
     session::enter(
         container,
         ctx.host.as_ref(),
+        ctx.local.as_ref(),
         &config.session,
         &Session {
             workdir: &attached.workdir,
@@ -102,7 +110,8 @@ mod tests {
     use crate::bundle::manifest::Manifest;
     use crate::bundle::source::{Origin, Prepared};
     use crate::forward::ForwardDaemon;
-    use crate::host::local;
+    use crate::host::fake;
+    use crate::local::fake::FakeLocal;
     use crate::port::PortForward;
     use crate::runtime::RUN_PROBE_SCRIPT;
     use crate::runtime::fake::{FakeEnv, FakeRuntime};
@@ -111,6 +120,7 @@ mod tests {
     use crate::tools;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     /// Records what it was asked to forward instead of starting a process.
     struct RecordingDaemon(Rc<RefCell<Vec<String>>>);
@@ -162,7 +172,8 @@ mod tests {
         let rt = FakeRuntime::new(FakeEnv::new).with_container("c1", env);
         let forwarded = Rc::new(RefCell::new(Vec::new()));
         let ctx = Ctx {
-            host: local(),
+            host: fake(),
+            local: Arc::new(FakeLocal::new()),
             forwarder: Box::new(RecordingDaemon(forwarded.clone())),
             rt: Box::new(rt),
             tools: tools::external(),

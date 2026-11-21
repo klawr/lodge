@@ -55,7 +55,7 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
     // The devcontainer here (if any) decides whether compose and oras matter.
     let needs = ctx
         .project(path)
-        .and_then(|p| crate::devcontainer::needs(&p, &ctx.host));
+        .and_then(|p| crate::devcontainer::needs(&p, &ctx.host, ctx.local.as_ref()));
     checks.push(match &needs {
         Ok(n) => Check::new(
             "devcontainer",
@@ -109,7 +109,7 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
             }
         }
         for decl in &cfg.secret {
-            checks.push(secret_check(decl));
+            checks.push(secret_check(decl, ctx.local.as_ref()));
         }
     }
 
@@ -141,7 +141,10 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
 
 /// Whether a declared secret's source resolves on this machine. The value is
 /// read to find out, then dropped; only the source's kind is shown.
-fn secret_check(decl: &crate::config::secret::SecretDecl) -> Check {
+fn secret_check(
+    decl: &crate::config::secret::SecretDecl,
+    local: &dyn crate::local::Local,
+) -> Check {
     use crate::config::secret::Source;
     let source = match &decl.from {
         Source::Env(var) => format!("env {var}"),
@@ -149,7 +152,7 @@ fn secret_check(decl: &crate::config::secret::SecretDecl) -> Check {
         Source::Command(cmd) => format!("command {}", cmd.split_whitespace().next().unwrap_or("")),
     };
     let name = format!("secret {}", decl.name);
-    match crate::secret::resolve(decl) {
+    match crate::secret::resolve(decl, local) {
         Ok(_) => Check::new(name, Level::Ok, format!("resolves ({source})")),
         Err(e) => Check::new(name, Level::Missing, format!("{e:#}")),
     }

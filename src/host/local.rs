@@ -2,14 +2,38 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 
-use super::{FirstFile, Host, ScratchFile};
-use crate::shell::CmdLine;
+use super::{FirstFile, Host, Job, Line, Ran, ScratchFile, run_interactive, run_process};
 use crate::tmpfile::TempFile;
 
 /// This machine: commands run as child processes and files are read directly.
 pub struct LocalHost;
+
+/// The local process that runs `line`, in `dir` if given.
+fn command(line: &Line, dir: Option<&Path>) -> Command {
+    let mut c = match line {
+        Line::Shell(script) => {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(script);
+            c
+        }
+        Line::Argv(argv) => match argv.split_first() {
+            Some((program, args)) => {
+                let mut c = Command::new(program);
+                c.args(args);
+                c
+            }
+            // Nothing to run: `false` is the closest honest answer, and the
+            // caller sees a failed step like any other.
+            None => Command::new("false"),
+        },
+    };
+    if let Some(dir) = dir {
+        c.current_dir(dir);
+    }
+    c
+}
 
 impl Host for LocalHost {
     fn label(&self) -> Option<String> {
@@ -24,43 +48,13 @@ impl Host for LocalHost {
         true
     }
 
-    fn respawn_args(&self) -> Vec<String> {
-        vec![]
+    fn run(&self, job: &mut Job) -> std::io::Result<Ran> {
+        run_process(command(&job.line, job.dir), job)
     }
 
-    fn command(&self, line: &CmdLine, dir: Option<&Path>) -> Command {
-        let mut c = match line {
-            CmdLine::Shell(script) => {
-                let mut c = Command::new("sh");
-                c.arg("-c").arg(script);
-                c
-            }
-            CmdLine::Argv(argv) => match argv.split_first() {
-                Some((program, args)) => {
-                    let mut c = Command::new(program);
-                    c.args(args);
-                    c
-                }
-                // Nothing to run: `false` is the closest honest answer, and the
-                // caller sees a failed step like any other.
-                None => Command::new("false"),
-            },
-        };
-        if let Some(dir) = dir {
-            c.current_dir(dir);
-        }
-        c
-    }
-
-    fn interactive(&self, argv: &[&str]) -> Command {
-        match argv.split_first() {
-            Some((program, args)) => {
-                let mut c = Command::new(program);
-                c.args(args);
-                c
-            }
-            None => Command::new("false"),
-        }
+    fn interactive(&self, argv: &[&str]) -> std::io::Result<ExitStatus> {
+        let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+        run_interactive(command(&Line::Argv(argv), None))
     }
 
     fn write_scratch(&self, name: &str, content: &str) -> Result<ScratchFile<'_>> {
@@ -166,6 +160,10 @@ mod tests {
         assert_eq!(LocalHost.names(), ["local"]);
         assert_eq!(LocalHost.on_host(), "");
         assert!(LocalHost.shares_cwd());
-        assert!(LocalHost.tunnel(1, "x:2").is_none());
+        assert!(
+            LocalHost
+                .tunnel(1, "x:2", crate::host::Stream::Null)
+                .is_none()
+        );
     }
 }

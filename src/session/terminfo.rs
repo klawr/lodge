@@ -10,6 +10,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
+use crate::local::Local;
 use crate::output::warning;
 use crate::runtime::Env;
 
@@ -17,9 +18,10 @@ use crate::runtime::Env;
 const FALLBACK: &str = "xterm-256color";
 
 /// The local terminal's name, unless it says nothing useful.
-pub fn local_term() -> Option<String> {
-    std::env::var("TERM")
-        .ok()
+pub fn local_term(local: &dyn Local) -> Option<String> {
+    local
+        .var("TERM")
+        .and_then(|t| t.into_string().ok())
         // The name goes into paths and shell scripts.
         .filter(|t| t != "dumb" && crate::shell::is_plain_name(t))
 }
@@ -36,15 +38,15 @@ fn find_entry(term: &str, dirs: &[PathBuf]) -> Option<(String, PathBuf)> {
 }
 
 /// The terminfo directories ncurses searches on this host, in its order.
-fn host_dirs() -> Vec<PathBuf> {
+fn host_dirs(local: &dyn Local) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(d) = std::env::var_os("TERMINFO") {
+    if let Some(d) = local.var("TERMINFO") {
         dirs.push(PathBuf::from(d));
     }
-    if let Some(home) = dirs::home_dir() {
-        dirs.push(home.join(".terminfo"));
+    if let Some(home) = local.var("HOME") {
+        dirs.push(PathBuf::from(home).join(".terminfo"));
     }
-    if let Some(list) = std::env::var_os("TERMINFO_DIRS") {
+    if let Some(list) = local.var("TERMINFO_DIRS") {
         dirs.extend(std::env::split_paths(&list).filter(|p| !p.as_os_str().is_empty()));
     }
     for d in [
@@ -68,12 +70,12 @@ fn container_knows(env: &dyn Env, dir: &str, term: &str) -> bool {
 }
 
 /// The `TERM` a session should use, or `None` to leave the container's default
-/// (when `local`, this machine's terminal, says nothing useful). Copies the
+/// (when `term`, this machine's terminal, says nothing useful). Copies the
 /// host's entry for it into the container first when the container lacks it;
 /// if that isn't possible, a widely known fallback. Best effort: a missing entry
 /// only costs some colours.
-pub fn prepare(env: &dyn Env, dir: &str, local: Option<&str>) -> Option<String> {
-    prepare_from(env, dir, local?, &host_dirs())
+pub fn prepare(env: &dyn Env, dir: &str, term: Option<&str>, local: &dyn Local) -> Option<String> {
+    prepare_from(env, dir, term?, &host_dirs(local))
 }
 
 fn prepare_from(env: &dyn Env, dir: &str, term: &str, dirs: &[PathBuf]) -> Option<String> {
@@ -113,6 +115,7 @@ pub fn session_setup(dir: &str, term: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local::fake::FakeLocal;
     use crate::runtime::fake::FakeEnv;
 
     const DIR: &str = "/p/terminfo";
@@ -175,7 +178,7 @@ mod tests {
             prepare_from(&env, DIR, "tmux-256color", &[]).as_deref(),
             Some("tmux-256color")
         );
-        assert_eq!(prepare(&env, DIR, None), None);
+        assert_eq!(prepare(&env, DIR, None, &FakeLocal::new()), None);
     }
 
     #[test]
@@ -204,5 +207,29 @@ mod tests {
             s.contains("TERMINFO_DIRS='/p/terminfo':\"${TERMINFO_DIRS:-}\""),
             "{s}"
         );
+    }
+
+    #[test]
+    fn the_terminal_and_where_its_entries_are_come_from_the_machine_lodge_runs_on() {
+        let local = FakeLocal::new()
+            .with_var("TERM", "xterm-kitty")
+            .with_var("TERMINFO", "/opt/ti")
+            .with_var("HOME", "/home/me")
+            .with_var("TERMINFO_DIRS", "/a::/b");
+        assert_eq!(local_term(&local).as_deref(), Some("xterm-kitty"));
+        let dirs = host_dirs(&local);
+        assert_eq!(
+            dirs[..4],
+            [
+                PathBuf::from("/opt/ti"),
+                PathBuf::from("/home/me/.terminfo"),
+                PathBuf::from("/a"),
+                PathBuf::from("/b")
+            ]
+        );
+        // A terminal that says nothing, or something unsafe in a path, is none.
+        assert_eq!(local_term(&FakeLocal::new()), None);
+        assert_eq!(local_term(&FakeLocal::new().with_var("TERM", "dumb")), None);
+        assert_eq!(local_term(&FakeLocal::new().with_var("TERM", "../x")), None);
     }
 }

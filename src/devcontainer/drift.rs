@@ -162,62 +162,53 @@ fn lexical(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::LocalHost;
+    use crate::host::fake::FakeHost;
     use crate::runtime::Runtime;
     use crate::runtime::fake::{FakeEnv, FakeRuntime};
 
-    fn project(files: &[(&str, &str)]) -> crate::tmpfile::TempDir {
-        let tmp = crate::tmpfile::TempDir::new("dc-hash").unwrap();
-        for (f, body) in files {
-            let path = tmp.path().join(f);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, body).unwrap();
-        }
-        tmp
+    /// A host with these files, under `/p`.
+    fn project(files: &[(&str, &str)]) -> FakeHost {
+        files.iter().fold(FakeHost::new(), |host, (f, body)| {
+            host.with_file(&format!("/p/{f}"), body)
+        })
     }
 
     #[test]
     fn files_nobody_declared_do_not_change_the_hash() {
-        let tmp = project(&[
+        let host = project(&[
             (".devcontainer/devcontainer.json", "{}"),
             (".devcontainer/Dockerfile", "FROM a\n"),
             (".devcontainer/go/devcontainer.json", "{}"),
         ]);
-        let dc = tmp.path().join(".devcontainer");
-        let config = dc.join("devcontainer.json");
-        let docker = [dc.join("Dockerfile")];
-        let hash = || hash_inputs(&config, &docker, &[], &LocalHost).unwrap();
+        let config = PathBuf::from("/p/.devcontainer/devcontainer.json");
+        let docker = [PathBuf::from("/p/.devcontainer/Dockerfile")];
+        let hash = || hash_inputs(&config, &docker, &[], &host).unwrap();
         let before = hash();
         // A sibling config, a script, a hook's cache: none of them is an input.
-        std::fs::write(dc.join("go/devcontainer.json"), r#"{"a":1}"#).unwrap();
-        std::fs::write(dc.join("setup.sh"), "echo\n").unwrap();
-        std::fs::create_dir_all(dc.join(".cache")).unwrap();
-        std::fs::write(dc.join(".cache/x"), "y").unwrap();
+        host.put_file("/p/.devcontainer/go/devcontainer.json", r#"{"a":1}"#);
+        host.put_file("/p/.devcontainer/setup.sh", "echo\n");
+        host.put_file("/p/.devcontainer/.cache/x", "y");
         assert_eq!(hash(), before);
-        std::fs::write(dc.join("Dockerfile"), "FROM b\n").unwrap();
+        host.put_file("/p/.devcontainer/Dockerfile", "FROM b\n");
         assert_ne!(hash(), before, "the Dockerfile counts");
         let before = hash();
-        std::fs::write(&config, r#"{"image":"x"}"#).unwrap();
+        host.put_file("/p/.devcontainer/devcontainer.json", r#"{"image":"x"}"#);
         assert_ne!(hash(), before, "the config counts");
     }
 
     #[test]
     fn a_local_feature_counts_whole_under_the_reference_it_was_given() {
-        let tmp = project(&[
+        let host = project(&[
             (".devcontainer/devcontainer.json", "{}"),
             (".devcontainer/feat/install.sh", "a"),
         ]);
-        let dc = tmp.path().join(".devcontainer");
-        let config = dc.join("devcontainer.json");
-        let feature = [("./feat".to_string(), dc.join("./feat"))];
-        let none = hash_inputs(&config, &[], &[], &LocalHost).unwrap();
-        let with = hash_inputs(&config, &[], &feature, &LocalHost).unwrap();
+        let config = PathBuf::from("/p/.devcontainer/devcontainer.json");
+        let feature = [("./feat".to_string(), PathBuf::from("/p/.devcontainer/feat"))];
+        let none = hash_inputs(&config, &[], &[], &host).unwrap();
+        let with = hash_inputs(&config, &[], &feature, &host).unwrap();
         assert_ne!(with, none);
-        std::fs::write(dc.join("feat/install.sh"), "b").unwrap();
-        assert_ne!(
-            hash_inputs(&config, &[], &feature, &LocalHost).unwrap(),
-            with
-        );
+        host.put_file("/p/.devcontainer/feat/install.sh", "b");
+        assert_ne!(hash_inputs(&config, &[], &feature, &host).unwrap(), with);
     }
 
     #[test]
@@ -231,20 +222,17 @@ mod tests {
 
     #[test]
     fn a_declared_file_counts_wherever_it_lives() {
-        let tmp = project(&[
+        let host = project(&[
             (".devcontainer/devcontainer.json", "{}"),
             ("outside.yml", "x"),
         ]);
-        let config = tmp.path().join(".devcontainer/devcontainer.json");
-        let outside = [tmp.path().join(".devcontainer/../outside.yml")];
-        let none = hash_inputs(&config, &[], &[], &LocalHost).unwrap();
-        let with = hash_inputs(&config, &outside, &[], &LocalHost).unwrap();
+        let config = PathBuf::from("/p/.devcontainer/devcontainer.json");
+        let outside = [PathBuf::from("/p/.devcontainer/../outside.yml")];
+        let none = hash_inputs(&config, &[], &[], &host).unwrap();
+        let with = hash_inputs(&config, &outside, &[], &host).unwrap();
         assert_ne!(with, none);
-        std::fs::write(tmp.path().join("outside.yml"), "y").unwrap();
-        assert_ne!(
-            hash_inputs(&config, &outside, &[], &LocalHost).unwrap(),
-            with
-        );
+        host.put_file("/p/outside.yml", "y");
+        assert_ne!(hash_inputs(&config, &outside, &[], &host).unwrap(), with);
     }
 
     #[test]

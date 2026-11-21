@@ -2,14 +2,13 @@
 //! from here) or the tunnel process the host provides (they are not).
 
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::process::{Child, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
-use crate::host::Host;
+use crate::host::{Child, Host, Stream};
 
 macro_rules! log {
     ($($arg:tt)*) => { $crate::output::scoped!("lodge forward", $($arg)*) };
@@ -20,7 +19,7 @@ macro_rules! log {
 enum Forwarder {
     Proxy(ProxyHandle),
     Tunnel {
-        child: Child,
+        child: Box<dyn Child>,
         local: u16,
         dest: String,
         /// When it was started, to tell a tunnel that held for a while from one
@@ -72,9 +71,15 @@ impl<'a> HostForwarders<'a> {
 
 impl Forwarders for HostForwarders<'_> {
     fn start(&self, local: u16, dest: &str) -> std::io::Result<Box<dyn Forward>> {
-        let forward = if let Some(cmd) = self.host.tunnel(local, dest) {
+        // With --verbose, the tunnel's own chatter lands in the daemon log.
+        let chatter = if crate::output::is_verbose() {
+            Stream::Inherit
+        } else {
+            Stream::Null
+        };
+        let forward = if let Some(child) = self.host.tunnel(local, dest, chatter) {
             log!("port {local} — tunnel to {dest}{}", self.on_host());
-            Forwarder::tunnel(cmd, local, dest)?
+            Forwarder::tunnel(child?, local, dest)
         } else {
             log!("port {local} — proxy 127.0.0.1:{local} → {dest}");
             Forwarder::proxy(local, dest.to_string())?
@@ -93,23 +98,14 @@ impl Forwarder {
         ProxyHandle::spawn(local, dest).map(Forwarder::Proxy)
     }
 
-    /// `cmd` is the host's own tunnel process for `local` to `dest`.
-    fn tunnel(mut cmd: std::process::Command, local: u16, dest: &str) -> std::io::Result<Self> {
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            // With --verbose, let the tunnel's own chatter land in the daemon log.
-            .stderr(if crate::output::is_verbose() {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            });
-        crate::output::trace(&cmd);
-        cmd.spawn().map(|child| Forwarder::Tunnel {
+    /// `child` is the host's own tunnel process for `local` to `dest`.
+    fn tunnel(child: Box<dyn Child>, local: u16, dest: &str) -> Self {
+        Forwarder::Tunnel {
             child,
             local,
             dest: dest.to_string(),
             since: Instant::now(),
-        })
+        }
     }
 }
 
@@ -243,6 +239,35 @@ fn proxy_conn(client: TcpStream, server: TcpStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_host_with_tunnels_gets_a_tunnel_that_stops_when_dropped() {
+        let host = crate::host::fake::FakeHost::remote("h").with_tunnels();
+        let forwarders = HostForwarders::new(&host);
+        let mut forward = forwarders.start(8080, "10.0.0.2:80").unwrap();
+        assert_eq!(forward.describe(), "8080\t10.0.0.2:80");
+        assert!(forward.is_alive());
+        assert!(
+            forward.ran_for().is_some(),
+            "a tunnel has a connection to lose"
+        );
+        assert_eq!(host.argvs(), [["tunnel", "8080", "10.0.0.2:80"]]);
+        drop(forward);
+    }
+
+    #[test]
+    fn a_host_without_tunnels_is_proxied_in_process() {
+        let server = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let dest = server.local_addr().unwrap().to_string();
+        let host = crate::host::fake::FakeHost::new();
+        let forward = HostForwarders::new(&host).start(0, &dest).unwrap();
+        assert_eq!(forward.dest(), dest);
+        assert!(forward.ran_for().is_none());
+        assert!(
+            host.argvs().is_empty(),
+            "no process: the proxy is in-process"
+        );
+    }
 
     #[test]
     fn the_proxy_listens_on_localhost_only_and_forwards() {

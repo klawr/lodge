@@ -13,6 +13,7 @@ pub mod terminfo;
 use crate::config::SessionConfig;
 use crate::host::Host;
 use crate::layout::Layout;
+use crate::local::Local;
 use crate::output::{info, note, prompt, warning};
 use crate::runtime::{Acting, Container, ContainerUser};
 use crate::shell::shell_quote;
@@ -71,10 +72,11 @@ fn path_script(layout: &Layout) -> String {
 }
 
 /// Opens an interactive login shell in `container` (on the engine on `host`),
-/// wrapped as `config` says.
+/// wrapped as `config` says. `local` is the terminal it is opened from.
 pub fn enter(
     container: &dyn Container,
     host: &dyn Host,
+    local: &dyn Local,
     config: &SessionConfig,
     s: &Session,
 ) -> Result<()> {
@@ -98,23 +100,24 @@ pub fn enter(
     // effort: a missing entry only costs some colours.
     let env = Acting::new(container, s.user);
     let terminfo_dir = s.layout.terminfo();
-    let term_setup = terminfo::prepare(&env, &terminfo_dir, terminfo::local_term().as_deref())
-        .map(|t| terminfo::session_setup(&terminfo_dir, &t))
-        .unwrap_or_default();
+    let term_setup = terminfo::prepare(
+        &env,
+        &terminfo_dir,
+        terminfo::local_term(local).as_deref(),
+        local,
+    )
+    .map(|t| terminfo::session_setup(&terminfo_dir, &t))
+    .unwrap_or_default();
     let inner = startup_script(
         s.layout,
         shell,
         &format!("{}{term_setup}{set_title}; ", s.setup),
     );
 
-    // The local command that opens the interactive session; how it reaches the
-    // container (docker exec, through the host's terminal) is the environment's
-    // business. Built afresh for each start.
-    let start = || {
-        let mut cmd = container.interactive_command(s.user.exec_as(), s.workdir, &inner);
-        crate::output::trace(&cmd);
-        cmd.status()
-    };
+    // Opens the interactive session; how it reaches the container (docker exec,
+    // through the host's terminal) is the environment's business. Can be started
+    // again.
+    let start = || container.interactive(s.user.exec_as(), s.workdir, &inner);
     let container_id = container.id();
 
     info!("entering {container_id}");

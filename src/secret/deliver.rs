@@ -4,6 +4,7 @@
 use super::{place, resolve};
 use crate::config::secret::SecretDecl;
 use crate::host::Host;
+use crate::local::Local;
 use crate::output::{info, note, warning};
 use crate::runtime::{Container, ContainerUser};
 use anyhow::Result;
@@ -18,6 +19,7 @@ pub fn deliver(
     host: &dyn Host,
     user: &ContainerUser,
     decls: &[SecretDecl],
+    local: &dyn Local,
 ) -> Result<String> {
     if decls.is_empty() {
         // Nothing declared (any more): take away whatever an earlier run placed.
@@ -36,7 +38,7 @@ pub fn deliver(
 
     let mut resolved = Vec::new();
     for decl in wanted {
-        match resolve(decl) {
+        match resolve(decl, local) {
             Ok(value) => resolved.push((decl, value)),
             Err(e) => warning!("secret not delivered: {e:#}"),
         }

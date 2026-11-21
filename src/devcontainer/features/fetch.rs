@@ -110,7 +110,7 @@ mod tests {
         let work = crate::tmpfile::TempDir::new("pull-test").unwrap();
         let ctx = Context {
             base_dir: Path::new("/p/.devcontainer"),
-            host: &crate::host::LocalHost,
+            host: &crate::host::fake::FakeHost::new(),
             oci: &OneFeature,
         };
         let (meta, dir) = fetch(&ctx, "ghcr.io/x/feat:1", &work.path().join("0")).unwrap();
@@ -123,7 +123,7 @@ mod tests {
         let work = crate::tmpfile::TempDir::new("pull-fail").unwrap();
         let ctx = Context {
             base_dir: Path::new("/p/.devcontainer"),
-            host: &crate::host::LocalHost,
+            host: &crate::host::fake::FakeHost::new(),
             oci: &crate::tools::NoRegistry,
         };
         let err = fetch(&ctx, "ghcr.io/x/feat:1", &work.path().join("0"))

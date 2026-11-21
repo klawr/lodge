@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::ExitStatus;
 
 use crate::shell::{script_argv, shell_quote};
 use crate::tmpfile::TempFile;
@@ -147,10 +147,10 @@ pub trait Env {
     /// atomically. The parent directory must already exist.
     fn write_secret(&self, dest: &str, contents: &[u8], mode: u32, user: User) -> Result<()>;
 
-    /// A local command that opens an interactive session in the environment,
-    /// running `inner` (a `sh -c` script) as `user` from `workdir`. Built afresh
-    /// on each call, so a session can be started again.
-    fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> Command;
+    /// Opens an interactive session in the environment, running `inner` (a
+    /// `sh -c` script) as `user` from `workdir`, and waits until it ends. Can be
+    /// called again to start another.
+    fn interactive(&self, user: User, workdir: &str, inner: &str) -> std::io::Result<ExitStatus>;
 
     /// Whether `user` can write a program into `dir` (made if need be) and run it
     /// from there; with `private`, also that `user` owns `dir`, which is then
@@ -308,8 +308,8 @@ impl Env for Acting<'_> {
         self.env.write_secret(dest, contents, mode, user)
     }
 
-    fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> Command {
-        self.env.interactive_command(user, workdir, inner)
+    fn interactive(&self, user: User, workdir: &str, inner: &str) -> std::io::Result<ExitStatus> {
+        self.env.interactive(user, workdir, inner)
     }
 
     fn can_run_in(&self, dir: &str, private: bool, user: &ContainerUser) -> Result<bool> {
@@ -463,10 +463,6 @@ pub trait Runtime {
     /// A handle for the container with this id or name.
     fn container(&self, id: &str) -> Box<dyn Container>;
 
-    /// The arguments that make a child lodge (the forward daemon is one) drive
-    /// this same engine, in front of its subcommand.
-    fn respawn_args(&self) -> Vec<String>;
-
     /// The engine's server version; errors if the engine can't be reached.
     fn version(&self) -> Result<String>;
 
@@ -619,7 +615,12 @@ mod tests {
         fn write_secret(&self, _: &str, _: &[u8], _: u32, _: User) -> anyhow::Result<()> {
             unreachable!()
         }
-        fn interactive_command(&self, _: User, _: &str, _: &str) -> std::process::Command {
+        fn interactive(
+            &self,
+            _: User,
+            _: &str,
+            _: &str,
+        ) -> std::io::Result<std::process::ExitStatus> {
             unreachable!()
         }
         fn can_run_in(

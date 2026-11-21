@@ -71,7 +71,8 @@ every subcommand.
 | `port.rs` | `PortForward`, a port to forward: what the devcontainer spec declares and the daemon carries out, so neither depends on the other. |
 | `tools/` | The build-time helpers behind interfaces: `DepReader` (which libraries a binary needs), `ElfEditor` (relink a copy of a binary for the bundle's prefix) and `OciFetcher` (pull a feature's layer), bundled as a `Toolchain` that `cmd::run` builds. `external` has the implementations that run the programs (`Ldd`, `Patchelf`, `Oras`, parsing `ldd`'s output); a native one is one more type. Packing, the bundle cache and feature fetching take the interfaces and are tested with fakes. |
 | `host_tools.rs` | The helper programs lodge may run here (`ssh`, `ldd`, `patchelf`, `oras`): what each is needed for (a `Need`, which decides when `doctor` requires it) and how to get it. `doctor` reports from this table and each tool is started only through it (the `tools` implementations and `host/ssh.rs`). |
-| `host/` | How a machine is reached. `mod` is the `Host` trait (a local process that runs a command on the host, one with a terminal, a tunnel, the connection hooks) with everything built on those provided: running a script, `read_first` (finds files by pattern and reads the first in one round trip), `read_file`, `canonical_dir`, `fetch_dir` (copies a folder from the project's host), `write_scratch`, `uid_gid`; and `attempt`, which reruns a step after a lost connection if it is marked `Repeat::Safe`. `local` is `LocalHost`, this machine. `ssh` is `SshHost`: `--remote` destination parsing, the shared connection (`connect` opens it up front with the terminal available, `ControlMaster` multiplexes everything after), and the few ssh invocations lodge needs, all built from one private `base`. |
+| `local.rs` | `Local`: the machine lodge runs on (environment variables, files a secret names, a local shell for a secret's `command`), with `SystemLocal` and, in tests, `FakeLocal`. Built once in `cmd/` and handed down, so nothing else asks the process. |
+| `host/` | How a machine is reached. `mod` is the `Host` trait (`run` one `Job` with the streams the caller asks for, `interactive`, `tunnel`, the connection hooks; no process type crosses it) with everything built on those provided (`exec` runs a job and retries it after a lost connection if it is `Repeat::Safe`): running a script, `read_first` (finds files by pattern and reads the first in one round trip), `read_file`, `canonical_dir`, `fetch_dir` (copies a folder from the project's host), `write_scratch`, `uid_gid`; and `attempt`, which reruns a step after a lost connection if it is marked `Repeat::Safe`. `fake` (tests) is `FakeHost`: it records every job and answers from a script, with files in memory, so everything that only uses a host is tested without a process. `local` is `LocalHost`, this machine. `ssh` is `SshHost`: `--remote` destination parsing, the shared connection (`connect` opens it up front with the terminal available, `ControlMaster` multiplexes everything after), and the few ssh invocations lodge needs, all built from one private `base`. |
 | `runtime/` | The seam to whatever runs the workload: the `Env`, `Container`, `Runtime` and `Compose` traits (see below), `User` (who a command runs as) and `ContainerUser` (the session user's name, uid, gid and home, looked up once), `Acting` (an `Env` seen as one user, below), `tarball` (packs files as a tar owned by a user), the docker-compatible CLI implementation (`cli/`, for `docker` and `podman`: the engine, which runs on a `Host` it is given, the per-container `Env`, and the file-copy streaming; `Docker` and `Podman` are two engines, each a `CliEngine` of its own `Flavor` (`docker.rs`, `podman.rs`), which holds what is its own: the program, `cp`'s flags and wording, extra `run` flags, how compose is asked, and whether a container's address is reachable (not for rootless Podman). The plumbing is shared and asks the flavor; it never checks which engine it is), and strict in-memory fakes for tests (`FakeEnv`, and `FakeRuntime`, whose containers each run in one). |
 | `shell.rs` | POSIX `shell_quote`, which everything that builds a command string goes through; `script_argv`, how every script with arguments is started (`sh -c <script> sh <args…>`, so arguments are `$1`, `$2`, …); the rules for names written into scripts unquoted (`is_plain_name`, `is_var_name`) and for destinations in a container (`container_path_problem`); `slug` for container names; and `CmdLine`, a command as `sh -c` script or argv. |
 | `fingerprint.rs` | The small content hash used to notice changes (devcontainer inputs, updated libraries, bundle contents), as a `Fingerprint` builder. Its values are stored, so a test pins them. |
@@ -269,11 +270,11 @@ and the docker CLI runs *on the remote host* over SSH, so no local Docker is
 needed. Nothing but `host/ssh.rs` knows that; this section is what `SshHost`
 does behind the `Host` trait. Four things make it work:
 
-- `CliEngine` asks its host for a process that runs `docker …`
-  (`Host::command`), and `SshHost` answers with `ssh <dest> …`, shell-quoting each
-  argument. Anything that reads **files** (compose projects, build contexts)
-  goes through `CliEngine::command_in`, which hands the host the project
-  directory too, so `SshHost` `cd`s into it *on the remote*.
+- `CliEngine` hands its host a `Job` that runs `docker …` (`Host::exec`), and
+  `SshHost` answers with `ssh <dest> …`, shell-quoting each argument. Anything
+  that reads **files** (compose projects, build contexts) goes through
+  `CliEngine::job_in`, which gives the job the project directory too, so
+  `SshHost` `cd`s into it *on the remote*.
 - **Connection reuse.** A single `ldg up` issues dozens of SSH calls.
   `Host::connect` opens one connection first (a password or 2FA prompt is
   answered once, with the terminal available) and every later call is
@@ -323,7 +324,7 @@ small traits from narrow to broad, plus one for compose:
 | `Compose` | an engine's compose support (`Runtime::compose()`, an error where there is none): up, down, ps | the compose backend, `doctor` |
 
 `Env` carries the primitives (`exec`, `output`, `put`, plus `write_secret` and
-`interactive_command`, which need engine-specific stdin and TTY handling) and
+`interactive`, which need engine-specific stdin and TTY handling) and
 provides everything else on top of them: `write_file`, `read_file`, `mkdir_p`,
 `exists`, and so on. So code that injects a tool takes one `&dyn Env`
 instead of a `(docker, container)` pair, and anything new that implements the
@@ -385,7 +386,8 @@ just how it is done.
 
 | Dependency | Interface | Implementations |
 | --- | --- | --- |
-| How a machine is reached | `host::Host` | `LocalHost`, `SshHost`; anything else that can run a command implements the two primitives |
+| How a machine is reached | `host::Host` | `LocalHost`, `SshHost`, and `FakeHost` for tests; anything else that can run a command implements `run`, `interactive` and `tunnel` |
+| The machine lodge runs on | `local::Local` | `SystemLocal` (environment, files a secret names, a local shell); `FakeLocal` for tests |
 | The container engine | `runtime::Runtime`, `Compose`, `Container`, `Env` | `runtime::cli`, and the in-memory `FakeRuntime` for tests |
 | The build-time helpers | `tools::DepReader`, `ElfEditor`, `OciFetcher` (a `Toolchain`) | `Ldd`, `Patchelf`, `Oras`; a test passes fakes |
 | Making an endpoint ready | `provision::Provisioner` | `devcontainer::Devcontainer` (the only one so far) |
@@ -393,12 +395,12 @@ just how it is done.
 | What is injected | `[[inject]]` data | multiplexers and other tools are injected like any other, never named in code |
 
 The pieces compose instead of branching. The engine is built *on* a host
-(`CliEngine::new(host)`), so "docker over ssh" is the same engine with a different
+(`Docker::new(host)`, `Podman::new(host)`), so "docker over ssh" is the same engine with a different
 host, not a third case; a remote Podman would be a second engine on the same
-host. `Host` has two primitives, `command` (a local process that runs a command
-on the host) and `interactive` (the same with a terminal), plus the connection
-hooks (`connect`, `link_lost`, `reset_link`, `retry_policy`, `pty_denied`,
-`tunnel`); everything else (`sh_output`, `run_in`, `canonical_dir`, `read_first`,
+host. `Host` has three primitives, `run` (one `Job`: the command, its directory, what
+it reads on stdin and what happens to its output and errors), `interactive` (a
+command with a terminal) and `tunnel`, plus the connection hooks (`connect`,
+`link_lost`, `reset_link`, `retry_policy`, `pty_denied`); everything else (`sh_output`, `run_in`, `canonical_dir`, `read_first`,
 `read_file`, `fetch_dir`, `write_scratch`, `remove_file`, `uid_gid`) is provided on
 top of them, so an implementation gets it by writing the primitives and
 overrides only what it can do better (`LocalHost` reads files directly). The
@@ -407,15 +409,15 @@ removes it again.
 
 `--remote` and `--engine` (or `engine` in the config, `choose_engine`) are read once, in
 `cmd::run`, which is the composition root: the only place that picks `LocalHost` or `SshHost` and, with
-`build_engine`, the engine built on it (`CliEngine`, for `--engine docker`), then
-puts both in the `Ctx`, together with the `Toolchain` of helper tools it builds. A child lodge (the forward daemon) is pointed at the same
-pair through `Host::respawn_args` and `Runtime::respawn_args`. From there on nothing handles a bare `Option<String>`
+`build_engine`, the engine built on it, then puts both in the `Ctx`, together with
+the `Toolchain` of helper tools and the `Local` machine it builds. A child lodge
+(the forward daemon) is pointed at the same pair by `cmd::respawn_args`: the
+command line is the command layer's to know, not the host's or the engine's. From there on nothing handles a bare `Option<String>`
 or matches on a kind of host. The command hands `&dyn Host` (or `HostRef`, where a
 backend keeps one) to whatever needs it (`devcontainer`, `forward`, `secret`,
 `session`) and the `Runtime` as `&dyn Runtime`. What differs between hosts is
 asked as a capability, not by name: `shares_cwd` (may the project path be left
-out), `names` (what a secret's `targets` match), `respawn_args` (how the forward
-daemon reaches the same host), `tunnel` (the process that forwards a port, or
+out), `names` (what a secret's `targets` match), `tunnel` (the process that forwards a port, or
 `None` when the engine's addresses are reachable from here and the in-process
 proxy is used).
 
@@ -430,11 +432,13 @@ second provisioner, `up` is where it is picked, from the project's signals (a
 
 **What is not a choice yet.** Some things are still used directly, so there is
 nothing to swap or fake there:
-- the interactive session's local side (`session/` runs `sh` for the terminfo
-  copy and reads the reconnect answer from this terminal);
-- a secret's `command` source (`secret/` runs `sh` on this machine);
-- this machine's own files and process (the bundle cache, temp files, loading the
-  config, finding `ldg`'s own executable to start the forward daemon).
+- the interactive session's local side (`session/` reads the reconnect answer
+  from this terminal);
+- this machine's own files and standard directories (the bundle cache, temp
+  files, loading the config, finding `ldg`'s own executable to start the forward
+  daemon). `conventions.rs` lists which files still reach for the process itself,
+  and the list may only shrink. The environment, the files a secret names, a
+  secret's `command` and `${localEnv:…}` go through `local::Local`.
 
 Making one of these a choice follows the same recipe as the others.
 
@@ -476,7 +480,7 @@ erode.
 - **One place per external program.** `ssh` is started only in `host/ssh.rs`;
   `docker` is never started directly: `runtime/cli/` asks its `Host` to run it,
   and no other module spells it out; a local `sh` only in `host/local.rs` (scripts
-  on this machine as the project's host) and `secret/` (a secret's `command`
+  on this machine as the project's host) and `local.rs` (a secret's `command`
   source, which is on this machine whatever the host); and the helper tools
   (`ldd`, `patchelf`, `oras`) only in `tools/external.rs`, through `host_tools`,
   behind `DepReader`, `ElfEditor` and `OciFetcher`. lodge never runs a local

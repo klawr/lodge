@@ -14,11 +14,10 @@
 use anyhow::{Context, Result, bail};
 use std::io::Read;
 use std::path::Path;
-use std::process::Stdio;
 
 use super::Flavor;
 use super::container::CliContainer;
-use crate::host::Repeat;
+use crate::host::{Input, Repeat};
 use crate::runtime::{ContainerUser, Env, ExecOpts, tarball};
 
 impl<F: Flavor> CliContainer<F> {
@@ -53,26 +52,23 @@ impl<F: Flavor> CliContainer<F> {
         let target = format!("{}:{into}", self.id);
         // Unpacking the same archive again leaves the same files, so a lost
         // connection reruns the whole send, packing the tar afresh.
-        let (status, packed) = self
+        let mut packed = Ok(());
+        let mut feed = |stdin: &mut dyn std::io::Write| {
+            // Dropping the writer closes the pipe, so the engine sees the end of input.
+            packed = tarball::pack(source, &name, owner, stdin);
+            Ok(())
+        };
+        let ran = self
             .cli
             .host
-            .attempt(Repeat::Safe, || {
-                let mut cmd = self.cli.command(&self.cli.flavor.cp_in_args(&target));
-                // `command` closes stdin; this one streams, so override it.
-                cmd.stdin(Stdio::piped());
-                let mut child = cmd.spawn()?;
-                // Dropping the writer closes the pipe, so docker sees the end of input.
-                let packed = {
-                    let stdin = child
-                        .stdin
-                        .take()
-                        .ok_or_else(|| std::io::Error::other("cp stdin was not piped"))?;
-                    tarball::pack(source, &name, owner, stdin)
-                };
-                Ok((child.wait()?, packed))
-            })
+            .exec(
+                self.cli
+                    .job(&self.cli.flavor.cp_in_args(&target))
+                    .stdin(Input::Feed(&mut feed))
+                    .repeat(Repeat::Safe),
+            )
             .with_context(|| format!("running {} cp", self.cli.name()))?;
-        if !status.success() {
+        if !ran.status.success() {
             bail!("{} cp failed: {src} -> {target}", self.cli.name());
         }
         packed.with_context(|| format!("packing {src}"))
@@ -86,12 +82,15 @@ impl<F: Flavor> CliContainer<F> {
         let out = self
             .cli
             .host
-            .attempt(Repeat::Safe, || {
-                self.cli.command(&["cp", &from, "-"]).output()
-            })
+            .exec(
+                self.cli
+                    .job(&["cp", &from, "-"])
+                    .capture()
+                    .repeat(Repeat::Safe),
+            )
             .with_context(|| format!("spawning {} cp", self.cli.name()))?;
         if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
+            let err = out.stderr_text();
             if self.cli.flavor.says_path_is_missing(&err) {
                 return Ok(None);
             }

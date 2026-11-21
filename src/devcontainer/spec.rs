@@ -5,6 +5,7 @@
 //! project path. The backend (and the container's name) is
 //! [`backend`](super::backend)'s.
 
+use crate::local::Local;
 use crate::output::warning;
 use anyhow::{Context, Result, bail};
 use json_comments::StripComments;
@@ -154,9 +155,9 @@ impl Spec {
     }
 }
 
-pub(super) fn load_spec(project_path: &Path, host: &HostRef) -> Result<Spec> {
+pub(super) fn load_spec(project_path: &Path, host: &HostRef, local: &dyn Local) -> Result<Spec> {
     let (config_path, raw) = find_config(project_path, host.as_ref())?;
-    build_spec(parse_config(&raw)?, config_path, project_path, host)
+    build_spec(parse_config(&raw)?, config_path, project_path, host, local)
 }
 
 fn parse_config(raw: &str) -> Result<DevcontainerConfig> {
@@ -171,6 +172,7 @@ fn build_spec(
     config_path: PathBuf,
     project_path: &Path,
     host: &HostRef,
+    local: &dyn Local,
 ) -> Result<Spec> {
     let DevcontainerConfig {
         workspace_folder,
@@ -190,10 +192,10 @@ fn build_spec(
     let base_dir = config_path.parent().unwrap_or(project_path).to_path_buf();
     let basename = project_basename(project_path);
     let workspace_folder = workspace_folder
-        .map(|wf| Vars::new(project_path).apply(&wf))
+        .map(|wf| Vars::new(project_path, local).apply(&wf))
         .unwrap_or_else(|| format!("/workspaces/{basename}"));
     // From here on `${containerWorkspaceFolder}` can be resolved too.
-    let vars = Vars::new(project_path).with_container_workspace(&workspace_folder);
+    let vars = Vars::new(project_path, local).with_container_workspace(&workspace_folder);
 
     let built = build_backend(
         source,
@@ -344,33 +346,30 @@ fn find_config(project_path: &Path, host: &dyn Host) -> Result<(PathBuf, String)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{LocalHost, local};
+    use crate::host::fake;
+    use crate::host::fake::FakeHost;
+    use crate::local::fake::FakeLocal;
 
     #[test]
     fn the_config_is_found_in_spec_order() {
-        let tmp = crate::tmpfile::TempDir::new("find-config").unwrap();
-        let p = tmp.path();
-        assert!(find_config(p, &LocalHost).is_err());
-        for f in [
-            ".devcontainer/b/devcontainer.json",
-            ".devcontainer/a/devcontainer.json",
-        ] {
-            std::fs::create_dir_all(p.join(f).parent().unwrap()).unwrap();
-            std::fs::write(p.join(f), "{}").unwrap();
-        }
+        let p = Path::new("/p");
+        let host = FakeHost::new();
+        assert!(find_config(p, &host).is_err());
+        host.put_file("/p/.devcontainer/b/devcontainer.json", "{}");
+        host.put_file("/p/.devcontainer/a/devcontainer.json", "{}");
         // Subfolders: the first alphabetically.
         assert_eq!(
-            find_config(p, &LocalHost).unwrap().0,
+            find_config(p, &host).unwrap().0,
             p.join(".devcontainer/a/devcontainer.json")
         );
-        std::fs::write(p.join(".devcontainer.json"), "{}").unwrap();
+        host.put_file("/p/.devcontainer.json", "{}");
         assert_eq!(
-            find_config(p, &LocalHost).unwrap().0,
+            find_config(p, &host).unwrap().0,
             p.join(".devcontainer.json")
         );
-        std::fs::write(p.join(".devcontainer/devcontainer.json"), "{}").unwrap();
+        host.put_file("/p/.devcontainer/devcontainer.json", "{}");
         assert_eq!(
-            find_config(p, &LocalHost).unwrap().0,
+            find_config(p, &host).unwrap().0,
             p.join(".devcontainer/devcontainer.json")
         );
     }
@@ -406,7 +405,8 @@ mod tests {
             parse_config(json)?,
             PathBuf::from("/home/me/proj/.devcontainer/devcontainer.json"),
             Path::new("/home/me/proj"),
-            &local(),
+            &fake(),
+            &FakeLocal::new(),
         )
     }
 

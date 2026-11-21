@@ -4,6 +4,7 @@
 //! handled here: it is rewritten for the container's own shell to expand (see
 //! `spec::normalize_env_value`).
 
+use crate::local::Local;
 use std::path::Path;
 
 use crate::fingerprint::Fingerprint;
@@ -21,13 +22,16 @@ pub(super) fn path_tag(path: &Path) -> String {
 pub(super) struct Vars<'a> {
     project: &'a Path,
     container_workspace: Option<&'a str>,
+    /// Where `${localEnv:…}` is read from.
+    local: &'a dyn Local,
 }
 
 impl<'a> Vars<'a> {
-    pub(super) fn new(project: &'a Path) -> Self {
+    pub(super) fn new(project: &'a Path, local: &'a dyn Local) -> Self {
         Self {
             project,
             container_workspace: None,
+            local,
         }
     }
 
@@ -66,7 +70,11 @@ impl<'a> Vars<'a> {
             let end = start + end_rel;
             let spec = &out[start + "${localEnv:".len()..end];
             let (name, default) = spec.split_once(':').unwrap_or((spec, ""));
-            let value = std::env::var(name).unwrap_or_else(|_| default.to_string());
+            let value = self
+                .local
+                .var(name)
+                .and_then(|v| v.into_string().ok())
+                .unwrap_or_else(|| default.to_string());
             out.replace_range(start..=end, &value);
             from = start + value.len();
         }
@@ -77,26 +85,30 @@ impl<'a> Vars<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local::fake::FakeLocal;
 
     #[test]
     fn local_workspace_variables() {
         let p = Path::new("/home/me/proj");
-        let v = Vars::new(p);
+        let local = FakeLocal::new().with_var("PATH", "/usr/bin");
+        let v = Vars::new(p, &local);
         assert_eq!(v.apply("${localWorkspaceFolder}/x"), "/home/me/proj/x");
         assert_eq!(v.apply("${localWorkspaceFolderBasename}"), "proj");
     }
 
     #[test]
     fn local_env_resolves_and_missing_is_empty() {
-        let v = Vars::new(Path::new("/p"));
+        let local = FakeLocal::new().with_var("PATH", "/usr/bin");
+        let v = Vars::new(Path::new("/p"), &local);
         // PATH is reliably set.
-        assert_eq!(v.apply("${localEnv:PATH}"), std::env::var("PATH").unwrap());
+        assert_eq!(v.apply("${localEnv:PATH}"), "/usr/bin");
         assert_eq!(v.apply("a${localEnv:LODGE_DEFINITELY_UNSET}b"), "ab");
     }
 
     #[test]
     fn local_env_default_is_used_when_unset() {
-        let v = Vars::new(Path::new("/p"));
+        let local = FakeLocal::new().with_var("PATH", "/usr/bin");
+        let v = Vars::new(Path::new("/p"), &local);
         assert_eq!(
             v.apply("${localEnv:LODGE_DEFINITELY_UNSET:fallback}"),
             "fallback"
@@ -105,15 +117,13 @@ mod tests {
         // A default may itself contain a colon.
         assert_eq!(v.apply("${localEnv:LODGE_DEFINITELY_UNSET:a:b}"), "a:b");
         // The variable wins over the default when it is set.
-        assert_eq!(
-            v.apply("${localEnv:PATH:fallback}"),
-            std::env::var("PATH").unwrap()
-        );
+        assert_eq!(v.apply("${localEnv:PATH:fallback}"), "/usr/bin");
     }
 
     #[test]
     fn several_variables_in_one_value() {
-        let v = Vars::new(Path::new("/p"));
+        let local = FakeLocal::new().with_var("PATH", "/usr/bin");
+        let v = Vars::new(Path::new("/p"), &local);
         assert_eq!(
             v.apply("${localEnv:LODGE_UNSET_A:x}-${localEnv:LODGE_UNSET_B:y}"),
             "x-y"
@@ -124,11 +134,12 @@ mod tests {
     fn container_workspace_variables_need_the_folder() {
         let p = Path::new("/home/me/proj");
         assert_eq!(
-            Vars::new(p).apply("${containerWorkspaceFolder}"),
+            Vars::new(p, &FakeLocal::new()).apply("${containerWorkspaceFolder}"),
             "${containerWorkspaceFolder}",
             "left alone until the folder is known"
         );
-        let v = Vars::new(p).with_container_workspace("/workspaces/proj");
+        let local = FakeLocal::new();
+        let v = Vars::new(p, &local).with_container_workspace("/workspaces/proj");
         assert_eq!(
             v.apply("${containerWorkspaceFolder}/src"),
             "/workspaces/proj/src"
@@ -138,21 +149,22 @@ mod tests {
 
     #[test]
     fn devcontainer_id_is_stable_and_path_scoped() {
-        let a = Vars::new(Path::new("/a/proj")).apply("${devcontainerId}");
+        let a = Vars::new(Path::new("/a/proj"), &FakeLocal::new()).apply("${devcontainerId}");
         assert_eq!(
             a,
-            Vars::new(Path::new("/a/proj")).apply("${devcontainerId}")
+            Vars::new(Path::new("/a/proj"), &FakeLocal::new()).apply("${devcontainerId}")
         );
         assert_ne!(
             a,
-            Vars::new(Path::new("/b/proj")).apply("${devcontainerId}")
+            Vars::new(Path::new("/b/proj"), &FakeLocal::new()).apply("${devcontainerId}")
         );
         assert!(!a.contains("${"));
     }
 
     #[test]
     fn an_unterminated_reference_is_left_as_is() {
-        let v = Vars::new(Path::new("/p"));
+        let local = FakeLocal::new().with_var("PATH", "/usr/bin");
+        let v = Vars::new(Path::new("/p"), &local);
         assert_eq!(v.apply("x${localEnv:PATH"), "x${localEnv:PATH");
     }
 }

@@ -15,10 +15,10 @@
 
 use anyhow::{Context, Result, bail};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::ExitStatus;
 
 use super::{BuildSpec, Compose, Container, Containers, Listed, RunSpec, Runtime};
-use crate::host::{HostRef, Repeat};
+use crate::host::{HostRef, Input, Job, Repeat, Stream};
 
 mod container;
 mod copy;
@@ -91,96 +91,93 @@ impl<F: Flavor> CliEngine<F> {
         v
     }
 
-    /// Builds a command that runs `docker <args>` on the host. Stdin is closed
-    /// (`/dev/null`) so a remote hop doesn't swallow the terminal; callers that
-    /// need to stream data override it. Traced at `-v`. Every `docker` lodge runs
-    /// is built here, in [`command_in`](Self::command_in) or in
-    /// [`interactive`](Self::interactive).
-    pub(super) fn command(&self, args: &[&str]) -> Command {
-        let mut c = self.host.argv(&self.argv(args), None);
-        c.stdin(Stdio::null());
-        crate::output::trace(&c);
-        c
+    /// A job that runs `<program> <args>` on the host. Its input is closed so a
+    /// remote hop doesn't swallow the terminal; callers that need to stream data
+    /// override it. Every container-engine command lodge runs is built here, in
+    /// [`job_in`](Self::job_in) or in [`interactive`](Self::interactive).
+    pub(super) fn job<'a>(&self, args: &[&str]) -> Job<'a> {
+        Job::argv(&self.argv(args))
     }
 
-    /// Like [`command`](Self::command) for operations that read *files* from
-    /// disk (a compose project, a build context). Those are read client-side,
-    /// i.e. on the host where the docker CLI runs, so the working directory has
-    /// to be the project dir *there*.
-    fn command_in(&self, dir: Option<&Path>, args: &[&str]) -> Command {
-        let c = self.host.argv(&self.argv(args), dir);
-        crate::output::trace(&c);
-        c
+    /// Like [`job`](Self::job) for operations that read *files* from disk (a
+    /// compose project, a build context). Those are read client-side, i.e. on the
+    /// host where the CLI runs, so the working directory has to be the project
+    /// dir *there*, and the terminal stays available.
+    fn job_in<'a>(&self, dir: Option<&'a Path>, args: &[&str]) -> Job<'a> {
+        self.job(args).in_dir(dir).stdin(Input::Inherit)
     }
 
-    /// A command that opens an interactive `docker <args>` on the host, with a
-    /// terminal.
-    pub(super) fn interactive(&self, args: &[&str]) -> Command {
+    /// Opens an interactive `<program> <args>` on the host, with a terminal, and
+    /// waits for it.
+    pub(super) fn interactive(&self, args: &[&str]) -> std::io::Result<ExitStatus> {
         self.host.interactive(&self.argv(args))
     }
 
-    /// `docker compose -p <project> -f <file>… <tail…>`, run in `dir`.
-    fn compose(&self, dir: &Path, project: &str, files: &[String], tail: &[&str]) -> Command {
+    /// `compose -p <project> -f <file>… <tail…>`, run in `dir`.
+    fn compose_job<'a>(
+        &self,
+        dir: &'a Path,
+        project: &str,
+        files: &[String],
+        tail: &[&str],
+    ) -> Job<'a> {
         let mut args = vec!["compose", "-p", project];
         for f in files {
             args.extend(["-f", f.as_str()]);
         }
         args.extend_from_slice(tail);
-        self.command_in(Some(dir), &args)
+        self.job_in(Some(dir), &args)
     }
 
-    /// Runs `docker <args>` with inherited stdio; errors if it exits non-zero.
+    /// Runs `<program> <args>` with inherited stdio; errors if it exits non-zero.
     /// Over ssh a dropped connection reruns it only if `repeat` says that is safe.
     fn run(&self, args: &[&str], repeat: Repeat) -> Result<()> {
-        self.run_with(|| self.command(args), args, repeat)
+        self.run_job(self.job(args), args, repeat)
     }
 
-    /// Like [`run`](Self::run) for a command `make` builds (afresh for each try).
-    fn run_with(&self, make: impl Fn() -> Command, args: &[&str], repeat: Repeat) -> Result<()> {
+    /// Like [`run`](Self::run) for a job built by the caller; `args` name it in
+    /// messages.
+    fn run_job(&self, job: Job, args: &[&str], repeat: Repeat) -> Result<()> {
         let what = subcommand(args);
-        let status = self
+        let ran = self
             .host
-            .attempt(repeat, || make().status())
+            .exec(job.repeat(repeat))
             .with_context(|| format!("spawning {} {what}", self.name()))?;
-        if !status.success() {
-            bail!("{} {what} failed ({status})", self.name());
+        if !ran.status.success() {
+            bail!("{} {what} failed ({})", self.name(), ran.status);
         }
         Ok(())
     }
 
-    /// Runs a command `make` builds, capturing its output, and returns stdout; a
-    /// non-zero exit is an error carrying docker's stderr.
-    fn checked(&self, make: impl Fn() -> Command, args: &[&str], repeat: Repeat) -> Result<String> {
+    /// Runs a job, capturing its output, and returns stdout; a non-zero exit is an
+    /// error carrying the engine's stderr.
+    fn checked(&self, job: Job, args: &[&str], repeat: Repeat) -> Result<String> {
         let what = subcommand(args);
         let out = self
             .host
-            .attempt(repeat, || make().output())
+            .exec(job.capture().repeat(repeat))
             .with_context(|| format!("spawning {} {what}", self.name()))?;
         if !out.status.success() {
             bail!(
                 "{} {what} failed: {}",
                 self.name(),
-                String::from_utf8_lossy(&out.stderr).trim()
+                out.stderr_text().trim()
             );
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok(out.stdout_text())
     }
 
-    /// Runs `docker <args>` quietly and returns stdout, or `None` if it could not
-    /// run or exited non-zero. For probes whose failure is an answer, not an error.
-    /// A probe changes nothing, so a dropped connection reruns it.
+    /// Runs `<program> <args>` quietly and returns stdout, or `None` if it could
+    /// not run or exited non-zero. For probes whose failure is an answer, not an
+    /// error. A probe changes nothing, so a dropped connection reruns it.
     fn capture_ok(&self, args: &[&str]) -> Option<String> {
-        let out = self
-            .host
-            .attempt(Repeat::Safe, || {
-                let mut cmd = self.command(args);
-                cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-                cmd.output()
-            })
-            .ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        let job = self
+            .job(args)
+            .stdout(Stream::Capture)
+            .stderr(Stream::Null)
+            .repeat(Repeat::Safe);
+        let out = self.host.exec(job).ok()?;
+        out.status.success().then(|| out.stdout_text())
     }
 }
 
@@ -259,10 +256,6 @@ impl<F: Flavor> Runtime for CliEngine<F> {
         })
     }
 
-    fn respawn_args(&self) -> Vec<String> {
-        vec!["--engine".into(), self.name().into()]
-    }
-
     fn version(&self) -> Result<String> {
         match self.capture_ok(&["version", "--format", "{{.Server.Version}}"]) {
             Some(v) if !v.trim().is_empty() => Ok(format!("{} {}", self.name(), v.trim())),
@@ -283,7 +276,7 @@ impl<F: Flavor> Runtime for CliEngine<F> {
         let filter = format!("label={label}");
         let args = ["ps", "-a", "--filter", &filter, "--format", &format];
         Ok(parse_listed(&self.checked(
-            || self.command(&args),
+            self.job(&args),
             &args,
             Repeat::Safe,
         )?))
@@ -293,7 +286,7 @@ impl<F: Flavor> Runtime for CliEngine<F> {
         let filter = format!("name=^{name}$");
         let args = ["ps", "-aq", "--filter", &filter];
         Ok(first_line(&self.checked(
-            || self.command(&args),
+            self.job(&args),
             &args,
             Repeat::Safe,
         )?))
@@ -315,10 +308,10 @@ impl<F: Flavor> Runtime for CliEngine<F> {
         }
         a.push(spec.context.to_string_lossy().into_owned());
         // The build context (and -f dockerfile) are read client-side, so the
-        // build runs on the host that has them (through `command_in`).
+        // build runs on the host that has them (through `job_in`).
         let args: Vec<&str> = a.iter().map(String::as_str).collect();
         // A build is cached layer by layer, so doing it again is harmless.
-        self.run_with(|| self.command_in(None, &args), &args, Repeat::Safe)
+        self.run_job(self.job_in(None, &args), &args, Repeat::Safe)
     }
 
     fn run_detached(&self, spec: &RunSpec) -> Result<()> {
@@ -333,19 +326,19 @@ impl<F: Flavor> Runtime for CliEngine<F> {
         // first looks for the container, and starts what it finds (it may have
         // been created but not started) instead of running again.
         let mut first = true;
-        let status = self
+        let ran = self
             .host
             .attempt(Repeat::Safe, || {
                 if !std::mem::take(&mut first)
                     && let Ok(Some(_)) = self.find_by_name(name)
                 {
-                    return self.command(&["start", name]).status();
+                    return self.host.run(&mut self.job(&["start", name]));
                 }
-                self.command(&args).status()
+                self.host.run(&mut self.job(&args))
             })
             .with_context(|| format!("spawning {} run", self.name()))?;
-        if !status.success() {
-            bail!("{} run failed ({status})", self.name());
+        if !ran.status.success() {
+            bail!("{} run failed ({})", self.name(), ran.status);
         }
         Ok(())
     }
@@ -385,16 +378,16 @@ impl<F: Flavor> Compose for CliEngine<F> {
         tail.extend_from_slice(extra);
         // `up -d` converges on the same state when run again (with
         // `--force-recreate` it recreates once more, which costs time only).
-        self.run_with(
-            || self.compose(dir, project, files, &tail),
+        self.run_job(
+            self.compose_job(dir, project, files, &tail),
             &["compose", "up"],
             Repeat::Safe,
         )
     }
 
     fn down(&self, dir: &Path, project: &str, files: &[String]) -> Result<()> {
-        self.run_with(
-            || self.compose(dir, project, files, &["down"]),
+        self.run_job(
+            self.compose_job(dir, project, files, &["down"]),
             &["compose", "down"],
             Repeat::Safe,
         )
@@ -414,7 +407,7 @@ impl<F: Flavor> Compose for CliEngine<F> {
         }
         tail.extend(["-q", service]);
         let out = self.checked(
-            || self.compose(dir, project, files, &tail),
+            self.compose_job(dir, project, files, &tail),
             &["compose", "ps"],
             Repeat::Safe,
         )?;
@@ -450,6 +443,7 @@ fn parse_listed(out: &str) -> Vec<Listed> {
 mod tests {
     use super::{Docker, Podman, RunSpec, parse_listed, run_flags, subcommand};
     use crate::host::LocalHost;
+    use std::path::Path;
     use std::sync::Arc;
 
     #[test]
@@ -546,5 +540,169 @@ mod tests {
             subcommand(&["compose", "-p", "x", "-f", "a.yml", "down"]),
             "compose down"
         );
+    }
+
+    use crate::host::fake::{FakeHost, Reply};
+    use crate::runtime::{BuildSpec, Containers, Runtime};
+
+    fn docker(host: &Arc<FakeHost>) -> Docker {
+        Docker::new(host.clone())
+    }
+
+    fn words(line: &[&str]) -> Vec<String> {
+        line.iter().map(|w| w.to_string()).collect()
+    }
+
+    #[test]
+    fn containers_are_listed_and_found_through_the_host() {
+        let host = Arc::new(
+            FakeHost::new()
+                .on(
+                    &["docker", "ps", "-a"],
+                    "abc\tlodge-x\trunning\t/p\ndef\ty\texited\t/q\n",
+                )
+                .on(&["docker", "ps", "-aq"], "abc\n"),
+        );
+        let rt = docker(&host);
+        let listed = rt.list_labeled("dev.lodge.project").unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(rt.find_by_name("lodge-x").unwrap().as_deref(), Some("abc"));
+        assert_eq!(
+            host.argvs()[0],
+            words(&[
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                "label=dev.lodge.project",
+                "--format",
+                "{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Label \"dev.lodge.project\"}}"
+            ])
+        );
+        assert_eq!(
+            host.argvs()[1],
+            words(&["docker", "ps", "-aq", "--filter", "name=^lodge-x$"])
+        );
+    }
+
+    #[test]
+    fn a_failing_engine_command_is_an_error_that_carries_its_message() {
+        let host =
+            Arc::new(FakeHost::new().reply(&["docker", "ps"], Reply::fail(1, "permission denied")));
+        let err = docker(&host).find_by_name("x").unwrap_err();
+        assert!(format!("{err:#}").contains("permission denied"), "{err:#}");
+    }
+
+    #[test]
+    fn a_build_runs_where_the_context_is_with_the_terminal_and_is_repeatable() {
+        let host =
+            Arc::new(FakeHost::remote("h").reply_once(&["docker", "build"], Reply::fail(255, "")));
+        let spec = BuildSpec {
+            context: "/p/.devcontainer".into(),
+            dockerfile: Some("Dockerfile".into()),
+            stage: None,
+            args: Default::default(),
+            tag: "t".into(),
+        };
+        docker(&host).build_image(&spec).unwrap();
+        let calls = host.calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "the dropped connection is retried: {calls:?}"
+        );
+        assert_eq!(
+            calls[0].argv,
+            words(&[
+                "docker",
+                "build",
+                "-t",
+                "t",
+                "-f",
+                "/p/.devcontainer/Dockerfile",
+                "/p/.devcontainer"
+            ])
+        );
+    }
+
+    #[test]
+    fn a_run_after_a_lost_connection_starts_the_container_it_finds_instead_of_running_again() {
+        let host = Arc::new(
+            FakeHost::remote("h")
+                .reply_once(&["docker", "run"], Reply::fail(255, "connection lost"))
+                .on(&["docker", "ps", "-aq"], "abc\n"),
+        );
+        let spec = RunSpec {
+            name: "lodge-x".into(),
+            image: "debian".into(),
+            ..Default::default()
+        };
+        docker(&host).run_detached(&spec).unwrap();
+        let argvs = host.argvs();
+        assert_eq!(argvs[0][..4], words(&["docker", "run", "-d", "--name"])[..]);
+        assert_eq!(argvs[1][..2], words(&["docker", "ps"])[..]);
+        assert_eq!(argvs[2], words(&["docker", "start", "lodge-x"]));
+        assert_eq!(argvs.len(), 3);
+    }
+
+    #[test]
+    fn a_run_that_never_got_that_far_is_run_again() {
+        let host = Arc::new(
+            FakeHost::remote("h").reply_once(&["docker", "run"], Reply::fail(255, "refused")),
+        );
+        let spec = RunSpec {
+            name: "n".into(),
+            image: "debian".into(),
+            ..Default::default()
+        };
+        docker(&host).run_detached(&spec).unwrap();
+        let runs = host.argvs().iter().filter(|a| a[1] == "run").count();
+        assert_eq!(runs, 2);
+    }
+
+    #[test]
+    fn compose_runs_in_the_project_folder_with_its_files() {
+        let host = Arc::new(FakeHost::new().on(
+            &["docker", "compose", "-p", "p", "-f", "a.yml", "ps"],
+            "svc1\n",
+        ));
+        let rt = docker(&host);
+        let compose = Runtime::compose(&rt).unwrap();
+        compose
+            .up(
+                Path::new("/p/.devcontainer"),
+                "p",
+                &["a.yml".into()],
+                &["--build"],
+            )
+            .unwrap();
+        let found = compose
+            .ps(
+                Path::new("/p/.devcontainer"),
+                "p",
+                &["a.yml".into()],
+                "app",
+                Containers::All,
+            )
+            .unwrap();
+        assert_eq!(found.as_deref(), Some("svc1"));
+        let calls = host.calls();
+        assert_eq!(calls[0].dir.as_deref(), Some(Path::new("/p/.devcontainer")));
+        assert_eq!(
+            calls[0].argv,
+            words(&[
+                "docker", "compose", "-p", "p", "-f", "a.yml", "up", "-d", "--build"
+            ])
+        );
+        assert_eq!(calls[1].argv.last().unwrap(), "app");
+    }
+
+    #[test]
+    fn an_unreachable_engine_is_reported_by_name() {
+        let host = Arc::new(FakeHost::new().reply(&["docker", "version"], Reply::fail(1, "")));
+        let err = Runtime::version(&docker(&host)).unwrap_err();
+        assert!(err.to_string().contains("docker"), "{err}");
+        let ok = Arc::new(FakeHost::new().on(&["podman", "version"], "5.0.1\n"));
+        assert_eq!(Runtime::version(&Podman::new(ok)).unwrap(), "podman 5.0.1");
     }
 }

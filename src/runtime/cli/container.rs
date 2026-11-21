@@ -4,8 +4,9 @@
 use anyhow::{Context, Result, bail};
 
 use super::{CliEngine, Flavor};
-use crate::host::Repeat;
+use crate::host::{Input, Repeat};
 use crate::runtime::{Container, ContainerUser, Env, ExecOpts, Output, Reach, User};
+use std::process::ExitStatus;
 
 /// One container, driven through the docker CLI.
 pub struct CliContainer<F: Flavor> {
@@ -111,12 +112,12 @@ impl<F: Flavor> Env for CliContainer<F> {
     fn exec(&self, argv: &[&str], opts: &ExecOpts) -> Result<()> {
         let args = self.exec_args(argv, opts);
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let status = self
+        let ran = self
             .cli
             .host
-            .attempt(opts.repeat, || self.cli.command(&refs).status())
+            .exec(self.cli.job(&refs).repeat(opts.repeat))
             .with_context(|| format!("spawning {} exec", self.cli.name()))?;
-        if !status.success() {
+        if !ran.status.success() {
             bail!("{} exec failed: {argv:?}", self.cli.name());
         }
         Ok(())
@@ -128,12 +129,12 @@ impl<F: Flavor> Env for CliContainer<F> {
         let out = self
             .cli
             .host
-            .attempt(opts.repeat, || self.cli.command(&refs).output())
+            .exec(self.cli.job(&refs).capture().repeat(opts.repeat))
             .with_context(|| format!("spawning {} exec", self.cli.name()))?;
         Ok(Output {
             success: out.status.success(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stdout: out.stdout_text(),
+            stderr: out.stderr_text(),
         })
     }
 
@@ -143,7 +144,6 @@ impl<F: Flavor> Env for CliContainer<F> {
     }
 
     fn write_secret(&self, dest: &str, contents: &[u8], mode: u32, user: User) -> Result<()> {
-        use std::io::Write as _;
         let script = crate::runtime::WRITE_SECRET_SCRIPT.replace("%MODE%", &format!("{mode:o}"));
         // The value goes on stdin; argv carries only the script and the path.
         let argv = crate::shell::script_argv(&script, &[dest]);
@@ -152,29 +152,25 @@ impl<F: Flavor> Env for CliContainer<F> {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         // The script writes to a temporary file and renames it into place, so
         // sending the secret again after a lost connection is harmless.
-        let (status, written) = self
+        let mut feed = |stdin: &mut dyn std::io::Write| stdin.write_all(contents);
+        let ran = self
             .cli
             .host
-            .attempt(Repeat::Safe, || {
-                // `command` closes stdin; this one streams, so override it.
-                let mut cmd = self.cli.command(&refs);
-                cmd.stdin(std::process::Stdio::piped());
-                let mut child = cmd.spawn()?;
-                let written = child
-                    .stdin
-                    .take()
-                    .ok_or_else(|| std::io::Error::other("exec stdin was not piped"))?
-                    .write_all(contents);
-                Ok((child.wait()?, written))
-            })
+            .exec(
+                self.cli
+                    .job(&refs)
+                    .stdin(Input::Feed(&mut feed))
+                    .repeat(Repeat::Safe),
+            )
             .with_context(|| format!("running {} exec", self.cli.name()))?;
-        if !status.success() {
-            bail!("writing secret file {dest} failed ({status})");
+        if !ran.status.success() {
+            bail!("writing secret file {dest} failed ({})", ran.status);
         }
-        written.with_context(|| format!("sending secret to {} exec", self.cli.name()))
+        ran.fed
+            .with_context(|| format!("sending secret to {} exec", self.cli.name()))
     }
 
-    fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> std::process::Command {
+    fn interactive(&self, user: User, workdir: &str, inner: &str) -> std::io::Result<ExitStatus> {
         let opts = ExecOpts {
             workdir: Some(workdir),
             ..ExecOpts::as_user(user)
@@ -229,12 +225,12 @@ impl<F: Flavor> Container for CliContainer<F> {
         let out = self
             .cli
             .host
-            .attempt(Repeat::Safe, || self.cli.command(&args).output())
+            .exec(self.cli.job(&args).capture().repeat(Repeat::Safe))
             .with_context(|| format!("spawning {} inspect", self.cli.name()))?;
         if out.status.success() {
-            return Ok(String::from_utf8_lossy(&out.stdout).trim() == "true");
+            return Ok(out.stdout_text().trim() == "true");
         }
-        let err = String::from_utf8_lossy(&out.stderr);
+        let err = out.stderr_text();
         if is_no_such_container(&err) {
             return Ok(false);
         }
@@ -284,27 +280,31 @@ impl<F: Flavor> CliContainer<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{LocalHost, SshHost};
-    use crate::runtime::cli::Docker;
+    use crate::host::fake::{FakeHost, Reply};
+    use crate::runtime::cli::{Docker, DockerFlavor};
     use std::sync::Arc;
 
-    /// The program and arguments of a command, as one list.
-    fn words(c: &std::process::Command) -> Vec<String> {
-        std::iter::once(c.get_program())
-            .chain(c.get_args())
-            .map(|w| w.to_string_lossy().into_owned())
-            .collect()
+    fn container(host: Arc<FakeHost>) -> CliContainer<DockerFlavor> {
+        CliContainer {
+            cli: Docker::new(host),
+            id: "abc".into(),
+        }
+    }
+
+    fn words(line: &[&str]) -> Vec<String> {
+        line.iter().map(|w| w.to_string()).collect()
     }
 
     #[test]
-    fn the_interactive_command_is_the_exec_command_with_a_tty_run_on_the_host() {
-        let local = CliContainer {
-            cli: Docker::new(Arc::new(LocalHost)),
-            id: "abc".into(),
-        };
+    fn the_interactive_session_is_the_exec_command_with_a_tty_run_through_the_host() {
+        let host = Arc::new(FakeHost::new());
+        container(host.clone())
+            .interactive(User::Named("dev"), "/w", "exec bash -l")
+            .unwrap();
         assert_eq!(
-            words(&local.interactive_command(User::Named("dev"), "/w", "exec bash -l")),
-            [
+            host.argvs(),
+            [words(&[
+                "interactive",
                 "docker",
                 "exec",
                 "-it",
@@ -316,19 +316,68 @@ mod tests {
                 "sh",
                 "-c",
                 "exec bash -l"
+            ])]
+        );
+    }
+
+    #[test]
+    fn a_command_in_the_container_is_one_exec_through_the_host_as_the_user_asked() {
+        let host = Arc::new(FakeHost::new().on(&["docker", "exec"], "out\n"));
+        let c = container(host.clone());
+        let opts = ExecOpts::as_user(User::Named("dev"));
+        let out = c.output(&["echo", "x"], &opts).unwrap();
+        assert!(out.success);
+        assert_eq!(out.stdout, "out\n");
+        c.exec(&["true"], &ExecOpts::root()).unwrap();
+        assert_eq!(
+            host.argvs(),
+            [
+                words(&["docker", "exec", "-u", "dev", "abc", "echo", "x"]),
+                words(&["docker", "exec", "-u", "0", "abc", "true"]),
             ]
         );
-        // On another host it is the host that decides how the terminal gets there.
-        let remote = CliContainer {
-            cli: Docker::new(Arc::new(SshHost::new("h"))),
-            id: "abc".into(),
+    }
+
+    #[test]
+    fn a_failing_command_is_an_error_for_exec_and_a_value_for_output() {
+        let host = Arc::new(FakeHost::new().reply(&["docker", "exec"], Reply::fail(3, "nope")));
+        let c = container(host);
+        assert!(c.exec(&["false"], &ExecOpts::default()).is_err());
+        let out = c.output(&["false"], &ExecOpts::default()).unwrap();
+        assert!(!out.success);
+        assert_eq!(out.stderr, "nope");
+    }
+
+    #[test]
+    fn a_secret_travels_on_stdin_and_never_in_the_arguments() {
+        let host = Arc::new(FakeHost::new());
+        container(host.clone())
+            .write_secret("/run/s", b"hunter2", 0o600, User::Default)
+            .unwrap();
+        let call = &host.calls()[0];
+        assert_eq!(call.fed, b"hunter2");
+        assert!(call.argv.iter().all(|a| !a.contains("hunter2")), "{call:?}");
+        assert!(call.argv.contains(&"-i".to_string()));
+    }
+
+    #[test]
+    fn a_stopped_container_is_told_from_a_missing_one_and_an_unreachable_engine() {
+        let running = |reply| {
+            container(Arc::new(
+                FakeHost::new().reply(&["docker", "inspect"], reply),
+            ))
         };
-        let line = words(&remote.interactive_command(User::Root, "/", "x"));
-        assert_eq!(line[0], "ssh");
-        assert!(line.contains(&"-tt".to_string()), "{line:?}");
-        assert_eq!(
-            line.last().unwrap(),
-            "'docker' 'exec' '-it' '-u' '0' '--workdir' '/' 'abc' 'sh' '-c' 'x'"
+        assert!(running(Reply::ok("true\n")).is_running().unwrap());
+        assert!(!running(Reply::ok("false\n")).is_running().unwrap());
+        assert!(
+            !running(Reply::fail(1, "Error: No such object: abc"))
+                .is_running()
+                .unwrap()
+        );
+        assert!(
+            running(Reply::fail(1, "Cannot connect to the Docker daemon"))
+                .is_running()
+                .is_err()
         );
     }
 

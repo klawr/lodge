@@ -26,6 +26,7 @@ use crate::cli::{Cli, Command};
 use crate::config::Config;
 use crate::forward::{DetachedDaemon, ForwardDaemon};
 use crate::host::{HostRef, LocalHost, SshHost};
+use crate::local::{Local, SystemLocal};
 use crate::runtime::cli::{Docker, Podman};
 use crate::runtime::{Engine, Runtime};
 use crate::tools::{Ldd, Oras, Patchelf, Toolchain};
@@ -60,11 +61,29 @@ fn build_engine(kind: Engine, host: HostRef) -> Box<dyn Runtime> {
     }
 }
 
+/// The arguments that make a child lodge (the forward daemon is one) reach the
+/// same host and drive the same engine as this one, in front of its subcommand.
+/// The command-line surface is the command layer's to know, not the host's or the
+/// engine's.
+fn respawn_args(remote: Option<&str>, engine: Engine) -> Vec<String> {
+    use clap::ValueEnum as _;
+    let mut args = Vec::new();
+    if let Some(remote) = remote {
+        args.extend(["--remote".to_string(), remote.to_string()]);
+    }
+    if let Some(name) = engine.to_possible_value() {
+        args.extend(["--engine".to_string(), name.get_name().to_string()]);
+    }
+    args
+}
+
 /// What every command works with: the host the project is on, the engine on it,
 /// the helper tools and where the config is. Built once, in [`run`], which is the only place that
 /// chooses an implementation of either; everything below takes the interfaces.
 pub struct Ctx {
     pub host: HostRef,
+    /// The machine lodge runs on: its environment, and a shell for secrets.
+    pub local: Arc<dyn Local>,
     pub rt: Box<dyn Runtime>,
     /// The helper programs, for packing a bundle and fetching features.
     pub tools: Toolchain,
@@ -100,6 +119,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
     // is reached and which engine runs on it. Each is an interface everything
     // else takes; a new way of reaching a machine or a new engine is one more arm.
     // The helper tools (`ldd`, `patchelf`, `oras`) are chosen here too.
+    let remote = cli.remote.clone();
     let host: HostRef = match cli.remote {
         Some(remote) => Arc::new(SshHost::new(remote)),
         None => Arc::new(LocalHost),
@@ -114,7 +134,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
     let engine = choose_engine(cli.engine, &cli.command, &config_path)?;
     let rt = build_engine(engine, host.clone());
     let ctx = Ctx {
-        forwarder: Box::new(DetachedDaemon::new(host.as_ref(), rt.as_ref())),
+        forwarder: Box::new(DetachedDaemon::new(respawn_args(remote.as_deref(), engine))),
         rt,
         tools: Toolchain {
             deps: Box::new(Ldd),
@@ -122,6 +142,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
             oci: Box::new(Oras),
         },
         host,
+        local: Arc::new(SystemLocal),
         config_path,
     };
 
@@ -262,17 +283,16 @@ mod tests {
 
     #[test]
     fn a_child_lodge_is_pointed_at_the_same_engine_and_host() {
-        use crate::host::SshHost;
         use clap::Parser as _;
-        let host: HostRef = Arc::new(SshHost::new("me@h:22"));
-        let engine = build_engine(Engine::Docker, host.clone());
-        let mut args = vec!["ldg".to_string()];
-        args.extend(host.respawn_args());
-        args.extend(engine.respawn_args());
-        args.push("ls".into());
-        let cli = Cli::try_parse_from(args).unwrap();
-        assert_eq!(cli.remote.as_deref(), Some("me@h:22"));
-        assert_eq!(cli.engine, Some(Engine::Docker));
+        for engine in [Engine::Docker, Engine::Podman] {
+            let mut args = vec!["ldg".to_string()];
+            args.extend(respawn_args(Some("me@h:22"), engine));
+            args.push("ls".into());
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.remote.as_deref(), Some("me@h:22"));
+            assert_eq!(cli.engine, Some(engine));
+        }
+        assert!(!respawn_args(None, Engine::Docker).contains(&"--remote".to_string()));
     }
 
     #[test]

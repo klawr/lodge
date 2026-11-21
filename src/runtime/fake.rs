@@ -341,15 +341,15 @@ impl Env for FakeEnv {
         Ok(())
     }
 
-    fn interactive_command(
+    fn interactive(
         &self,
-        _user: User,
+        user: User,
         workdir: &str,
         inner: &str,
-    ) -> std::process::Command {
-        let mut c = std::process::Command::new("fake-shell");
-        c.arg(workdir).arg(inner);
-        c
+    ) -> std::io::Result<std::process::ExitStatus> {
+        use std::os::unix::process::ExitStatusExt as _;
+        self.record(&["interactive", workdir, inner], user);
+        Ok(std::process::ExitStatus::from_raw(0))
     }
 }
 
@@ -440,10 +440,6 @@ impl Fake {
 }
 
 impl Runtime for FakeRuntime {
-    fn respawn_args(&self) -> Vec<String> {
-        vec![]
-    }
-
     /// Panics for a container that doesn't exist: lodge only asks for handles
     /// to containers it found.
     fn container(&self, id: &str) -> Box<dyn Container> {
@@ -613,8 +609,13 @@ impl Env for FakeContainer {
         self.env()?.write_secret(dest, contents, mode, user)
     }
 
-    fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> std::process::Command {
-        self.fake.env.interactive_command(user, workdir, inner)
+    fn interactive(
+        &self,
+        user: User,
+        workdir: &str,
+        inner: &str,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        self.fake.env.interactive(user, workdir, inner)
     }
 }
 

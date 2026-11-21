@@ -13,8 +13,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
 
-use super::{Host, Repeat, RetryPolicy};
-use crate::shell::{CmdLine, shell_quote};
+use super::{
+    Child, Host, Job, Line, Ran, Repeat, RetryPolicy, Stream, run_interactive, run_process,
+    start_process,
+};
+use crate::shell::shell_quote;
 
 /// A host reached with `ssh <destination>`: a `~/.ssh/config` alias, `user@host`,
 /// `user@host:port`, `[v6]:port`, with or without an `ssh://` prefix. Proxies,
@@ -244,6 +247,39 @@ fn interactive(remote: &str, remote_command: &str) -> Command {
     cmd
 }
 
+impl SshHost {
+    /// `ssh <host> <line>`, the line run by the remote login shell. A script is
+    /// forced to `sh` semantics rather than the remote user's own shell, and a
+    /// working directory becomes a `cd` in front.
+    fn command(&self, line: &Line, dir: Option<&Path>) -> Command {
+        let body = match line {
+            Line::Shell(script) => format!("sh -c {}", shell_quote(script)),
+            Line::Argv(argv) => argv
+                .iter()
+                .map(|a| shell_quote(a))
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        let script = match dir {
+            Some(dir) => format!("cd {} && {body}", shell_quote(&dir.to_string_lossy())),
+            None => body,
+        };
+        command(&self.remote, &script)
+    }
+}
+
+impl SshHost {
+    /// The local `ssh` that opens `argv` on the host with a terminal.
+    fn interactive_command(&self, argv: &[&str]) -> Command {
+        let line = argv
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        interactive(&self.remote, &line)
+    }
+}
+
 impl Host for SshHost {
     fn label(&self) -> Option<String> {
         Some(self.remote.clone())
@@ -267,40 +303,21 @@ impl Host for SshHost {
         false
     }
 
-    fn respawn_args(&self) -> Vec<String> {
-        vec!["--remote".into(), self.remote.clone()]
+    fn run(&self, job: &mut Job) -> std::io::Result<Ran> {
+        run_process(self.command(&job.line, job.dir), job)
     }
 
-    /// `ssh <host> <line>`, the line run by the remote login shell. A script is
-    /// forced to `sh` semantics rather than the remote user's own shell, and a
-    /// working directory becomes a `cd` in front.
-    fn command(&self, line: &CmdLine, dir: Option<&Path>) -> Command {
-        let body = match line {
-            CmdLine::Shell(script) => format!("sh -c {}", shell_quote(script)),
-            CmdLine::Argv(argv) => argv
-                .iter()
-                .map(|a| shell_quote(a))
-                .collect::<Vec<_>>()
-                .join(" "),
-        };
-        let script = match dir {
-            Some(dir) => format!("cd {} && {body}", shell_quote(&dir.to_string_lossy())),
-            None => body,
-        };
-        command(&self.remote, &script)
+    fn interactive(&self, argv: &[&str]) -> std::io::Result<ExitStatus> {
+        run_interactive(self.interactive_command(argv))
     }
 
-    fn interactive(&self, argv: &[&str]) -> Command {
-        let line = argv
-            .iter()
-            .map(|a| shell_quote(a))
-            .collect::<Vec<_>>()
-            .join(" ");
-        interactive(&self.remote, &line)
-    }
-
-    fn tunnel(&self, local: u16, to: &str) -> Option<Command> {
-        Some(tunnel(&self.remote, local, to))
+    fn tunnel(
+        &self,
+        local: u16,
+        to: &str,
+        chatter: Stream,
+    ) -> Option<std::io::Result<Box<dyn Child>>> {
+        Some(start_process(tunnel(&self.remote, local, to), chatter))
     }
 
     fn connect(&self) -> anyhow::Result<()> {
@@ -395,7 +412,8 @@ mod tests {
 
     #[test]
     fn an_interactive_session_forces_a_pty_reuses_the_connection_and_quotes_the_command() {
-        let c = SshHost::new("user@host:2222").interactive(&["docker", "exec", "-it", "c", "a b"]);
+        let c = SshHost::new("user@host:2222")
+            .interactive_command(&["docker", "exec", "-it", "c", "a b"]);
         let a = args(&c);
         assert_eq!(&a[..2], ["-p", "2222"]);
         assert!(a.contains(&"ControlMaster=auto".to_string()), "{a:?}");
@@ -436,11 +454,11 @@ mod tests {
     #[test]
     fn a_host_runs_commands_through_ssh_with_sh_semantics_and_a_directory() {
         let host = SshHost::new("user@host:2222");
-        let a = args(&host.command(&CmdLine::Shell("echo hi"), None));
+        let a = args(&host.command(&Line::Shell("echo hi".into()), None));
         assert_eq!(&a[..2], ["-p", "2222"]);
         assert_eq!(&a[a.len() - 2..], ["user@host", "sh -c 'echo hi'"]);
-        let argv = ["docker".to_string(), "ps -a".to_string()];
-        let a = args(&host.command(&CmdLine::Argv(&argv), Some(Path::new("/p q"))));
+        let argv = Line::Argv(vec!["docker".to_string(), "ps -a".to_string()]);
+        let a = args(&host.command(&argv, Some(Path::new("/p q"))));
         assert_eq!(a.last().unwrap(), "cd '/p q' && 'docker' 'ps -a'");
     }
 
@@ -450,10 +468,6 @@ mod tests {
         assert_eq!(
             SshHost::new("me@build.example:2222").names(),
             ["me@build.example:2222", "me@build.example", "build.example"]
-        );
-        assert_eq!(
-            SshHost::new("h").respawn_args(),
-            ["--remote".to_string(), "h".to_string()]
         );
     }
 }

@@ -640,20 +640,18 @@ mod tests {
         assert_eq!(strip_tag("./feat"), "./feat");
     }
 
-    /// A folder whose subfolders are local features: name to its `dependsOn` JSON.
-    fn local_features(features: &[(&str, &str)]) -> crate::tmpfile::TempDir {
-        let dir = crate::tmpfile::TempDir::new("features-dep").unwrap();
-        for (name, depends_on) in features {
-            let feature = dir.path().join(name);
-            std::fs::create_dir_all(&feature).unwrap();
-            std::fs::write(feature.join("install.sh"), "true\n").unwrap();
-            std::fs::write(
-                feature.join("devcontainer-feature.json"),
-                format!(r#"{{"id": {name:?}, "dependsOn": {depends_on}}}"#),
-            )
-            .unwrap();
-        }
-        dir
+    /// A host with local features in `/dc`: name to its `dependsOn` JSON.
+    fn local_features(features: &[(&str, &str)]) -> crate::host::fake::FakeHost {
+        features.iter().fold(
+            crate::host::fake::FakeHost::new(),
+            |host, (name, depends_on)| {
+                host.with_file(&format!("/dc/{name}/install.sh"), "true\n")
+                    .with_file(
+                        &format!("/dc/{name}/devcontainer-feature.json"),
+                        &format!(r#"{{"id": {name:?}, "dependsOn": {depends_on}}}"#),
+                    )
+            },
+        )
     }
 
     fn request(reference: &str, options: Value) -> FeatureRequest {
@@ -663,10 +661,10 @@ mod tests {
         }
     }
 
-    fn resolve_local(dir: &Path, requested: &[FeatureRequest]) -> Plan {
+    fn resolve_local(host: &crate::host::fake::FakeHost, requested: &[FeatureRequest]) -> Plan {
         let ctx = Context {
-            base_dir: dir,
-            host: &crate::host::LocalHost,
+            base_dir: Path::new("/dc"),
+            host,
             oci: &crate::tools::NoRegistry,
         };
         resolve(&ctx, requested, &[]).unwrap()
@@ -675,7 +673,7 @@ mod tests {
     #[test]
     fn a_dependency_nobody_asked_for_is_installed_first_with_its_options() {
         let dir = local_features(&[("app", r#"{"./lib": {"mode": "x"}}"#), ("lib", "{}")]);
-        let plan = resolve_local(dir.path(), &[request("./app", json!({}))]);
+        let plan = resolve_local(&dir, &[request("./app", json!({}))]);
         let got: Vec<_> = plan
             .resolved
             .iter()
@@ -689,7 +687,7 @@ mod tests {
     fn a_dependency_that_is_also_requested_is_installed_once_with_the_users_options() {
         let dir = local_features(&[("app", r#"{"./lib": {"mode": "x"}}"#), ("lib", "{}")]);
         let plan = resolve_local(
-            dir.path(),
+            &dir,
             &[
                 request("./app", json!({})),
                 request("./lib", json!({"mode": "mine"})),
@@ -709,7 +707,7 @@ mod tests {
             ("b", r#"{"./c": {}}"#),
             ("c", r#"{"./a": {}}"#),
         ]);
-        let plan = resolve_local(dir.path(), &[request("./a", json!({}))]);
+        let plan = resolve_local(&dir, &[request("./a", json!({}))]);
         assert_eq!(plan.resolved.len(), 3);
     }
 
@@ -721,7 +719,7 @@ mod tests {
             ("plain", "{}"),
         ]);
         let plan = resolve_local(
-            dir.path(),
+            &dir,
             &[request("./app", json!({})), request("./plain", json!({}))],
         );
         let ids: Vec<_> = plan.resolved.iter().map(|r| r.meta.id.as_str()).collect();

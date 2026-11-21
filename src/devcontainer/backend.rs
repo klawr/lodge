@@ -439,7 +439,8 @@ pub(super) fn project_basename(project_path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::local;
+    use crate::host::fake;
+    use crate::local::fake::FakeLocal;
 
     #[test]
     fn the_run_spec_has_the_workspace_the_settings_and_the_user_args_last() {
@@ -452,7 +453,7 @@ mod tests {
                 privileged: true,
                 ..Default::default()
             },
-            &Vars::new(p),
+            &Vars::new(p, &FakeLocal::new()),
             p,
             "/workspaces/proj",
         );
@@ -508,7 +509,7 @@ mod tests {
             None,
             Some("type=bind,source=${localWorkspaceFolder},target=/w".into()),
             &CreateSettings::default(),
-            &Vars::new(p),
+            &Vars::new(p, &FakeLocal::new()),
             p,
             "/w",
         );
@@ -551,10 +552,11 @@ mod tests {
     fn a_dockerfile_outside_the_config_folder_feeds_the_drift_hash() {
         let p = Path::new("/home/me/proj");
         let base = p.join(".devcontainer");
-        let vars = Vars::new(p).with_container_workspace("/workspaces/proj");
+        let local = FakeLocal::new();
+        let vars = Vars::new(p, &local).with_container_workspace("/workspaces/proj");
         let ctx = BackendContext {
             project_path: p,
-            host: &local(),
+            host: &fake(),
             base_dir: &base,
             workspace_folder: "/workspaces/proj",
             vars: &vars,

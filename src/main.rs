@@ -21,6 +21,7 @@ mod host;
 mod host_tools;
 mod inject;
 mod layout;
+mod local;
 mod output;
 mod port;
 mod provision;

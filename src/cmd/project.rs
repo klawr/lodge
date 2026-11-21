@@ -11,23 +11,26 @@ use super::{Ctx, print_json};
 use crate::config::Config;
 use crate::devcontainer::{self, ConfigState, Found};
 use crate::host::HostRef;
+use crate::local::Local;
 use crate::output::{info, line, note, warning};
 use crate::runtime::{ContainerUser, Runtime};
 
 /// The project's container, or an error saying there is none.
 fn require(ctx: &Ctx, path: Option<PathBuf>) -> Result<Found> {
     let project = ctx.project(path)?;
-    devcontainer::find(&project, &ctx.host, ctx.rt.as_ref())?.with_context(|| {
-        format!(
-            "no container for {} (run `ldg up` to create it)",
-            project.display()
-        )
-    })
+    devcontainer::find(&project, &ctx.host, ctx.local.as_ref(), ctx.rt.as_ref())?.with_context(
+        || {
+            format!(
+                "no container for {} (run `ldg up` to create it)",
+                project.display()
+            )
+        },
+    )
 }
 
 pub fn down(ctx: &Ctx, path: Option<PathBuf>) -> Result<()> {
     let project = ctx.project(path)?;
-    match devcontainer::stop(&project, &ctx.host, ctx.rt.as_ref())? {
+    match devcontainer::stop(&project, &ctx.host, ctx.local.as_ref(), ctx.rt.as_ref())? {
         Some(id) => info!("stopped {id}"),
         None => info!("no container exists for this devcontainer"),
     }
@@ -36,7 +39,7 @@ pub fn down(ctx: &Ctx, path: Option<PathBuf>) -> Result<()> {
 
 pub fn rm(ctx: &Ctx, path: Option<PathBuf>) -> Result<()> {
     let project = ctx.project(path)?;
-    match devcontainer::remove(&project, &ctx.host, ctx.rt.as_ref())? {
+    match devcontainer::remove(&project, &ctx.host, ctx.local.as_ref(), ctx.rt.as_ref())? {
         Some(id) => info!("removed {id}"),
         None => info!("no container exists for this devcontainer"),
     }
@@ -46,7 +49,13 @@ pub fn rm(ctx: &Ctx, path: Option<PathBuf>) -> Result<()> {
 pub fn status(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<()> {
     let project = ctx.project(path)?;
     let config = ctx.config()?;
-    let report = StatusReport::gather(&project, &ctx.host, ctx.rt.as_ref(), &config)?;
+    let report = StatusReport::gather(
+        &project,
+        &ctx.host,
+        ctx.local.as_ref(),
+        ctx.rt.as_ref(),
+        &config,
+    )?;
     if as_json {
         return print_json(&report.to_json());
     }
@@ -77,8 +86,14 @@ struct ContainerStatus {
 }
 
 impl StatusReport {
-    fn gather(project: &Path, host: &HostRef, rt: &dyn Runtime, config: &Config) -> Result<Self> {
-        let Some(status) = devcontainer::status(project, host, rt)? else {
+    fn gather(
+        project: &Path,
+        host: &HostRef,
+        local: &dyn Local,
+        rt: &dyn Runtime,
+        config: &Config,
+    ) -> Result<Self> {
+        let Some(status) = devcontainer::status(project, host, local, rt)? else {
             return Ok(Self {
                 project: project.to_path_buf(),
                 container: None,
@@ -301,9 +316,12 @@ pub fn clean(ctx: &Ctx, path: Option<PathBuf>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::devcontainer::Prompt;
-    use crate::host::local;
+    use crate::host::HostRef;
+    use crate::host::fake::FakeHost;
+    use crate::local::fake::FakeLocal;
     use crate::runtime::fake::{FakeEnv, FakeRuntime};
     use crate::tools::NoRegistry;
+    use std::sync::Arc;
 
     struct NoQuestions;
 
@@ -313,34 +331,54 @@ mod tests {
         }
     }
 
-    fn project() -> crate::tmpfile::TempDir {
-        let dir = crate::tmpfile::TempDir::new("status").unwrap();
-        let dc = dir.path().join(".devcontainer");
-        std::fs::create_dir_all(&dc).unwrap();
-        std::fs::write(
-            dc.join("devcontainer.json"),
-            r#"{"image": "debian", "workspaceFolder": "/w", "updateRemoteUserUID": false}"#,
-        )
-        .unwrap();
-        dir
+    /// A project with an image-based devcontainer, and the host its files are on.
+    struct Project {
+        host: HostRef,
+    }
+
+    impl Project {
+        fn path(&self) -> &std::path::Path {
+            std::path::Path::new("/proj")
+        }
+    }
+
+    fn project() -> Project {
+        Project {
+            host: Arc::new(FakeHost::new().with_file(
+                "/proj/.devcontainer/devcontainer.json",
+                r#"{"image": "debian", "workspaceFolder": "/w", "updateRemoteUserUID": false}"#,
+            )),
+        }
     }
 
     #[test]
     fn a_project_without_a_container_says_so() {
         let dir = project();
         let rt = FakeRuntime::new(FakeEnv::new);
-        let r = StatusReport::gather(dir.path(), &local(), &rt, &Config::default()).unwrap();
+        let r = StatusReport::gather(
+            dir.path(),
+            &dir.host,
+            &FakeLocal::new(),
+            &rt,
+            &Config::default(),
+        )
+        .unwrap();
         assert_eq!(r.lines()[1], "container  none (run `ldg up` to create it)");
         assert_eq!(r.to_json()["container"], serde_json::Value::Null);
     }
 
-    fn start(
-        dir: &crate::tmpfile::TempDir,
-        rt: &FakeRuntime,
-    ) -> Box<dyn crate::runtime::Container> {
-        devcontainer::start(dir.path(), &local(), false, rt, &NoRegistry, &NoQuestions)
-            .unwrap()
-            .container
+    fn start(dir: &Project, rt: &FakeRuntime) -> Box<dyn crate::runtime::Container> {
+        devcontainer::start(
+            dir.path(),
+            &dir.host,
+            &FakeLocal::new(),
+            false,
+            rt,
+            &NoRegistry,
+            &NoQuestions,
+        )
+        .unwrap()
+        .container
     }
 
     fn one_secret() -> Config {
@@ -373,7 +411,8 @@ mod tests {
         )
         .unwrap();
 
-        let r = StatusReport::gather(dir.path(), &local(), &rt, &one_secret()).unwrap();
+        let r = StatusReport::gather(dir.path(), &dir.host, &FakeLocal::new(), &rt, &one_secret())
+            .unwrap();
         assert_eq!(
             r.lines()[1..],
             [
@@ -408,7 +447,8 @@ mod tests {
         rt.stop(c.id()).unwrap();
         // The fake refuses commands in a stopped container, so a command would
         // show up as "unknown" (and a warning).
-        let r = StatusReport::gather(dir.path(), &local(), &rt, &one_secret()).unwrap();
+        let r = StatusReport::gather(dir.path(), &dir.host, &FakeLocal::new(), &rt, &one_secret())
+            .unwrap();
         assert_eq!(
             r.lines()[1..],
             [
@@ -425,7 +465,8 @@ mod tests {
         let dir = project();
         let rt = FakeRuntime::new(|| FakeEnv::new().with_file("/w", "").with_failure(&PROBE));
         start(&dir, &rt);
-        let r = StatusReport::gather(dir.path(), &local(), &rt, &one_secret()).unwrap();
+        let r = StatusReport::gather(dir.path(), &dir.host, &FakeLocal::new(), &rt, &one_secret())
+            .unwrap();
         assert_eq!(r.lines().last().unwrap(), "secrets    unknown");
         assert_eq!(r.to_json()["container"]["secrets"], serde_json::Value::Null);
     }

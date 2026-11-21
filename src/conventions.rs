@@ -74,9 +74,9 @@ fn docker_is_run_through_a_host_and_named_only_by_the_docker_runtime() {
 #[test]
 fn local_shells_are_started_by_the_local_host_and_secrets_only() {
     // `host/local.rs` runs scripts on this machine as the project's host;
-    // `secret/` runs a secret's `command` source, which is on this machine
+    // `local.rs` runs a secret's `command` source, which is on this machine
     // whatever the host is.
-    assert_eq!(spawners("sh"), ["host/local.rs", "secret/mod.rs"]);
+    assert_eq!(spawners("sh"), ["host/local.rs", "local.rs"]);
 }
 
 #[test]
@@ -110,6 +110,50 @@ fn only_the_command_layer_chooses_implementations() {
         files_containing(&["Ldd", "Patchelf", "Oras"], &["tools/", "cmd/"]),
         Vec::<String>::new()
     );
+}
+
+#[test]
+fn the_machine_lodge_runs_on_is_read_through_local_and_the_list_that_still_isnt_only_shrinks() {
+    // The environment, files a secret names and the local shell go through
+    // `local::Local`, handed in by the command layer, so a test hands in a fake.
+    // What is below still reaches for the process itself, each for a reason: the
+    // `PATH` lookup that finds a helper program, the operating system's standard
+    // directories, the scratch folder, and the way lodge starts itself. A file
+    // that stops needing it must come off this list, and one that starts to is
+    // an architecture decision, not a quiet addition.
+    let known: &[(&str, &[&str])] = &[
+        ("env::var", &["doc_facts.rs", "local.rs", "shell.rs"]),
+        ("env::current_exe", &["forward/mod.rs"]),
+        ("env::current_dir", &["cmd/mod.rs"]),
+        ("env::temp_dir", &["host/ssh.rs", "tmpfile.rs"]),
+        (
+            "dirs::",
+            &[
+                "bundle/cache.rs",
+                "bundle/pack.rs",
+                "cmd/init.rs",
+                "config/mod.rs",
+                "forward/mod.rs",
+            ],
+        ),
+        (
+            "Command::new(",
+            &[
+                "forward/mod.rs",
+                "host/local.rs",
+                "host/ssh.rs",
+                "host_tools.rs",
+                "local.rs",
+            ],
+        ),
+    ];
+    for (needle, files) in known {
+        assert_eq!(
+            files_containing(&[needle], &[]),
+            *files,
+            "files that use `{needle}`"
+        );
+    }
 }
 
 #[test]
@@ -181,6 +225,7 @@ const FOUNDATION: &[&str] = &[
     "host",
     "host_tools",
     "layout",
+    "local",
     "output",
     "port",
     "provision",

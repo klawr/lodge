@@ -11,9 +11,6 @@ use crate::output::{info, warning};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::host::Host;
-use crate::runtime::Runtime;
-
 pub use daemon::run_daemon;
 pub use tunnel::HostForwarders;
 
@@ -38,9 +35,8 @@ pub struct DetachedDaemon {
 }
 
 impl DetachedDaemon {
-    pub fn new(host: &dyn Host, rt: &dyn Runtime) -> Self {
-        let mut args = host.respawn_args();
-        args.extend(rt.respawn_args());
+    /// `args` point the child at the same host and engine as this process.
+    pub fn new(args: Vec<String>) -> Self {
         DetachedDaemon { args }
     }
 }

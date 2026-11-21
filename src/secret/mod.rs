@@ -8,13 +8,12 @@ pub mod deliver;
 pub mod place;
 
 use anyhow::{Context, Result, bail};
-use std::ffi::OsString;
 use std::fmt;
 use std::os::unix::ffi::OsStringExt;
-use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::config::secret::{SecretDecl, Source};
+use crate::local::Local;
 
 /// A resolved secret value. It cannot be printed: `Debug` redacts it and there is
 /// no `Display`. The only way to the bytes is the explicit `expose`.
@@ -83,77 +82,18 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Reads a secret's value on this machine. Errors name the secret and its source
 /// but never contain the value.
-pub fn resolve(decl: &SecretDecl) -> Result<Secret> {
-    resolve_with(decl, |k| std::env::var_os(k), run_command)
-}
-
-fn run_command(script: &str) -> Result<Vec<u8>> {
-    let out = local_sh_capture(script, COMMAND_TIMEOUT)?;
-    if !out.status.success() {
-        bail!("{}", out.status);
-    }
-    Ok(out.stdout)
-}
-
-/// Runs `sh -c <script>` on *this* machine with no stdin, capturing stdout and
-/// letting stderr through to the terminal, and kills it after `timeout`.
-///
-/// A secret's source is on the machine running lodge whatever the host is
-/// (`pass show x`), so this is deliberately not a [`Host`](crate::host::Host)
-/// command, which runs on the project's host. The returned `Output` has an empty
-/// `stderr`.
-fn local_sh_capture(script: &str, timeout: Duration) -> Result<Output> {
-    use std::io::Read;
-    let mut cmd = Command::new("sh");
-    cmd.args(["-c", script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    crate::output::trace(&cmd);
-    let mut child = cmd.spawn().context("running sh")?;
-    let mut pipe = child.stdout.take().context("capturing stdout")?;
-    // Drain on a thread so a chatty child can't block on a full pipe.
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        pipe.read_to_end(&mut buf).ok();
-        buf
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait().context("waiting for command")? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            child.kill().ok();
-            child.wait().ok();
-            reader.join().ok();
-            bail!("timed out after {}s", timeout.as_secs());
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let stdout = reader.join().unwrap_or_default();
-    Ok(Output {
-        status,
-        stdout,
-        stderr: Vec::new(),
-    })
-}
-
-fn resolve_with(
-    decl: &SecretDecl,
-    env: impl Fn(&str) -> Option<OsString>,
-    command: impl Fn(&str) -> Result<Vec<u8>>,
-) -> Result<Secret> {
+pub fn resolve(decl: &SecretDecl, local: &dyn Local) -> Result<Secret> {
     let (what, bytes) = match &decl.from {
         Source::Env(var) => {
-            let v = env(var).map(OsStringExt::into_vec);
+            let v = local.var(var).map(OsStringExt::into_vec);
             (
                 format!("environment variable {var}"),
                 v.context("is not set"),
             )
         }
         Source::File(path) => {
-            let r = std::fs::read(path)
+            let r = local
+                .read_file(path)
                 .map(|mut b| {
                     // A trailing newline is an editor artefact, not part of the value.
                     while matches!(b.last(), Some(b'\n' | b'\r')) {
@@ -166,7 +106,9 @@ fn resolve_with(
         }
         Source::Command(cmd) => {
             let program = cmd.split_whitespace().next().unwrap_or_default();
-            let r = command(cmd).map(|b| b.trim_ascii().to_vec());
+            let r = local
+                .run_sh(cmd, COMMAND_TIMEOUT)
+                .map(|b| b.trim_ascii().to_vec());
             (format!("command `{program}`"), r)
         }
     };
@@ -181,6 +123,7 @@ fn resolve_with(
 mod tests {
     use super::*;
     use crate::config::secret::As;
+    use crate::local::fake::FakeLocal;
 
     #[test]
     fn secret_value_is_redacted() {
@@ -198,63 +141,46 @@ mod tests {
         }
     }
 
-    fn no_env(_: &str) -> Option<OsString> {
-        None
-    }
-
-    fn no_cmd(_: &str) -> Result<Vec<u8>> {
-        unreachable!("not a command source")
-    }
-
     #[test]
     fn resolves_env_untouched() {
         let d = decl(Source::Env("X".into()));
-        let s = resolve_with(&d, |_| Some("  v al \n".into()), no_cmd).unwrap();
-        assert_eq!(s.expose(), b"  v al \n");
-        let e = resolve_with(&d, no_env, no_cmd).unwrap_err();
+        let set = FakeLocal::new().with_var("X", "  v al \n");
+        assert_eq!(resolve(&d, &set).unwrap().expose(), b"  v al \n");
+        let e = resolve(&d, &FakeLocal::new()).unwrap_err();
         assert!(format!("{e:#}").contains("TOKEN") && format!("{e:#}").contains("not set"));
-        let e = resolve_with(&d, |_| Some("".into()), no_cmd).unwrap_err();
+        let e = resolve(&d, &FakeLocal::new().with_var("X", "")).unwrap_err();
         assert!(format!("{e:#}").contains("empty"));
     }
 
     #[test]
     fn resolves_file_stripping_trailing_newline() {
-        let tmp = crate::tmpfile::TempDir::new("secret").unwrap();
-        let dir = tmp.path();
-        let p = dir.join("tok");
-        std::fs::write(&p, "abc\r\n\n").unwrap();
-        let s = resolve_with(&decl(Source::File(p.clone())), no_env, no_cmd).unwrap();
+        let d = decl(Source::File("/tok".into()));
+        let s = resolve(&d, &FakeLocal::new().with_file("/tok", b"abc\r\n\n")).unwrap();
         assert_eq!(s.expose(), b"abc");
-        std::fs::write(&p, "\n").unwrap();
-        assert!(resolve_with(&decl(Source::File(p.clone())), no_env, no_cmd).is_err());
-        let e = resolve_with(&decl(Source::File(dir.join("missing"))), no_env, no_cmd).unwrap_err();
+        assert!(resolve(&d, &FakeLocal::new().with_file("/tok", b"\n")).is_err());
+        let e = resolve(&d, &FakeLocal::new()).unwrap_err();
         assert!(format!("{e:#}").contains("not found"), "{e:#}");
     }
 
     #[test]
     fn command_output_is_trimmed_and_errors_hide_the_value() {
-        let d = decl(Source::Command("pass show hunter2-entry --flag".into()));
-        let s = resolve_with(&d, no_env, |_| Ok(b"\n tok \n".to_vec())).unwrap();
+        let script = "pass show hunter2-entry --flag";
+        let d = decl(Source::Command(script.into()));
+        let s = resolve(&d, &FakeLocal::new().with_script(script, b"\n tok \n")).unwrap();
         assert_eq!(s.expose(), b"tok");
-        let e = resolve_with(&d, no_env, |_| Ok(b" \n".to_vec())).unwrap_err();
+        let e = resolve(&d, &FakeLocal::new().with_script(script, b" \n")).unwrap_err();
         assert!(format!("{e:#}").contains("empty"));
-        let e = resolve_with(&d, no_env, |_| bail!("exit status: 1")).unwrap_err();
+        let e = resolve(
+            &d,
+            &FakeLocal::new().with_failing_script(script, "exit status: 1"),
+        )
+        .unwrap_err();
         let msg = format!("{e:#}");
         // Only the program is named, not its arguments.
         assert!(
             msg.contains("`pass`") && !msg.contains("hunter2-entry"),
             "{msg}"
         );
-    }
-
-    #[test]
-    fn real_command_source_runs_and_times_out() {
-        let d = decl(Source::Command("printf '  s3cret\\n'".into()));
-        assert_eq!(resolve(&d).unwrap().expose(), b"s3cret");
-        let e = resolve(&decl(Source::Command("exit 3".into()))).unwrap_err();
-        assert!(format!("{e:#}").contains("exit"), "{e:#}");
-        let e = local_sh_capture("sleep 5", Duration::from_millis(100)).unwrap_err();
-        assert!(e.to_string().contains("timed out"));
     }
 
     #[test]

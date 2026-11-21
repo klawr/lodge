@@ -192,6 +192,7 @@ mod tests {
     use super::*;
     use crate::devcontainer::backend::LABEL_PROJECT;
     use crate::devcontainer::vars::Vars;
+    use crate::local::fake::FakeLocal;
     use serde_json::json;
     use std::path::Path;
 
@@ -219,7 +220,8 @@ mod tests {
     #[test]
     fn mounts_resolve_variables_including_the_container_workspace() {
         let p = Path::new("/home/me/proj");
-        let vars = Vars::new(p).with_container_workspace("/workspaces/proj");
+        let local = FakeLocal::new();
+        let vars = Vars::new(p, &local).with_container_workspace("/workspaces/proj");
         let obj = json!({
             "type": "bind",
             "source": "${localWorkspaceFolder}/cache",
