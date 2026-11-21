@@ -3,7 +3,7 @@
 
 use super::Prompt;
 use crate::output::warning;
-use crate::runtime::Container;
+use crate::runtime::{Container, ExecOpts};
 
 /// `configured` if it exists in the container; otherwise `prompt` decides,
 /// offered mount destinations and `/workspaces/*` entries. When existence
@@ -29,11 +29,14 @@ fn discover_workdirs(container: &dyn Container) -> Vec<String> {
 
     // `find` exits non-zero when either root is missing (the usual case) but has
     // still listed the other, so its status is ignored.
-    if let Ok(out) = container.exec_capture(&[
-        "sh",
-        "-c",
-        "find /workspaces /workspace -maxdepth 1 -mindepth 1 -type d 2>/dev/null; true",
-    ]) {
+    if let Ok(out) = container.exec_capture_with(
+        &[
+            "sh",
+            "-c",
+            "find /workspaces /workspace -maxdepth 1 -mindepth 1 -type d 2>/dev/null; true",
+        ],
+        &ExecOpts::default().repeatable(),
+    ) {
         for line in out.lines().map(str::trim).filter(|s| !s.is_empty()) {
             let s = line.to_string();
             if !candidates.contains(&s) {

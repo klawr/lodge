@@ -633,7 +633,7 @@ mod tests {
     #[should_panic(expected = "FakeEnv: unexpected command")]
     fn an_undeclared_command_panics_instead_of_succeeding() {
         let env = FakeEnv::new();
-        let _ = env.exec_capture(&["some-tool", "--flag"]);
+        let _ = env.exec_capture_with(&["some-tool", "--flag"], &ExecOpts::default());
     }
 
     #[test]
@@ -648,7 +648,11 @@ mod tests {
         let env = FakeEnv::new()
             .with_output(&["uname", "-m"], "x86_64\n")
             .with_failure(&["infocmp", "nope"]);
-        assert_eq!(env.exec_capture(&["uname", "-m"]).unwrap(), "x86_64\n");
+        assert_eq!(
+            env.exec_capture_with(&["uname", "-m"], &ExecOpts::default())
+                .unwrap(),
+            "x86_64\n"
+        );
         assert!(!env.succeeds(&["infocmp", "nope"]));
     }
 
@@ -728,7 +732,11 @@ mod tests {
         let env = FakeEnv::new();
         env.write_file("/etc/x", b"hello").unwrap();
         assert!(env.exists("/etc/x").unwrap());
-        assert_eq!(env.exec_capture(&["cat", "/etc/x"]).unwrap(), "hello");
+        assert_eq!(
+            env.exec_capture_with(&["cat", "/etc/x"], &ExecOpts::default())
+                .unwrap(),
+            "hello"
+        );
         env.exec_root(&["rm", "-f", "/etc/x"]).unwrap();
         assert!(!env.exists("/etc/x").unwrap());
     }

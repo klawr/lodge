@@ -57,6 +57,10 @@ pub struct ExecOpts<'a> {
     pub user: User<'a>,
     pub workdir: Option<&'a str>,
     pub env: &'a [(String, String)],
+    /// Whether the command may be run again if the connection to a remote
+    /// engine drops while it runs. Off unless the caller knows that running it
+    /// twice is harmless.
+    pub repeat: crate::ssh::Repeat,
 }
 
 impl<'a> ExecOpts<'a> {
@@ -66,6 +70,15 @@ impl<'a> ExecOpts<'a> {
             user,
             workdir: None,
             env: &[],
+            repeat: crate::ssh::Repeat::Never,
+        }
+    }
+
+    /// This command is safe to run again; see [`ExecOpts::repeat`].
+    pub fn repeatable(self) -> Self {
+        ExecOpts {
+            repeat: crate::ssh::Repeat::Safe,
+            ..self
         }
     }
 
@@ -132,14 +145,10 @@ pub trait Env {
         self.exec(argv, &ExecOpts::root())
     }
 
-    /// Runs `argv` as the default user and returns stdout; errors on non-zero exit.
-    fn exec_capture(&self, argv: &[&str]) -> Result<String> {
-        self.exec_capture_as(User::Default, argv)
-    }
-
-    /// Like [`exec_capture`](Self::exec_capture) as `user`.
-    fn exec_capture_as(&self, user: User, argv: &[&str]) -> Result<String> {
-        let out = self.output(argv, &ExecOpts::as_user(user))?;
+    /// Runs `argv` and returns stdout; errors on non-zero exit. For a read or a
+    /// probe, ask for [`ExecOpts::repeatable`].
+    fn exec_capture_with(&self, argv: &[&str], opts: &ExecOpts) -> Result<String> {
+        let out = self.output(argv, opts)?;
         if !out.success {
             bail!("exec failed: {argv:?}\n{}", out.stderr.trim());
         }
@@ -156,7 +165,7 @@ pub trait Env {
     /// it could not be found out, which callers must not mistake for "missing".
     fn exists(&self, path: &str) -> Result<bool> {
         let actor = self.actor();
-        let opts = ExecOpts::as_user(actor.exec_as());
+        let opts = ExecOpts::as_user(actor.exec_as()).repeatable();
         let out = self.output(&script_argv(EXISTS_SCRIPT, &[path]), &opts)?;
         match (out.success, out.stdout.as_str()) {
             (true, "y") => Ok(true),
@@ -169,7 +178,8 @@ pub trait Env {
     /// True if `cmd` is on `PATH`.
     fn has_command(&self, cmd: &str) -> bool {
         let probe = format!("command -v {} >/dev/null 2>&1", shell_quote(cmd));
-        self.succeeds(&["sh", "-c", &probe])
+        self.output(&["sh", "-c", &probe], &ExecOpts::default().repeatable())
+            .is_ok_and(|o| o.success)
     }
 
     /// `mkdir -p` as the actor.
@@ -177,7 +187,7 @@ pub trait Env {
         let mut argv = vec!["mkdir", "-p"];
         argv.extend_from_slice(dirs);
         let actor = self.actor();
-        self.exec(&argv, &ExecOpts::as_user(actor.exec_as()))
+        self.exec(&argv, &ExecOpts::as_user(actor.exec_as()).repeatable())
     }
 
     /// Copies `src` into the environment, owned by the actor; see
@@ -209,7 +219,7 @@ pub trait Env {
     /// not mistake for "missing".
     fn read_file(&self, path: &str) -> Result<Option<String>> {
         let actor = self.actor();
-        let opts = ExecOpts::as_user(actor.exec_as());
+        let opts = ExecOpts::as_user(actor.exec_as()).repeatable();
         let out = self.output(&script_argv(READ_FILE_SCRIPT, &[path]), &opts)?;
         if !out.success {
             bail!("reading {path} failed: {}", out.stderr.trim());

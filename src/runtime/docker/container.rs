@@ -113,8 +113,8 @@ impl Env for DockerContainer {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let status = self
             .cli
-            .command(&refs)
-            .status()
+            .target
+            .attempt(opts.repeat, || self.cli.command(&refs).status())
             .context("spawning docker exec")?;
         if !status.success() {
             bail!("docker exec failed: {argv:?}");
@@ -127,8 +127,8 @@ impl Env for DockerContainer {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = self
             .cli
-            .command(&refs)
-            .output()
+            .target
+            .attempt(opts.repeat, || self.cli.command(&refs).output())
             .context("spawning docker exec")?;
         Ok(Output {
             success: out.status.success(),
@@ -150,16 +150,24 @@ impl Env for DockerContainer {
         let mut args = self.exec_args(&argv, &ExecOpts::as_user(user));
         args.insert(1, "-i".into());
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        // `command` closes stdin for ssh; this one streams, so override it.
-        let mut cmd = self.cli.command(&refs);
-        cmd.stdin(std::process::Stdio::piped());
-        let mut child = cmd.spawn().context("spawning docker exec")?;
-        let written = child
-            .stdin
-            .take()
-            .context("docker exec stdin was not piped")?
-            .write_all(contents);
-        let status = child.wait().context("waiting for docker exec")?;
+        // The script writes to a temporary file and renames it into place, so
+        // sending the secret again after a lost connection is harmless.
+        let (status, written) = self
+            .cli
+            .target
+            .attempt(crate::ssh::Repeat::Safe, || {
+                // `command` closes stdin for ssh; this one streams, so override it.
+                let mut cmd = self.cli.command(&refs);
+                cmd.stdin(std::process::Stdio::piped());
+                let mut child = cmd.spawn()?;
+                let written = child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| std::io::Error::other("docker exec stdin was not piped"))?
+                    .write_all(contents);
+                Ok((child.wait()?, written))
+            })
+            .context("running docker exec")?;
         if !status.success() {
             bail!("writing secret file {dest} failed ({status})");
         }
@@ -224,8 +232,10 @@ impl Container for DockerContainer {
         let args = ["inspect", "--format", "{{.State.Running}}", &self.id];
         let out = self
             .cli
-            .command(&args)
-            .output()
+            .target
+            .attempt(crate::ssh::Repeat::Safe, || {
+                self.cli.command(&args).output()
+            })
             .context("spawning docker inspect")?;
         if out.status.success() {
             return Ok(String::from_utf8_lossy(&out.stdout).trim() == "true");

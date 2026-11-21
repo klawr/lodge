@@ -7,7 +7,7 @@ use crate::bundle::elf;
 use crate::bundle::manifest::{BIN_DIR, Binary, Manifest, Tool};
 use crate::bundle::source::Prepared;
 use crate::layout::Layout;
-use crate::runtime::{ContainerUser, Env};
+use crate::runtime::{ContainerUser, Env, ExecOpts};
 
 /// Puts the tool's binary into `stage/bin/`, which is sent as a whole to the
 /// prefix.
@@ -78,7 +78,8 @@ pub(super) fn check_architecture(env: &dyn Env, manifest: &Manifest) -> Result<(
     let Ok(bundle_arch) = manifest.arch() else {
         return Ok(());
     };
-    let Ok(uname) = env.exec_capture(&["uname", "-m"]) else {
+    let Ok(uname) = env.exec_capture_with(&["uname", "-m"], &ExecOpts::default().repeatable())
+    else {
         return Ok(());
     };
     let Some(runs_on) = Arch::from_uname(&uname) else {

@@ -64,14 +64,14 @@ every subcommand.
 | `inject/` | Copies a bundle's binaries, libraries and configs into a container for one `ContainerUser`, reading only from the bundle directory and acting *as that user* (through `runtime::Acting`), so it never needs root: `prefix` (chooses and checks the prefix: the user's home, else a private `/tmp` directory; `installed`, in `state`, finds where it was installed), `binary` (rewrites a dynamic binary's interpreter for the prefix, and writes the wrapper a config asked for), `libs` (tracked by content hash), `config_files`, `git` (`safe.directory`), `installed` (a hash and the destination per installed piece; a record that can't be read means that piece is installed again, and the list of records `ldg clean` works from is an error when it can't be read, not "nothing installed"), `state` (the installed bundle id, and `installed`, which finds what was injected and where), `remove` (`ldg clean`; placed secrets are removed by `secret::place::clear`). |
 | `layout.rs` | Every path lodge writes inside a container: `Layout`, the paths inside the user's prefix (the table under "What lives where"); the provisioning state, which is the devcontainer's own and root-owned; and the secrets directory. Nothing else spells these paths out. |
 | `secret/` | Secrets that must not be in a bundle. Their `[[secret]]` declarations are config (`config/secret.rs`: validated; names reach shell scripts). `mod` is the `Secret` value type (redacted `Debug`, no `Display`), matching `targets` globs, and `resolve` (env, file or a command run on *this* machine with a timeout, with errors that never contain the value). `place` writes values into a container under `/dev/shm/lodge-secrets-<uid>/` and builds the session lines that export them; `clear` removes the user's (`ldg clean`). `deliver` picks the secrets whose `targets` match, resolves and places them (or clears them when none are declared), and prints names only. |
-| `session/` | Opens the interactive session: `docker exec -it`, optionally inside tmux. Its start-up script (`startup_script`) starts the shell as a login shell, so the profile scripts run, then puts the user's prefix `bin/` first on `PATH` and restores what the profile dropped before running the shell interactively; that is how the injected tools reach the session without any file outside the prefix. `terminfo` makes the terminal the session is opened from work in the container (copies its entry from this machine into the prefix when the container lacks it, and sets `TERM`). |
+| `session/` | Opens the interactive session: `docker exec -it`, and nothing around it; after a lost `--remote` connection it offers to reconnect. Its start-up script (`startup_script`) starts the shell as a login shell, so the profile scripts run, then puts the user's prefix `bin/` first on `PATH` and restores what the profile dropped before running the shell interactively; that is how the injected tools reach the session without any file outside the prefix. `terminfo` makes the terminal the session is opened from work in the container (copies its entry from this machine into the prefix when the container lacks it, and sets `TERM`). |
 | `forward/` | Port forwarding. `mod` spawns the daemon and owns its state files (log, lock, and the ports file `ldg ports` reads, which starts with the daemon's pid so a dead daemon's file is ignored), `daemon` is the `_forward` loop (declared ports plus whatever starts listening), `tunnel` one forward: the in-process TCP proxy or an `ssh -L` tunnel. The daemon decodes its own `--port` flags, re-points a forward when its destination's address changes (looked up again every 30 s), and exits when the container stops, not when the engine merely can't be reached for a while. |
 | `port.rs` | `PortForward`, a port to forward: what the devcontainer spec declares and the daemon carries out, so neither depends on the other. |
-| `host_tools.rs` | The helper programs lodge may run here (`ssh`, `ldd`, `patchelf`, `oras`, `tmux`): what each is needed for (a `Need`, which decides when `doctor` requires it) and how to get it. `doctor` reports from this table and each tool is started only through it. |
+| `host_tools.rs` | The helper programs lodge may run here (`ssh`, `ldd`, `patchelf`, `oras`): what each is needed for (a `Need`, which decides when `doctor` requires it) and how to get it. `doctor` reports from this table and each tool is started only through it. |
 | `target.rs` | `Target` (`Local` or `Ssh(host)`): the one place that decides local vs remote, plus host-side file helpers (`read_first` finds files by pattern and reads the first in one round trip, `read_file` reads one, `fetch_dir` copies a folder from the project's host). |
 | `runtime/` | The seam to whatever runs the workload: the `Env`, `Container`, `Runtime` and `Compose` traits (see below), `User` (who a command runs as) and `ContainerUser` (the session user's name, uid, gid and home, looked up once), `Acting` (an `Env` seen as one user, below), `tarball` (packs files as a tar owned by a user), the docker CLI implementation (`docker/`: the engine, the per-container `Env`, and the file-copy streaming), and strict in-memory fakes for tests (`FakeEnv`, and `FakeRuntime`, whose containers each run in one). |
 | `ssh.rs` | `--remote` destination parsing, connection multiplexing, small SSH helpers. |
-| `shell.rs` | POSIX `shell_quote`, which everything that builds a command string goes through; `script_argv`, how every script with arguments is started (`sh -c <script> sh <args…>`, so arguments are `$1`, `$2`, …); the rules for names written into scripts unquoted (`is_plain_name`, `is_var_name`) and for destinations in a container (`container_path_problem`); `slug` for container names and `session_name` for tmux sessions; and `CmdLine`, a command as `sh -c` script or argv. |
+| `shell.rs` | POSIX `shell_quote`, which everything that builds a command string goes through; `script_argv`, how every script with arguments is started (`sh -c <script> sh <args…>`, so arguments are `$1`, `$2`, …); the rules for names written into scripts unquoted (`is_plain_name`, `is_var_name`) and for destinations in a container (`container_path_problem`); `slug` for container names; and `CmdLine`, a command as `sh -c` script or argv. |
 | `fingerprint.rs` | The small content hash used to notice changes (devcontainer inputs, updated libraries, bundle contents), as a `Fingerprint` builder. Its values are stored, so a test pins them. |
 | `tmpfile.rs` | Self-deleting staging files for `docker cp`. |
 | `tree.rs` | Walking a file tree on this machine in one stable order (name order, a directory before its contents), with an explicit choice about symlinks (a followed link loop is entered once) and unreadable directories. Every hash, fingerprint and copy of a tree goes through it. |
@@ -360,7 +360,7 @@ erode.
   `docker` only in `runtime/docker/`, a local `sh` only in `target.rs` (scripts
   on the project's host), `secret/` (a secret's `command` source, which is on
   this machine whatever the target) and `session/` (launching the user's
-  session), and the helper tools (`ldd`, `patchelf`, `oras`, `tmux`) only
+  session), and the helper tools (`ldd`, `patchelf`, `oras`) only
   through `host_tools`. lodge never runs a local `tar`; tar streams are built and
   unpacked in-process. `ssh.rs` offers `command`, `sh_output`, `write_scratch`,
   `tunnel`, `pty_denied` and `interactive_line`, all built on one private
@@ -444,11 +444,11 @@ variables, compose, forwarding (loopback-only, one daemon), `--remote`, bundles
 secrets (never in the image, the trace or the disk; scoping), hooks and feature
 scripts as `remoteUser`, local features over `--remote`, one container per
 folder however it is spelled, `ls`/`status --json`/`ports`/`logs`/`clean`, config
-typos, `init`/`completions`/`man`, a real tmux session, a glibc tool in an Alpine
+typos, `init`/`completions`/`man`, a glibc tool in an Alpine
 (musl) container, and `--remote` against a real OpenSSH server. They are `#[ignore]`d, so `cargo test`
 stays Docker-free; run them with `make integration` (about 30 s; quiet on success, and a failure shows the tail of
 the command that failed). Narrow with `make integration T=uid`. They need docker
-with compose, `patchelf`, `tmux` and an ssh client (the tests build their own
+with compose, `patchelf` and an ssh client (the tests build their own
 `sshd` image and pull `debian:stable-slim` and `alpine:3`).
 
 Each test gets a sandbox: its own config, data and temp directories, and, for
@@ -456,8 +456,7 @@ Each test gets a sandbox: its own config, data and temp directories, and, for
 command locally, so no second machine is needed. One test instead starts a real
 `sshd` (a container with the docker CLI and this engine's socket, the sandbox
 mounted at the same path) and uses the real ssh client through a wrapper that
-adds a private `-F` config. A private `TMUX_TMPDIR` keeps tmux tests away from
-the tmux you may be running them in. A project removes its container
+adds a private `-F` config. A project removes its container
 when dropped, even if the test failed, and the sandbox waits for its forward
 daemons before deleting itself. `ldg up --no-attach`
 does all the work and exit without opening a shell, which is what makes the exit

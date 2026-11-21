@@ -59,7 +59,6 @@ pub struct Started {
     /// The container was created by this call (new, or rebuilt), so nothing has
     /// been injected into it yet.
     pub created: bool,
-    pub session_name: String,
     pub workdir: String,
     pub forward_ports: Vec<PortForward>,
     /// The user to run as inside the container (`remoteUser` in devcontainer.json).
@@ -181,7 +180,6 @@ pub fn start(
     Ok(Started {
         container,
         created,
-        session_name: spec.session_name,
         workdir,
         forward_ports: spec.forward_ports,
         remote_user: spec.remote_user,

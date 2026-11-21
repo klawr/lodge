@@ -6,7 +6,7 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 
 use super::{Ctx, print_json};
-use crate::config::{Config, Multiplexer};
+use crate::config::Config;
 use crate::host_tools::{self, Need, Tool};
 use crate::output::{info, line, plural, warning};
 
@@ -87,16 +87,12 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
     let packs_live = config
         .as_ref()
         .is_ok_and(|c| c.bundle.is_none() && !c.inject.is_empty());
-    let tmux_wanted = config
-        .as_ref()
-        .is_ok_and(|c| c.session.multiplexer == Multiplexer::Tmux);
     for tool in host_tools::ALL {
         // (shown at all, required) for what this host and config ask of it.
         let (shown, required) = match tool.need {
             Need::Remote => (remote.is_some(), remote.is_some()),
             Need::Pack => (true, packs_live),
             Need::RegistryFeatures => (true, needs_oras),
-            Need::Multiplexer => (tmux_wanted, false),
         };
         if shown {
             checks.push(tool_check(tool, required));

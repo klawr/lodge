@@ -40,7 +40,6 @@
       "description": "How the interactive session is opened.",
       "$ref": "#/$defs/SessionConfig",
       "default": {
-        "multiplexer": "tmux",
         "shell": "/bin/bash"
       }
     }
@@ -107,21 +106,6 @@
       "additionalProperties": false,
       "required": [
         "name"
-      ]
-    },
-    "Multiplexer": {
-      "description": "What the session is wrapped in on this machine.",
-      "oneOf": [
-        {
-          "description": "A per-container tmux session (falls back to `none` without tmux).",
-          "type": "string",
-          "const": "tmux"
-        },
-        {
-          "description": "Exec straight into the container.",
-          "type": "string",
-          "const": "none"
-        }
       ]
     },
     "RawAs": {
@@ -204,11 +188,6 @@
     "SessionConfig": {
       "type": "object",
       "properties": {
-        "multiplexer": {
-          "description": "Terminal multiplexer to wrap the session in (default: tmux).",
-          "$ref": "#/$defs/Multiplexer",
-          "default": "tmux"
-        },
         "shell": {
           "description": "Shell to launch inside the container (default: /bin/bash).",
           "type": "string",

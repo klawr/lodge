@@ -64,15 +64,7 @@ pub fn up(
         return Ok(());
     }
     started.run_post_attach();
-    attach(
-        ctx,
-        container,
-        &config,
-        &user,
-        &layout,
-        &started.session_name,
-        &started.workdir,
-    )
+    attach(ctx, container, &config, &user, &layout, &started.workdir)
 }
 
 /// Delivers the secrets, then opens the session.
@@ -82,7 +74,6 @@ fn attach(
     config: &Config,
     user: &ContainerUser,
     layout: &Layout,
-    name: &str,
     workdir: &str,
 ) -> Result<()> {
     let setup = secret::deliver::deliver(container, &ctx.target, user, &config.secret)?;
@@ -91,7 +82,6 @@ fn attach(
         &ctx.target,
         &config.session,
         &Session {
-            name,
             workdir,
             user,
             layout,

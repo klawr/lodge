@@ -83,28 +83,12 @@ pub struct SessionConfig {
     /// Shell to launch inside the container (default: /bin/bash).
     #[serde(default = "default_shell")]
     pub shell: String,
-    /// Terminal multiplexer to wrap the session in (default: tmux).
-    #[serde(default)]
-    pub multiplexer: Multiplexer,
-}
-
-/// What the session is wrapped in on this machine.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-#[cfg_attr(test, derive(schemars::JsonSchema))]
-pub enum Multiplexer {
-    /// A per-container tmux session (falls back to `none` without tmux).
-    #[default]
-    Tmux,
-    /// Exec straight into the container.
-    None,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             shell: default_shell(),
-            multiplexer: Multiplexer::default(),
         }
     }
 }
@@ -342,7 +326,6 @@ mod tests {
         let c = parse("").unwrap();
         assert!(c.inject.is_empty());
         assert_eq!(c.session.shell, "/bin/bash");
-        assert_eq!(c.session.multiplexer, Multiplexer::Tmux);
         assert_eq!(c.git.safe_directories, vec!["*".to_string()]);
     }
 
@@ -356,7 +339,6 @@ mod tests {
 
             [session]
             shell = "/bin/zsh"
-            multiplexer = "none"
 
             [git]
             safe_directories = ["/work"]
@@ -367,7 +349,6 @@ mod tests {
         assert_eq!(c.inject[0].name, "nvim");
         assert!(c.inject[0].copy_deps); // defaults to true
         assert_eq!(c.session.shell, "/bin/zsh");
-        assert_eq!(c.session.multiplexer, Multiplexer::None);
         assert_eq!(c.git.safe_directories, vec!["/work".to_string()]);
     }
 
@@ -427,15 +408,6 @@ mod tests {
             parse("[sesion]\nshell = \"/bin/sh\"\n").unwrap_err()
         );
         assert!(err.contains("did you mean `session`?"), "{err}");
-    }
-
-    #[test]
-    fn an_unknown_multiplexer_is_rejected() {
-        let err = format!(
-            "{:#}",
-            parse("[session]\nmultiplexer = \"screen\"\n").unwrap_err()
-        );
-        assert!(err.contains("screen"), "{err}");
     }
 
     #[test]

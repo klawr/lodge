@@ -32,7 +32,10 @@ pub(super) fn inject_config(
     // whole chain and can create siblings (nvim writing `.local/state` next to
     // `.local/share`) later.
     let written = env
-        .exec(&["rm", "-rf", &dest], &crate::runtime::ExecOpts::default())
+        .exec(
+            &["rm", "-rf", &dest],
+            &crate::runtime::ExecOpts::default().repeatable(),
+        )
         .and_then(|()| env.cp_in(&bundle.config(name).to_string_lossy(), &dest));
     written.with_context(|| {
         format!(

@@ -204,12 +204,9 @@ impl Sandbox {
         &self.root
     }
 
-    /// Writes the user's lodge config. A session section that avoids tmux is
-    /// always included.
+    /// Writes the user's lodge config.
     pub fn config(&self, extra_toml: &str) {
-        self.config_raw(&format!(
-            "{extra_toml}\n[session]\nmultiplexer = \"none\"\n"
-        ));
+        self.config_raw(extra_toml);
     }
 
     /// Writes the user's lodge config exactly as given.
@@ -355,10 +352,7 @@ impl Sandbox {
             .env("XDG_CACHE_HOME", self.root.join("cache"))
             // Scratch files and ssh control sockets land here, not in /tmp, and go
             // away with the sandbox.
-            .env("TMPDIR", self.root.join("tmp"))
-            // A private tmux server, and never the one the tests run inside.
-            .env("TMUX_TMPDIR", self.root.join("tmp"))
-            .env_remove("TMUX");
+            .env("TMPDIR", self.root.join("tmp"));
         if self.fake_ssh {
             let mut paths = vec![self.root.join("bin")];
             paths.extend(std::env::split_paths(
@@ -448,12 +442,6 @@ impl Drop for Sandbox {
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        // A tmux server a test started lives in the sandbox; stop it.
-        let _ = Command::new("tmux")
-            .env("TMUX_TMPDIR", self.root.join("tmp"))
-            .env_remove("TMUX")
-            .args(["kill-server"])
-            .output();
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }

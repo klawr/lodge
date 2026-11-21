@@ -86,7 +86,7 @@ pub fn run(
     // overwritten.)
     env.exec(
         &["rm", "-rf", &layout.bin(), &layout.lib()],
-        &ExecOpts::default(),
+        &ExecOpts::default().repeatable(),
     )?;
     env.cp_in(&stage.path().to_string_lossy(), layout.prefix())?;
 

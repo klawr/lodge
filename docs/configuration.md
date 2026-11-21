@@ -46,8 +46,7 @@ config        = "~/.local/share/nvim/lazy"
 target_config = "~/.local/share/nvim/lazy"
 
 [session]
-shell       = "/bin/bash"   # shell launched inside the container (default)
-multiplexer = "tmux"        # "tmux" or "none" (default: "tmux")
+shell = "/bin/bash"   # shell launched inside the container (default)
 
 [git]
 # Registered as git `safe.directory` in the container, so git-backed tools
@@ -82,10 +81,67 @@ Shell aliases and other shell setup are your shell's own config: inject your
 
 ## `[session]`
 
+lodge opens a shell in the container and nothing more. For a session that
+outlives a disconnect, use a multiplexer: see
+[Keeping a session alive](#keeping-a-session-alive).
+
 | field         | default     | meaning |
 | ------------- | ----------- | ------- |
 | `shell`       | `/bin/bash` | the shell started in the container; it must exist there. bash, zsh, sh and dash are supported. It is started once as a login shell, so the profile scripts run, then as the interactive shell you work in |
-| `multiplexer` | `"tmux"`    | `"tmux"`: a per-container tmux session on this machine (from inside tmux, lodge switches to it instead of nesting; without tmux installed it falls back to `"none"`). `"none"`: exec straight into the container |
+
+## Keeping a session alive
+
+A multiplexer (tmux, zellij, screen) is not a lodge feature, and lodge has no
+code for one. It is a tool like any other: inject it, and start it from your
+shell's rc file. The container keeps it running when you leave, so the next
+`ldg up` (or `ldg attach`) lands in the same session, with your editor as you
+left it. The same holds after a dropped `--remote` connection: `ldg` asks whether
+to reconnect and open a new shell, which reads the rc file again and attaches.
+
+A tmux setup, with three `[[inject]]` entries:
+
+```toml
+[[inject]]
+name   = "tmux"
+binary = "/usr/bin/tmux"
+
+# ~/.bashrc in the container: start tmux once, attaching if it is already there.
+[[inject]]
+name          = "tmux-rc"
+config        = "~/.config/lodge/tmux-rc"
+target_config = "~/.bashrc"
+
+# ~/.tmux.conf in the container.
+[[inject]]
+name          = "tmux-conf"
+config        = "~/.config/lodge/tmux.conf"
+target_config = "~/.tmux.conf"
+```
+
+`~/.config/lodge/tmux-rc` (use your own `~/.bashrc` and add these lines, if you
+already inject one):
+
+```sh
+if [ -z "$TMUX" ] && command -v tmux >/dev/null; then
+  exec tmux new-session -A -s main
+fi
+```
+
+`~/.config/lodge/tmux.conf`:
+
+```
+set -g default-command bash
+```
+
+The last line matters. tmux starts each pane as a *login* shell, and on Debian
+and Ubuntu `/etc/profile` resets `PATH`, which would hide everything lodge
+injected (`tmux detach` itself would be "not found"). lodge's own session puts
+its tools back first on `PATH`; a pane started as a plain `bash` instead inherits
+that `PATH` from the tmux server. Use your shell if it isn't bash. Any other
+multiplexer needs the same care: its panes must not be login shells that reset
+`PATH`.
+
+This is covered by an integration test, so it keeps working.
 
 ## `[git]`
 

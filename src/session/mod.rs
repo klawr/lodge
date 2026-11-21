@@ -1,5 +1,8 @@
-//! The interactive session: a login shell in the container, optionally inside
-//! a tmux session on this machine.
+//! The interactive session: a login shell in the container.
+//!
+//! lodge starts a shell and nothing else. Keeping a session alive across a
+//! disconnect is the user's business: a multiplexer they inject and start from
+//! their shell's rc file is just another program in that shell.
 //!
 //! The session is what puts lodge's tools within reach: it makes the user's
 //! prefix `bin/` the first directory on `PATH` ([`startup_script`]), so that
@@ -7,21 +10,20 @@
 
 pub mod terminfo;
 
-use crate::config::{Multiplexer, SessionConfig};
+use crate::config::SessionConfig;
 use crate::layout::Layout;
-use crate::output::{info, warning};
+use crate::output::{info, note, prompt, warning};
 use crate::runtime::{Acting, Container, ContainerUser};
 use crate::shell::shell_quote;
+use crate::ssh::Outcome as _;
 use crate::target::Target;
-use anyhow::{Result, bail};
-use std::process::Command;
+use anyhow::Result;
+use std::io::IsTerminal as _;
+use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 /// Where and how to open the session.
 pub struct Session<'a> {
-    /// The tmux session name, already made of letters, digits and `-`
-    /// ([`crate::shell::slug`]), which tmux takes as is.
-    pub name: &'a str,
     pub workdir: &'a str,
     /// Who the shell runs as.
     pub user: &'a ContainerUser,
@@ -116,17 +118,27 @@ pub fn enter(
     info!("entering {container_id}");
     crate::output::trace_line(&run_cmd);
 
-    let started = Instant::now();
-    let result = match config.multiplexer {
-        Multiplexer::Tmux if crate::host_tools::TMUX.find().is_none() => {
-            warning!(
-                "tmux not found; opening the session without it \
-                 (set `multiplexer = \"none\"` to silence this)"
-            );
-            enter_direct(&run_cmd)
-        }
-        Multiplexer::Tmux => enter_tmux(s.name, &run_cmd),
-        Multiplexer::None => enter_direct(&run_cmd),
+    let mut started = Instant::now();
+    let mut status = run_shell(&run_cmd)?;
+    // The connection dropped under a session that had been in use. The shell on
+    // the other side is gone (or going), so the only thing to offer is a new one;
+    // if the user's shell setup attaches to something that outlived the
+    // disconnect, that is where they land. Not offered after an instant failure,
+    // which is the connection never coming up, and not without a terminal to ask.
+    while let Some(host) = target.ssh_host()
+        && status.connection_lost()
+        && started.elapsed() >= Duration::from_secs(2)
+        && ask_to_reconnect(host)
+    {
+        crate::ssh::connect(host)?;
+        info!("entering {container_id}");
+        started = Instant::now();
+        status = run_shell(&run_cmd)?;
+    }
+    let result = if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("session exited with failure"))
     };
 
     // A remote session that fails almost instantly is the signature of the SSH
@@ -151,57 +163,27 @@ pub fn enter(
     result
 }
 
-// Opens (or reuses) the named tmux session for this workspace. If lodge itself is being run
-// from inside tmux, we must not nest — `attach-session` refuses that — so we
-// `switch-client` the current client to the lodge session instead. Outside
-// tmux we attach normally.
-fn enter_tmux(session: &str, run_cmd: &str) -> Result<()> {
-    // Create the session detached if it doesn't already exist (idempotent): a
-    // failure just means the session is already there.
-    #[allow(clippy::let_underscore_must_use, reason = "the session may exist")]
-    let _ = tmux(&["new-session", "-d", "-s", session, run_cmd]);
-
-    // New windows in this session also exec into the container. Without it
-    // the session still works; new windows just open on this machine.
-    if let Err(e) = tmux(&["set-option", "-t", session, "default-command", run_cmd]) {
-        warning!("new tmux windows will open on this machine, not in the container: {e:#}");
+/// Asks whether to open a new shell after the connection to `host` was lost.
+/// Without a terminal to ask on, no.
+fn ask_to_reconnect(host: &str) -> bool {
+    if !std::io::stdin().is_terminal() {
+        return false;
     }
-
-    // `run_cmd` sets the pane title via OSC once it's running (see `enter`);
-    // forward that into the real terminal's title instead of leaving tmux's
-    // own title machinery (which defaults to showing the session/window name)
-    // in charge of it.
-    #[allow(
-        clippy::let_underscore_must_use,
-        reason = "cosmetic: without these the title is merely less pretty"
-    )]
-    let _ = tmux(&["set-option", "-t", session, "set-titles", "on"])
-        .and_then(|()| tmux(&["set-option", "-t", session, "set-titles-string", "#T"]));
-
-    let action = if std::env::var_os("TMUX").is_some() {
-        "switch-client"
-    } else {
-        "attach-session"
-    };
-    tmux(&[action, "-t", session])
+    note!("lost the connection to {host}");
+    prompt!("reconnect and open a new shell? [Y/n] ");
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).is_ok() && !declined(&line)
 }
 
-/// Runs `tmux <args>`; an error when it can't be run or exits non-zero.
-fn tmux(args: &[&str]) -> Result<()> {
-    let status = crate::host_tools::TMUX.command().args(args).status()?;
-    if !status.success() {
-        bail!("tmux {} failed ({status})", args.join(" "));
-    }
-    Ok(())
+/// Whether an answer to a yes-by-default question is a no.
+fn declined(answer: &str) -> bool {
+    answer.trim().to_ascii_lowercase().starts_with('n')
 }
 
-// Execs straight into the container with no multiplexer.
-fn enter_direct(run_cmd: &str) -> Result<()> {
-    let status = Command::new("sh").arg("-c").arg(run_cmd).status()?;
-    if !status.success() {
-        bail!("session exited with failure");
-    }
-    Ok(())
+// Runs the session command (`docker exec -it`, over `ssh -tt` for a remote
+// engine) and returns how it ended.
+fn run_shell(run_cmd: &str) -> Result<ExitStatus> {
+    Ok(Command::new("sh").arg("-c").arg(run_cmd).status()?)
 }
 
 #[cfg(test)]
@@ -318,5 +300,15 @@ mod tests {
     fn a_shell_path_with_odd_characters_is_quoted() {
         let s = startup_script(&layout(), "/opt/my shell/bash", "");
         assert!(s.contains("'/opt/my shell/bash'"), "{s}");
+    }
+
+    #[test]
+    fn only_an_answer_starting_with_n_declines() {
+        for no in ["n", "N\n", " no ", "No"] {
+            assert!(declined(no), "{no:?}");
+        }
+        for yes in ["", "\n", "y", "Y", "yes", "ok"] {
+            assert!(!declined(yes), "{yes:?}");
+        }
     }
 }

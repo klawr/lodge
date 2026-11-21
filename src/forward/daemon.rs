@@ -120,6 +120,35 @@ fn wanted(listening: HashSet<u16>, declared: &[PortForward]) -> HashMap<u16, Por
     wanted
 }
 
+/// How long a tunnel that died waits before it is started again: 2 s the first
+/// time, doubling up to a minute while it keeps dying at once. One that held
+/// for a minute starts over at 2 s.
+struct Cooldown {
+    until: std::time::Instant,
+    delay: Duration,
+}
+
+impl Cooldown {
+    const FIRST: Duration = Duration::from_secs(2);
+    const LONGEST: Duration = Duration::from_secs(60);
+
+    /// The wait after a tunnel that ran for `ran` died, given the previous wait.
+    fn after(previous: Option<&Cooldown>, ran: Duration) -> Cooldown {
+        let delay = match previous {
+            Some(p) if ran < Self::LONGEST => (p.delay * 2).min(Self::LONGEST),
+            _ => Self::FIRST,
+        };
+        Cooldown {
+            until: std::time::Instant::now() + delay,
+            delay,
+        }
+    }
+
+    fn over(&self) -> bool {
+        std::time::Instant::now() >= self.until
+    }
+}
+
 /// The forwarders kept for one container, and the ports file that reports them.
 struct Forwards<'a> {
     target: &'a Target,
@@ -129,6 +158,9 @@ struct Forwards<'a> {
     /// (likely failing the same way, e.g. host port occupied) doesn't spam the
     /// log.
     failed: HashSet<u16>,
+    /// Tunnels that died (the connection dropped, say): not restarted before
+    /// their time, so a host that is down is not hammered every 2 s.
+    cooling: HashMap<u16, Cooldown>,
     ports_file: PathBuf,
     /// What the ports file says; `None` until the first write, so the file
     /// exists (with the pid) at once.
@@ -146,6 +178,7 @@ impl<'a> Forwards<'a> {
             addresses: Addresses::new(Box::new(lookup), REFRESH),
             active: HashMap::new(),
             failed: HashSet::new(),
+            cooling: HashMap::new(),
             ports_file,
             published: None,
         }
@@ -161,10 +194,20 @@ impl<'a> Forwards<'a> {
                 dests.insert(local, format!("{ip}:{}", f.port));
             }
         }
+        let cooling = &mut self.cooling;
         self.active.retain(|&local, fwd| {
-            let keep = fwd.is_alive() && dests.get(&local).is_some_and(|d| d == fwd.dest());
+            let alive = fwd.is_alive();
+            let keep = alive && dests.get(&local).is_some_and(|d| d == fwd.dest());
             if !keep {
                 log!("stopped forwarding port {local}");
+            }
+            if !alive && let Some(ran) = fwd.ran_for() {
+                let wait = Cooldown::after(cooling.get(&local), ran);
+                log!(
+                    "port {local} — tunnel died; trying again in {} s",
+                    wait.delay.as_secs()
+                );
+                cooling.insert(local, wait);
             }
             keep
         });
@@ -177,6 +220,9 @@ impl<'a> Forwards<'a> {
     }
 
     fn start(&mut self, local: u16, dest: String) {
+        if self.cooling.get(&local).is_some_and(|c| !c.over()) {
+            return;
+        }
         let fwd = if let Some(r) = self.target.ssh_host() {
             log!("port {local} — ssh -L {local}:{dest} {r}");
             Forwarder::ssh_tunnel(local, &dest, r)
@@ -442,5 +488,25 @@ mod tests {
 ";
         let ports = parse_proc_net_tcp(data);
         assert_eq!(ports, HashSet::from([8081, 9091]));
+    }
+
+    #[test]
+    fn a_tunnel_that_keeps_dying_waits_longer_each_time_up_to_a_minute() {
+        let quick = Duration::from_secs(1);
+        let mut wait = Cooldown::after(None, quick);
+        assert_eq!(wait.delay, Duration::from_secs(2));
+        for secs in [4, 8, 16, 32, 60, 60] {
+            wait = Cooldown::after(Some(&wait), quick);
+            assert_eq!(wait.delay, Duration::from_secs(secs));
+        }
+    }
+
+    #[test]
+    fn a_tunnel_that_held_for_a_minute_starts_over() {
+        let long_wait =
+            Cooldown::after(Some(&Cooldown::after(None, Duration::ZERO)), Duration::ZERO);
+        assert_eq!(long_wait.delay, Duration::from_secs(4));
+        let after_a_good_run = Cooldown::after(Some(&long_wait), Duration::from_secs(61));
+        assert_eq!(after_a_good_run.delay, Duration::from_secs(2));
     }
 }

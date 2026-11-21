@@ -14,6 +14,8 @@ use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use crate::ssh::Repeat;
+
 use super::{BuildSpec, Compose, Container, Containers, Listed, Runtime};
 use crate::shell::shell_quote;
 use crate::target::Target;
@@ -95,49 +97,57 @@ impl DockerCli {
     }
 
     /// Runs `docker <args>` with inherited stdio; errors if it exits non-zero.
-    fn run(&self, args: &[&str]) -> Result<()> {
-        status_ok(self.command(args), args)
+    /// Over ssh a dropped connection reruns it only if `repeat` says that is safe.
+    fn run(&self, args: &[&str], repeat: Repeat) -> Result<()> {
+        self.run_with(|| self.command(args), args, repeat)
+    }
+
+    /// Like [`run`](Self::run) for a command `make` builds (afresh for each try).
+    fn run_with(&self, make: impl Fn() -> Command, args: &[&str], repeat: Repeat) -> Result<()> {
+        let what = subcommand(args);
+        let status = self
+            .target
+            .attempt(repeat, || make().status())
+            .with_context(|| format!("spawning docker {what}"))?;
+        if !status.success() {
+            bail!("docker {what} failed ({status})");
+        }
+        Ok(())
+    }
+
+    /// Runs a command `make` builds, capturing its output, and returns stdout; a
+    /// non-zero exit is an error carrying docker's stderr.
+    fn checked(&self, make: impl Fn() -> Command, args: &[&str], repeat: Repeat) -> Result<String> {
+        let what = subcommand(args);
+        let out = self
+            .target
+            .attempt(repeat, || make().output())
+            .with_context(|| format!("spawning docker {what}"))?;
+        if !out.status.success() {
+            bail!(
+                "docker {what} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     /// Runs `docker <args>` quietly and returns stdout, or `None` if it could not
     /// run or exited non-zero. For probes whose failure is an answer, not an error.
+    /// A probe changes nothing, so a dropped connection reruns it.
     fn capture_ok(&self, args: &[&str]) -> Option<String> {
-        let mut cmd = self.command(args);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-        let out = cmd.output().ok()?;
+        let out = self
+            .target
+            .attempt(Repeat::Safe, || {
+                let mut cmd = self.command(args);
+                cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+                cmd.output()
+            })
+            .ok()?;
         out.status
             .success()
             .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     }
-}
-
-/// Runs `cmd` with inherited stdio (so docker's own messages reach the user)
-/// and errors if it exits non-zero, naming the docker subcommand.
-fn status_ok(mut cmd: Command, args: &[&str]) -> Result<()> {
-    let what = subcommand(args);
-    let status = cmd
-        .status()
-        .with_context(|| format!("spawning docker {what}"))?;
-    if !status.success() {
-        bail!("docker {what} failed ({status})");
-    }
-    Ok(())
-}
-
-/// Runs `cmd` capturing its output and returns stdout; a non-zero exit is an
-/// error carrying docker's stderr.
-fn checked(mut cmd: Command, args: &[&str]) -> Result<String> {
-    let what = subcommand(args);
-    let out = cmd
-        .output()
-        .with_context(|| format!("spawning docker {what}"))?;
-    if !out.status.success() {
-        bail!(
-            "docker {what} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// "compose up", "ps", …: the words before the first flag, for messages.
@@ -202,13 +212,21 @@ impl Runtime for DockerCli {
             format!("{{{{.ID}}}}\t{{{{.Names}}}}\t{{{{.State}}}}\t{{{{.Label \"{label}\"}}}}");
         let filter = format!("label={label}");
         let args = ["ps", "-a", "--filter", &filter, "--format", &format];
-        Ok(parse_listed(&checked(self.command(&args), &args)?))
+        Ok(parse_listed(&self.checked(
+            || self.command(&args),
+            &args,
+            Repeat::Safe,
+        )?))
     }
 
     fn find_by_name(&self, name: &str) -> Result<Option<String>> {
         let filter = format!("name=^{name}$");
         let args = ["ps", "-aq", "--filter", &filter];
-        Ok(first_line(&checked(self.command(&args), &args)?))
+        Ok(first_line(&self.checked(
+            || self.command(&args),
+            &args,
+            Repeat::Safe,
+        )?))
     }
 
     fn build_image(&self, spec: &BuildSpec) -> Result<()> {
@@ -229,7 +247,8 @@ impl Runtime for DockerCli {
         // The build context (and -f dockerfile) are read client-side, so with a
         // remote target the build runs on the remote host via ssh.
         let args: Vec<&str> = a.iter().map(String::as_str).collect();
-        status_ok(self.command_in(None, &args), &args)
+        // A build is cached layer by layer, so doing it again is harmless.
+        self.run_with(|| self.command_in(None, &args), &args, Repeat::Safe)
     }
 
     fn run_detached(
@@ -243,19 +262,39 @@ impl Runtime for DockerCli {
         args.extend(run_args.iter().map(String::as_str));
         args.push(image);
         args.extend_from_slice(command);
-        self.run(&args)
+        // `docker run` is not repeatable as such: a second one fails on the name
+        // the first took, if it got that far. So a try after a lost connection
+        // first looks for the container, and starts what it finds (it may have
+        // been created but not started) instead of running again.
+        let mut first = true;
+        let status = self
+            .target
+            .attempt(Repeat::Safe, || {
+                if !std::mem::take(&mut first)
+                    && let Ok(Some(_)) = self.find_by_name(name)
+                {
+                    return self.command(&["start", name]).status();
+                }
+                self.command(&args).status()
+            })
+            .context("spawning docker run")?;
+        if !status.success() {
+            bail!("docker run failed ({status})");
+        }
+        Ok(())
     }
 
     fn start(&self, id: &str) -> Result<()> {
-        self.run(&["start", id])
+        self.run(&["start", id], Repeat::Safe)
     }
 
     fn stop(&self, id: &str) -> Result<()> {
-        self.run(&["stop", id])
+        self.run(&["stop", id], Repeat::Safe)
     }
 
     fn remove(&self, id: &str) -> Result<()> {
-        self.run(&["rm", "-f", id])
+        // `-f` makes removing what is already gone a success.
+        self.run(&["rm", "-f", id], Repeat::Safe)
     }
 }
 
@@ -271,13 +310,20 @@ impl Compose for DockerCli {
     fn up(&self, dir: &Path, project: &str, files: &[String], extra: &[&str]) -> Result<()> {
         let mut tail = vec!["up", "-d"];
         tail.extend_from_slice(extra);
-        status_ok(self.compose(dir, project, files, &tail), &["compose", "up"])
+        // `up -d` converges on the same state when run again (with
+        // `--force-recreate` it recreates once more, which costs time only).
+        self.run_with(
+            || self.compose(dir, project, files, &tail),
+            &["compose", "up"],
+            Repeat::Safe,
+        )
     }
 
     fn down(&self, dir: &Path, project: &str, files: &[String]) -> Result<()> {
-        status_ok(
-            self.compose(dir, project, files, &["down"]),
+        self.run_with(
+            || self.compose(dir, project, files, &["down"]),
             &["compose", "down"],
+            Repeat::Safe,
         )
     }
 
@@ -294,7 +340,11 @@ impl Compose for DockerCli {
             tail.push("-a");
         }
         tail.extend(["-q", service]);
-        let out = checked(self.compose(dir, project, files, &tail), &["compose", "ps"])?;
+        let out = self.checked(
+            || self.compose(dir, project, files, &tail),
+            &["compose", "ps"],
+            Repeat::Safe,
+        )?;
         Ok(first_line(&out))
     }
 }

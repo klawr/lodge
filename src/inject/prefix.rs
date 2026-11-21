@@ -62,7 +62,7 @@ fn usable(env: &dyn Env, layout: &Layout, own: bool) -> Result<bool> {
     let mode = if own { "own" } else { "any" };
     let out = env.output(
         &script_argv(PROBE_SCRIPT, &[layout.prefix(), mode]),
-        &ExecOpts::default(),
+        &ExecOpts::default().repeatable(),
     )?;
     Ok(out.success)
 }

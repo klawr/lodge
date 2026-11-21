@@ -98,6 +98,8 @@ pub(super) fn run_in_container(env: &dyn Env, ctx: &HookCtx, label: &str, cmd: &
         workdir: Some(ctx.workdir),
         env: ctx.vars,
         user: ctx.user.into(),
+        // A hook is the user's, so it is never run a second time on its own.
+        ..ExecOpts::default()
     };
     let mut ok = true;
     for (name, step) in cmd.steps() {

@@ -23,10 +23,24 @@ Change detection reads the `.devcontainer/` files from the remote host and
 hashes them here, the same way as for a local project, so a comment-only edit
 doesn't count as a change either.
 
-lodge opens one SSH connection and reuses it for the dozens of commands a single
-`ldg up` issues (a `ControlMaster` socket under `$TMPDIR/lodge-ssh/`).
-Connections must be non-interactive (key or agent auth). If something fails, run
-with `-v` to see each command, and `-vv`/`-vvv` for ssh's own debug output.
+lodge opens one SSH connection first and reuses it for the dozens of commands a
+single `ldg up` issues (a `ControlMaster` socket under `$TMPDIR/lodge-ssh/`, kept
+for 10 minutes after the last use). It opens it before anything else, with your
+terminal available, so a password, passphrase or 2FA prompt is answered once.
+The port-forwarding daemon has no terminal: it rides on that connection, or on
+key or agent auth if it has to reconnect.
+
+A link that goes quiet is dropped after about 45 seconds (`ServerAliveInterval=15`,
+`ServerAliveCountMax=3`). When the connection is lost during a step that is safe
+to repeat (a read, `mkdir -p`, copying files in, starting a container), lodge
+reconnects and runs it again, up to three tries, waiting 1 s then 2 s. A step that
+is not safe to repeat (your lifecycle hooks, a feature's `install.sh`) is not
+rerun: lodge says so, and running the same command again picks up where it
+stopped. A dead forwarded port is restarted with a growing wait, up to a minute.
+Rejected logins and host-key failures are not retried.
+
+If something fails, run with `-v` to see each command, and `-vv`/`-vvv` for ssh's
+own debug output.
 
 From a machine that isn't your Linux workstation (macOS, Windows, a CI runner),
 combine `--remote` with a bundle: see [Bundles and secrets](bundles-and-secrets.md).

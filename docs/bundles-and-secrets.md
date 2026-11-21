@@ -34,9 +34,6 @@ in one folder and point lodge at it with `-c`:
 # deploy/config.toml
 bundle = "bundle.tar"          # relative to this file's folder
 
-[session]
-multiplexer = "none"
-
 [[secret]]
 name = "ANTHROPIC_API_KEY"
 from = { env = "ANTHROPIC_API_KEY" }
@@ -110,10 +107,10 @@ used.
 
 Limits:
 
-- Secrets live in `/dev/shm`, so they last until the container stops, and a tmux
-  session outlives a detach. Removing *every* `[[secret]]` does not clear values
-  already placed (nothing runs when none are declared); removing some does, and
-  so does `ldg clean`.
+- Secrets live in `/dev/shm`, so they last until the container stops, and a
+  multiplexer you started in the container outlives a detach. Removing *every*
+  `[[secret]]` does not clear values already placed (nothing runs when none are
+  declared); removing some does, and so does `ldg clean`.
 - A tool that refreshes a credential file may replace the symlink with a real
   file in the home directory, which then stays on disk.
 - `/dev/shm` is 64 MB by default in Docker: enough for tokens, not for large files.

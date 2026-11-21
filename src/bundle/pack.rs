@@ -227,7 +227,13 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     // read-only directory can still be filled.
     let mut dir_modes = Vec::new();
     tree::walk(src, Links::Keep, Denied::Fail, &mut |e| {
-        let to = dst.join(e.relative);
+        // The root itself is `dst`: `join("")` would make it `dst/`, which a
+        // single file cannot be copied to.
+        let to = if e.relative.is_empty() {
+            dst.to_path_buf()
+        } else {
+            dst.join(e.relative)
+        };
         if e.meta.is_symlink() {
             std::os::unix::fs::symlink(std::fs::read_link(e.path)?, &to)
                 .with_context(|| format!("copying the link {}", e.path.display()))?;
@@ -235,6 +241,9 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
             std::fs::create_dir_all(&to)?;
             dir_modes.push((to, e.meta.permissions()));
         } else {
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             std::fs::copy(e.path, &to).with_context(|| format!("copying {}", e.path.display()))?;
         }
         Ok(())
@@ -527,5 +536,15 @@ mod tests {
             None
         );
         assert_eq!(sensitive_reason(Path::new("/home/me/.ssh"), None), None);
+    }
+
+    #[test]
+    fn a_single_file_is_copied_to_the_destination_itself() {
+        let dir = crate::tmpfile::TempDir::new("copy-tree").unwrap();
+        let src = dir.path().join("rc");
+        std::fs::write(&src, "set x").unwrap();
+        let dst = dir.path().join("out/rc");
+        copy_tree(&src, &dst).unwrap();
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "set x");
     }
 }

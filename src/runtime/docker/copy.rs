@@ -42,25 +42,35 @@ impl DockerContainer {
                 .with_context(|| format!("{dest} names no file"))?;
             (parent, file)
         };
-        self.exec(&["mkdir", "-p", into], &ExecOpts::as_user(owner.exec_as()))
-            .with_context(|| format!("making {into} as {}", owner.name))?;
+        self.exec(
+            &["mkdir", "-p", into],
+            &ExecOpts::as_user(owner.exec_as()).repeatable(),
+        )
+        .with_context(|| format!("making {into} as {}", owner.name))?;
 
         let target = format!("{}:{into}", self.id);
-        // `-q`: on a terminal docker otherwise prints "Successfully copied …" for
-        // every file, which would bury lodge's own output.
-        let mut cmd = self.cli.command(&["cp", "-q", "-a", "-", &target]);
-        // `command` closes stdin for ssh; this one streams, so override it.
-        cmd.stdin(Stdio::piped());
-        let mut child = cmd.spawn().context("spawning docker cp")?;
-        // Dropping the writer closes the pipe, so docker sees the end of input.
-        let packed = {
-            let stdin = child
-                .stdin
-                .take()
-                .context("docker cp stdin was not piped")?;
-            tarball::pack(source, &name, owner, stdin)
-        };
-        let status = child.wait().context("waiting on docker cp")?;
+        // Unpacking the same archive again leaves the same files, so a lost
+        // connection reruns the whole send, packing the tar afresh.
+        let (status, packed) =
+            self.cli
+                .target
+                .attempt(crate::ssh::Repeat::Safe, || {
+                    // `-q`: on a terminal docker otherwise prints "Successfully copied …"
+                    // for every file, which would bury lodge's own output.
+                    let mut cmd = self.cli.command(&["cp", "-q", "-a", "-", &target]);
+                    // `command` closes stdin for ssh; this one streams, so override it.
+                    cmd.stdin(Stdio::piped());
+                    let mut child = cmd.spawn()?;
+                    // Dropping the writer closes the pipe, so docker sees the end of input.
+                    let packed = {
+                        let stdin = child.stdin.take().ok_or_else(|| {
+                            std::io::Error::other("docker cp stdin was not piped")
+                        })?;
+                        tarball::pack(source, &name, owner, stdin)
+                    };
+                    Ok((child.wait()?, packed))
+                })
+                .context("running docker cp")?;
         if !status.success() {
             bail!("docker cp failed: {src} -> {target}");
         }
@@ -74,8 +84,10 @@ impl DockerContainer {
         let from = format!("{}:{path}", self.id);
         let out = self
             .cli
-            .command(&["cp", &from, "-"])
-            .output()
+            .target
+            .attempt(crate::ssh::Repeat::Safe, || {
+                self.cli.command(&["cp", &from, "-"]).output()
+            })
             .context("spawning docker cp")?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);

@@ -18,9 +18,6 @@ pub enum Need {
     Pack,
     /// Devcontainer features from a registry.
     RegistryFeatures,
-    /// Opening sessions in a multiplexer. Never required: sessions open
-    /// directly without it.
-    Multiplexer,
 }
 
 pub struct Tool {
@@ -72,12 +69,5 @@ pub const ORAS: Tool = Tool {
     hint: "install oras from https://oras.land",
 };
 
-pub const TMUX: Tool = Tool {
-    name: "tmux",
-    need: Need::Multiplexer,
-    needed_for: "optional: sessions open directly without it",
-    hint: "install tmux, or set `multiplexer = \"none\"`",
-};
-
 /// Every tool, in the order `ldg doctor` lists them.
-pub const ALL: [&Tool; 5] = [&SSH, &LDD, &PATCHELF, &ORAS, &TMUX];
+pub const ALL: [&Tool; 4] = [&SSH, &LDD, &PATCHELF, &ORAS];

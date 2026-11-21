@@ -57,6 +57,14 @@ impl Ctx {
 
 pub fn run(cli: Cli) -> Result<ExitCode> {
     let target = Target::new(cli.remote);
+    // Open the connection while the terminal is ours, so a password or 2FA prompt
+    // is answered once and everything after reuses it. The forward daemon has no
+    // terminal: it joins the connection that is already there.
+    if let Some(host) = target.ssh_host()
+        && !matches!(cli.command, Command::Forward { .. })
+    {
+        crate::ssh::connect(host)?;
+    }
     let ctx = Ctx {
         rt: crate::runtime::connect(&target),
         target,

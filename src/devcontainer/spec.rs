@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use super::backend::{Backend, BackendContext, build_backend, project_basename};
 use super::lifecycle::{Hook, Lifecycle};
-use super::vars::{Vars, path_tag};
+use super::vars::Vars;
 use crate::port::PortForward;
 use crate::target::Target;
 
@@ -22,8 +22,6 @@ use crate::target::Target;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DevcontainerConfig {
-    // Human-readable label, used (when present) for the tmux session name.
-    name: Option<String>,
     workspace_folder: Option<String>,
     forward_ports: Option<Vec<serde_json::Value>>,
     features: Option<serde_json::Map<String, serde_json::Value>>,
@@ -130,8 +128,6 @@ pub(super) struct Spec {
     // Extra files (besides the .devcontainer dir) to fold into the hash.
     pub(super) hash_extra: Vec<PathBuf>,
     pub(super) workspace_folder: String,
-    // Human-readable tmux session name (e.g. "lodge-myproject-1a2b3c").
-    pub(super) session_name: String,
     pub(super) forward_ports: Vec<PortForward>,
     pub(super) lifecycle: Lifecycle,
     pub(super) features: Vec<super::features::FeatureRequest>,
@@ -163,7 +159,6 @@ fn build_spec(
     target: &Target,
 ) -> Result<Spec> {
     let DevcontainerConfig {
-        name,
         workspace_folder,
         forward_ports,
         features,
@@ -199,14 +194,12 @@ fn build_spec(
         },
     )?;
     let env = build_env(container_env, remote_env, &vars);
-    let session_name = session_name(name.as_deref(), &basename, project_path);
 
     Ok(Spec {
         config_path,
         base_dir,
         hash_extra: built.hash_extra,
         workspace_folder,
-        session_name,
         forward_ports: parse_forward_ports(forward_ports),
         lifecycle: hooks.into_lifecycle(),
         features: feature_requests(features),
@@ -249,15 +242,6 @@ fn build_env(
         .flatten()
         .map(|(k, v)| (k, normalize_env_value(&v, vars)))
         .collect()
-}
-
-// A readable tmux session name: the devcontainer's `name` (or the project
-// basename when it has none) plus a short path hash so two projects that share
-// a label don't land on the same session. We derive this from the human label
-// rather than the container id, whose compose form is an opaque hash that makes
-// "lodge-<hash>" sessions impossible to tell apart.
-fn session_name(name: Option<&str>, basename: &str, project_path: &Path) -> String {
-    crate::shell::session_name(name.unwrap_or(basename), Some(&path_tag(project_path)))
 }
 
 // Parses forwardPorts entries. The spec allows an integer (a port of the
@@ -377,23 +361,6 @@ mod tests {
     }
 
     #[test]
-    fn session_name_prefers_devcontainer_label() {
-        let p = Path::new("/home/me/proj");
-        // The devcontainer's `name` wins and is sanitized for tmux.
-        let s = session_name(Some("My App (dev)"), "proj", p);
-        assert!(s.starts_with("lodge-My-App--dev-"), "got {s}");
-        // Falls back to the basename when there's no name.
-        assert!(session_name(None, "proj", p).starts_with("lodge-proj-"));
-        // Same label, different path → different session (no collision).
-        assert_ne!(
-            session_name(Some("app"), "proj", Path::new("/a/proj")),
-            session_name(Some("app"), "proj", Path::new("/b/proj")),
-        );
-        // An all-punctuation label degrades to a usable placeholder.
-        assert!(session_name(Some("***"), "proj", p).starts_with("lodge-workspace-"));
-    }
-
-    #[test]
     fn forward_ports_parse_all_spec_forms() {
         let values = serde_json::json!([3000, "4000", "3000:8080", "db:5432", "9000/tcp", false]);
         let parsed = parse_forward_ports(Some(values.as_array().unwrap().clone()));
@@ -443,7 +410,6 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(c.name.as_deref(), Some("demo"));
         assert_eq!(c.remote_user.as_deref(), Some("dev"));
         assert_eq!(c.source.image.as_deref(), Some("debian"));
         assert_eq!(

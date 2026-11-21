@@ -30,7 +30,7 @@ check: ## What CI gates on: fmt, clippy, docs, unit tests
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --quiet
 	cargo test
 
-# Needs a running docker daemon (with compose), patchelf, tmux and ssh. Quiet on success.
+# Needs a running docker daemon (with compose), patchelf and ssh. Quiet on success.
 integration: ## The real binary against docker (~30 s); narrow with T=name
 	@cargo test --test integration --quiet -- --ignored $(T)
 

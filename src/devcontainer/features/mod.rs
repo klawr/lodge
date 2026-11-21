@@ -259,7 +259,7 @@ fn validate_options(r: &Resolved) {
 // Copies a feature into the container and runs its install.sh as root.
 fn install_one(env: &dyn Env, r: &Resolved, users: &[ContainerUser; 2]) -> Result<()> {
     let dest = format!("{FEATURES_DIR}/{}", r.meta.id);
-    env.exec_root(&["rm", "-rf", &dest])?;
+    env.exec(&["rm", "-rf", &dest], &ExecOpts::root().repeatable())?;
     env.cp_in(&r.dir.to_string_lossy(), &dest)?;
 
     info!("installing feature {}", r.reference);
@@ -270,6 +270,8 @@ fn install_one(env: &dyn Env, r: &Resolved, users: &[ContainerUser; 2]) -> Resul
             user: User::Root,
             workdir: Some(&dest),
             env: &vars,
+            // An installer may do anything, so it is not run a second time.
+            repeat: crate::ssh::Repeat::Never,
         },
     )
 }

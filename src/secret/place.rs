@@ -83,7 +83,8 @@ pub fn place(
     user: &ContainerUser,
     items: &[(&SecretDecl, &Secret)],
 ) -> Result<Placed> {
-    let opts = ExecOpts::as_user(user.exec_as());
+    // Every step below leaves the same state when run again.
+    let opts = ExecOpts::as_user(user.exec_as()).repeatable();
     let dir = secrets_dir(user);
 
     // Names are validated to [A-Za-z0-9_], so they are safe as arguments and as
@@ -127,7 +128,7 @@ fn secrets_dir(user: &ContainerUser) -> String {
 pub fn clear(env: &dyn Env, user: &ContainerUser) -> Result<()> {
     env.exec(
         &["rm", "-rf", &secrets_dir(user)],
-        &ExecOpts::as_user(user.exec_as()),
+        &ExecOpts::as_user(user.exec_as()).repeatable(),
     )
     .context("removing placed secrets")
 }
@@ -157,9 +158,9 @@ pub(crate) const LIST_SCRIPT: &str = "[ -d \"$1\" ] || exit 0; ls -1 \"$1\"";
 /// Names of the secrets currently placed for `user`.
 fn present_names(env: &dyn Env, user: &ContainerUser) -> Result<Vec<String>> {
     let out = env
-        .exec_capture_as(
-            user.exec_as(),
+        .exec_capture_with(
             &script_argv(LIST_SCRIPT, &[&secrets_dir(user)]),
+            &ExecOpts::as_user(user.exec_as()).repeatable(),
         )
         .context("listing placed secrets")?;
     Ok(out

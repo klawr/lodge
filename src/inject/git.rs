@@ -29,7 +29,7 @@ pub(super) fn configure_git_safe(env: &dyn Env, dirs: &[String]) -> Result<()> {
             "git config --global --get-all safe.directory 2>/dev/null | grep -qxF {q} \
              || git config --global --add safe.directory {q}"
         );
-        env.exec(&["sh", "-c", &script], &ExecOpts::default())?;
+        env.exec(&["sh", "-c", &script], &ExecOpts::default().repeatable())?;
     }
     Ok(())
 }

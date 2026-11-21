@@ -46,7 +46,23 @@ impl Target {
             .unwrap_or_default()
     }
 
+    /// Runs one step against the project's host. Locally that is just `op`;
+    /// over ssh a lost connection is retried when the step is `repeat`-safe (see
+    /// [`crate::ssh::retry`]), so `op` runs afresh each time.
+    pub fn attempt<T: crate::ssh::Outcome>(
+        &self,
+        repeat: crate::ssh::Repeat,
+        mut op: impl FnMut() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        match self {
+            Self::Local => op(),
+            Self::Ssh(host) => crate::ssh::retry(host, repeat, op),
+        }
+    }
+
     /// Runs `sh -c <script>` on the project's host and captures its output.
+    /// Over ssh the script is rerun if the connection drops, so it must be safe
+    /// to run twice: a read or a probe.
     pub fn sh_output(&self, script: &str) -> Result<std::process::Output> {
         match self {
             Self::Local => {

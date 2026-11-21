@@ -50,7 +50,10 @@ pub fn remove(container: &dyn Env, user: &ContainerUser, installed: &Installed) 
     let marker = format!("exec {}/", layout.bin());
     let script = script(layout.prefix(), &marker);
     let recorded: Vec<&str> = installed.wrappers.iter().map(String::as_str).collect();
-    let out = env.output(&script_argv(&script, &recorded), &ExecOpts::default())?;
+    let out = env.output(
+        &script_argv(&script, &recorded),
+        &ExecOpts::default().repeatable(),
+    )?;
     if !out.success {
         bail!("removing lodge's files failed: {}", out.stderr.trim());
     }

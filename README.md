@@ -43,6 +43,10 @@ was injected is left as it is, and `ldg up` says when your config (or ldg) has
 changed since. `ldg up --reinject` updates it, `ldg up --build` recreates the
 container.
 
+To keep a session across a disconnect, inject a multiplexer like any other tool
+and start it from your shell's rc file: see
+[Keeping a session alive](docs/configuration.md#keeping-a-session-alive).
+
 Shell completions: `ldg completions bash|zsh|fish` (see `ldg completions --help`
 for where to put them). Man page: `ldg man | man -l -`.
 
@@ -79,7 +83,6 @@ On the host:
 - `ldd` and `patchelf`, **only to pack** your tools (that is, when your config
   lists `[[inject]]` entries). Injecting from a bundle needs neither.
 - `oras`, only for devcontainer features from a registry.
-- `tmux` is optional: without it the session opens directly.
 
 `ldg doctor` checks all of this, and says what each missing piece would break.
 
@@ -140,7 +143,7 @@ linked binaries are copied as they are.
 ```sh
 make            # list the targets
 make check      # fmt, clippy -D warnings, unit tests (what CI gates on)
-make integration  # the real binary against docker (~30 s; needs docker, patchelf, tmux)
+make integration  # the real binary against docker (~30 s; needs docker, patchelf)
 make dev        # open this repo's own devcontainer with the ldg built from this tree
 ```
 

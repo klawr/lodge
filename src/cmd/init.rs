@@ -205,8 +205,7 @@ fn render(found: &[Detected], home: &Path) -> String {
     s.push_str(
         "\n# ── Session ──────────────────────────────────────────────────────────\n\
          # [session]\n\
-         # shell       = \"/bin/bash\"   # must exist in the container\n\
-         # multiplexer = \"tmux\"        # or \"none\"\n\
+         # shell = \"/bin/bash\"   # must exist in the container\n\
          \n\
          # ── Secrets (delivered at attach, never stored in a bundle) ──────────\n\
          # [[secret]]\n\

@@ -7,7 +7,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ── Forwarder ─────────────────────────────────────────────────────────────────
 
@@ -17,6 +17,9 @@ pub(super) enum Forwarder {
         child: Child,
         local: u16,
         dest: String,
+        /// When it was started, to tell a tunnel that held for a while from one
+        /// that died at once.
+        since: Instant,
     },
 }
 
@@ -57,7 +60,17 @@ impl Forwarder {
             child,
             local,
             dest: dest.to_string(),
+            since: Instant::now(),
         })
+    }
+
+    /// How long an ssh tunnel has been running, `None` for the in-process proxy
+    /// (which has no connection to lose).
+    pub(super) fn ran_for(&self) -> Option<Duration> {
+        match self {
+            Forwarder::Proxy(_) => None,
+            Forwarder::Ssh { since, .. } => Some(since.elapsed()),
+        }
     }
 
     pub(super) fn is_alive(&mut self) -> bool {

@@ -850,7 +850,7 @@ fn secrets_are_added_on_the_machine_that_uses_a_tarred_bundle() {
     let deploy_config = deploy.join("config.toml");
     std::fs::write(
         &deploy_config,
-        "bundle = \"bundle.tar\"\n\n[session]\nmultiplexer = \"none\"\n\n\
+        "bundle = \"bundle.tar\"\n\n\
          [[secret]]\nname = \"API_KEY\"\nfrom = { env = \"LODGE_IT_API_KEY\" }\nas = \"env\"\n",
     )
     .unwrap();
@@ -1063,15 +1063,42 @@ fn init_writes_a_config_doctor_accepts_and_completions_and_man_render() {
 
 #[test]
 #[ignore = "needs docker"]
-fn a_tmux_session_runs_the_shell_in_the_container() {
+fn a_multiplexer_is_an_injected_tool_that_the_shells_rc_file_starts() {
+    // lodge has no multiplexer support of its own: tmux is injected like any tool
+    // and the rc file starts it, so a second `ldg up` lands in the same session.
+    // tmux starts its panes as login shells, which reset PATH on Debian and hide
+    // the injected tools, so its config starts them as plain shells instead.
+    require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
     require_tool("tmux", "apt install tmux / pacman -S tmux");
     let sb = Sandbox::new();
-    sb.config_raw("[session]\nmultiplexer = \"tmux\"\n");
-    let p = sb.project("tmux", &json(r#"{ "image": "@IMAGE@" }"#));
-    let out = p.attach(&[], &[], "echo in-tmux > /tmp/tmux-proof; exit\n");
-    assert!(!out.has("tmux not found"), "the session did not use tmux");
-    assert!(out.ok, "ldg up failed:\n{}", out.tail(15));
-    assert_eq!(p.sh("cat /tmp/tmux-proof"), "in-tmux");
+    let rc = sb.root().join("tmux-rc");
+    std::fs::write(
+        &rc,
+        "if [ -z \"$TMUX\" ] && command -v tmux >/dev/null; then exec tmux new-session -A -s main; fi\n",
+    )
+    .unwrap();
+    let conf = sb.root().join("tmux.conf");
+    std::fs::write(&conf, "set -g default-command bash\n").unwrap();
+    sb.config(&format!(
+        "[[inject]]\nname = \"tmux\"\nbinary = \"/usr/bin/tmux\"\n\n\
+         [[inject]]\nname = \"tmux-conf\"\nconfig = \"{}\"\ntarget_config = \"~/.tmux.conf\"\n\n\
+         [[inject]]\nname = \"tmux-rc\"\nconfig = \"{}\"\ntarget_config = \"~/.bashrc\"\n",
+        conf.display(),
+        rc.display()
+    ));
+    let p = sb.project("mux", &json(r#"{ "image": "@IMAGE@" }"#));
+
+    let first = p.attach(&[], &[], "echo $$ > /tmp/first; tmux detach\n");
+    assert!(first.ok, "first ldg up failed:\n{}", first.tail(15));
+    let second = p.attach(&[], &[], "echo $$ > /tmp/second; exit\n");
+    assert!(second.ok, "second ldg up failed:\n{}", second.tail(15));
+
+    let (first_pid, second_pid) = (p.sh("cat /tmp/first"), p.sh("cat /tmp/second"));
+    assert!(!first_pid.trim().is_empty());
+    assert_eq!(
+        first_pid, second_pid,
+        "the second session was not the first one"
+    );
 }
 
 #[test]
