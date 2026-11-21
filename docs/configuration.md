@@ -28,8 +28,8 @@ an older one:
 name           = "nvim"
 binary         = "/usr/local/bin/nvim"     # host binary to copy in
 config         = "~/.config/nvim"          # host config dir/file to copy in
-target_binary  = "/usr/local/bin/nvim"     # where the wrapper goes (optional)
-target_config  = "/root/.config/nvim"      # where the config goes (optional)
+target_binary  = "~/.local/bin/nvim"       # also write a wrapper script here (optional)
+target_config  = "~/.config/nvim"          # where the config goes (optional, default shown)
 skip_if_exists = false                     # true: never replace it once it exists (default: false)
 copy_deps      = true                      # copy shared libs via ldd when packing (default: true)
 
@@ -55,10 +55,6 @@ multiplexer = "tmux"        # "tmux" or "none" (default: "tmux")
 # (lazy.nvim, gitsigns, …) don't trip over "detected dubious ownership" on the
 # host-owned workspace/plugins. Default: ["*"]; set [] to disable.
 safe_directories = ["*"]
-
-[aliases]
-# Written to /etc/profile.d/lodge.sh (login shells).
-ll = "ls -la"
 ```
 
 ## `[[inject]]`
@@ -71,18 +67,26 @@ or both.
 | `name`           | yes      | —                       | identifier, unique; used for default paths |
 | `binary`         | no       | —                       | host path to a binary to inject |
 | `config`         | no       | —                       | host path to a config file/dir to inject |
-| `target_binary`  | no       | `/usr/local/bin/<name>` | wrapper location in the container (absolute or `~/…`, no `..`) |
+| `target_binary`  | no       | none                    | also write a wrapper script that runs the binary at this path in the container (absolute or `~/…`, no `..`). Without it the binary is on the `PATH` of the sessions lodge opens |
 | `target_config`  | no       | `~/.config/<name>`      | config location in the container (`~` is the container user's home; absolute or `~/…`, no `..`) |
 | `skip_if_exists` | no       | `false`                 | `true`: never replace it once present, even if the bundle changed (for a tree you update in the container yourself). `false`: replaced when the bundle changed, left alone when it did not |
 | `copy_deps`      | no       | `true`                  | copy shared-library dependencies via `ldd` when packing |
 
 At least one of `binary` and `config` must be set. Host paths may start with `~/`.
 
+lodge writes as the container user and never uses root, so a target must be a place
+that user can write (under `~`, say). A target elsewhere fails with the path and the
+user named.
+
+Shell aliases and other shell setup are your shell's own config: inject your
+`~/.bashrc` (or your shell and its config) with an `[[inject]]` entry whose
+`target_config` is where the container user's shell reads it.
+
 ## `[session]`
 
 | field         | default     | meaning |
 | ------------- | ----------- | ------- |
-| `shell`       | `/bin/bash` | the login shell started in the container; it must exist there |
+| `shell`       | `/bin/bash` | the shell started in the container; it must exist there. bash, zsh, sh and dash are supported. It is started once as a login shell, so the profile scripts run, then as the interactive shell you work in |
 | `multiplexer` | `"tmux"`    | `"tmux"`: a per-container tmux session on this machine (from inside tmux, lodge switches to it instead of nesting; without tmux installed it falls back to `"none"`). `"none"`: exec straight into the container |
 
 ## `[git]`
@@ -90,11 +94,6 @@ At least one of `binary` and `config` must be set. Host paths may start with `~/
 | field              | default | meaning |
 | ------------------ | ------- | ------- |
 | `safe_directories` | `["*"]` | directories registered as git `safe.directory` for the container user; `[]` disables it |
-
-## `[aliases]`
-
-`name = "command"` pairs, written to `/etc/profile.d/lodge.sh` for login shells.
-Names may use letters, digits, `_`, `-` and `.`.
 
 ## `bundle`
 

@@ -208,10 +208,6 @@ fn render(found: &[Detected], home: &Path) -> String {
          # shell       = \"/bin/bash\"   # must exist in the container\n\
          # multiplexer = \"tmux\"        # or \"none\"\n\
          \n\
-         # ── Aliases (written to /etc/profile.d/lodge.sh) ─────────────────────\n\
-         # [aliases]\n\
-         # ll = \"ls -la\"\n\
-         \n\
          # ── Secrets (delivered at attach, never stored in a bundle) ──────────\n\
          # [[secret]]\n\
          # name = \"GH_TOKEN\"\n\

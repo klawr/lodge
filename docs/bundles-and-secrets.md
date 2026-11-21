@@ -3,8 +3,10 @@
 ## Bundles
 
 Injection always works from a **bundle**: a plain tar holding your tools already
-relinked to a bundled glibc, their libraries, your configs, your aliases and git
-settings, and a manifest. Without any options, `ldg up` packs your config into a
+relinked to a bundled glibc, their libraries, your configs and git settings, and a
+manifest. A bundle is tied to a CPU architecture, but not to a user, a home
+directory or an install location: it is injected into whichever user's prefix it
+is used for. Without any options, `ldg up` packs your config into a
 bundle itself and keeps it in `~/.cache/lodge/bundles/`. It is reused as long as
 nothing it depends on has changed (the config, each source file's size and
 mtime, the libraries `ldd` finds). Checking that runs `ldd`, but a repeated `up`

@@ -12,7 +12,8 @@ use super::deps;
 use super::elf;
 use super::hash::hash_path;
 use super::manifest::{
-    BIN_DIR, Binary, CONFIG_DIR, ConfigTree, FORMAT, LIB_DIR, Lib, MANIFEST_FILE, Manifest, Tool,
+    BIN_DIR, Binary, CONFIG_DIR, ConfigTree, FORMAT, LIB_DIR, Lib, MANIFEST_FILE, Manifest,
+    ORIGIN_RPATH, Tool,
 };
 use crate::config::{Config, Injectable};
 use crate::layout;
@@ -126,7 +127,7 @@ impl Packer<'_> {
                         format!("{name} is dynamic but ldd named no dynamic linker")
                     })?;
                 self.add_libs(&deps.libs, &linker, name)?;
-                let patched = patch_binary(&path, &linker)?;
+                let patched = patch_binary(&path)?;
                 std::fs::copy(patched.path(), &dst)
                     .with_context(|| format!("copying the relinked {name}"))?;
                 dynamic = true;
@@ -139,10 +140,7 @@ impl Packer<'_> {
         std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
 
         Ok(Binary {
-            dest: item
-                .target_binary
-                .clone()
-                .unwrap_or_else(|| layout::default_binary_dest(name)),
+            dest: item.target_binary.clone(),
             dynamic,
             hash: hash_path(&dst)?,
         })
@@ -219,11 +217,6 @@ impl Packer<'_> {
                 .map(|(name, hash)| Lib { name, hash })
                 .collect(),
             tools: self.tools,
-            aliases: config
-                .aliases
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
             git_safe_directories: config.git.safe_directories.clone(),
         }
     }
@@ -272,14 +265,17 @@ fn sensitive_reason(path: &Path, home: Option<&Path>) -> Option<&'static str> {
         .map(|(_, why)| *why)
 }
 
-/// Relinks a copy of `binary` so it runs *directly* against the bundled glibc,
-/// with `patchelf`:
+/// Relinks a copy of `binary` so that, once injected, it runs *directly* against
+/// the bundled glibc, with `patchelf`:
 ///
-/// - `--set-interpreter /lodge/<ld>`: the bundled dynamic linker is the program
-///   interpreter;
-/// - `--force-rpath --set-rpath …`: DT_RPATH (not RUNPATH), so the search path
-///   also resolves *transitive* deps (e.g. libnsl pulling libtirpc); RUNPATH
-///   would not.
+/// - `--set-interpreter <placeholder>`: a path that fills the space reserved for
+///   the interpreter ([`elf::INTERP_CAPACITY`]); injection overwrites it in place
+///   with the bundled dynamic linker's real path, so the bundle is tied to no
+///   install prefix. (`patchelf` is the one that has to grow the field; the
+///   rewrite at injection never moves anything.)
+/// - `--force-rpath --set-rpath $ORIGIN/../lib`: DT_RPATH (not RUNPATH), so the
+///   search path also resolves *transitive* deps (e.g. libnsl pulling libtirpc);
+///   RUNPATH would not. It is relative to the binary, so it needs no rewrite.
 ///
 /// Running directly keeps `/proc/self/exe` pointing at the binary, which tools
 /// like Neovim need when they re-exec themselves (`--embed`); baking the search
@@ -287,7 +283,7 @@ fn sensitive_reason(path: &Path, home: Option<&Path>) -> Option<&'static str> {
 /// subprocesses it spawns (git, shells, LSPs) on the container's own glibc.
 /// patchelf copes even when there is no slack in the original `.dynstr` and
 /// `.dynamic`, which is the common case for real binaries.
-pub(crate) fn patch_binary(binary: &str, linker_name: &str) -> Result<TempFile> {
+pub(crate) fn patch_binary(binary: &str) -> Result<TempFile> {
     let data = std::fs::read(binary).with_context(|| format!("reading {binary} to patch"))?;
     let stem = Path::new(binary).file_name().map_or_else(
         || "binary".to_string(),
@@ -297,10 +293,10 @@ pub(crate) fn patch_binary(binary: &str, linker_name: &str) -> Result<TempFile> 
 
     let mut cmd = crate::host_tools::PATCHELF.command();
     cmd.arg("--set-interpreter")
-        .arg(format!("{}/{linker_name}", layout::LINKER_DIR))
+        .arg(elf::placeholder_interpreter())
         .arg("--force-rpath")
         .arg("--set-rpath")
-        .arg(layout::LIB)
+        .arg(ORIGIN_RPATH)
         .arg(tmp.path());
     crate::output::trace(&cmd);
     let status = cmd.status().with_context(|| {
@@ -360,7 +356,11 @@ mod tests {
 
         let tool = &manifest.tools[0];
         assert_eq!(tool.name, "hello");
-        assert_eq!(tool.binary.as_ref().unwrap().dest, "/usr/local/bin/hello");
+        assert_eq!(
+            tool.binary.as_ref().unwrap().dest,
+            None,
+            "no wrapper asked for"
+        );
         assert!(!tool.binary.as_ref().unwrap().dynamic);
         assert!(tool.config.as_ref().unwrap().is_dir);
         assert_eq!(manifest.arch, Arch::host().unwrap().to_string());
@@ -373,6 +373,69 @@ mod tests {
             "symlinks stay symlinks"
         );
         assert!(!out.path().join("b.tar.partial").exists());
+    }
+
+    #[test]
+    fn a_wrapper_target_is_kept_only_when_the_config_names_one() {
+        let work = TempDir::new("pack-target").unwrap();
+        let mut tool = script_tool(work.path(), "hello");
+        tool.target_binary = Some("~/.local/bin/hello".into());
+        let out = TempDir::new("pack-target-out").unwrap();
+        let manifest = build(
+            &config_with(vec![tool]),
+            out.path(),
+            &mut deps::Resolver::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.tools[0].binary.as_ref().unwrap().dest.as_deref(),
+            Some("~/.local/bin/hello")
+        );
+    }
+
+    #[test]
+    fn a_dynamic_binary_is_packed_without_an_install_prefix() {
+        if crate::host_tools::PATCHELF.find().is_none() || crate::host_tools::LDD.find().is_none() {
+            return; // `make check` machines have both; this keeps the test portable
+        }
+        let work = TempDir::new("pack-dyn").unwrap();
+        let mut tool = script_tool(work.path(), "sh");
+        let Ok(sh) = std::fs::canonicalize("/bin/sh") else {
+            return;
+        };
+        if deps::Resolver::default()
+            .resolve(&sh.to_string_lossy())
+            .is_ok_and(|d| d.is_empty())
+        {
+            return; // a static shell has nothing to relink
+        }
+        tool.binary = Some(sh);
+        tool.copy_deps = true;
+        let out = TempDir::new("pack-dyn-out").unwrap();
+        let manifest = build(
+            &config_with(vec![tool]),
+            out.path(),
+            &mut deps::Resolver::default(),
+        )
+        .unwrap();
+        assert!(manifest.tools[0].binary.as_ref().unwrap().dynamic);
+
+        let mut packed = std::fs::read(out.path().join("bin/sh")).unwrap();
+        assert_eq!(
+            elf::interpreter(&packed).unwrap(),
+            Some(elf::placeholder_interpreter()),
+            "the interpreter is a placeholder, not a path in some prefix"
+        );
+        // It can be given any real path up to the reserved size, in place.
+        let before = packed.len();
+        elf::set_interpreter(&mut packed, "/home/dev/.local/share/lodge/lib/ld.so").unwrap();
+        assert_eq!(packed.len(), before);
+        let rpath = std::process::Command::new("patchelf")
+            .arg("--print-rpath")
+            .arg(out.path().join("bin/sh"))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&rpath.stdout).trim(), ORIGIN_RPATH);
     }
 
     #[test]

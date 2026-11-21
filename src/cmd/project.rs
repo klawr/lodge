@@ -86,9 +86,23 @@ impl StatusReport {
         };
         let (found, running) = (&status.found, status.running);
         let c = found.container.as_ref();
-        let bundle = crate::inject::installed_bundle(c)
-            .map_err(|e| warning!("could not tell which bundle is installed: {e:#}"))
-            .ok();
+        // A stopped container can't be asked who its user is, so it is looked up
+        // in its passwd file; either way the user tells where lodge installed.
+        let user = if running {
+            ContainerUser::resolve(c, found.remote_user.as_deref())
+        } else {
+            ContainerUser::from_stored(c, found.remote_user.as_deref())
+                .and_then(|u| u.context("the container has no such user"))
+        };
+        let bundle = match &user {
+            Ok(user) => crate::inject::installed_bundle(c, user)
+                .map_err(|e| warning!("could not tell which bundle is installed: {e:#}"))
+                .ok(),
+            Err(e) => {
+                warning!("could not tell which bundle is installed: {e:#}");
+                None
+            }
+        };
         // Secrets live in memory, so a stopped container has none.
         let secrets = if !running || config.secret.is_empty() {
             Some(
@@ -99,8 +113,7 @@ impl StatusReport {
                     .collect(),
             )
         } else {
-            ContainerUser::resolve(c, found.remote_user.as_deref())
-                .and_then(|user| crate::secret::place::status(c, &user, &config.secret))
+            user.and_then(|user| crate::secret::place::status(c, &user, &config.secret))
                 .map_err(|e| warning!("could not tell which secrets are placed: {e:#}"))
                 .ok()
         };
@@ -254,19 +267,30 @@ pub fn logs(ctx: &Ctx, path: Option<PathBuf>, follow: bool) -> Result<()> {
     }
 }
 
-pub fn clean(ctx: &Ctx, path: Option<PathBuf>, name: Option<&str>) -> Result<()> {
-    let container: Box<dyn Container> = match name {
-        Some(n) => ctx.rt.container(n),
-        None => require(ctx, path)?.container,
+pub fn clean(
+    ctx: &Ctx,
+    path: Option<PathBuf>,
+    name: Option<&str>,
+    user: Option<&str>,
+) -> Result<()> {
+    let (container, remote_user): (Box<dyn Container>, Option<String>) = match name {
+        Some(n) => (ctx.rt.container(n), user.map(str::to_string)),
+        None => {
+            let found = require(ctx, path)?;
+            (found.container, found.remote_user)
+        }
     };
     if !container.is_running()? {
         bail!(
             "the container is not running; start it first (`ldg up --no-attach`, or `docker start`)"
         );
     }
-    let removed = crate::inject::remove(container.as_ref())?;
-    crate::secret::place::clear_all(container.as_ref())?;
+    let user = ContainerUser::resolve(container.as_ref(), remote_user.as_deref())?;
+    let layout = crate::inject::existing_layout(container.as_ref(), &user)?;
+    let removed = crate::inject::remove(container.as_ref(), &user, &layout)?;
+    crate::secret::place::clear(container.as_ref(), &user)?;
     info!("removed lodge from {}", container.display_name());
+
     for w in &removed.wrappers {
         line!("wrapper  {w}");
     }
@@ -351,7 +375,7 @@ mod tests {
                 .with_output(&list, "T\n")
         });
         let c = start(&dir, &rt);
-        c.write_file("/opt/lodge/bundle", b"0123456789abcdef\n")
+        c.write_file("/home/dev/.local/share/lodge/bundle", b"0123456789abcdef\n")
             .unwrap();
 
         let r = StatusReport::gather(dir.path(), &Target::Local, &rt, &one_secret()).unwrap();
@@ -373,9 +397,15 @@ mod tests {
     #[test]
     fn a_stopped_container_is_reported_in_full_without_running_anything_in_it() {
         let dir = project();
-        let rt = FakeRuntime::new(|| FakeEnv::new().with_file("/w", ""));
+        // A stopped container can't say who its user is, so it is looked up in its
+        // passwd file (root, as the image sets no other user).
+        let rt = FakeRuntime::new(|| {
+            FakeEnv::new()
+                .with_file("/w", "")
+                .with_file("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n")
+        });
         let c = start(&dir, &rt);
-        c.write_file("/opt/lodge/bundle", b"0123456789abcdef\n")
+        c.write_file("/root/.local/share/lodge/bundle", b"0123456789abcdef\n")
             .unwrap();
         rt.stop(c.id()).unwrap();
         // The fake refuses commands in a stopped container, so a command would

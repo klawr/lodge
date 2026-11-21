@@ -1,18 +1,18 @@
 //! Taking an injection back out of a container (`ldg clean`).
 //!
-//! Removes what injection put there: the binaries, libraries and linker, the
-//! wrappers (only ones that still point at lodge) and the shell setup. Placed
-//! secrets are [`crate::secret`]'s to remove. Injected *configs* are left in
-//! place and reported, since the user may have changed them in the container.
-//! The devcontainer's own state (hook markers, the config hash, `containerEnv`)
-//! is kept, so a later `ldg up` neither re-runs create hooks nor thinks the
-//! config drifted.
+//! Removes what injection put there: the user's prefix (binaries, libraries, the
+//! dynamic linker and the records) and the wrappers the config asked for, if they
+//! still point at lodge. Placed secrets are [`crate::secret`]'s to remove.
+//! Injected *configs* are left in place and reported, since the user may have
+//! changed them in the container. The devcontainer's own state (hook markers, the
+//! config hash, `containerEnv`) is kept, so a later `ldg up` neither re-runs create
+//! hooks nor thinks the config drifted.
 
 use anyhow::{Result, bail};
 
 use super::installed::{self, Kind};
-use crate::layout;
-use crate::runtime::{Env, ExecOpts};
+use crate::layout::Layout;
+use crate::runtime::{Acting, ContainerUser, Env, ExecOpts};
 use crate::shell::{script_argv, shell_quote};
 
 /// What [`remove`] did.
@@ -24,50 +24,52 @@ pub struct Removed {
     pub configs_kept: Vec<String>,
 }
 
-/// The script: `$@` are recorded wrapper paths. Removes the lodge wrappers
-/// among them and among the small files directly in `search` (each removed path
-/// is printed), then everything in `owned`. Exits non-zero when anything could
-/// not be removed, after trying the rest.
-fn script(search: &[&str], owned: &[&str]) -> String {
-    // The search folders may hold globs (`/home/*/.local/bin`), so they are left
-    // for the shell to expand; they are lodge's own constants.
-    let search = search.join(" ");
-    let owned: Vec<String> = owned.iter().map(|p| shell_quote(p)).collect();
+/// The script: `$@` are recorded wrapper paths. Removes the ones that are lodge's
+/// (they contain `marker`), printing each removed path, then the directory
+/// `prefix`. Exits non-zero when anything could not be removed, after trying the
+/// rest.
+fn script(prefix: &str, marker: &str) -> String {
     format!(
         "status=0; marker={marker}; \
-         for p in \"$@\" $(find {search} -maxdepth 1 -type f -size -2k 2>/dev/null); do \
+         for p in \"$@\"; do \
            [ -f \"$p\" ] && grep -q \"$marker\" \"$p\" 2>/dev/null || continue; \
            if rm -f \"$p\"; then echo \"$p\"; else status=1; fi; \
          done; \
-         rm -rf {owned} || status=1; \
+         rm -rf {prefix} || status=1; \
          exit $status",
-        marker = shell_quote(&format!("exec {}/", layout::BIN)),
-        owned = owned.join(" "),
+        marker = shell_quote(marker),
+        prefix = shell_quote(prefix),
     )
 }
 
-/// Removes the injection from `env`. An error when something could not be
-/// removed (what could be is gone all the same).
-pub fn remove(env: &dyn Env) -> Result<Removed> {
+/// Removes the injection for `user` from `container`. An error when something
+/// could not be removed (what could be is gone all the same).
+pub fn remove(container: &dyn Env, user: &ContainerUser, layout: &Layout) -> Result<Removed> {
+    let env = Acting::new(container, user);
     let mut wrappers = Vec::new();
     let mut configs_kept = Vec::new();
-    for (kind, path) in installed::placed(env)? {
+    for (kind, path) in installed::placed(&env, &layout.installed())? {
         match kind {
             Kind::Binary => wrappers.push(path),
             Kind::Config => configs_kept.push(path),
         }
     }
-    let script = script(layout::WRAPPER_SEARCH, layout::INJECTED);
+    // A binary without a wrapper is recorded at its place in the prefix, which is
+    // removed as a whole below, so it is not a wrapper to report.
+    wrappers.retain(|w| !w.starts_with(layout.prefix()));
+
+    let marker = format!("exec {}/", layout.bin());
+    let script = script(layout.prefix(), &marker);
     let recorded: Vec<&str> = wrappers.iter().map(String::as_str).collect();
-    let out = env.output(&script_argv(&script, &recorded), &ExecOpts::root())?;
+    let out = env.output(&script_argv(&script, &recorded), &ExecOpts::default())?;
     if !out.success {
         bail!("removing lodge's files failed: {}", out.stderr.trim());
     }
-    let mut removed: Vec<String> = out.stdout.lines().map(str::to_string).collect();
-    removed.sort();
-    removed.dedup();
+    let mut wrappers: Vec<String> = out.stdout.lines().map(str::to_string).collect();
+    wrappers.sort();
+    wrappers.dedup();
     Ok(Removed {
-        wrappers: removed,
+        wrappers,
         configs_kept,
     })
 }
@@ -75,29 +77,24 @@ pub fn remove(env: &dyn Env) -> Result<Removed> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::fake::{FakeEnv, Who};
     use std::path::Path;
     use std::process::Command;
 
-    #[test]
-    fn the_script_names_what_injection_owns_and_not_the_devcontainers_state() {
-        let s = script(layout::WRAPPER_SEARCH, layout::INJECTED);
-        assert!(s.contains("'/opt/lodge/bin'"));
-        assert!(s.contains("'/lodge'"));
-        assert!(s.contains("find /usr/local/bin"));
-        // Hook markers, the config hash and containerEnv stay.
-        assert!(!s.contains("/opt/lodge/state"));
-        assert!(!s.contains("devcontainer.hash"));
-        assert!(!s.contains("lodge-env.sh"));
-        assert!(!s.contains("rm -rf '/opt/lodge' "));
+    fn dev() -> ContainerUser {
+        ContainerUser {
+            requested: Some("dev".into()),
+            name: "dev".into(),
+            uid: 1000,
+            gid: 1000,
+            home: "/home/dev".into(),
+        }
     }
 
-    /// Runs the script for real: `search` and `owned` in place of lodge's
-    /// folders, `recorded` as the recorded wrappers.
-    fn run(search: &Path, owned: &[&Path], recorded: &[&Path]) -> (bool, String) {
-        let search = shell_quote(&search.to_string_lossy());
-        let owned: Vec<String> = owned.iter().map(|p| p.to_string_lossy().into()).collect();
-        let owned: Vec<&str> = owned.iter().map(String::as_str).collect();
-        let script = script(&[&search], &owned);
+    /// Runs the script for real against `prefix`, with `recorded` as the recorded
+    /// wrappers: whether it succeeded, and the paths it printed.
+    fn exec(prefix: &Path, recorded: &[&Path], marker: &str) -> (bool, String) {
+        let script = script(&prefix.to_string_lossy(), marker);
         let recorded: Vec<String> = recorded
             .iter()
             .map(|p| p.to_string_lossy().into())
@@ -116,51 +113,73 @@ mod tests {
     }
 
     #[test]
-    fn only_lodge_wrappers_are_removed_with_what_injection_owns() {
-        let dir = crate::tmpfile::TempDir::new("wrappers").unwrap();
-        let searched = dir.path().join("bin");
-        let custom = dir.path().join("custom");
-        let owned = dir.path().join("opt-lodge");
-        for d in [&searched, &custom, &owned] {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        std::fs::write(owned.join("lib"), "x").unwrap();
-        let ours = searched.join("nvim");
-        let theirs = searched.join("other");
-        let recorded = custom.join("x");
-        std::fs::write(&ours, "#!/bin/sh\nexec /opt/lodge/bin/nvim \"$@\"\n").unwrap();
-        std::fs::write(&theirs, "#!/bin/sh\nexec /usr/bin/other \"$@\"\n").unwrap();
-        std::fs::write(&recorded, "#!/bin/sh\nexec /opt/lodge/bin/x \"$@\"\n").unwrap();
+    fn the_script_names_the_prefix_and_not_the_devcontainers_state() {
+        let layout = Layout::preferred(&dev());
+        let s = script(layout.prefix(), &format!("exec {}/", layout.bin()));
+        assert!(s.contains("'/home/dev/.local/share/lodge'"));
+        // Hook markers, the config hash and containerEnv stay.
+        assert!(!s.contains("/opt/lodge"));
+        assert!(!s.contains("lodge-env.sh"));
+    }
 
-        // `bin/` is searched; `custom/x`, outside it, is a recorded path.
-        let (ok, printed) = run(&searched, &[&owned], &[&recorded]);
-        assert!(ok, "{printed}");
-        assert!(!ours.exists() && !recorded.exists(), "{printed}");
-        assert!(!owned.exists(), "what injection owns is removed");
-        assert!(theirs.exists(), "a wrapper that isn't lodge's was removed");
-        assert!(
-            printed.contains("nvim") && !printed.contains("other"),
-            "{printed}"
-        );
+    #[test]
+    fn a_recorded_wrapper_is_removed_only_while_it_still_points_at_the_prefix() {
+        let dir = crate::tmpfile::TempDir::new("wrapper-mine").unwrap();
+        let prefix = dir.path().join("lodge");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::write(prefix.join("bin/tool"), "x").unwrap();
+        let marker = format!("exec {}/", prefix.join("bin").display());
+        let lodges = dir.path().join("a");
+        let mine = dir.path().join("b");
+        std::fs::write(&lodges, format!("#!/bin/sh\n{marker}a \"$@\"\n")).unwrap();
+        std::fs::write(&mine, "#!/bin/sh\necho the user replaced it\n").unwrap();
+        let (ok, printed) = exec(&prefix, &[&lodges, &mine], &marker);
+        assert!(ok);
+        assert!(!lodges.exists() && !prefix.exists());
+        assert!(mine.exists(), "a file the user took over is not lodge's");
+        assert_eq!(printed.trim(), lodges.to_string_lossy());
     }
 
     #[test]
     fn a_failed_removal_fails_the_script_after_trying_the_rest() {
         use std::os::unix::fs::PermissionsExt;
         let dir = crate::tmpfile::TempDir::new("clean-fail").unwrap();
-        let locked = dir.path().join("locked");
-        std::fs::create_dir_all(locked.join("inner")).unwrap();
-        std::fs::write(locked.join("inner/f"), "x").unwrap();
-        let other = dir.path().join("other");
-        std::fs::write(&other, "x").unwrap();
-        let set = |mode| std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(mode));
+        let prefix = dir.path().join("prefix");
+        std::fs::create_dir_all(prefix.join("inner")).unwrap();
+        std::fs::write(prefix.join("inner/f"), "x").unwrap();
+        let wrapper = dir.path().join("wrapper");
+        std::fs::write(&wrapper, "exec /nothing/").unwrap();
+        let set = |mode| std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(mode));
         set(0o500).unwrap();
-        let (ok, _) = run(dir.path(), &[&locked, &other], &[]);
+        let (ok, printed) = exec(&prefix, &[&wrapper], "exec /nothing/");
         set(0o700).unwrap();
-        if locked.join("inner").exists() {
+        if prefix.join("inner").exists() {
             // Not root: the read-only folder kept its contents.
             assert!(!ok, "a removal that failed was reported as success");
         }
-        assert!(!other.exists(), "the rest is removed all the same");
+        assert!(!wrapper.exists(), "the rest is removed all the same");
+        assert_eq!(printed.trim(), wrapper.to_string_lossy());
+    }
+
+    #[test]
+    fn cleaning_reports_the_kept_configs_and_never_runs_as_root() {
+        let layout = Layout::preferred(&dev());
+        let removal = script(layout.prefix(), &format!("exec {}/", layout.bin()));
+        let env = FakeEnv::new()
+            .with_output(
+                &["sh", "-c", &installed::placed_script(&layout.installed())],
+                "nvim.bin\t/home/dev/.local/share/lodge/bin/nvim\n\
+                 nvim.config\t/home/dev/.config/nvim\n",
+            )
+            .with_output(&script_argv(&removal, &[]), "");
+        let removed = remove(&env, &dev(), &layout).unwrap();
+        assert_eq!(removed.configs_kept, ["/home/dev/.config/nvim"]);
+        assert!(
+            removed.wrappers.is_empty(),
+            "the binary lives in the prefix"
+        );
+        for (call, who) in env.calls() {
+            assert_ne!(who, Who::Root, "{call:?} ran as root");
+        }
     }
 }

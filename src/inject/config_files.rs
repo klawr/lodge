@@ -1,24 +1,25 @@
 //! Injecting config files and directories.
 
-use anyhow::Result;
-use std::path::Path;
+use anyhow::{Context, Result};
 
-use super::home::chown_home_chain;
 use super::installed::{Decision, Kind, Piece, decide, record};
 use crate::bundle::manifest::{ConfigTree, Tool};
 use crate::bundle::source::Prepared;
+use crate::layout::Layout;
 use crate::output::info;
-use crate::runtime::{ContainerUser, Env, ExecOpts};
+use crate::runtime::{ContainerUser, Env};
 
 pub(super) fn inject_config(
     env: &dyn Env,
     user: &ContainerUser,
+    layout: &Layout,
     bundle: &Prepared,
     tool: &Tool,
     config: &ConfigTree,
 ) -> Result<()> {
     let name = &tool.name;
     let dest = user.expand_home(&config.dest);
+    let dir = layout.installed();
     let piece = Piece {
         tool: name,
         kind: Kind::Config,
@@ -28,6 +29,7 @@ pub(super) fn inject_config(
     // protected with `skip_if_exists`.
     let decision = decide(
         env,
+        &dir,
         piece,
         &config.hash,
         env.exists(&dest)?,
@@ -39,44 +41,29 @@ pub(super) fn inject_config(
         } else {
             info!("{name} config already present, skipping");
         }
-        // Fix ownership even when skipping the copy — the files may be
-        // root-owned from a previous run.
-        chown_home_chain(env, user, &dest)?;
         return Ok(());
     }
 
     info!("injecting {name} config → {dest}");
 
-    // Create parent dirs as the container user when the destination is under their
-    // home directory — `mkdir -p` as root would leave the whole chain
-    // (e.g. /home/dev/.local) root-owned, blocking the user from creating
-    // siblings later. For system paths (e.g. /usr/local/share) root is correct.
-    let parent = Path::new(&dest)
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "/".to_string());
-    if !user.is_root() && user.is_in_home(&dest) {
-        env.exec(
-            &["mkdir", "-p", &parent],
-            &ExecOpts::as_user(user.exec_as()),
-        )?;
-    } else {
-        env.mkdir_p(&[&parent])?;
-    }
-
-    // Replace anything at the destination before copying: `cp_in` merges a directory
+    // Replace anything at the destination before copying: a directory is merged
     // into an existing one, so removing first makes the copy mirror the bundle
-    // exactly (and drops files that are no longer in it).
-    env.exec_root(&["rm", "-rf", &dest])?;
-    env.cp_in(&bundle.config(name).to_string_lossy(), &dest)?;
+    // exactly (and drops files that are no longer in it). The copy makes every
+    // missing directory down to the destination as the user, so the user owns the
+    // whole chain and can create siblings (nvim writing `.local/state` next to
+    // `.local/share`) later.
+    let written = env
+        .exec(&["rm", "-rf", &dest], &crate::runtime::ExecOpts::default())
+        .and_then(|()| env.cp_in(&bundle.config(name).to_string_lossy(), &dest));
+    written.with_context(|| {
+        format!(
+            "{name}: writing {dest} as {} failed. lodge never uses root, so a target must be \
+             somewhere that user can write (under ~, say)",
+            user.name
+        )
+    })?;
 
-    // Fix ownership of the entire path chain from home to the destination. docker cp
-    // (especially in remote mode) may recreate intermediate dirs as root.
-    // Chowning the chain ensures the user can create siblings (e.g.
-    // .local/state) at runtime.
-    chown_home_chain(env, user, &dest)?;
-
-    record(env, piece, &config.hash, &dest)
+    record(env, &dir, piece, &config.hash, &dest)
 }
 
 #[cfg(test)]
@@ -86,9 +73,12 @@ mod tests {
     use crate::bundle::source::Origin;
     use crate::runtime::fake::{FakeEnv, Who};
     use crate::tmpfile::TempDir;
-    use std::collections::BTreeMap;
 
     const HASH: &str = "00000000000000aa";
+
+    fn layout() -> Layout {
+        Layout::new("/p")
+    }
 
     fn dev() -> ContainerUser {
         ContainerUser {
@@ -124,7 +114,6 @@ mod tests {
             linker: None,
             libs: vec![],
             tools: vec![tool],
-            aliases: BTreeMap::new(),
             git_safe_directories: vec![],
         };
         let prepared = Prepared {
@@ -135,89 +124,109 @@ mod tests {
         (dir, prepared)
     }
 
-    fn inject(env: &FakeEnv, user: &ContainerUser, b: &Prepared) {
+    fn inject(env: &FakeEnv, b: &Prepared) -> Result<()> {
         let tool = &b.manifest.tools[0];
-        inject_config(env, user, b, tool, tool.config.as_ref().unwrap()).unwrap();
+        let user = dev();
+        inject_config(
+            &crate::runtime::Acting::new(env, &user),
+            &user,
+            &layout(),
+            b,
+            tool,
+            tool.config.as_ref().unwrap(),
+        )
     }
 
     #[test]
-    fn a_config_in_the_home_is_copied_recorded_and_owned_by_the_user() {
-        let (_d, b) = bundle("~/.config/hello", false);
-        let env = FakeEnv::new().with_file("/home/dev/.config/hello/stale", "old");
-        inject(&env, &dev(), &b);
+    fn a_config_lands_in_the_users_home_owned_by_them_without_any_chown() {
+        let (_dir, b) = bundle("~/.config/hello", false);
+        let env = FakeEnv::new();
+        inject(&env, &b).unwrap();
 
         assert_eq!(
             env.file("/home/dev/.config/hello/rc").as_deref(),
             Some("set x")
         );
-        assert!(
-            env.file("/home/dev/.config/hello/stale").is_none(),
-            "the copy mirrors the bundle"
+        assert_eq!(
+            env.owner_of("/home/dev/.config/hello/rc"),
+            Some((1000, 1000))
         );
         assert_eq!(
-            env.file("/opt/lodge/installed/hello.config").as_deref(),
-            Some("00000000000000aa\n/home/dev/.config/hello\n")
-        );
-        // Parents are made as the user, and the chain below the home is theirs.
-        assert_eq!(
-            env.ran_as(&["mkdir", "-p", "/home/dev/.config"]),
-            Some(Who::Named("dev".into()))
-        );
-        assert!(env.ran(&["chown", "1000:1000", "/home/dev/.config"]));
-        assert!(env.ran(&["chown", "-R", "1000:1000", "/home/dev/.config/hello"]));
-        assert!(
-            !env.ran(&["chown", "1000:1000", "/home/dev"]),
-            "not the home itself"
-        );
-    }
-
-    #[test]
-    fn a_config_outside_the_home_is_left_to_root() {
-        let (_d, b) = bundle("/usr/local/share/hello", false);
-        let env = FakeEnv::new();
-        inject(&env, &dev(), &b);
-        assert_eq!(
-            env.file("/usr/local/share/hello/rc").as_deref(),
-            Some("set x")
-        );
-        assert_eq!(
-            env.ran_as(&["mkdir", "-p", "/usr/local/share"]),
-            Some(Who::Root)
+            env.ran_as(&["mkdir", "-p", "/home/dev/.config/hello"]),
+            Some(Who::Named("dev".into())),
+            "the chain down to the destination is made as the user"
         );
         assert!(!env.ran_matching(|c| c[0] == "chown"));
+        assert_eq!(
+            env.file("/p/installed/hello.config").unwrap().trim(),
+            format!("{HASH}\n/home/dev/.config/hello")
+        );
     }
 
     #[test]
-    fn an_unchanged_config_is_not_copied_again() {
-        let (_d, b) = bundle("~/.config/hello", false);
+    fn nothing_here_runs_as_root() {
+        let (_dir, b) = bundle("~/.config/hello", false);
+        let env = FakeEnv::new();
+        let user = dev();
+        let acting = crate::runtime::Acting::new(&env, &user);
+        inject_config(
+            &acting,
+            &user,
+            &layout(),
+            &b,
+            &b.manifest.tools[0],
+            b.manifest.tools[0].config.as_ref().unwrap(),
+        )
+        .unwrap();
+        for (call, who) in env.calls() {
+            assert_ne!(who, Who::Root, "{call:?} ran as root");
+        }
+    }
+
+    #[test]
+    fn an_unchanged_config_is_left_alone_and_a_changed_one_replaced() {
+        let (_dir, b) = bundle("~/.config/hello", false);
         let env = FakeEnv::new()
-            .with_file("/home/dev/.config/hello/rc", "edited in the container")
-            .with_file(
-                "/opt/lodge/installed/hello.config",
-                "00000000000000aa\n/home/dev/.config/hello\n",
-            );
-        inject(&env, &dev(), &b);
+            .with_file("/home/dev/.config/hello/rc", "mine")
+            .with_file("/p/installed/hello.config", &format!("{HASH}\n"));
+        inject(&env, &b).unwrap();
         assert_eq!(
             env.file("/home/dev/.config/hello/rc").as_deref(),
-            Some("edited in the container")
+            Some("mine")
+        );
+
+        let env = FakeEnv::new()
+            .with_file("/home/dev/.config/hello/rc", "mine")
+            .with_file("/p/installed/hello.config", "1111111111111111\n");
+        inject(&env, &b).unwrap();
+        assert_eq!(
+            env.file("/home/dev/.config/hello/rc").as_deref(),
+            Some("set x")
         );
     }
 
     #[test]
-    fn a_protected_config_is_kept_when_the_bundle_changed_but_still_owned() {
-        let (_d, b) = bundle("~/.config/hello", true);
+    fn a_protected_config_is_kept_even_when_the_bundle_changed() {
+        let (_dir, b) = bundle("~/.config/hello", true);
         let env = FakeEnv::new()
-            .with_file("/home/dev/.config/hello/plugins", "the user's")
-            .with_file(
-                "/opt/lodge/installed/hello.config",
-                "1111111111111111\n/home/dev/.config/hello\n",
-            );
-        inject(&env, &dev(), &b);
+            .with_file("/home/dev/.config/hello/rc", "mine")
+            .with_file("/p/installed/hello.config", "1111111111111111\n");
+        inject(&env, &b).unwrap();
         assert_eq!(
-            env.file("/home/dev/.config/hello/plugins").as_deref(),
-            Some("the user's")
+            env.file("/home/dev/.config/hello/rc").as_deref(),
+            Some("mine")
         );
-        assert!(env.file("/home/dev/.config/hello/rc").is_none());
-        assert!(env.ran(&["chown", "-R", "1000:1000", "/home/dev/.config/hello"]));
+    }
+
+    #[test]
+    fn a_target_the_user_cannot_write_is_an_error_that_says_so() {
+        let (_dir, b) = bundle("/etc/hello", false);
+        let env = FakeEnv::new().with_failure(&["rm", "-rf", "/etc/hello"]);
+        let err = format!("{:#}", inject(&env, &b).unwrap_err());
+        assert!(
+            err.contains("never uses root") && err.contains("/etc/hello") && err.contains("dev"),
+            "{err}"
+        );
+        assert!(env.file("/p/installed/hello.config").is_none());
     }
 }

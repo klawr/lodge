@@ -108,9 +108,11 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Ls { json } => project::ls(&ctx, json)?,
         Command::Ports { project, json } => project::ports(&ctx, project.path, json)?,
         Command::Logs { project, follow } => project::logs(&ctx, project.path, follow)?,
-        Command::Clean { project, container } => {
-            project::clean(&ctx, project.path, container.as_deref())?
-        }
+        Command::Clean {
+            project,
+            container,
+            user,
+        } => project::clean(&ctx, project.path, container.as_deref(), user.as_deref())?,
         Command::Pack { output } => bundle::pack(&ctx, output)?,
         Command::Bundle { command } => bundle::bundle(command)?,
         Command::Cache { command } => bundle::cache(command)?,

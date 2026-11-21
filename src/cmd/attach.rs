@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use super::Ctx;
 use crate::config::Config;
 use crate::devcontainer::{self, StartOpts};
+use crate::layout::Layout;
 use crate::runtime::{Container, ContainerUser};
 use crate::session::{self, Session};
 use crate::{bundle, forward, inject, secret};
@@ -32,7 +33,8 @@ pub fn up(
     // After `start`, which may have changed the user's uid.
     let user = ContainerUser::resolve(container, started.remote_user.as_deref())?;
     forward::spawn_daemon(container.id(), &ctx.target, &started.forward_ports);
-    inject::run(container, &user, &prepared)?;
+    let layout = inject::resolve_layout(container, &user)?;
+    inject::run(container, &user, &layout, &prepared)?;
     if no_attach {
         return Ok(());
     }
@@ -42,6 +44,7 @@ pub fn up(
         container,
         &config,
         &user,
+        &layout,
         &started.session_name,
         &started.workdir,
     )
@@ -62,7 +65,8 @@ pub fn exec(
         bail!("container {name} is not running (check the name with `docker ps`)");
     }
     let user = ContainerUser::resolve(container.as_ref(), user)?;
-    inject::run(container.as_ref(), &user, &prepared)?;
+    let layout = inject::resolve_layout(container.as_ref(), &user)?;
+    inject::run(container.as_ref(), &user, &layout, &prepared)?;
     if no_attach {
         return Ok(());
     }
@@ -71,6 +75,7 @@ pub fn exec(
         container.as_ref(),
         &config,
         &user,
+        &layout,
         &crate::shell::session_name(name, None),
         workdir,
     )
@@ -82,6 +87,7 @@ fn attach(
     container: &dyn Container,
     config: &Config,
     user: &ContainerUser,
+    layout: &Layout,
     name: &str,
     workdir: &str,
 ) -> Result<()> {
@@ -93,7 +99,8 @@ fn attach(
         &Session {
             name,
             workdir,
-            user: user.exec_as(),
+            user,
+            layout,
             setup: &setup,
         },
     )

@@ -13,15 +13,6 @@ pub fn is_plain_name(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
 }
 
-/// A shell alias name (`alias <name>=…` is written unquoted): letters, digits,
-/// `_`, `-` and `.`, not starting with `-`.
-pub fn is_alias_name(s: &str) -> bool {
-    !s.is_empty()
-        && !s.starts_with('-')
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-}
-
 /// A shell variable name: letters, digits and `_`, not starting with a digit.
 /// Secret names and the variables they become.
 pub fn is_var_name(s: &str) -> bool {
@@ -115,8 +106,8 @@ fn which_in(name: &str, path_var: &std::ffi::OsStr) -> Option<std::path::PathBuf
 #[cfg(test)]
 mod tests {
     use super::{
-        container_path_problem, is_alias_name, is_plain_name, is_var_name, script_argv,
-        session_name, shell_quote, slug, which_in,
+        container_path_problem, is_plain_name, is_var_name, script_argv, session_name, shell_quote,
+        slug, which_in,
     };
 
     #[test]
@@ -173,14 +164,6 @@ mod tests {
         assert!(is_plain_name("nvim") && is_plain_name("g++") && is_plain_name("libc.so.6"));
         for bad in ["", ".", "..", "a/b", "../x", "a b", "x;y"] {
             assert!(!is_plain_name(bad), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn alias_names_cannot_look_like_options_or_syntax() {
-        assert!(is_alias_name("ll") && is_alias_name("g.st"));
-        for bad in ["", "-x", "rm -rf", "a;b", "a=b"] {
-            assert!(!is_alias_name(bad), "{bad:?}");
         }
     }
 

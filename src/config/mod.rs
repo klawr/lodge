@@ -4,12 +4,12 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 pub mod secret;
 
-use crate::shell::{container_path_problem, is_alias_name, is_plain_name};
+use crate::shell::{container_path_problem, is_plain_name};
 use secret::{RawSecret, SecretDecl};
 
 // The user's config. `S` is how a `[[secret]]` entry is held: as written
@@ -37,9 +37,6 @@ pub struct Config<S = SecretDecl> {
     /// Git settings applied in the container.
     #[serde(default)]
     pub git: GitConfig,
-    /// Shell aliases, written to `/etc/profile.d/lodge.sh` (login shells).
-    #[serde(default)]
-    pub aliases: BTreeMap<String, String>,
     /// Secrets to deliver at attach time. Local config only, never in a bundle.
     #[serde(default)]
     // Generic, so schemars can't work the default out itself.
@@ -54,7 +51,6 @@ impl<S> Default for Config<S> {
             inject: Vec::new(),
             session: SessionConfig::default(),
             git: GitConfig::default(),
-            aliases: BTreeMap::new(),
             secret: Vec::new(),
         }
     }
@@ -70,7 +66,8 @@ pub struct Injectable {
     pub binary: Option<PathBuf>,
     /// Host path to a config file or directory to inject.
     pub config: Option<PathBuf>,
-    /// Where the wrapper goes in the container (default: `/usr/local/bin/<name>`).
+    /// Where to put an extra wrapper script that runs the binary (default: none:
+    /// the binary is on the `PATH` of the sessions lodge opens).
     pub target_binary: Option<String>,
     /// Where the config goes in the container (default: `~/.config/<name>`).
     pub target_config: Option<String>,
@@ -233,7 +230,6 @@ impl Config {
             mut inject,
             session,
             git,
-            aliases,
             secret,
         } = file;
         for item in &mut inject {
@@ -255,7 +251,6 @@ impl Config {
             inject,
             session,
             git,
-            aliases,
             secret,
         }
     }
@@ -290,13 +285,6 @@ impl Config {
                 problems.push(format!(
                     "[[inject]] `{}` sets neither `binary` nor `config`, so there is nothing to inject",
                     item.name
-                ));
-            }
-        }
-        for name in self.aliases.keys() {
-            if !is_alias_name(name) {
-                problems.push(format!(
-                    "[aliases] `{name}` is not a valid alias name (letters, digits, `_`, `-`, `.`)"
                 ));
             }
         }
@@ -362,7 +350,6 @@ mod tests {
         assert_eq!(c.session.shell, "/bin/bash");
         assert_eq!(c.session.multiplexer, Multiplexer::Tmux);
         assert_eq!(c.git.safe_directories, vec!["*".to_string()]);
-        assert!(c.aliases.is_empty());
     }
 
     #[test]
@@ -380,9 +367,6 @@ mod tests {
 
             [git]
             safe_directories = ["/work"]
-
-            [aliases]
-            ll = "ls -la"
         "#,
         )
         .unwrap();
@@ -393,7 +377,6 @@ mod tests {
         assert_eq!(c.session.shell, "/bin/zsh");
         assert_eq!(c.session.multiplexer, Multiplexer::None);
         assert_eq!(c.git.safe_directories, vec!["/work".to_string()]);
-        assert_eq!(c.aliases.get("ll").map(String::as_str), Some("ls -la"));
     }
 
     #[test]
@@ -474,8 +457,7 @@ mod tests {
                  [[inject]]\nname = \"../up\"\nbinary = \"/u\"\n\
                  [[inject]]\nname = \"t\"\nbinary = \"/t\"\ntarget_config = \"rel/x\"\n\
                  [[secret]]\nname = \"S\"\nfrom = { env = \"A\", file = \"/b\" }\nas = \"env\"\n\
-                 [[secret]]\nname = \"T\"\nfrom = { env = \"A\" }\nas = \"socket\"\n\
-                 [aliases]\n\"rm -rf\" = \"x\"\n"
+                 [[secret]]\nname = \"T\"\nfrom = { env = \"A\" }\nas = \"socket\"\n"
             )
             .unwrap_err()
         );
@@ -486,7 +468,6 @@ mod tests {
             err.contains("`t`: `target_config` must be absolute"),
             "{err}"
         );
-        assert!(err.contains("`rm -rf` is not a valid alias name"), "{err}");
         assert!(
             err.contains("secret \"S\": `from` needs exactly one"),
             "{err}"

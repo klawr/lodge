@@ -131,10 +131,10 @@ fn an_injected_binary_runs_against_the_injected_glibc() {
     let p = sb.project("inject", &json(r#"{ "image": "@IMAGE@" }"#));
     p.up();
 
-    assert_eq!(p.exec(&["/usr/local/bin/hostsh", "-c", "echo ok"]), "ok");
-    assert_eq!(p.sh("cat /opt/lodge/version").trim(), "1");
+    assert_eq!(p.exec(&[&root_tool("hostsh"), "-c", "echo ok"]), "ok");
+    assert_eq!(p.sh(&format!("cat {ROOT_PREFIX}/version")).trim(), "2");
     assert!(
-        p.sh("wc -l < /opt/lodge/lib/.manifest")
+        p.sh(&format!("wc -l < {ROOT_PREFIX}/lib/.manifest"))
             .trim()
             .parse::<u32>()
             .unwrap()
@@ -157,21 +157,21 @@ fn a_library_that_changed_on_the_host_is_refreshed() {
 
     // Simulate a host upgrade: the container's libc is stale and the manifest
     // remembers a different hash for it.
-    let libc = p.sh("ls /opt/lodge/lib | grep '^libc.so'");
+    let libc = p.sh(&format!("ls {ROOT_PREFIX}/lib | grep '^libc.so'"));
     p.sh(&format!(
-        "echo STALE > /opt/lodge/lib/{libc} && \
-         sed -i 's/^[0-9a-f]* {libc}$/0000000000000000 {libc}/' /opt/lodge/lib/.manifest"
+        "echo STALE > {ROOT_PREFIX}/lib/{libc} && \
+         sed -i 's/^[0-9a-f]* {libc}$/0000000000000000 {libc}/' {ROOT_PREFIX}/lib/.manifest"
     ));
 
     let container = p.container();
     let out = sb.run(&["exec", "--no-attach", &container]);
     assert!(out.ok, "re-injecting failed:\n{}", out.tail(10));
     assert_eq!(
-        p.sh(&format!("head -c 4 /opt/lodge/lib/{libc} | tail -c 3")),
+        p.sh(&format!("head -c 4 {ROOT_PREFIX}/lib/{libc} | tail -c 3")),
         "ELF",
         "libc was not restored"
     );
-    assert_eq!(p.exec(&["/usr/local/bin/hostsh", "-c", "echo ok"]), "ok");
+    assert_eq!(p.exec(&[&root_tool("hostsh"), "-c", "echo ok"]), "ok");
 }
 
 #[test]
@@ -455,10 +455,7 @@ fn doctor_reports_a_reachable_engine() {
 fn a_bundle_can_be_packed_inspected_verified_and_damage_is_caught() {
     require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
     let sb = Sandbox::new();
-    sb.config(&format!(
-        "{}\n[aliases]\nll = \"ls -la\"\n",
-        inject_sh_config(true)
-    ));
+    sb.config(&inject_sh_config(true));
     let bundle = sb.root().join("b.tar");
     let bundle_arg = bundle.to_string_lossy().into_owned();
 
@@ -473,7 +470,7 @@ fn a_bundle_can_be_packed_inspected_verified_and_damage_is_caught() {
 
     let inspect = sb.run(&["bundle", "inspect", &bundle_arg]);
     assert!(
-        inspect.ok && inspect.has("hostsh") && inspect.has("relinked") && inspect.has("1 alias"),
+        inspect.ok && inspect.has("hostsh") && inspect.has("relinked"),
         "unexpected inspect output:\n{}",
         inspect.text
     );
@@ -577,7 +574,7 @@ fn a_repeated_up_reuses_the_cached_bundle_and_a_change_updates_the_container() {
     let p = sb.project("cached", &json(r#"{ "image": "@IMAGE@" }"#));
 
     assert!(p.up().has("(packed)"), "the first run should pack");
-    assert_eq!(p.exec(&["/usr/local/bin/hello"]), "one");
+    assert_eq!(p.exec(&[&root_tool("hello")]), "one");
     let again = p.up();
     assert!(
         again.has("(cached)"),
@@ -594,7 +591,7 @@ fn a_repeated_up_reuses_the_cached_bundle_and_a_change_updates_the_container() {
         "{}",
         changed.tail(8)
     );
-    assert_eq!(p.exec(&["/usr/local/bin/hello"]), "two, and longer");
+    assert_eq!(p.exec(&[&root_tool("hello")]), "two, and longer");
 }
 
 #[test]
@@ -633,7 +630,7 @@ fn injecting_from_a_bundle_needs_neither_ldd_nor_patchelf() {
         "injecting from a bundle failed without ldd/patchelf:\n{}",
         out.tail(10)
     );
-    assert_eq!(p.exec(&["/usr/local/bin/hostsh", "-c", "echo ok"]), "ok");
+    assert_eq!(p.exec(&[&root_tool("hostsh"), "-c", "echo ok"]), "ok");
 }
 
 const SECRET: &str = "s3cr3t-VALUE-9f2a";
@@ -865,7 +862,7 @@ fn secrets_are_added_on_the_machine_that_uses_a_tarred_bundle() {
     let out = p.attach(
         &["-c", &config_arg],
         &[("LODGE_IT_API_KEY", SECRET)],
-        "printf 'GOT=%s\\n' \"$API_KEY\"; /usr/local/bin/hello; exit\n",
+        "printf 'GOT=%s\\n' \"$API_KEY\"; hello; exit\n",
     );
     assert!(out.ok, "{}", out.tail(15));
     assert!(out.has(&format!("GOT={SECRET}")), "{}", out.tail(15));
@@ -1004,20 +1001,17 @@ fn ls_status_ports_and_clean_describe_and_undo_what_up_did() {
     assert!(shown.contains(&format!("127.0.0.1:{port}")), "{shown}");
     assert!(p.ldg("logs", &[]).has("forwarding port"));
 
-    // clean: lodge's files and wrapper go, the devcontainer's state stays.
-    assert!(p.sh("test -x /usr/local/bin/hostsh && echo yes") == "yes");
-    // As an older ldg left it: the record has the hash but no path, so the
-    // wrapper must be found by looking.
-    p.sh("sed -i 2d /opt/lodge/installed/hostsh.bin");
-    let out = p.ldg("clean", &[]);
-    assert!(
-        out.ok && out.has("/usr/local/bin/hostsh"),
-        "{}",
-        out.tail(10)
-    );
+    // clean: lodge's prefix goes, the devcontainer's state stays.
     assert_eq!(
-        p.sh("ls -d /opt/lodge/bin /lodge /usr/local/bin/hostsh 2>/dev/null | wc -l"),
-        "0"
+        p.sh(&format!("test -x {} && echo yes", root_tool("hostsh"))),
+        "yes"
+    );
+    let out = p.ldg("clean", &[]);
+    assert!(out.ok, "{}", out.tail(10));
+    assert_eq!(
+        p.sh(&format!("ls -d {ROOT_PREFIX} 2>/dev/null | wc -l")),
+        "0",
+        "the prefix is removed whole"
     );
     assert_eq!(p.sh("ls /opt/lodge/state"), "postCreate");
     assert!(p.ldg("status", &[]).has("up to date"));
@@ -1078,6 +1072,101 @@ fn a_tmux_session_runs_the_shell_in_the_container() {
 
 #[test]
 #[ignore = "needs docker"]
+fn a_user_without_root_gets_everything_in_their_own_prefix_and_nothing_elsewhere() {
+    require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
+    let sb = Sandbox::new();
+    let settings = sb.root().join("settings");
+    std::fs::create_dir_all(&settings).unwrap();
+    std::fs::write(settings.join("rc"), "set x").unwrap();
+    sb.config(&format!(
+        "{}\n[[inject]]\nname = \"settings\"\nconfig = \"{}\"\ntarget_config = \"/tmp/lodge-test-settings\"\n",
+        inject_sh_config(false),
+        settings.display()
+    ));
+    // `nobody` has the home /nonexistent, which doesn't exist and which lodge
+    // won't create (that would need root), so the prefix goes to /tmp.
+    let p = sb.project(
+        "nonroot",
+        &json(r#"{ "image": "@IMAGE@", "remoteUser": "nobody", "updateRemoteUserUID": false }"#),
+    );
+    p.up();
+    let prefix = "/tmp/lodge-65534";
+    let container = p.container();
+    let run = |script: &str| docker(&["exec", "-u", "nobody", &container, "sh", "-c", script]);
+
+    // The tool runs as that user, from their prefix, with the bundled glibc.
+    assert_eq!(run(&format!("{prefix}/bin/hostsh -c 'echo ok'")), "ok");
+    assert_eq!(run("id -un"), "nobody");
+    // Everything they own is theirs; nothing was put where only root can write.
+    assert_eq!(
+        run(&format!(
+            "find {prefix} /tmp/lodge-test-settings ! -user nobody | wc -l"
+        )),
+        "0",
+        "something in the prefix or the config is not the user's"
+    );
+    assert_eq!(run("cat /tmp/lodge-test-settings/rc"), "set x");
+    assert_eq!(
+        p.sh(
+            "ls -d /nonexistent /opt/lodge/bin /opt/lodge/lib /lodge /usr/local/bin/hostsh \
+              /etc/profile.d/lodge.sh /etc/profile.d/lodge-path.sh 2>/dev/null | wc -l"
+        ),
+        "0",
+        "injection touched root-owned places"
+    );
+    assert!(p.up().has("is up to date"), "a second run found work to do");
+
+    // `clean --container` finds what was injected for another user when told which.
+    let out = sb.run(&["clean", "--container", &container, "-u", "nobody"]);
+    assert!(out.ok, "{}", out.tail(10));
+    assert_eq!(p.sh(&format!("ls -d {prefix} 2>/dev/null | wc -l")), "0");
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn the_session_finds_injected_tools_even_though_the_login_profile_resets_path() {
+    require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
+    let sb = Sandbox::new();
+    sb.config(&inject_sh_config(false));
+    // Debian's /etc/profile sets PATH from scratch for a login shell; the image's
+    // own ENV entry would be lost with it.
+    let p = sb.project(
+        "session-path",
+        r#"{ "build": { "dockerfile": "Dockerfile" }, "remoteUser": "root" }"#,
+    );
+    p.write(
+        ".devcontainer/Dockerfile",
+        &format!("FROM {IMAGE}\nENV PATH=/opt/imagetool/bin:$PATH\n"),
+    );
+    let out = p.attach(
+        &[],
+        &[],
+        "command -v hostsh; echo \"PATH=$PATH\"; hostsh -c 'echo from-session'; exit\n",
+    );
+    assert!(out.ok, "{}", out.tail(15));
+    assert!(
+        out.has(&format!("{}\r", root_tool("hostsh"))),
+        "{}",
+        out.tail(15)
+    );
+    assert!(out.has("from-session"), "{}", out.tail(15));
+    let path = out
+        .text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("PATH="))
+        .unwrap_or_default();
+    assert!(
+        path.starts_with(&format!("{ROOT_PREFIX}/bin:")),
+        "the prefix must come first: {path}"
+    );
+    assert!(
+        path.contains("/opt/imagetool/bin"),
+        "what the image put on PATH was lost: {path}"
+    );
+}
+
+#[test]
+#[ignore = "needs docker"]
 fn a_glibc_tool_runs_in_a_musl_container() {
     require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
     let sb = Sandbox::new();
@@ -1089,9 +1178,16 @@ fn a_glibc_tool_runs_in_a_musl_container() {
     );
     p.up();
     // The host's (glibc) shell, with its bundled libraries, on busybox/musl.
+    // Alpine gives `nobody` the home `/`, which is no place for a prefix, so lodge
+    // uses a private directory in /tmp.
     assert_eq!(
-        p.exec(&["/usr/local/bin/hostsh", "-c", "echo glibc-on-musl"]),
+        p.exec(&["/tmp/lodge-65534/bin/hostsh", "-c", "echo glibc-on-musl"]),
         "glibc-on-musl"
+    );
+    assert_eq!(
+        p.sh("stat -c %U /; stat -c %U /tmp/lodge-65534"),
+        "root\nnobody",
+        "the root directory must stay root's"
     );
     assert_eq!(p.sh("cat /tmp/hook-user"), "nobody");
     assert!(p.ldg("status", &[]).has("up to date"));

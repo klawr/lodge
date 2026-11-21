@@ -3,24 +3,36 @@
 //! A bundle is a file that arrives from somewhere else, so a manifest is
 //! validated before anything is trusted: paths inside the bundle are *derived
 //! from names* (`bin/<tool>`, `lib/<file>`, `config/<tool>`) rather than stored,
-//! so it cannot point outside itself, and names that end up in shell scripts
-//! (alias names) are restricted to plain characters.
+//! so it cannot point outside itself.
+//!
+//! A bundle does not know where it will be installed. Its dynamic binaries carry
+//! a placeholder interpreter and find their libraries relative to themselves
+//! ([`ORIGIN_RPATH`]), so injection only has to write the real interpreter path
+//! ([`crate::bundle::elf::set_interpreter`]).
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use crate::bundle::arch::Arch;
 use crate::fingerprint::content_hash;
-use crate::shell::{container_path_problem, is_alias_name, is_plain_name};
+use crate::shell::{container_path_problem, is_plain_name};
 
 /// The bundle format this ldg writes and reads.
-pub const FORMAT: u32 = 1;
+///
+/// Format 2 bakes no install prefix into the binaries.
+pub const FORMAT: u32 = 2;
 
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const BIN_DIR: &str = "bin";
 pub const LIB_DIR: &str = "lib";
 pub const CONFIG_DIR: &str = "config";
+
+/// The library search path of a packed binary, relative to where the binary is:
+/// `bin/` and `lib/` are siblings in a bundle and stay siblings where it is
+/// installed. `DT_RPATH` (not `RUNPATH`) so it also resolves the libraries' own
+/// dependencies. Part of the format.
+pub const ORIGIN_RPATH: &str = "$ORIGIN/../lib";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -36,7 +48,6 @@ pub struct Manifest {
     /// Shared libraries (and the linker), stored at `lib/<name>`.
     pub libs: Vec<Lib>,
     pub tools: Vec<Tool>,
-    pub aliases: BTreeMap<String, String>,
     pub git_safe_directories: Vec<String>,
 }
 
@@ -57,10 +68,12 @@ pub struct Tool {
 /// A binary, stored at `bin/<tool name>`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Binary {
-    /// Where the wrapper goes in the container (`~/` is the user's home).
-    /// Called `target` in the manifest, after the config's `target_binary`.
-    #[serde(rename = "target")]
-    pub dest: String,
+    /// Where an extra wrapper script goes (`~/` is the user's home), when the
+    /// config asked for one with `target_binary`. Without it the binary is
+    /// reached through the `PATH` of lodge's sessions. Called `target` in the
+    /// manifest, after the config's `target_binary`.
+    #[serde(rename = "target", default, skip_serializing_if = "Option::is_none")]
+    pub dest: Option<String>,
     /// Whether it was relinked to the bundled glibc (false: static, or copied as is).
     pub dynamic: bool,
     pub hash: String,
@@ -144,7 +157,9 @@ impl Manifest {
                 bail!("tool '{}' has neither a binary nor a config", tool.name);
             }
             if let Some(b) = &tool.binary {
-                check_dest(&tool.name, &b.dest)?;
+                if let Some(dest) = &b.dest {
+                    check_dest(&tool.name, dest)?;
+                }
                 check_hash(&tool.name, &b.hash)?;
                 if b.dynamic && self.linker.is_none() {
                     bail!(
@@ -156,13 +171,6 @@ impl Manifest {
             if let Some(c) = &tool.config {
                 check_dest(&tool.name, &c.dest)?;
                 check_hash(&tool.name, &c.hash)?;
-            }
-        }
-
-        for name in self.aliases.keys() {
-            // Alias names are written unquoted into a shell script.
-            if !is_alias_name(name) {
-                bail!("'{name}' is not a plain alias name");
             }
         }
         Ok(())
@@ -215,7 +223,7 @@ mod tests {
             tools: vec![Tool {
                 name: "nvim".into(),
                 binary: Some(Binary {
-                    dest: "/usr/local/bin/nvim".into(),
+                    dest: Some("/usr/local/bin/nvim".into()),
                     dynamic: true,
                     hash: "00000000000000aa".into(),
                 }),
@@ -226,9 +234,30 @@ mod tests {
                 }),
                 skip_if_exists: true,
             }],
-            aliases: BTreeMap::from([("ll".into(), "ls -la".into())]),
             git_safe_directories: vec!["*".into()],
         }
+    }
+
+    #[test]
+    fn the_rpath_matches_the_bundle_layout() {
+        assert_eq!(ORIGIN_RPATH, format!("$ORIGIN/../{LIB_DIR}"));
+        assert_eq!(
+            BIN_DIR, "bin",
+            "the rpath assumes bin/ and lib/ are siblings"
+        );
+    }
+
+    #[test]
+    fn a_binary_without_a_wrapper_target_is_valid_and_leaves_it_out() {
+        let mut m = sample();
+        m.tools[0].binary.as_mut().unwrap().dest = None;
+        m.validate().unwrap();
+        assert!(
+            !String::from_utf8(m.to_json().unwrap())
+                .unwrap()
+                .contains("\"target\": \"/usr")
+        );
+        assert_eq!(Manifest::from_json(&m.to_json().unwrap()).unwrap(), m);
     }
 
     #[test]
@@ -280,22 +309,12 @@ mod tests {
     #[test]
     fn targets_must_be_absolute_or_home_relative_without_dotdot() {
         assert!(
-            invalid(|m| m.tools[0].binary.as_mut().unwrap().dest = "bin/nvim".into())
+            invalid(|m| m.tools[0].binary.as_mut().unwrap().dest = Some("bin/nvim".into()))
                 .contains("unusable target")
         );
         assert!(
             invalid(|m| m.tools[0].config.as_mut().unwrap().dest = "/etc/../x".into())
                 .contains("unusable target")
-        );
-    }
-
-    #[test]
-    fn alias_names_cannot_smuggle_shell_syntax() {
-        assert!(
-            invalid(|m| {
-                m.aliases.insert("x; rm -rf /".into(), "true".into());
-            })
-            .contains("alias")
         );
     }
 

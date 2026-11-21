@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 
-use super::{Env, ExecOpts};
+use super::{Container, Env, ExecOpts};
 
 /// Who a command runs as.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -10,8 +10,9 @@ pub enum User<'a> {
     /// The environment's default user (a container's `USER`).
     #[default]
     Default,
-    /// uid 0, regardless of the default. lodge needs this for setup that writes
-    /// to root-owned locations (`/opt/lodge`, `/lodge`, `/etc/profile.d`).
+    /// uid 0, regardless of the default. Only provisioning asks for it, through
+    /// the engine (a home to fix, a feature to install); what lodge does for a
+    /// user never does.
     Root,
     Named(&'a str),
 }
@@ -88,6 +89,46 @@ impl ContainerUser {
         })
     }
 
+    /// The user as a container knows them *without running anything in it*, for a
+    /// stopped container: `requested` (or the image's configured user, or root)
+    /// looked up in its `/etc/passwd`, read through the engine. `None` when the
+    /// passwd file has no such user.
+    pub fn from_stored(container: &dyn Container, requested: Option<&str>) -> Result<Option<Self>> {
+        let configured = container.configured_user();
+        let wanted = requested
+            .map(str::to_string)
+            .or(configured)
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| "root".to_string());
+        // The image's setting may be `user:group` or `uid:gid`.
+        let wanted = wanted.split(':').next().unwrap_or("root");
+        let passwd = container
+            .read_stored_file("/etc/passwd")?
+            .unwrap_or_default();
+        Ok(Self::from_passwd(requested, wanted, &passwd))
+    }
+
+    /// `wanted` (a name or a uid) in the text of a passwd file.
+    fn from_passwd(requested: Option<&str>, wanted: &str, passwd: &str) -> Option<Self> {
+        for fields in passwd.lines().map(|l| l.split(':').collect::<Vec<_>>()) {
+            let [name, _, uid, gid, _, home, ..] = fields[..] else {
+                continue;
+            };
+            if name == wanted || uid == wanted {
+                return Some(Self {
+                    requested: requested.map(str::to_string),
+                    name: name.to_string(),
+                    uid: uid.parse().ok()?,
+                    gid: gid.parse().ok()?,
+                    home: home.to_string(),
+                });
+            }
+        }
+        // A uid with no passwd entry, as the probe would have reported it.
+        let uid: u32 = wanted.parse().ok()?;
+        Self::parse(requested, &format!("{uid}\n{uid}\n\n\n"))
+    }
+
     /// root, as a fallback when the container can't say.
     pub fn root() -> Self {
         Self {
@@ -99,18 +140,18 @@ impl ContainerUser {
         }
     }
 
-    /// How to run a command as this user.
+    /// How to run a command as this user. uid 0 is root whatever name it was asked
+    /// for by, so that is how it is run.
     pub fn exec_as(&self) -> User<'_> {
-        self.requested.as_deref().into()
+        if self.is_root() {
+            User::Root
+        } else {
+            self.requested.as_deref().into()
+        }
     }
 
     pub fn is_root(&self) -> bool {
         self.uid == 0
-    }
-
-    /// `uid:gid`, for `chown`.
-    pub fn owner(&self) -> String {
-        format!("{}:{}", self.uid, self.gid)
     }
 
     /// `path` with a leading `~` expanded to this user's home.
@@ -123,12 +164,6 @@ impl ContainerUser {
         } else {
             path.to_string()
         }
-    }
-
-    /// Whether `path` is the home directory or inside it (by path, whoever
-    /// owns it).
-    pub fn is_in_home(&self, path: &str) -> bool {
-        std::path::Path::new(path).starts_with(&self.home)
     }
 }
 
@@ -159,7 +194,7 @@ mod tests {
             u.gid = 1001;
             u
         });
-        assert_eq!(u.owner(), "1000:1001");
+        assert_eq!((u.uid, u.gid), (1000, 1001));
         assert_eq!(u.exec_as(), User::Named("vscode"));
     }
 
@@ -170,8 +205,53 @@ mod tests {
         let u = ContainerUser::parse(None, "0\n0\nroot\n\n").unwrap();
         assert_eq!(u.home, "/root");
         assert!(u.is_root());
-        assert_eq!(u.exec_as(), User::Default);
+        assert_eq!(
+            u.exec_as(),
+            User::Root,
+            "uid 0 is run as root, not as 'default'"
+        );
         assert!(ContainerUser::parse(None, "who knows").is_none());
+    }
+
+    #[test]
+    fn a_stopped_containers_user_is_found_in_its_passwd_file() {
+        let passwd = "root:x:0:0:root:/root:/bin/bash\nnode:x:1000:1001::/home/node:/bin/bash\n";
+        let by_name = ContainerUser::from_passwd(Some("node"), "node", passwd).unwrap();
+        assert_eq!(
+            (by_name.uid, by_name.gid, by_name.home.as_str()),
+            (1000, 1001, "/home/node")
+        );
+        assert_eq!(by_name.requested.as_deref(), Some("node"));
+        let by_uid = ContainerUser::from_passwd(None, "1000", passwd).unwrap();
+        assert_eq!(by_uid.name, "node");
+        assert_eq!(by_uid.requested, None);
+        let root = ContainerUser::from_passwd(None, "root", passwd).unwrap();
+        assert!(root.is_root() && root.home == "/root");
+        // A uid nobody lists still gets the probe's fallbacks; a name nobody lists
+        // is not guessed.
+        let ghost = ContainerUser::from_passwd(None, "4242", passwd).unwrap();
+        assert_eq!((ghost.uid, ghost.home.as_str()), (4242, "/home/4242"));
+        assert!(ContainerUser::from_passwd(None, "nobody", passwd).is_none());
+    }
+
+    #[test]
+    fn the_stored_user_follows_the_images_configured_user_and_defaults_to_root() {
+        use crate::runtime::Runtime;
+        use crate::runtime::fake::FakeRuntime;
+        let passwd = "root:x:0:0::/root:/bin/sh\napp:x:1234:1234::/srv/app:/bin/sh\n";
+        let rt = FakeRuntime::new(FakeEnv::new)
+            .with_container("c", FakeEnv::new().with_file("/etc/passwd", passwd));
+        let c = rt.container("c");
+        // No requested user and no configured one: root.
+        let u = ContainerUser::from_stored(c.as_ref(), None)
+            .unwrap()
+            .unwrap();
+        assert!(u.is_root());
+        // A requested user is looked up.
+        let u = ContainerUser::from_stored(c.as_ref(), Some("app"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(u.home, "/srv/app");
     }
 
     #[test]
@@ -186,12 +266,5 @@ mod tests {
         assert_eq!(u.expand_home("~/.config/nvim"), "/home/vscode/.config/nvim");
         assert_eq!(u.expand_home("~"), "/home/vscode");
         assert_eq!(u.expand_home("/usr/local/bin/nvim"), "/usr/local/bin/nvim");
-    }
-
-    #[test]
-    fn is_in_home_compares_whole_components() {
-        let u = user("/home/dev");
-        assert!(u.is_in_home("/home/dev/.config"));
-        assert!(!u.is_in_home("/home/dev2/.config"));
     }
 }

@@ -189,10 +189,13 @@ pub enum Command {
         /// A running container (name or ID) instead of the project's
         #[arg(long, value_name = "NAME", conflicts_with = "path")]
         container: Option<String>,
+        /// Clean what was injected for this user (default: the container's user)
+        #[arg(long, short, requires = "container")]
+        user: Option<String>,
     },
     /// Pack your tools and configs into a portable bundle
     #[command(
-        long_about = "Build a bundle from the [[inject]] entries, [aliases] and [git] settings \
+        long_about = "Build a bundle from the [[inject]] entries and [git] settings \
             in your config: your binaries relinked to a bundled glibc, their libraries, \
             and your configs, in one tar. This is the only step that needs ldd and \
             patchelf, and it must run on a Linux machine of the architecture the bundle \

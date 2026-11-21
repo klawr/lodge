@@ -100,7 +100,6 @@ mod tests {
     use super::super::manifest::{Binary, ConfigTree, FORMAT, Lib, Tool};
     use super::*;
     use crate::tmpfile::TempDir;
-    use std::collections::BTreeMap;
 
     /// A small but complete bundle directory, with its manifest.
     fn bundle_dir() -> (TempDir, Manifest) {
@@ -127,7 +126,7 @@ mod tests {
             tools: vec![Tool {
                 name: "hello".into(),
                 binary: Some(Binary {
-                    dest: "/usr/local/bin/hello".into(),
+                    dest: None,
                     dynamic: true,
                     hash: hash_path(&p.join("bin/hello")).unwrap(),
                 }),
@@ -138,7 +137,6 @@ mod tests {
                 }),
                 skip_if_exists: true,
             }],
-            aliases: BTreeMap::new(),
             git_safe_directories: vec![],
         };
         std::fs::write(p.join(MANIFEST_FILE), manifest.to_json().unwrap()).unwrap();

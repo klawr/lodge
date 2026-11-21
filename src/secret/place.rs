@@ -132,19 +132,6 @@ pub fn clear(env: &dyn Env, user: &ContainerUser) -> Result<()> {
     .context("removing placed secrets")
 }
 
-/// The `sh -c` script behind [`clear_all`]: `$1` is the prefix of the secrets
-/// directories, one per uid.
-const CLEAR_ALL_SCRIPT: &str = "rm -rf \"$1\"*";
-
-/// Removes the secrets placed for every user (`ldg clean`), as root.
-pub fn clear_all(env: &dyn Env) -> Result<()> {
-    env.exec(
-        &script_argv(CLEAR_ALL_SCRIPT, &[crate::layout::SECRETS_PREFIX]),
-        &ExecOpts::root(),
-    )
-    .context("removing placed secrets")
-}
-
 /// Each declared secret's name and whether it is placed for `user`: what
 /// `ldg status` reports. Reads the directory listing only, never a value. An
 /// error when the container can't be asked, which is not "none placed".
@@ -296,31 +283,6 @@ mod tests {
         let env = FakeEnv::new();
         clear(&env, &dev()).unwrap();
         assert!(env.ran(&["rm", "-rf", "/dev/shm/lodge-secrets-1000"]));
-    }
-
-    #[test]
-    fn clearing_everyones_secrets_runs_as_root() {
-        let env = FakeEnv::new();
-        clear_all(&env).unwrap();
-        assert_eq!(
-            env.ran_as(&script_argv(CLEAR_ALL_SCRIPT, &["/dev/shm/lodge-secrets-"])),
-            Some(crate::runtime::fake::Who::Root)
-        );
-    }
-
-    #[test]
-    fn the_clear_all_script_removes_every_users_directory_and_nothing_else() {
-        let tmp = crate::tmpfile::TempDir::new("clear-all").unwrap();
-        let prefix = tmp.path().join("lodge-secrets-");
-        for d in ["lodge-secrets-0", "lodge-secrets-1000", "other"] {
-            std::fs::create_dir(tmp.path().join(d)).unwrap();
-        }
-        assert!(sh(CLEAR_ALL_SCRIPT, &[prefix.to_str().unwrap()]));
-        let left: Vec<_> = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(left, ["other"]);
     }
 
     // The scripts, run for real against a temp directory.

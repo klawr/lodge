@@ -50,7 +50,7 @@ mod tests {
     fn keys_are_made_path_safe() {
         let env = FakeEnv::new();
         mark_done(&env, "ghcr.io/x/feat:1").unwrap();
-        assert!(env.file_exists("/opt/lodge/state/ghcr.io_x_feat_1"));
+        assert!(env.exists("/opt/lodge/state/ghcr.io_x_feat_1").unwrap());
     }
 
     #[test]

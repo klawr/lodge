@@ -3,14 +3,6 @@
   "title": "Config",
   "type": "object",
   "properties": {
-    "aliases": {
-      "description": "Shell aliases, written to `/etc/profile.d/lodge.sh` (login shells).",
-      "type": "object",
-      "additionalProperties": {
-        "type": "string"
-      },
-      "default": {}
-    },
     "bundle": {
       "description": "A bundle file to inject from instead of packing the `[[inject]]` entries.\nA relative path is relative to this file's folder.",
       "type": [
@@ -103,7 +95,7 @@
           "default": false
         },
         "target_binary": {
-          "description": "Where the wrapper goes in the container (default: `/usr/local/bin/<name>`).",
+          "description": "Where to put an extra wrapper script that runs the binary (default: none:\nthe binary is on the `PATH` of the sessions lodge opens).",
           "type": [
             "string",
             "null"

@@ -1,57 +1,42 @@
-//! Shared libraries and the dynamic linker.
-//!
-//! Copied from the bundle, tracked by content hash: a library that changed (same
-//! name, new content) is refreshed rather than skipped. Names don't change across
-//! versions (`libc.so.6` is `libc.so.6` in every glibc), and a container outlives
-//! upgrades, so skipping by name would leave an old libc beside a newer linker or
-//! binary, which crashes at startup.
-
 use anyhow::Result;
 use std::collections::BTreeMap;
 
 use crate::bundle::manifest::Lib;
 use crate::bundle::source::Prepared;
-use crate::layout::{LIB, LIB_MANIFEST, LINKER_DIR};
+use crate::layout::Layout;
 use crate::output::{info, plural};
 use crate::runtime::Env;
 
-/// Copies the bundle's libraries (and the dynamic linker) into `/opt/lodge/lib`
-/// when their content differs from what an earlier injection recorded.
+/// Copies the bundle's libraries (and the dynamic linker) into the prefix's
+/// `lib/` when their content differs from what an earlier injection recorded.
 ///
-/// The linker is also kept at `/lodge` for the relinked binaries' interpreter.
-/// When it is refreshed there it must move together with libc, or binaries
-/// injected earlier would end up with a linker and a libc from different glibc
-/// versions.
-pub(super) fn inject_libs(env: &dyn Env, bundle: &Prepared) -> Result<()> {
+/// The linker lives there too, as one copy: binaries name it as their interpreter
+/// and find their libraries next to it, so a refresh of the linker and libc
+/// always moves together.
+pub(super) fn inject_libs(env: &dyn Env, layout: &Layout, bundle: &Prepared) -> Result<()> {
     let libs = &bundle.manifest.libs;
     if libs.is_empty() {
         return Ok(());
     }
 
-    let mut installed = parse_manifest(&env.read_file(LIB_MANIFEST)?.unwrap_or_default());
+    let manifest_path = layout.lib_manifest();
+    let mut installed = parse_manifest(&env.read_file(&manifest_path)?.unwrap_or_default());
     let changed = changed_libs(libs, &installed);
-    if !changed.is_empty() {
-        info!(
-            "copying {}",
-            plural(changed.len(), "changed library", "changed libraries")
-        );
-        for lib in &changed {
-            env.cp_in(
-                &bundle.lib(&lib.name).to_string_lossy(),
-                &format!("{LIB}/{}", lib.name),
-            )?;
-            installed.insert(lib.name.clone(), lib.hash.clone());
-        }
-        env.write_file(LIB_MANIFEST, render_manifest(&installed).as_bytes())?;
+    if changed.is_empty() {
+        return Ok(());
     }
-
-    if let Some(ld) = &bundle.manifest.linker {
-        let placed = format!("{LINKER_DIR}/{ld}");
-        if changed.iter().any(|l| &l.name == ld) || !env.file_exists(&placed) {
-            env.exec_root(&["cp", &format!("{LIB}/{ld}"), &placed])?;
-        }
+    info!(
+        "copying {}",
+        plural(changed.len(), "changed library", "changed libraries")
+    );
+    for lib in &changed {
+        env.cp_in(
+            &bundle.lib(&lib.name).to_string_lossy(),
+            &layout.lib_file(&lib.name),
+        )?;
+        installed.insert(lib.name.clone(), lib.hash.clone());
     }
-    Ok(())
+    env.write_file(&manifest_path, render_manifest(&installed).as_bytes())
 }
 
 /// Parses the manifest: one `<hash> <file name>` per line.
@@ -84,6 +69,10 @@ mod tests {
     use crate::bundle::source::Origin;
     use crate::runtime::fake::FakeEnv;
     use crate::tmpfile::TempDir;
+
+    fn layout() -> Layout {
+        Layout::new("/p")
+    }
 
     fn lib(name: &str, hash: &str) -> Lib {
         Lib {
@@ -147,7 +136,6 @@ mod tests {
                 .map(|(n, c)| lib(n, &format!("{:016x}", c.len())))
                 .collect(),
             tools: vec![],
-            aliases: BTreeMap::new(),
             git_safe_directories: vec![],
         };
         let prepared = Prepared {
@@ -159,61 +147,41 @@ mod tests {
     }
 
     #[test]
-    fn libraries_are_copied_once_and_the_linker_is_placed() {
+    fn libraries_and_the_linker_are_copied_once_into_the_prefix() {
         let (_dir, bundle) = bundle_with(&[("ld-linux.so.2", "linker"), ("libc.so.6", "libc")]);
         let env = FakeEnv::new();
-        inject_libs(&env, &bundle).unwrap();
+        inject_libs(&env, &layout(), &bundle).unwrap();
 
-        assert_eq!(env.file("/opt/lodge/lib/libc.so.6").unwrap(), "libc");
-        assert!(
-            env.file("/opt/lodge/lib/.manifest")
-                .unwrap()
-                .contains("libc.so.6")
+        assert_eq!(env.file("/p/lib/libc.so.6").unwrap(), "libc");
+        assert_eq!(
+            env.file("/p/lib/ld-linux.so.2").unwrap(),
+            "linker",
+            "the one copy of the linker is next to the libraries"
         );
-        assert!(env.ran(&["cp", "/opt/lodge/lib/ld-linux.so.2", "/lodge/ld-linux.so.2"]));
+        assert!(env.file("/p/lib/.manifest").unwrap().contains("libc.so.6"));
     }
 
     #[test]
     fn an_unchanged_bundle_copies_nothing_the_second_time() {
         let (_dir, bundle) = bundle_with(&[("ld-linux.so.2", "linker"), ("libc.so.6", "libc")]);
         let env = FakeEnv::new();
-        inject_libs(&env, &bundle).unwrap();
+        inject_libs(&env, &layout(), &bundle).unwrap();
 
-        // A second run against the container as the first left it.
-        let again = FakeEnv::new()
-            .with_file(
-                "/opt/lodge/lib/.manifest",
-                &env.file("/opt/lodge/lib/.manifest").unwrap(),
-            )
-            .with_file("/lodge/ld-linux.so.2", "linker");
-        inject_libs(&again, &bundle).unwrap();
+        // A second run against the target as the first left it.
+        let again =
+            FakeEnv::new().with_file("/p/lib/.manifest", &env.file("/p/lib/.manifest").unwrap());
+        inject_libs(&again, &layout(), &bundle).unwrap();
         assert!(
-            again.file("/opt/lodge/lib/libc.so.6").is_none(),
+            again.file("/p/lib/libc.so.6").is_none(),
             "libc was copied again"
         );
-        assert!(!again.ran(&["cp", "/opt/lodge/lib/ld-linux.so.2", "/lodge/ld-linux.so.2"]));
-    }
-
-    #[test]
-    fn a_missing_linker_copy_is_restored_even_when_nothing_changed() {
-        let (_dir, bundle) = bundle_with(&[("ld-linux.so.2", "linker")]);
-        let first = FakeEnv::new();
-        inject_libs(&first, &bundle).unwrap();
-        let manifest = first.file("/opt/lodge/lib/.manifest").unwrap();
-
-        // Same manifest and library, but /lodge/<ld> is gone.
-        let env = FakeEnv::new()
-            .with_file("/opt/lodge/lib/.manifest", &manifest)
-            .with_file("/opt/lodge/lib/ld-linux.so.2", "linker");
-        inject_libs(&env, &bundle).unwrap();
-        assert!(env.ran(&["cp", "/opt/lodge/lib/ld-linux.so.2", "/lodge/ld-linux.so.2"]));
     }
 
     #[test]
     fn a_bundle_without_libraries_touches_nothing() {
         let (_dir, bundle) = bundle_with(&[]);
         let env = FakeEnv::new();
-        inject_libs(&env, &bundle).unwrap();
-        assert!(env.file("/opt/lodge/lib/.manifest").is_none());
+        inject_libs(&env, &layout(), &bundle).unwrap();
+        assert!(env.file("/p/lib/.manifest").is_none());
     }
 }

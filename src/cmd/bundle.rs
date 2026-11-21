@@ -61,7 +61,10 @@ fn inspect(file: &Path) -> Result<()> {
         let mut parts = Vec::new();
         if let Some(b) = &tool.binary {
             let kind = if b.dynamic { "relinked" } else { "as is" };
-            parts.push(format!("bin → {} ({kind})", b.dest));
+            match &b.dest {
+                Some(dest) => parts.push(format!("bin ({kind}) + wrapper → {dest}")),
+                None => parts.push(format!("bin ({kind})")),
+            }
         }
         if let Some(c) = &tool.config {
             let kind = if c.is_dir { "dir" } else { "file" };
@@ -72,8 +75,7 @@ fn inspect(file: &Path) -> Result<()> {
     let linker = manifest.linker.as_deref().unwrap_or("none");
     line!("libs      {} (linker {linker})", manifest.libs.len());
     line!(
-        "settings  {} · git safe.directory: {}",
-        plural(manifest.aliases.len(), "alias", "aliases"),
+        "settings  git safe.directory: {}",
         manifest.git_safe_directories.join(", ")
     );
     Ok(())

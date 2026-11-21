@@ -130,8 +130,8 @@ fn live(root: &Path, config: &Config) -> Result<Prepared> {
 /// A fingerprint of everything a live pack depends on. Packing is skipped when it
 /// is unchanged.
 ///
-/// [`pack::build`] reads the `[[inject]]` entries, `[aliases]` and `[git]`, and
-/// the files they name. The entries and settings go in whole, serialized, so a
+/// [`pack::build`] reads the `[[inject]]` entries and `[git]`, and the files they
+/// name. The entries and settings go in whole, serialized, so a
 /// setting added to them later counts without anyone remembering to list it
 /// here; the files go in by size, mtime and mode.
 fn inputs_fingerprint(config: &Config, deps: &mut deps::Resolver) -> Result<String> {
@@ -158,8 +158,6 @@ fn inputs_fingerprint(config: &Config, deps: &mut deps::Resolver) -> Result<Stri
             stat_tree(cfg, &mut parts)?;
         }
     }
-    // A BTreeMap serializes in key order, so this is stable.
-    parts.push(serde_json::to_string(&config.aliases)?);
     parts.push(serde_json::to_string(&config.git)?);
 
     for part in &parts {
@@ -307,10 +305,10 @@ mod tests {
     }
 
     #[test]
-    fn aliases_are_part_of_the_fingerprint() {
+    fn git_settings_are_part_of_the_fingerprint() {
         let a = config(vec![]);
         let mut b = config(vec![]);
-        b.aliases.insert("ll".into(), "ls -la".into());
+        b.git.safe_directories = vec!["/work".into()];
         assert_ne!(
             inputs_fingerprint(&a, &mut deps::Resolver::default()).unwrap(),
             inputs_fingerprint(&b, &mut deps::Resolver::default()).unwrap()

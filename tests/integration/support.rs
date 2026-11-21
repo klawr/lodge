@@ -13,6 +13,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const IMAGE: &str = "debian:stable-slim";
 
+/// Where lodge installs for root, whose home is `/root`: the user's prefix.
+pub const ROOT_PREFIX: &str = "/root/.local/share/lodge";
+
+/// A tool injected for root, by its path in the prefix.
+pub fn root_tool(name: &str) -> String {
+    format!("{ROOT_PREFIX}/bin/{name}")
+}
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The result of one `ldg` (or docker) invocation.

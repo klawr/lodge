@@ -23,16 +23,16 @@ the host, and nothing is installed in the image.
 
 ```
 ldg up [PATH]        devcontainer::start → ContainerUser::resolve → forward::spawn_daemon
-                     → inject::run → Started::run_post_attach → secret::deliver → session::enter
-ldg exec <ctr>       ContainerUser::resolve → inject::run → secret::deliver → session::enter
-                     (no devcontainer)
+                     → inject::resolve_layout → inject::run → Started::run_post_attach → secret::deliver → session::enter
+ldg exec <ctr>       ContainerUser::resolve → inject::resolve_layout → inject::run
+                     → secret::deliver → session::enter (no devcontainer)
 ldg down [PATH]      devcontainer::stop
 ldg status [PATH]    devcontainer::status (state, drift) + installed bundle + placed secrets
 ldg rm [PATH]        devcontainer::remove (container, and the compose project)
 ldg ls               Runtime::list_labeled (every container with lodge's project label)
 ldg ports [PATH]     forward::active_ports (what the daemon reports)
 ldg logs [PATH]      the daemon's log file
-ldg clean [PATH]     inject::remove
+ldg clean [PATH]     ContainerUser::resolve → inject::existing_layout → inject::remove
 ldg init             a commented config from the tools found on PATH
 ldg doctor [PATH]    host tools, engine, compose, config, binaries, secrets
 ldg pack             bundle::pack::pack_to_file (config → bundle tar)
@@ -58,20 +58,20 @@ every subcommand.
 | --- | --- |
 | `cli.rs` | `clap` definitions: subcommands and the global flags. |
 | `cmd/` | One file per group of commands (`attach`: up/exec, `project`: down/status/rm/ls/ports/logs/clean, `doctor`, `init`, `bundle`: pack/bundle/cache), plus `prompt`, the terminal side of `devcontainer::Prompt`. The only layer that loads the config, prints reports and reads the terminal. |
-| `config/` | The user's `config.toml`: `[[inject]]`, `[session]`, `[git]`, `[aliases]`, `[[secret]]` (its declaration types are in `config/secret.rs`: `RawSecret` as written, `SecretDecl` once checked), `bundle`. Unknown keys and wrong types are errors (with a "did you mean"); past those, every problem, secrets included, is reported at once. A relative `bundle =` resolves against the file's folder. The JSON schema in `docs/config.schema.json` is generated from these types. |
+| `config/` | The user's `config.toml`: `[[inject]]`, `[session]`, `[git]`, `[[secret]]` (its declaration types are in `config/secret.rs`: `RawSecret` as written, `SecretDecl` once checked), `bundle`. Unknown keys and wrong types are errors (with a "did you mean"); past those, every problem, secrets included, is reported at once. A relative `bundle =` resolves against the file's folder. The JSON schema in `docs/config.schema.json` is generated from these types. |
 | `devcontainer/` | Everything about running a `devcontainer.json` (see below). |
-| `bundle/` | A bundle is a portable tar of relinked binaries, their libraries and configs, with a manifest. `manifest` defines and validates it (paths derive from names, so a bundle can't point outside itself), `archive` writes, reads and verifies the tar, `pack` builds one from the config (the only step needing `patchelf`; `deps` parses `ldd`, asking it once per binary however often the answer is needed, `elf` reads a binary's architecture, as an `arch::Arch`, the one name for a CPU that bundles, binaries and machines are compared by, and `Arch::host()` is this machine's), `source` readies a bundle *directory* to inject from (extracted from a file, or packed live), keyed by the file's hash or a fingerprint of the live inputs, and `cache` keeps those directories under `~/.cache/lodge/bundles/`. `hash` is the content hash of a file or tree. |
-| `inject/` | Copies a bundle's binaries, libraries and configs into a container and wires them up for the `ContainerUser`, reading only from the bundle directory: `binary`, `libs` (tracked by content hash), `config_files` (and ownership), `installed` (a hash and the destination per installed piece; a record that can't be read means that piece is installed again, and the list of records `ldg clean` works from is an error when it can't be read, not "nothing installed"), `home` (the user's home is writable, and the user owns what lodge puts in it), `shell_env` (`PATH`, aliases, git), `state` (format version, installed bundle id), `remove` (`ldg clean`, apart from the secrets, which `secret::place::clear_all` removes). |
-| `layout.rs` | Every path lodge writes inside a container (the table under "What lives where"), the default destinations of an injected tool, the folders `ldg clean` searches for wrappers, and `INJECTED`, the part `ldg clean` removes. Nothing else spells these paths out. |
-| `secret/` | Secrets that must not be in a bundle. Their `[[secret]]` declarations are config (`config/secret.rs`: validated; names reach shell scripts). `mod` is the `Secret` value type (redacted `Debug`, no `Display`), matching `targets` globs, and `resolve` (env, file or a command run on *this* machine with a timeout, with errors that never contain the value). `place` writes values into a container under `/dev/shm/lodge-secrets-<uid>/` and builds the session lines that export them; `clear_all` removes everyone's (`ldg clean`). `deliver` picks the secrets whose `targets` match, resolves and places them (or clears them when none are declared), and prints names only. |
-| `session/` | Opens the interactive session: `docker exec -it`, optionally inside tmux. `terminfo` makes the terminal the session is opened from work in the container (copies its entry from this machine when the container lacks it, and sets `TERM`). |
+| `bundle/` | A bundle is a portable tar of relinked binaries, their libraries and configs, with a manifest, and is tied to no install prefix (see "Injection"). `manifest` defines and validates it (paths derive from names, so a bundle can't point outside itself), `archive` writes, reads and verifies the tar, `pack` builds one from the config (the only step needing `patchelf`; `deps` parses `ldd`, asking it once per binary however often the answer is needed, `elf` reads a binary's architecture, as an `arch::Arch`, the one name for a CPU that bundles, binaries and machines are compared by, and `Arch::host()` is this machine's, and writes the interpreter of a dynamic binary in place), `source` readies a bundle *directory* to inject from (extracted from a file, or packed live), keyed by the file's hash or a fingerprint of the live inputs, and `cache` keeps those directories under `~/.cache/lodge/bundles/`. `hash` is the content hash of a file or tree. |
+| `inject/` | Copies a bundle's binaries, libraries and configs into a container for one `ContainerUser`, reading only from the bundle directory and acting *as that user* (through `runtime::Acting`), so it never needs root: `prefix` (chooses and checks the prefix: the user's home, else a private `/tmp` directory; `existing` finds where it was installed), `binary` (rewrites a dynamic binary's interpreter for the prefix, and writes the wrapper a config asked for), `libs` (tracked by content hash), `config_files`, `git` (`safe.directory`), `installed` (a hash and the destination per installed piece; a record that can't be read means that piece is installed again, and the list of records `ldg clean` works from is an error when it can't be read, not "nothing installed"), `state` (format version, installed bundle id), `remove` (`ldg clean`; placed secrets are removed by `secret::place::clear`). |
+| `layout.rs` | Every path lodge writes inside a container: `Layout`, the paths inside the user's prefix (the table under "What lives where"); the provisioning state, which is the devcontainer's own and root-owned; and the secrets directory. Nothing else spells these paths out. |
+| `secret/` | Secrets that must not be in a bundle. Their `[[secret]]` declarations are config (`config/secret.rs`: validated; names reach shell scripts). `mod` is the `Secret` value type (redacted `Debug`, no `Display`), matching `targets` globs, and `resolve` (env, file or a command run on *this* machine with a timeout, with errors that never contain the value). `place` writes values into a container under `/dev/shm/lodge-secrets-<uid>/` and builds the session lines that export them; `clear` removes the user's (`ldg clean`). `deliver` picks the secrets whose `targets` match, resolves and places them (or clears them when none are declared), and prints names only. |
+| `session/` | Opens the interactive session: `docker exec -it`, optionally inside tmux. Its start-up script (`startup_script`) starts the shell as a login shell, so the profile scripts run, then puts the user's prefix `bin/` first on `PATH` and restores what the profile dropped before running the shell interactively; that is how the injected tools reach the session without any file outside the prefix. `terminfo` makes the terminal the session is opened from work in the container (copies its entry from this machine into the prefix when the container lacks it, and sets `TERM`). |
 | `forward/` | Port forwarding. `mod` spawns the daemon and owns its state files (log, lock, and the ports file `ldg ports` reads, which starts with the daemon's pid so a dead daemon's file is ignored), `daemon` is the `_forward` loop (declared ports plus whatever starts listening), `tunnel` one forward: the in-process TCP proxy or an `ssh -L` tunnel. The daemon decodes its own `--port` flags, re-points a forward when its destination's address changes (looked up again every 30 s), and exits when the container stops, not when the engine merely can't be reached for a while. |
 | `port.rs` | `PortForward`, a port to forward: what the devcontainer spec declares and the daemon carries out, so neither depends on the other. |
 | `host_tools.rs` | The helper programs lodge may run here (`ssh`, `ldd`, `patchelf`, `oras`, `tmux`): what each is needed for (a `Need`, which decides when `doctor` requires it) and how to get it. `doctor` reports from this table and each tool is started only through it. |
 | `target.rs` | `Target` (`Local` or `Ssh(host)`): the one place that decides local vs remote, plus host-side file helpers (`read_first` finds files by pattern and reads the first in one round trip, `read_file` reads one, `fetch_dir` copies a folder from the project's host). |
-| `runtime/` | The seam to whatever runs the workload: the `Env`, `Container`, `Runtime` and `Compose` traits (see below), `User` (who a command runs as) and `ContainerUser` (the session user's name, uid, gid and home, looked up once), the docker CLI implementation (`docker/`: the engine, the per-container `Env`, and the file-copy streaming), and strict in-memory fakes for tests (`FakeEnv`, and `FakeRuntime`, whose containers each run in one). |
+| `runtime/` | The seam to whatever runs the workload: the `Env`, `Container`, `Runtime` and `Compose` traits (see below), `User` (who a command runs as) and `ContainerUser` (the session user's name, uid, gid and home, looked up once), `Acting` (an `Env` seen as one user, below), `tarball` (packs files as a tar owned by a user), the docker CLI implementation (`docker/`: the engine, the per-container `Env`, and the file-copy streaming), and strict in-memory fakes for tests (`FakeEnv`, and `FakeRuntime`, whose containers each run in one). |
 | `ssh.rs` | `--remote` destination parsing, connection multiplexing, small SSH helpers. |
-| `shell.rs` | POSIX `shell_quote`, which everything that builds a command string goes through; `script_argv`, how every script with arguments is started (`sh -c <script> sh <args…>`, so arguments are `$1`, `$2`, …); the rules for names written into scripts unquoted (`is_plain_name`, `is_alias_name`, `is_var_name`) and for destinations in a container (`container_path_problem`); `slug` for container names and `session_name` for tmux sessions; and `CmdLine`, a command as `sh -c` script or argv. |
+| `shell.rs` | POSIX `shell_quote`, which everything that builds a command string goes through; `script_argv`, how every script with arguments is started (`sh -c <script> sh <args…>`, so arguments are `$1`, `$2`, …); the rules for names written into scripts unquoted (`is_plain_name`, `is_var_name`) and for destinations in a container (`container_path_problem`); `slug` for container names and `session_name` for tmux sessions; and `CmdLine`, a command as `sh -c` script or argv. |
 | `fingerprint.rs` | The small content hash used to notice changes (devcontainer inputs, updated libraries, bundle contents), as a `Fingerprint` builder. Its values are stored, so a test pins them. |
 | `tmpfile.rs` | Self-deleting staging files for `docker cp`. |
 | `tree.rs` | Walking a file tree on this machine in one stable order (name order, a directory before its contents), with an explicit choice about symlinks (a followed link loop is entered once) and unreadable directories. Every hash, fingerprint and copy of a tree goes through it. |
@@ -94,7 +94,7 @@ every subcommand.
 | `markers.rs` | One-shot markers: which create-time hooks and feature installs already succeeded. |
 | `drift.rs` | Drift detection: fingerprint the folder the config is in (`.devcontainer/`, or `.devcontainer/<name>/`), or a standalone `.devcontainer.json`, plus the files the backend names outside it (a Dockerfile, compose files), and compare with the value stored in the container. `config_state` is the one comparison, used by `ldg up` and `ldg status` alike: `UpToDate`, `Changed`, or `Unknown` when no hash is recorded or it can't be read, which is not drift. The files are read through `Target` (`fetch_dir`, `read_file`), so a remote project is hashed exactly like a local one. |
 | `workdir.rs` | The directory a session lands in: `workspaceFolder`, or one the person picks when it doesn't exist. |
-| `uid.rs` | Lines the container user's uid/gid up with the host user's so a bind-mounted workspace is writable. Planned in Rust from `/etc/passwd`, applied by a small script. |
+| `uid.rs` | Lines the container user's uid/gid up with the host user's so a bind-mounted workspace is writable. Worked out in Rust from `/etc/passwd`, applied by a small script. |
 | `vars.rs` | `${localEnv:X:default}`, `${containerWorkspaceFolder}`, `${devcontainerId}` and friends, and `path_tag`, the short hash of the project path behind `${devcontainerId}` and the container and session names. |
 
 The `Backend` split is what keeps `start()` simple: a backend only knows how to
@@ -131,10 +131,12 @@ and hooks all work from the resulting container id.
    never aborts `ldg`.
 9. **Choose a working directory.** `workspaceFolder` if it exists, otherwise ask.
 10. **Look up the container user** (`remoteUser`, or the default user: name,
-    uid, gid, home) once, then **start the port-forward daemon** and **inject
-    your environment** for that user.
+    uid, gid, home) once, then **start the port-forward daemon**, choose the
+    **prefix** and **inject your environment** for that user into it, as that
+    user.
 11. **`postAttachCommand`**, then **deliver secrets** and **open the session**,
-    which first copies in the terminfo entry of the terminal it is opened from.
+    which first copies in the terminfo entry of the terminal it is opened from
+    and puts the prefix's `bin/` on the `PATH` of the shell it starts.
 
 ## Injection
 
@@ -150,27 +152,42 @@ bundle-file path end in the same place, so there is one injector. It is prepared
 *before* anything starts, so a problem with it fails without leaving a half-started
 container.
 
+Injection is done **as the container user, into a prefix that user owns**, and
+never needs root (see `runtime::Acting`). `ldg up` and `ldg exec` first resolve the
+user once (`ContainerUser`: the configured `remoteUser`, or the container's default
+user) and then the prefix: `~/.local/share/lodge`, or, when the home can't hold
+programs (none, not writable, mounted `noexec`: checked by writing a script there
+and running it), a private `/tmp/lodge-<uid>`. lodge does not repair a home the
+user can't use (it would need root): the prefix then goes to `/tmp`, and a config
+whose target is under `~` fails with the path and the user named.
+
 For each tool in the bundle (`inject/`):
 
-- **Libraries first.** Copied to `/opt/lodge/lib/` when their hash differs from
-  `/opt/lodge/lib/.manifest`, and the dynamic linker to `/lodge/<ld>` whenever it
-  changed or is missing, so a linker and libc never come from different versions.
-- **Binaries.** The relinked copy from the bundle goes to `/opt/lodge/bin/<name>`,
-  so it runs directly, without an `ld.so` indirection, and `/proc/self/exe` stays
-  correct for tools that re-exec themselves. A two-line wrapper at the target
-  path (`/usr/local/bin/<name>`) just `exec`s it. A static binary is simply
-  copied (relinking happens at pack time, where `patchelf` runs).
-- **Skipping.** A hash is recorded per installed piece (`/opt/lodge/installed/`):
+- **Libraries first.** Copied to `<prefix>/lib/`, with the dynamic linker, when
+  their hash differs from `<prefix>/lib/.manifest`, so a linker and libc never come
+  from different versions.
+- **Binaries.** A bundle holds no install prefix: a dynamic binary was packed with
+  a placeholder interpreter filling a reserved 512 bytes and a library search path
+  relative to itself (`$ORIGIN/../lib`). Injection overwrites the placeholder in
+  place with `<prefix>/lib/<ld>` (`bundle::elf::set_interpreter`: the file keeps its
+  size and layout, so `patchelf` is not needed here) and copies the result to
+  `<prefix>/bin/<name>`. It runs directly, without an `ld.so` indirection, and
+  `/proc/self/exe` stays correct for tools that re-exec themselves. A static binary
+  is simply copied. Only if the config sets `target_binary` is a two-line wrapper
+  script written there, which `exec`s the binary.
+- **Skipping.** A hash is recorded per installed piece (`<prefix>/installed/`):
   unchanged is a no-op, changed is replaced, and `skip_if_exists = true` keeps a
   piece that is already there even when the bundle changed.
-- **Configs** are copied to their target, and ownership under the user's home is
-  fixed up to the container user (never on a host bind mount, where it would
-  change the host's files).
-- **Home directory.** The user's home is made writable first, since injected
-  configs and tool caches live there.
-- **Shell setup.** The container's `PATH` is preserved across login shells
-  (`/etc/profile.d/lodge-path.sh`), aliases go to `/etc/profile.d/lodge.sh`, and
-  git `safe.directory` is set so tools can run `git` on host-owned files.
+- **Configs** are copied to their target (default `~/.config/<name>`) with the user
+  as owner of every directory down to it, so nothing needs a `chown`. A target the
+  user can't write is an error naming the path and the user.
+- **Git.** `safe.directory` is set (`git config --global`, as the user) so tools
+  can run `git` on host-owned files.
+
+Nothing is written outside the prefix except those targets: no `PATH` or alias
+setup in `/etc/profile.d`, no wrappers in `/usr/local/bin`. The tools reach the
+user through the session (`session::startup_script`), which puts `<prefix>/bin`
+first on `PATH`.
 
 The terminal's terminfo entry is not part of the injection: it belongs to the
 machine a session is opened from, not to the bundle, so `session` copies it
@@ -182,28 +199,42 @@ inside the container (installed plugins, for example).
 
 ## What lives where
 
-**Inside the container** (each path is a constant in `layout.rs`)
+**Inside the container** (each path comes from `layout.rs`)
+
+The user's prefix, `<prefix>` = `~/.local/share/lodge` (or `/tmp/lodge-<uid>`), is
+what `ldg clean` removes:
 
 | Path | Contents |
 | --- | --- |
-| `/opt/lodge/lib/`, `/lodge/<ld>` | Copied libraries and the dynamic linker. |
-| `/opt/lodge/bin/` | Relinked binaries. |
-| `/opt/lodge/installed/` | A content hash and the destination path per installed binary and config, so an unchanged piece is skipped, a changed one replaced (`skip_if_exists` protects a piece from replacement), and `ldg clean` knows what to remove. |
-| `/opt/lodge/bundle` | The id of the bundle last injected; `ldg status` shows it. |
+| `<prefix>/bin/` | The injected binaries; first on the session's `PATH`. |
+| `<prefix>/lib/` | Copied libraries and the dynamic linker, one copy; `.manifest` holds the hash of every library copied, so a changed host library is refreshed (names don't change across glibc versions). |
+| `<prefix>/installed/` | A content hash and the destination path per installed binary and config, so an unchanged piece is skipped, a changed one replaced (`skip_if_exists` protects a piece from replacement), and `ldg clean` knows what to remove. |
+| `<prefix>/bundle` | The id of the bundle last injected; `ldg status` shows it. |
+| `<prefix>/version` | Format version of this layout; a lodge older than the one that wrote it warns. |
+| `<prefix>/terminfo/` | The user's terminfo entry, when the container lacked it. |
+
+Provisioning state, which is the devcontainer's own and written as root when the
+container is created (so `ldg clean` keeps it):
+
+| Path | Contents |
+| --- | --- |
 | `/opt/lodge/state/` | One-shot markers (`onCreate`, `postCreate`, feature installs). |
 | `/opt/lodge/devcontainer.hash` | Fingerprint of the devcontainer inputs. |
-| `/opt/lodge/version` | Format version of this layout, so a future lodge can migrate it. |
-| `/opt/lodge/lib/.manifest` | Hash of every library copied, so a changed host library is refreshed (names don't change across glibc versions). |
-| `/dev/shm/lodge-secrets-<uid>/` | Placed secret values (memory only, 0700 directory, 0600 files); see `secret/`. |
-| `/opt/lodge/terminfo/` | The user's terminfo entry, when the container lacked it. |
-| `/tmp/lodge-features/` | Devcontainer feature files, copied in to run their `install.sh` (left in place; `ldg clean` doesn't touch them). |
-| `/etc/profile.d/lodge{,-env,-path}.sh` | Aliases, `containerEnv`/`remoteEnv`, `PATH`. |
+| `/etc/profile.d/lodge-env.sh` | `containerEnv`/`remoteEnv`, for login shells. |
 | `/etc/profile.d/lodge-feature-<id>.sh` | One feature's `containerEnv`, so installing one feature again leaves the others' env alone. |
+| `/tmp/lodge-features/` | Devcontainer feature files, copied in to run their `install.sh` (left in place; `ldg clean` doesn't touch them). |
+
+Elsewhere:
+
+| Path | Contents |
+| --- | --- |
+| `/dev/shm/lodge-secrets-<uid>/` | Placed secret values (memory only, 0700 directory, 0600 files); see `secret/`. |
+| the `target_config` / `target_binary` paths | What the config asked to be placed there; `ldg clean` removes the wrappers and keeps the configs. |
 
 Because all state is *in* the container, it survives reboots and disappears
 when the container is recreated, with no host bookkeeping to go stale. Every
 container lodge creates also carries the label `dev.lodge.project=<path>`.
-`ldg clean` removes the injection (binaries, libraries, wrappers, shell setup,
+`ldg clean` removes the injection (the prefix, the wrappers it wrote and the user's
 secrets) and keeps the devcontainer's state (markers, hash, `containerEnv`).
 
 **On the host**
@@ -229,9 +260,11 @@ local Docker is needed. Three things make that work:
   `ssh::base_command` multiplexes them over one `ControlMaster` socket per
   destination; without that, each call renegotiates and a flaky link silently
   breaks random steps.
-- **Local bytes → remote container.** `docker cp` can't see local paths on the
-  remote, so `cp_in` streams a tar over SSH (packed in-process, so no local
-  `tar` is needed). The devcontainer config is found with
+- **Local bytes → container.** The remote docker can't see local paths, so
+  `put` streams a tar to `docker cp -q -a - <id>:<dir>`, locally and over SSH alike,
+  packed in-process (`runtime::tarball`), so no local `tar` is needed, none in the
+  container, and the entries carry the owner's uid and gid, which `-a` makes the
+  daemon honour. The devcontainer config is found with
   `Target::read_first` (one probe script remotely, which also returns the
   file, with the same lookup order as locally); its inputs are fetched for
   hashing with `Target::fetch_dir`.
@@ -251,10 +284,10 @@ small traits from narrow to broad, plus one for compose:
 | `Runtime` | container engine: find, build, run, start, stop | devcontainer backends, `start`/`stop` |
 | `Compose` | an engine's compose support (`Runtime::compose()`, an error where there is none): up, down, ps | the compose backend, `doctor` |
 
-`Env` carries the primitives (`exec`, `output`, `cp_in`, plus `write_secret` and
+`Env` carries the primitives (`exec`, `output`, `put`, plus `write_secret` and
 `interactive_command`, which need engine-specific stdin and TTY handling) and
 provides everything else on top of them: `write_file`, `read_file`, `mkdir_p`,
-`file_exists`, and so on. So code that injects a tool takes one `&dyn Env`
+`exists`, and so on. So code that injects a tool takes one `&dyn Env`
 instead of a `(docker, container)` pair, and anything new that implements the
 primitives gets the rest for free. The traits know nothing of lodge's own
 layout: markers, hashes and profiles live in the modules that use them. An
@@ -262,9 +295,18 @@ layout: markers, hashes and profiles live in the modules that use them. An
 know (matching a secret's `targets`, diagnosing a refused PTY) is handed the
 `Target` by the command.
 
-`cp_in` behaves the same on every target: a file becomes `dest`, and a
-directory's *contents* are merged into `dest` (created if missing). Callers
+`put` behaves the same on every target: a file becomes `dest`, and a
+directory's *contents* are merged into `dest`; every missing directory down to
+it is made, and everything created is owned by the `owner` it is given. Callers
 that want an exact copy remove `dest` first.
+
+**Acting as a user.** The provided helpers act as `Env::actor()`: root for the
+plain environment, which is what provisioning a devcontainer uses. What lodge
+does *for a user* (inject, write their state, open their session) goes through
+`Acting::new(env, &user)`, an `Env` whose default user is that user, whose helpers
+(`mkdir_p`, `write_file`, `read_file`, `exists`) run as them, and whose copies are
+theirs. So the injector and the code under it have no way to need root: asking
+for it takes an explicit `exec_root`, which none of them contain.
 
 `runtime::docker` implements all four over the `docker` CLI, locally or on a
 remote host over SSH. `runtime::fake::FakeEnv` is an in-memory `Env` that
@@ -329,7 +371,7 @@ erode.
   `ContainerUser` resolved once by the command, after `devcontainer::start`
   (inside `start` the user's uid may still change, so uid alignment and feature
   scripts look it up there); **names written into scripts** are checked with
-  `shell::is_plain_name` / `is_alias_name` / `is_var_name`, and **destinations
+  `shell::is_plain_name` / `is_var_name`, and **destinations
   in a container** that come from a config or bundle with
   `shell::container_path_problem`. Anything read from a bundle or a feature's
   metadata is checked the same way before it becomes a path.
@@ -355,7 +397,7 @@ erode.
   error. "Could not find out" is never treated as "absent": `Env::read_file`
   tells a missing file from a failed read, and `Env::exists` a missing path
   from a failed check (a create hook whose marker can't be checked is skipped,
-  not run again), and `ldg clean` fails when something could not be removed. The `bool` checks (`file_exists`, `succeeds`) are only for
+  not run again), and `ldg clean` fails when something could not be removed. The `bool` check (`succeeds`) is only for
   answers where a wrong "no" is harmless.
 - **Docs follow the code.** `doc_facts.rs` checks what the docs can be checked
   on: every command appears in the README and in the list above, the documented
@@ -368,8 +410,9 @@ erode.
 (config parsing and building a `Spec`, ldd parsing, shell quoting, SSH
 destination parsing, port-forward parsing, hash normalisation, feature ordering,
 the uid plan, library refresh) and, through `FakeEnv`, the logic that writes into
-a container: binaries, configs and the home's ownership, aliases, `PATH`
-preservation, the wrapper script, the env profiles, feature installs, the stored
+a container: binaries (and the interpreter rewrite for the prefix), configs
+owned by the user with no root involved, the choice of prefix, the session's
+`PATH`, the wrapper script, the env profiles, feature installs, the stored
 hash, the hook markers and a whole `inject::run`. Through `FakeRuntime` they
 cover what `ldg up` decides about an existing container (create, start, ask,
 recreate, keep one with no recorded config) and what `ldg status` reports,
@@ -382,7 +425,7 @@ was told about panics, so a test can't pass because the fake said "success" to
 something a real container might refuse; and a `FakeRuntime` container that is
 stopped refuses every command, as `docker exec` does. The one exception is a `sh -c` script run for its effect, which is
 recorded and assumed to work; tests assert on the recorded script, and scripts
-whose behaviour matters (secrets, `ldg clean`'s wrapper search) are also run for
+whose behaviour matters (secrets, `ldg clean`'s removal script, the prefix probe, the session's `PATH` script) are also run for
 real against a temp directory. The fake records who each command ran as
 (`ran_as`), so "as root" and "as `remoteUser`" are tested too. Tests that need
 scratch files use `tmpfile::TempDir`, which removes itself even when the test

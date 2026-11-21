@@ -4,7 +4,7 @@
 use anyhow::{Context, Result, bail};
 
 use super::{DockerCli, docker_line};
-use crate::runtime::{Container, Env, ExecOpts, Output, User};
+use crate::runtime::{Container, ContainerUser, Env, ExecOpts, Output, User};
 use crate::target::Target;
 
 /// One container, driven through the docker CLI.
@@ -137,9 +137,9 @@ impl Env for DockerContainer {
         })
     }
 
-    /// `docker cp <src> <id>:<dest>`; see [`copy`](super::copy).
-    fn cp_in(&self, src: &str, dest: &str) -> Result<()> {
-        self.copy_in(src, dest)
+    /// A tar stream through `docker cp -a -`; see [`copy`](super::copy).
+    fn put(&self, src: &str, dest: &str, owner: &ContainerUser) -> Result<()> {
+        self.copy_in(src, dest, owner)
     }
 
     fn write_secret(&self, dest: &str, contents: &[u8], mode: u32, user: User) -> Result<()> {
@@ -194,6 +194,14 @@ impl Container for DockerContainer {
             .capture_ok(&["inspect", "--format", "{{.Name}}", &self.id])?;
         let name = out.trim().trim_start_matches('/');
         (!name.is_empty()).then(|| name.to_string())
+    }
+
+    fn configured_user(&self) -> Option<String> {
+        let out = self
+            .cli
+            .capture_ok(&["inspect", "--format", "{{.Config.User}}", &self.id])?;
+        let user = out.trim();
+        (!user.is_empty()).then(|| user.to_string())
     }
 
     fn mounts(&self) -> Vec<String> {

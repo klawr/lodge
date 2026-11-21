@@ -176,3 +176,39 @@ fn only_the_command_layer_knows_the_command_line() {
         .collect();
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// The non-test source of every file outside `skip` (path prefixes under `src/`)
+/// that contains any of `needles`.
+fn files_containing(needles: &[&str], skip: &[&str]) -> Vec<String> {
+    let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let src = Path::new(&root).join("src");
+    let mut files = Vec::new();
+    rust_files(&src, &mut files);
+    let mut found: Vec<String> = files
+        .iter()
+        .map(|f| f.strip_prefix(&src).unwrap().to_string_lossy().into_owned())
+        .filter(|name| name != "conventions.rs" && !skip.iter().any(|s| name.starts_with(s)))
+        .filter(|name| {
+            let text = std::fs::read_to_string(src.join(name)).unwrap();
+            let code = text.split("#[cfg(test)]\nmod ").next().unwrap();
+            needles.iter().any(|n| code.contains(n))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn root_is_asked_for_by_provisioning_and_the_runtime_only() {
+    // What lodge does *for a user* (inject, session, secrets, clean, status) is
+    // done as that user through `runtime::Acting`. Root is for creating a
+    // devcontainer (`devcontainer/`), where the spec asks for it, and for the
+    // runtime that provides it.
+    assert_eq!(
+        files_containing(
+            &["exec_root", "User::Root", "ExecOpts::root"],
+            &["devcontainer/", "runtime/"]
+        ),
+        Vec::<String>::new()
+    );
+}

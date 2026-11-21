@@ -20,6 +20,7 @@
 pub mod docker;
 #[cfg(test)]
 pub mod fake;
+pub(crate) mod tarball;
 mod user;
 
 #[cfg(test)]
@@ -28,6 +29,7 @@ pub use user::{ContainerUser, User};
 
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::shell::{script_argv, shell_quote};
@@ -82,6 +84,11 @@ pub struct Output {
 }
 
 /// A place commands can run and files can be copied into.
+///
+/// What lodge does *for a user* (injecting tools, writing their state, opening
+/// their session) goes through an [`Acting`] view of the environment, so it runs
+/// as that user and owns what it creates, with no root involved. The plain
+/// environment acts as root, which is what provisioning a devcontainer uses.
 pub trait Env {
     /// Runs `argv` with inherited stdio. Errors if it exits non-zero.
     fn exec(&self, argv: &[&str], opts: &ExecOpts) -> Result<()>;
@@ -91,11 +98,13 @@ pub trait Env {
     fn output(&self, argv: &[&str], opts: &ExecOpts) -> Result<Output>;
 
     /// Copies the local file or directory `src` to `dest` inside the
-    /// environment, as root, keeping file modes. A file becomes `dest`; a
-    /// directory's *contents* are merged into `dest`, which is created if
-    /// missing (its parent must exist). Files already in `dest` that `src` lacks
-    /// are kept, so remove `dest` first for an exact copy.
-    fn cp_in(&self, src: &str, dest: &str) -> Result<()>;
+    /// environment, keeping file modes, with `owner` owning everything that is
+    /// created, parent directories included. A file becomes `dest`; a
+    /// directory's *contents* are merged into `dest`. Missing parent directories
+    /// (of `dest`, for a file; `dest` itself, for a directory) are made. Files
+    /// already in `dest` that `src` lacks are kept, so remove `dest` first for an
+    /// exact copy.
+    fn put(&self, src: &str, dest: &str, owner: &ContainerUser) -> Result<()>;
 
     /// Writes `contents` to `dest` inside the environment with permission bits
     /// `mode`, as `user`. The bytes travel on the command's **stdin**, never in
@@ -109,9 +118,16 @@ pub trait Env {
     /// environment, running `inner` (a `sh -c` script) as `user` from `workdir`.
     fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> String;
 
+    /// Who the provided helpers below act as, and who owns what they create:
+    /// root, unless this is an [`Acting`] view of another user.
+    fn actor(&self) -> ContainerUser {
+        ContainerUser::root()
+    }
+
     // ── provided, built on the above ───────────────────────────────────────
 
-    /// Runs `argv` as root.
+    /// Runs `argv` as root, whoever [`actor`](Self::actor) is. For provisioning,
+    /// where the engine allows it; what lodge does for a user never needs it.
     fn exec_root(&self, argv: &[&str]) -> Result<()> {
         self.exec(argv, &ExecOpts::root())
     }
@@ -136,17 +152,12 @@ pub trait Env {
             .is_ok_and(|o| o.success)
     }
 
-    /// True if `path` is a regular file. `false` also when the environment
-    /// couldn't be asked: only for checks where a wrong "no" is harmless (it
-    /// just repeats a copy). Otherwise use [`exists`](Self::exists).
-    fn file_exists(&self, path: &str) -> bool {
-        self.succeeds(&["test", "-f", path])
-    }
-
-    /// Whether `path` exists (file or directory), as root. An error means it
-    /// could not be found out, which callers must not mistake for "missing".
+    /// Whether `path` exists (file or directory), as the actor. An error means
+    /// it could not be found out, which callers must not mistake for "missing".
     fn exists(&self, path: &str) -> Result<bool> {
-        let out = self.output(&script_argv(EXISTS_SCRIPT, &[path]), &ExecOpts::root())?;
+        let actor = self.actor();
+        let opts = ExecOpts::as_user(actor.exec_as());
+        let out = self.output(&script_argv(EXISTS_SCRIPT, &[path]), &opts)?;
         match (out.success, out.stdout.as_str()) {
             (true, "y") => Ok(true),
             (true, "n") => Ok(false),
@@ -161,36 +172,45 @@ pub trait Env {
         self.succeeds(&["sh", "-c", &probe])
     }
 
-    /// `mkdir -p` as root. lodge's directories live under root-owned trees.
+    /// `mkdir -p` as the actor.
     fn mkdir_p(&self, dirs: &[&str]) -> Result<()> {
         let mut argv = vec!["mkdir", "-p"];
         argv.extend_from_slice(dirs);
-        self.exec_root(&argv)
+        let actor = self.actor();
+        self.exec(&argv, &ExecOpts::as_user(actor.exec_as()))
     }
 
-    /// Creates `dest` with `contents`, making parent directories first. Stages
-    /// the bytes in a local temp file and sends them with [`cp_in`](Self::cp_in).
+    /// Copies `src` into the environment, owned by the actor; see
+    /// [`put`](Self::put).
+    fn cp_in(&self, src: &str, dest: &str) -> Result<()> {
+        self.put(src, dest, &self.actor())
+    }
+
+    /// Creates `dest` with `contents` and mode 0644, owned by the actor, making
+    /// parent directories first.
     fn write_file(&self, dest: &str, contents: &[u8]) -> Result<()> {
-        let path = Path::new(dest);
-        if let Some(parent) = path
-            .parent()
-            .and_then(Path::to_str)
-            .filter(|p| !p.is_empty())
-        {
-            self.mkdir_p(&[parent])?;
-        }
-        let name = path
+        self.write_file_mode(dest, contents, 0o644)
+    }
+
+    /// Like [`write_file`](Self::write_file) with the permission bits `mode` (a
+    /// script that must run, say). Stages the bytes in a local temp file and
+    /// sends them with [`put`](Self::put).
+    fn write_file_mode(&self, dest: &str, contents: &[u8], mode: u32) -> Result<()> {
+        let name = Path::new(dest)
             .file_name()
             .map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
         let tmp = TempFile::write(&name, contents)?;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode))?;
         self.cp_in(&tmp.path().to_string_lossy(), dest)
     }
 
-    /// The text of the file `path` (read as root), `None` if there is no such
-    /// file. An error means it could not be found out, which callers must not
-    /// mistake for "missing".
+    /// The text of the file `path` (read as the actor), `None` if there is no
+    /// such file. An error means it could not be found out, which callers must
+    /// not mistake for "missing".
     fn read_file(&self, path: &str) -> Result<Option<String>> {
-        let out = self.output(&script_argv(READ_FILE_SCRIPT, &[path]), &ExecOpts::root())?;
+        let actor = self.actor();
+        let opts = ExecOpts::as_user(actor.exec_as());
+        let out = self.output(&script_argv(READ_FILE_SCRIPT, &[path]), &opts)?;
         if !out.success {
             bail!("reading {path} failed: {}", out.stderr.trim());
         }
@@ -199,6 +219,57 @@ pub trait Env {
             Some(("n", _)) => Ok(None),
             _ => bail!("reading {path} failed: unexpected output"),
         }
+    }
+}
+
+/// An environment seen as one user: what lodge does for that user, with no root
+/// involved. Commands that don't name a user run as them, the provided helpers
+/// ([`Env::mkdir_p`], [`Env::write_file`], [`Env::read_file`], …) act as them, and
+/// what is copied in is theirs. Root is still available by asking for it
+/// ([`Env::exec_root`]), which nothing done for a user does.
+pub struct Acting<'a> {
+    env: &'a dyn Env,
+    user: &'a ContainerUser,
+}
+
+impl<'a> Acting<'a> {
+    pub fn new(env: &'a dyn Env, user: &'a ContainerUser) -> Self {
+        Self { env, user }
+    }
+
+    /// `opts`, with the default user replaced by the one acted as.
+    fn resolve<'o>(&'o self, opts: &ExecOpts<'o>) -> ExecOpts<'o> {
+        let user = match opts.user {
+            User::Default => self.user.exec_as(),
+            explicit => explicit,
+        };
+        ExecOpts { user, ..*opts }
+    }
+}
+
+impl Env for Acting<'_> {
+    fn exec(&self, argv: &[&str], opts: &ExecOpts) -> Result<()> {
+        self.env.exec(argv, &self.resolve(opts))
+    }
+
+    fn output(&self, argv: &[&str], opts: &ExecOpts) -> Result<Output> {
+        self.env.output(argv, &self.resolve(opts))
+    }
+
+    fn put(&self, src: &str, dest: &str, owner: &ContainerUser) -> Result<()> {
+        self.env.put(src, dest, owner)
+    }
+
+    fn write_secret(&self, dest: &str, contents: &[u8], mode: u32, user: User) -> Result<()> {
+        self.env.write_secret(dest, contents, mode, user)
+    }
+
+    fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> String {
+        self.env.interactive_command(user, workdir, inner)
+    }
+
+    fn actor(&self) -> ContainerUser {
+        self.user.clone()
     }
 }
 
@@ -221,6 +292,11 @@ pub trait Container: Env {
     /// in it, so a stopped container can be read too. An error means it could
     /// not be found out, which callers must not mistake for "missing".
     fn read_stored_file(&self, path: &str) -> Result<Option<String>>;
+
+    /// The user the image or the container is configured to run as (`USER`, a
+    /// name, uid or `user:group`), `None` when it sets none, which means root.
+    /// Read through the engine, so it works for a stopped container.
+    fn configured_user(&self) -> Option<String>;
 
     /// The container's address on its first network, reachable from the host
     /// that runs the engine.
@@ -332,18 +408,98 @@ pub fn connect(target: &Target) -> Box<dyn Runtime> {
 
 #[cfg(test)]
 mod tests {
-    use super::Env;
-    use super::fake::FakeEnv;
+    use super::fake::{FakeEnv, Who};
+    use super::{Acting, ContainerUser, Env, ExecOpts, User};
+
+    fn dev() -> ContainerUser {
+        ContainerUser {
+            requested: Some("dev".into()),
+            name: "dev".into(),
+            uid: 1000,
+            gid: 1000,
+            home: "/home/dev".into(),
+        }
+    }
 
     #[test]
     fn write_file_makes_the_parent_as_root_and_copies_the_contents_in() {
         let env = FakeEnv::new();
         env.write_file("/a/b/c.txt", b"hi").unwrap();
         assert_eq!(env.file("/a/b/c.txt").unwrap(), "hi");
+        assert_eq!(env.ran_as(&["mkdir", "-p", "/a/b"]), Some(Who::Root));
+        assert_eq!(env.owner_of("/a/b/c.txt"), Some((0, 0)));
+    }
+
+    #[test]
+    fn an_acting_env_does_everything_as_its_user_and_owns_what_it_creates() {
+        let env = FakeEnv::new().with_file("/home/dev/x", "old");
+        let user = dev();
+        let acting = Acting::new(&env, &user);
+
+        acting
+            .write_file("/home/dev/.local/lodge/f", b"hi")
+            .unwrap();
+        acting.mkdir_p(&["/home/dev/d"]).unwrap();
+        assert!(acting.exists("/home/dev/x").unwrap());
         assert_eq!(
-            env.ran_as(&["mkdir", "-p", "/a/b"]),
-            Some(super::fake::Who::Root)
+            acting.read_file("/home/dev/x").unwrap().as_deref(),
+            Some("old")
         );
+
+        assert_eq!(env.owner_of("/home/dev/.local/lodge/f"), Some((1000, 1000)));
+        for call in env.calls() {
+            assert_eq!(
+                call.1,
+                Who::Named("dev".into()),
+                "{:?} ran as {:?}",
+                call.0,
+                call.1
+            );
+        }
+        assert!(!env.calls().is_empty());
+    }
+
+    #[test]
+    fn an_acting_env_still_runs_as_root_when_asked_to_and_as_the_user_otherwise() {
+        let env = FakeEnv::new();
+        let user = dev();
+        let acting = Acting::new(&env, &user);
+        acting
+            .exec(&["sh", "-c", "a"], &ExecOpts::default())
+            .unwrap();
+        acting.exec_root(&["sh", "-c", "b"]).unwrap();
+        acting
+            .exec(&["sh", "-c", "c"], &ExecOpts::as_user(User::Named("other")))
+            .unwrap();
+        assert_eq!(
+            env.ran_as(&["sh", "-c", "a"]),
+            Some(Who::Named("dev".into()))
+        );
+        assert_eq!(env.ran_as(&["sh", "-c", "b"]), Some(Who::Root));
+        assert_eq!(
+            env.ran_as(&["sh", "-c", "c"]),
+            Some(Who::Named("other".into()))
+        );
+    }
+
+    #[test]
+    fn a_user_without_a_name_acts_through_the_default_user() {
+        let env = FakeEnv::new();
+        let user = ContainerUser {
+            requested: None,
+            ..dev()
+        };
+        let acting = Acting::new(&env, &user);
+        acting.mkdir_p(&["/x"]).unwrap();
+        assert_eq!(env.ran_as(&["mkdir", "-p", "/x"]), Some(Who::Default));
+    }
+
+    #[test]
+    fn an_acting_root_acts_as_root() {
+        let env = FakeEnv::new();
+        let root = ContainerUser::root();
+        Acting::new(&env, &root).mkdir_p(&["/x"]).unwrap();
+        assert_eq!(env.ran_as(&["mkdir", "-p", "/x"]), Some(Who::Root));
     }
 }
 

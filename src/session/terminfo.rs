@@ -4,16 +4,14 @@
 //! sees plain `xterm`, which has 8 colours and none of the modern terminal's
 //! features. So a session sets `TERM` itself, and, when the container has no
 //! terminfo entry for that terminal (kitty's `xterm-kitty`, say), lodge copies
-//! the entry over from the host.
+//! the entry over from the host, into the user's lodge prefix (`dir` below is its
+//! `terminfo/`).
 
 use anyhow::Result;
 use std::path::PathBuf;
 
 use crate::output::warning;
 use crate::runtime::Env;
-
-// Where copied entries live inside the container.
-use crate::layout::TERMINFO as CONTAINER_DIR;
 
 /// What a session falls back to when the user's own terminal can't be used.
 const FALLBACK: &str = "xterm-256color";
@@ -61,10 +59,10 @@ fn host_dirs() -> Vec<PathBuf> {
 }
 
 /// Whether the container can already resolve `term`.
-fn container_knows(env: &dyn Env, term: &str) -> bool {
+fn container_knows(env: &dyn Env, dir: &str, term: &str) -> bool {
     let first = term.chars().next().unwrap_or('x');
     // Best effort: a wrong "no" only copies the entry again.
-    env.exists(&format!("{CONTAINER_DIR}/{first}/{term}"))
+    env.exists(&format!("{dir}/{first}/{term}"))
         .unwrap_or(false)
         || env.succeeds(&["infocmp", term])
 }
@@ -74,12 +72,12 @@ fn container_knows(env: &dyn Env, term: &str) -> bool {
 /// host's entry for it into the container first when the container lacks it;
 /// if that isn't possible, a widely known fallback. Best effort: a missing entry
 /// only costs some colours.
-pub fn prepare(env: &dyn Env, local: Option<&str>) -> Option<String> {
-    prepare_from(env, local?, &host_dirs())
+pub fn prepare(env: &dyn Env, dir: &str, local: Option<&str>) -> Option<String> {
+    prepare_from(env, dir, local?, &host_dirs())
 }
 
-fn prepare_from(env: &dyn Env, term: &str, dirs: &[PathBuf]) -> Option<String> {
-    match ensure_from(env, term, dirs) {
+fn prepare_from(env: &dyn Env, dir: &str, term: &str, dirs: &[PathBuf]) -> Option<String> {
+    match ensure_from(env, dir, term, dirs) {
         Ok(true) => Some(term.to_string()),
         Ok(false) => Some(FALLBACK.to_string()),
         Err(e) => {
@@ -89,25 +87,26 @@ fn prepare_from(env: &dyn Env, term: &str, dirs: &[PathBuf]) -> Option<String> {
     }
 }
 
-fn ensure_from(env: &dyn Env, term: &str, dirs: &[PathBuf]) -> Result<bool> {
-    if container_knows(env, term) {
+fn ensure_from(env: &dyn Env, dir: &str, term: &str, dirs: &[PathBuf]) -> Result<bool> {
+    if container_knows(env, dir, term) {
         return Ok(true);
     }
     let Some((relative, file)) = find_entry(term, dirs) else {
         return Ok(false);
     };
     let bytes = std::fs::read(&file)?;
-    env.write_file(&format!("{CONTAINER_DIR}/{relative}"), &bytes)?;
+    env.write_file(&format!("{dir}/{relative}"), &bytes)?;
     Ok(true)
 }
 
 /// Shell lines for the start of a session: set `TERM`, and let ncurses find
 /// entries copied by [`prepare`]. The trailing `:` keeps the system directories
 /// in the search path.
-pub fn session_setup(term: &str) -> String {
+pub fn session_setup(dir: &str, term: &str) -> String {
     format!(
-        "export TERM={}; export TERMINFO_DIRS={CONTAINER_DIR}:\"${{TERMINFO_DIRS:-}}\"; ",
-        crate::shell::shell_quote(term)
+        "export TERM={}; export TERMINFO_DIRS={}:\"${{TERMINFO_DIRS:-}}\"; ",
+        crate::shell::shell_quote(term),
+        crate::shell::shell_quote(dir)
     )
 }
 
@@ -115,6 +114,8 @@ pub fn session_setup(term: &str) -> String {
 mod tests {
     use super::*;
     use crate::runtime::fake::FakeEnv;
+
+    const DIR: &str = "/p/terminfo";
 
     /// A host terminfo directory holding a compiled entry for `term`.
     fn host_with(term: &str) -> (crate::tmpfile::TempDir, PathBuf) {
@@ -143,9 +144,9 @@ mod tests {
     fn a_missing_entry_is_copied_into_the_container() {
         let (dir, _) = host_with("xterm-copyme");
         let env = FakeEnv::new().with_failure(&["infocmp", "xterm-copyme"]);
-        assert!(ensure_from(&env, "xterm-copyme", &[dir.path().to_path_buf()]).unwrap());
+        assert!(ensure_from(&env, DIR, "xterm-copyme", &[dir.path().to_path_buf()]).unwrap());
         assert_eq!(
-            env.file("/opt/lodge/terminfo/x/xterm-copyme").unwrap(),
+            env.file("/p/terminfo/x/xterm-copyme").unwrap(),
             "compiled-terminfo"
         );
     }
@@ -154,15 +155,15 @@ mod tests {
     fn nothing_is_copied_when_the_container_already_knows_the_terminal() {
         let (dir, _) = host_with("xterm-known");
         let env = FakeEnv::new().with_output(&["infocmp", "xterm-known"], "");
-        assert!(ensure_from(&env, "xterm-known", &[dir.path().to_path_buf()]).unwrap());
-        assert!(env.file("/opt/lodge/terminfo/x/xterm-known").is_none());
+        assert!(ensure_from(&env, DIR, "xterm-known", &[dir.path().to_path_buf()]).unwrap());
+        assert!(env.file("/p/terminfo/x/xterm-known").is_none());
     }
 
     #[test]
     fn an_unknown_terminal_with_no_host_entry_falls_back() {
         let env = FakeEnv::new().with_failure(&["infocmp", "weird-term"]);
         assert_eq!(
-            prepare_from(&env, "weird-term", &[]).as_deref(),
+            prepare_from(&env, DIR, "weird-term", &[]).as_deref(),
             Some("xterm-256color")
         );
     }
@@ -171,10 +172,10 @@ mod tests {
     fn the_users_terminal_is_used_when_the_container_resolves_it() {
         let env = FakeEnv::new().with_output(&["infocmp", "tmux-256color"], "");
         assert_eq!(
-            prepare_from(&env, "tmux-256color", &[]).as_deref(),
+            prepare_from(&env, DIR, "tmux-256color", &[]).as_deref(),
             Some("tmux-256color")
         );
-        assert_eq!(prepare(&env, None), None);
+        assert_eq!(prepare(&env, DIR, None), None);
     }
 
     #[test]
@@ -182,7 +183,7 @@ mod tests {
         let (dir, _) = host_with("xterm-prepared");
         let env = FakeEnv::new().with_failure(&["infocmp", "xterm-prepared"]);
         assert_eq!(
-            prepare_from(&env, "xterm-prepared", &[dir.path().to_path_buf()]).as_deref(),
+            prepare_from(&env, DIR, "xterm-prepared", &[dir.path().to_path_buf()]).as_deref(),
             Some("xterm-prepared")
         );
         // Asked once: the copy and the choice share the answer.
@@ -197,10 +198,10 @@ mod tests {
 
     #[test]
     fn the_session_setup_sets_term_and_keeps_system_entries_searchable() {
-        let s = session_setup("xterm-kitty");
+        let s = session_setup(DIR, "xterm-kitty");
         assert!(s.contains("export TERM='xterm-kitty'"), "{s}");
         assert!(
-            s.contains("TERMINFO_DIRS=/opt/lodge/terminfo:\"${TERMINFO_DIRS:-}\""),
+            s.contains("TERMINFO_DIRS='/p/terminfo':\"${TERMINFO_DIRS:-}\""),
             "{s}"
         );
     }

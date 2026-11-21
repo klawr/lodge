@@ -6,7 +6,7 @@
 //! without an engine.
 //!
 //! It is deliberately strict. It emulates a small set of commands (`cat`, `cp`,
-//! `rm`, `test`, `printenv`, `command -v`, [`Env::read_file`], [`Env::exists`],
+//! `rm`, `test`, `command -v`, [`Env::read_file`], [`Env::exists`],
 //! and the no-output file operations), and a test declares anything else it
 //! depends on (`with_output`, `with_failure`, `with_commands`). A command it
 //! neither emulates nor was told about **panics**, naming the command, so a test
@@ -23,11 +23,13 @@
 use anyhow::{Context, Result};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::rc::Rc;
 
 use super::{
-    BuildSpec, Compose, Container, Containers, Env, ExecOpts, Listed, Output, Runtime, User,
+    BuildSpec, Compose, Container, ContainerUser, Containers, Env, ExecOpts, Listed, Output,
+    Runtime, User,
 };
 use crate::tree::{self, Denied, Links};
 
@@ -51,11 +53,12 @@ impl From<User<'_>> for Who {
 
 pub struct FakeEnv {
     files: RefCell<HashMap<String, Vec<u8>>>,
-    vars: HashMap<String, String>,
     canned: HashMap<Vec<String>, String>,
     failing: RefCell<Vec<Vec<String>>>,
     commands: Vec<String>,
     modes: RefCell<HashMap<String, u32>>,
+    /// The `uid:gid` that owns each file copied in with [`Env::put`].
+    owners: RefCell<HashMap<String, (u32, u32)>>,
     /// Every command run, with whom it ran as.
     calls: RefCell<Vec<(Vec<String>, Who)>>,
 }
@@ -64,19 +67,13 @@ impl FakeEnv {
     pub fn new() -> Self {
         Self {
             files: RefCell::default(),
-            vars: HashMap::new(),
             canned: HashMap::new(),
             failing: RefCell::default(),
             commands: Vec::new(),
             modes: RefCell::default(),
+            owners: RefCell::default(),
             calls: RefCell::default(),
         }
-    }
-
-    /// Sets an environment variable visible to `printenv`.
-    pub fn with_var(mut self, name: &str, value: &str) -> Self {
-        self.vars.insert(name.into(), value.into());
-        self
     }
 
     /// Makes the exact command `argv` print `stdout` and succeed.
@@ -123,7 +120,19 @@ impl FakeEnv {
             .map(|b| String::from_utf8_lossy(b).into_owned())
     }
 
-    /// The permission bits a file was last written with by `write_secret`.
+    /// The bytes of a file, if it exists (for binary content, which `file`
+    /// would mangle).
+    pub fn file_bytes(&self, path: &str) -> Option<Vec<u8>> {
+        self.files.borrow().get(path).cloned()
+    }
+
+    /// The `(uid, gid)` that owns a file copied in with [`Env::put`].
+    pub fn owner_of(&self, path: &str) -> Option<(u32, u32)> {
+        self.owners.borrow().get(path).copied()
+    }
+
+    /// The permission bits a file was last written with, by `write_secret` or
+    /// [`Env::put`].
     pub fn mode(&self, path: &str) -> Option<u32> {
         self.modes.borrow().get(path).copied()
     }
@@ -215,10 +224,6 @@ impl FakeEnv {
                     None => ok("n".into()),
                 }
             }
-            ["printenv", name] => match self.vars.get(*name) {
-                Some(v) => ok(format!("{v}\n")),
-                None => fail(),
-            },
             ["rm", .., path] => {
                 let below = format!("{}/", path.trim_end_matches('/'));
                 self.files
@@ -283,8 +288,19 @@ impl Env for FakeEnv {
     }
 
     /// A file becomes `dest`; a directory's files are merged into `dest`, as
-    /// [`Env::cp_in`] promises.
-    fn cp_in(&self, src: &str, dest: &str) -> Result<()> {
+    /// [`Env::put`] promises, and the owner owns them.
+    fn put(&self, src: &str, dest: &str, owner: &ContainerUser) -> Result<()> {
+        // The directory the real one unpacks into is made as the owner first.
+        let into = if Path::new(src).is_dir() {
+            dest
+        } else {
+            Path::new(dest)
+                .parent()
+                .and_then(Path::to_str)
+                .filter(|p| !p.is_empty())
+                .unwrap_or("/")
+        };
+        self.record(&["mkdir", "-p", into], owner.exec_as());
         let mut copied = Vec::new();
         tree::walk(Path::new(src), Links::Keep, Denied::Fail, &mut |e| {
             if !e.meta.is_dir() {
@@ -293,12 +309,20 @@ impl Env for FakeEnv {
                 } else {
                     format!("{}/{}", dest.trim_end_matches('/'), e.relative)
                 };
-                copied.push((to, std::fs::read(e.path)?));
+                let mode = e.meta.permissions().mode() & 0o777;
+                copied.push((to, std::fs::read(e.path)?, mode));
             }
             Ok(())
         })
         .with_context(|| format!("reading {src}"))?;
-        self.files.borrow_mut().extend(copied);
+        let mut owners = self.owners.borrow_mut();
+        for (path, _, mode) in &copied {
+            owners.insert(path.clone(), (owner.uid, owner.gid));
+            self.modes.borrow_mut().insert(path.clone(), *mode);
+        }
+        self.files
+            .borrow_mut()
+            .extend(copied.into_iter().map(|(path, bytes, _)| (path, bytes)));
         Ok(())
     }
 
@@ -557,8 +581,8 @@ impl Env for FakeContainer {
         }
     }
 
-    fn cp_in(&self, src: &str, dest: &str) -> Result<()> {
-        self.env()?.cp_in(src, dest)
+    fn put(&self, src: &str, dest: &str, owner: &ContainerUser) -> Result<()> {
+        self.env()?.put(src, dest, owner)
     }
 
     fn write_secret(&self, dest: &str, contents: &[u8], mode: u32, user: User) -> Result<()> {
@@ -577,6 +601,10 @@ impl Container for FakeContainer {
 
     fn name(&self) -> Option<String> {
         Some(self.id.clone())
+    }
+
+    fn configured_user(&self) -> Option<String> {
+        None
     }
 
     fn mounts(&self) -> Vec<String> {
@@ -658,6 +686,31 @@ mod tests {
     }
 
     #[test]
+    fn what_is_put_in_belongs_to_the_owner_and_its_parent_is_made_as_them() {
+        let owner = ContainerUser {
+            requested: Some("dev".into()),
+            name: "dev".into(),
+            uid: 1000,
+            gid: 1001,
+            home: "/home/dev".into(),
+        };
+        let src = crate::tmpfile::TempDir::new("fake-put").unwrap();
+        std::fs::write(src.path().join("f"), "x").unwrap();
+        let env = FakeEnv::new();
+        env.put(
+            &src.path().join("f").to_string_lossy(),
+            "/home/dev/.local/f",
+            &owner,
+        )
+        .unwrap();
+        assert_eq!(env.owner_of("/home/dev/.local/f"), Some((1000, 1001)));
+        assert_eq!(
+            env.ran_as(&["mkdir", "-p", "/home/dev/.local"]),
+            Some(Who::Named("dev".into()))
+        );
+    }
+
+    #[test]
     fn a_declared_failure_can_recover() {
         let env = FakeEnv::new().with_failure(&["sh", "-c", "make"]);
         assert!(env.exec_root(&["sh", "-c", "make"]).is_err());
@@ -680,9 +733,9 @@ mod tests {
     fn files_written_are_visible_to_later_commands() {
         let env = FakeEnv::new();
         env.write_file("/etc/x", b"hello").unwrap();
-        assert!(env.file_exists("/etc/x"));
+        assert!(env.exists("/etc/x").unwrap());
         assert_eq!(env.exec_capture(&["cat", "/etc/x"]).unwrap(), "hello");
         env.exec_root(&["rm", "-f", "/etc/x"]).unwrap();
-        assert!(!env.file_exists("/etc/x"));
+        assert!(!env.exists("/etc/x").unwrap());
     }
 }
