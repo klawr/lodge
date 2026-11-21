@@ -51,8 +51,13 @@ named commands. A failing hook is reported but never locks you out.
 project (`./local-feature`; with `--remote`, from the remote host). Their
 `install.sh` runs in the container, as root, when it is created: options become
 environment variables, `_REMOTE_USER` / `_CONTAINER_USER` and their homes are
-set, `installsAfter` and `overrideFeatureInstallOrder` order them, and
-`containerEnv` is written to `/etc/profile.d` so login shells pick it up.
+set, and `containerEnv` is written to `/etc/profile.d` so login shells pick it up.
+
+Order: `dependsOn` features are installed too (with the options it gives, unless
+you list the feature yourself), and before the feature that needs them; one that
+can't be fetched takes what depends on it down with it. `installsAfter` only
+orders features that are both present. `overrideFeatureInstallOrder` comes
+first, then the feature's reference decides ties.
 
 lodge installs features *in the container* rather than baking them into the
 image, so a feature's `mounts`, `privileged`, `capAdd`, `securityOpt` and

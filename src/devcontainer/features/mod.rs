@@ -43,6 +43,10 @@ struct FeatureMeta {
     options: BTreeMap<String, OptionSpec>,
     #[serde(default, rename = "installsAfter")]
     installs_after: Vec<String>,
+    /// Features that must be installed too, and before this one: reference to
+    /// options. Unlike `installsAfter`, they are pulled in when not requested.
+    #[serde(default, rename = "dependsOn")]
+    depends_on: BTreeMap<String, Value>,
     #[serde(default, rename = "containerEnv")]
     container_env: BTreeMap<String, String>,
     // Container *creation* settings — applied to the backend at up time
@@ -76,6 +80,8 @@ struct Resolved {
     options: Map<String, Value>,
     meta: FeatureMeta,
     dir: PathBuf, // local dir with install.sh + metadata
+    /// Pulled in by another feature's `dependsOn`, not asked for in the config.
+    implicit: bool,
 }
 
 /// Where features find the project.
@@ -145,6 +151,21 @@ impl Plan {
         }
         let users = [script_user(env, remote_user), script_user(env, None)];
         for r in &self.resolved {
+            // A dependency may be there already (it was installed for another
+            // feature that is being retried).
+            if r.implicit {
+                match markers::done(env, &marker_key(&r.reference)) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        warning!(
+                            "skipping feature {}: could not tell whether it is installed: {e:#}",
+                            r.reference
+                        );
+                        continue;
+                    }
+                }
+            }
             warn_unsupported(r);
             validate_options(r);
             if let Err(e) = install_one(env, r, &users) {
@@ -194,27 +215,68 @@ pub fn resolve(
 
     let work = TempDir::new("features")?;
 
-    let mut resolved = Vec::with_capacity(features.len());
-    for (i, req) in features.iter().enumerate() {
+    // The requested features, then whatever their `dependsOn` adds (and what
+    // those add, once each: the config's own entry, with its options, wins).
+    let mut queue: std::collections::VecDeque<(FeatureRequest, bool)> =
+        features.iter().cloned().map(|f| (f, false)).collect();
+    let mut seen: Vec<String> = Vec::new();
+    let mut resolved: Vec<Resolved> = Vec::with_capacity(features.len());
+    let mut n = 0;
+    while let Some((req, implicit)) = queue.pop_front() {
+        if seen.iter().any(|s| same_ref(s, &req.reference)) {
+            continue;
+        }
+        seen.push(req.reference.clone());
         info!("fetching feature {}", req.reference);
-        match fetch::fetch(ctx, &req.reference, &work.path().join(i.to_string())) {
-            Ok((meta, dir)) => resolved.push(Resolved {
-                reference: req.reference.clone(),
-                options: req.options.clone(),
-                meta,
-                dir,
-            }),
+        n += 1;
+        match fetch::fetch(ctx, &req.reference, &work.path().join(n.to_string())) {
+            Ok((meta, dir)) => {
+                for (dep, options) in &meta.depends_on {
+                    queue.push_back((
+                        FeatureRequest {
+                            reference: dep.clone(),
+                            options: options.as_object().cloned().unwrap_or_default(),
+                        },
+                        true,
+                    ));
+                }
+                resolved.push(Resolved {
+                    reference: req.reference,
+                    options: req.options,
+                    meta,
+                    dir,
+                    implicit,
+                });
+            }
             Err(e) => warning!(
                 "feature {} could not be fetched (skipping): {e:#}",
                 req.reference
             ),
         }
     }
+    drop_without_dependencies(&mut resolved);
 
     Ok(Plan {
         resolved: order(resolved, override_order),
         _work: Some(work),
     })
+}
+
+// Removes each feature whose `dependsOn` names one that is not there (it could
+// not be fetched), and then whatever depended on that, with a warning each.
+fn drop_without_dependencies(resolved: &mut Vec<Resolved>) {
+    while let Some(i) = resolved.iter().position(|r| {
+        r.meta
+            .depends_on
+            .keys()
+            .any(|d| !resolved.iter().any(|o| same_ref(d, &o.reference)))
+    }) {
+        let r = resolved.remove(i);
+        warning!(
+            "skipping feature {}: a feature it depends on is not available",
+            r.reference
+        );
+    }
 }
 
 /// The features that haven't been installed successfully in `env` yet: all of
@@ -351,14 +413,20 @@ fn order(resolved: Vec<Resolved>, override_order: &[String]) -> Vec<Resolved> {
             .then(resolved[a].reference.cmp(&resolved[b].reference))
     });
 
-    // deps[i] = indices that must precede i (its installsAfter present in the set).
+    // deps[i] = indices that must precede i: its installsAfter and dependsOn
+    // present in the set.
     let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (i, ri) in resolved.iter().enumerate() {
-        for dep in &ri.meta.installs_after {
-            for (j, rj) in resolved.iter().enumerate() {
-                if j != i && matches_ref(dep, rj) {
-                    deps[i].push(j);
-                }
+        for (j, rj) in resolved.iter().enumerate() {
+            if j != i
+                && (ri.meta.installs_after.iter().any(|d| matches_ref(d, rj))
+                    || ri
+                        .meta
+                        .depends_on
+                        .keys()
+                        .any(|d| same_ref(d, &rj.reference)))
+            {
+                deps[i].push(j);
             }
         }
     }
@@ -372,7 +440,16 @@ fn order(resolved: Vec<Resolved>, override_order: &[String]) -> Vec<Resolved> {
             .iter()
             .copied()
             .find(|&i| !done[i] && deps[i].iter().all(|&d| done[d]))
-            .or_else(|| idx.iter().copied().find(|&i| !done[i]));
+            .or_else(|| {
+                let first = idx.iter().copied().find(|&i| !done[i]);
+                if let Some(i) = first {
+                    warning!(
+                        "features that install after each other in a circle; {} goes next",
+                        resolved[i].reference
+                    );
+                }
+                first
+            });
         if let Some(i) = pick {
             done[i] = true;
             out.push(i);
@@ -386,10 +463,24 @@ fn order(resolved: Vec<Resolved>, override_order: &[String]) -> Vec<Resolved> {
         .collect()
 }
 
+// Whether two references name the same feature, ignoring the tag.
+fn same_ref(a: &str, b: &str) -> bool {
+    strip_tag(a) == strip_tag(b)
+}
+
+// `ghcr.io/x/node:1` without `:1`. A colon before the last `/` is a registry's
+// port (`localhost:5000/x`), not a tag.
+fn strip_tag(reference: &str) -> &str {
+    let name_start = reference.rfind('/').map_or(0, |i| i + 1);
+    match reference[name_start..].find(':') {
+        Some(i) => &reference[..name_start + i],
+        None => reference,
+    }
+}
+
 // Matches an installsAfter / override entry against a resolved feature, by full
 // reference, tag-stripped reference, or the feature's id (last path segment).
 fn matches_ref(target: &str, r: &Resolved) -> bool {
-    let strip_tag = |s: &str| s.rsplit_once(':').map(|(a, _)| a).unwrap_or(s).to_string();
     let t = strip_tag(target);
     if t == strip_tag(&r.reference) {
         return true;
@@ -412,6 +503,7 @@ mod tests {
                 ..Default::default()
             },
             dir: PathBuf::new(),
+            implicit: false,
         }
     }
 
@@ -538,5 +630,114 @@ mod tests {
             resolved("ghcr.io/x/b:1", "b", &["ghcr.io/x/a"]),
         ];
         assert_eq!(order(v, &[]).len(), 2); // both emitted, no panic/hang
+    }
+
+    #[test]
+    fn a_registry_port_is_not_a_tag() {
+        assert!(same_ref("localhost:5000/x/node:1", "localhost:5000/x/node"));
+        assert!(!same_ref("localhost:5000/x/node", "localhost:5001/x/node"));
+        assert_eq!(strip_tag("localhost:5000/x/node"), "localhost:5000/x/node");
+        assert_eq!(strip_tag("./feat"), "./feat");
+    }
+
+    /// A folder whose subfolders are local features: name to its `dependsOn` JSON.
+    fn local_features(features: &[(&str, &str)]) -> crate::tmpfile::TempDir {
+        let dir = crate::tmpfile::TempDir::new("features-dep").unwrap();
+        for (name, depends_on) in features {
+            let feature = dir.path().join(name);
+            std::fs::create_dir_all(&feature).unwrap();
+            std::fs::write(feature.join("install.sh"), "true\n").unwrap();
+            std::fs::write(
+                feature.join("devcontainer-feature.json"),
+                format!(r#"{{"id": {name:?}, "dependsOn": {depends_on}}}"#),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    fn request(reference: &str, options: Value) -> FeatureRequest {
+        FeatureRequest {
+            reference: reference.to_string(),
+            options: options.as_object().cloned().unwrap_or_default(),
+        }
+    }
+
+    fn resolve_local(dir: &Path, requested: &[FeatureRequest]) -> Plan {
+        let ctx = Context {
+            base_dir: dir,
+            host: &crate::host::LocalHost,
+            oci: &crate::tools::NoRegistry,
+        };
+        resolve(&ctx, requested, &[]).unwrap()
+    }
+
+    #[test]
+    fn a_dependency_nobody_asked_for_is_installed_first_with_its_options() {
+        let dir = local_features(&[("app", r#"{"./lib": {"mode": "x"}}"#), ("lib", "{}")]);
+        let plan = resolve_local(dir.path(), &[request("./app", json!({}))]);
+        let got: Vec<_> = plan
+            .resolved
+            .iter()
+            .map(|r| (r.meta.id.as_str(), r.implicit))
+            .collect();
+        assert_eq!(got, [("lib", true), ("app", false)]);
+        assert_eq!(plan.resolved[0].options["mode"], "x");
+    }
+
+    #[test]
+    fn a_dependency_that_is_also_requested_is_installed_once_with_the_users_options() {
+        let dir = local_features(&[("app", r#"{"./lib": {"mode": "x"}}"#), ("lib", "{}")]);
+        let plan = resolve_local(
+            dir.path(),
+            &[
+                request("./app", json!({})),
+                request("./lib", json!({"mode": "mine"})),
+            ],
+        );
+        assert_eq!(plan.resolved.len(), 2);
+        let lib = plan.resolved.iter().find(|r| r.meta.id == "lib").unwrap();
+        assert!(!lib.implicit);
+        assert_eq!(lib.options["mode"], "mine");
+        assert_eq!(plan.resolved[0].meta.id, "lib", "and before its dependent");
+    }
+
+    #[test]
+    fn dependencies_of_dependencies_come_along_and_a_cycle_ends() {
+        let dir = local_features(&[
+            ("a", r#"{"./b": {}}"#),
+            ("b", r#"{"./c": {}}"#),
+            ("c", r#"{"./a": {}}"#),
+        ]);
+        let plan = resolve_local(dir.path(), &[request("./a", json!({}))]);
+        assert_eq!(plan.resolved.len(), 3);
+    }
+
+    #[test]
+    fn a_feature_whose_dependency_cannot_be_fetched_is_skipped_with_what_needs_it() {
+        let dir = local_features(&[
+            ("app", r#"{"./lib": {}}"#),
+            ("lib", r#"{"./missing": {}}"#),
+            ("plain", "{}"),
+        ]);
+        let plan = resolve_local(
+            dir.path(),
+            &[request("./app", json!({})), request("./plain", json!({}))],
+        );
+        let ids: Vec<_> = plan.resolved.iter().map(|r| r.meta.id.as_str()).collect();
+        assert_eq!(ids, ["plain"]);
+    }
+
+    #[test]
+    fn an_installed_dependency_is_not_installed_again_but_a_requested_feature_is() {
+        let env = container();
+        markers::mark_done(&env, &marker_key("ghcr.io/x/lib:1")).unwrap();
+        let work = TempDir::new("dep-installed").unwrap();
+        let mut lib = fetched(work.path(), "lib", &[]);
+        lib.implicit = true;
+        let app = fetched(work.path(), "app", &[]);
+        plan(vec![lib, app]).install(&env, None).unwrap();
+        assert!(!env.ran_matching(|c| c.iter().any(|a| a.contains("/lib"))));
+        assert!(env.ran_matching(|c| c.iter().any(|a| a.contains("/app"))));
     }
 }
