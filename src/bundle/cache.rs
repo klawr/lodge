@@ -1,7 +1,8 @@
 //! The cache of readied bundle directories, under `~/.cache/lodge/bundles/`.
 //!
-//! An entry is a directory named by its key (`f-<file hash>` for an extracted
-//! bundle file, `p-<inputs fingerprint>` for a live pack). Entries appear
+//! An entry is a directory named by its key: the one a bundle store gave it
+//! (`f-<file hash>`, `o-<image digest>`), or `p-<inputs fingerprint>` for a live
+//! pack. Entries appear
 //! atomically (staged, then renamed into place), are marked as used by their
 //! modification time, and all but the [`KEEP`] most recently used are pruned.
 

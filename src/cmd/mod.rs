@@ -24,13 +24,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use crate::bundle::store::{FileStore, OciStore, Stores};
 use crate::cli::{Cli, Command};
 use crate::config::Config;
 use crate::forward::{DetachedDaemon, ForwardDaemon};
 use crate::host::{HostRef, LocalHost, SshHost};
 use crate::local::{Local, SystemLocal};
 use crate::provision::{Endpoints, Wiring};
-use crate::tools::{DockerConfig, Ldd, NativeOci, Patchelf, Toolchain, UreqHttp};
+use crate::tools::{DockerConfig, Ldd, NativeOci, OciFetcher, Patchelf, Toolchain, UreqHttp};
 
 /// Whether a command works in a target at all. `init` and the generated
 /// completions and man page do not, so a bad value in the config can't stop
@@ -127,6 +128,8 @@ pub struct Ctx {
     pub endpoints: Box<dyn Endpoints>,
     /// The helper programs, for packing a bundle and fetching features.
     pub tools: Toolchain,
+    /// Where a bundle can be read from, chosen by how the reference is written.
+    pub bundles: Stores,
     /// Starts port forwarding for a container once it is up.
     pub forwarder: Box<dyn ForwardDaemon>,
     pub config_path: PathBuf,
@@ -161,6 +164,11 @@ impl Ctx {
         };
         self.host.canonical_dir(&path)
     }
+}
+
+/// Where a bundle can come from. A new place is one more entry here.
+fn bundle_stores(oci: Arc<dyn OciFetcher>) -> Stores {
+    Stores::new(vec![Box::new(FileStore), Box::new(OciStore::new(oci))])
 }
 
 pub fn run(cli: Cli) -> Result<ExitCode> {
@@ -206,6 +214,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
     let ctx = Ctx {
         forwarder: Box::new(DetachedDaemon::new(respawn_args(remote.as_deref(), target))),
         endpoints,
+        bundles: bundle_stores(tools.oci.clone()),
         tools,
         host,
         local,

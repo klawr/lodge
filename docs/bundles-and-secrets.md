@@ -26,6 +26,56 @@ ldg up --bundle lodge-x86_64.tar         # anywhere with a container runtime (or
 or set `bundle = "~/lodge-x86_64.tar"` at the top of `config.toml`. A configured
 bundle replaces the `[[inject]]` entries on that machine; `[session]` stays local.
 
+### Keeping a bundle in a registry
+
+Instead of carrying a file, a bundle can live in any OCI registry (ghcr.io,
+Docker Hub, your own), and `bundle =` and `--bundle` take its reference:
+
+```toml
+bundle = "oci://ghcr.io/me/lodge:1"
+```
+
+```sh
+ldg up --bundle oci://ghcr.io/me/lodge:1
+ldg up --bundle oci://ghcr.io/me/lodge@sha256:4f1c…   # pinned to exact content
+```
+
+A reference with a scheme is a registry (or whatever else lodge learns to read);
+anything else is a file. lodge asks the registry what the tag points at on every
+`up`, which is one small request, and downloads only when it changed: the bundle
+is cached under the digest, so an unchanged tag costs no download. Nothing is
+cached for the lookup itself, so a registry that cannot be reached fails the `up`
+(use a file when you are offline).
+
+lodge reads an image, or an index with one image per machine (each entry with
+its `platform`, such as `linux/amd64` or `linux/arm64`; the one for the machine
+lodge runs on is used). The image has **one layer: the bundle's tar**, as `ldg pack`
+wrote it. Anything else is refused, and so is a tar that is not a bundle. The
+layer's media type is not checked; `application/vnd.lodge.bundle.v1.tar` is
+the suggested one. Any tool that makes such an artifact will do, for example:
+
+```sh
+ldg pack -o lodge-x86_64.tar
+oras push ghcr.io/me/lodge:1 --artifact-type application/vnd.lodge.bundle.v1 \
+  lodge-x86_64.tar:application/vnd.lodge.bundle.v1.tar
+```
+
+Without an index, publish one tag per architecture (`:1-x86_64`, `:1-aarch64`).
+lodge does not publish bundles itself.
+
+Two things to keep in mind:
+
+- **A bundle is code that runs in your containers.** Pin by digest when the
+  registry is not yours, and only use a registry you trust for what you publish.
+- **A bundle holds your configs and git settings**, so publish it to a private
+  repository (see the warning below about what a config directory can hold).
+  Secrets are never in a bundle.
+
+The login for a private registry is the one `docker login` stored in docker's
+config file; a credential helper is not asked (see
+[Troubleshooting](troubleshooting.md#a-bundle-or-a-feature-cannot-be-pulled)).
+`ldg bundle inspect` and `ldg bundle verify` still take a file.
+
 A machine that only *uses* a bundle needs just the tar and a small config of its
 own: the `bundle =` line, `[session]`, and any `[[secret]]` (see below). Keep them
 in one folder and point lodge at it with `-c`:
@@ -46,7 +96,9 @@ ldg -c deploy/config.toml --remote me@host:2222 up /devel/project
 
 `-c` replaces `~/.config/lodge/config.toml` for the run (the file must exist);
 `--bundle` on the command line still overrides the config's `bundle`. A bundle is
-for one CPU architecture and must match the container's. It can hold credentials
+for one CPU architecture and must match the container's (from a registry, the
+image for the machine you run `ldg` on is used, so for a container of another
+architecture use a file or a tag of its own). It can hold credentials
 if you list the wrong directory, so `pack` warns about `~/.ssh`, `~/.config/gh`,
 `~/.claude` and similar.
 

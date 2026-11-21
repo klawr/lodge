@@ -78,11 +78,12 @@ Hooks and features are reported and skipped, never fatal, and a failed
 create-time hook or feature is retried on the next `ldg up`. Hooks run as
 `remoteUser`, feature scripts as root. Run `ldg up -v` to see the exact command.
 
-## A feature cannot be pulled
+## A bundle or a feature cannot be pulled
 
-A feature from a registry is pulled by lodge itself (see
-[Devcontainers](devcontainers.md#features)), and the error names the step that
-failed:
+A devcontainer feature or an `oci://` bundle is pulled from its registry by lodge
+itself (see [Devcontainers](devcontainers.md#features) and
+[Bundles](bundles-and-secrets.md#keeping-a-bundle-in-a-registry)), and the error
+names the step that failed:
 
 - `not found: ghcr.io/owner/name`: the registry has no such repository or tag.
   Check the reference, including the tag.
@@ -96,7 +97,13 @@ failed:
 - `content is sha256:…, expected sha256:…`, or `is N bytes, the manifest says M`:
   what came is not what the registry's manifest promised (a broken proxy or
   mirror). Nothing is kept; retry, or check what sits between you and the registry.
-- `has N layers, a feature has exactly one`: the reference is not a feature.
+- `has N layers, a feature has exactly one`, or `has more than one layer, a bundle
+  has exactly one`: the artifact is not shaped as lodge needs.
+- `no image for linux/<arch> (it has …)`: an index with no entry for this
+  machine's architecture. `the reference is an index of N images and no
+  architecture was asked for` means lodge did not know this machine's CPU.
+- `cannot read a bundle from "<x>"; it is a file path or oci://…`: the
+  reference has a scheme lodge does not read.
 - A pull that stops moving fails after 30 seconds without data. Every other
   failure to connect or answer is reported as it came (`requesting <url>`).
 

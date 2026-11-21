@@ -22,6 +22,7 @@ mod hash;
 pub mod manifest;
 pub mod pack;
 pub mod source;
+pub mod store;
 
 use anyhow::Result;
 use std::path::Path;

@@ -507,3 +507,61 @@ fn live_a_public_feature_is_pulled_from_ghcr_anonymously() {
         .collect();
     assert!(names.iter().any(|n| n.ends_with("install.sh")), "{names:?}");
 }
+
+#[test]
+fn a_tag_is_pinned_to_the_digest_of_its_image() {
+    let l = layer();
+    let manifest = image(&l.0, l.1.len());
+    let http =
+        Arc::new(FakeHttp::new().answer(&format!("{REPO}/manifests/1"), 200, &[], &manifest));
+    let pinned = oci(&http, FakeCredentials::new())
+        .pin("ghcr.io/x/feat:1", None)
+        .unwrap();
+    assert_eq!(pinned.digest, Digest::of(&manifest).to_string());
+    assert_eq!(
+        pinned.reference,
+        format!("ghcr.io/x/feat@{}", pinned.digest)
+    );
+    // Nothing but the manifest was asked for.
+    assert_eq!(http.requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn an_index_is_pinned_to_the_image_for_the_architecture() {
+    let amd = Digest::of(b"amd");
+    let index = format!(
+        r#"{{"manifests": [
+            {{"digest": "{amd}", "size": 1, "platform": {{"architecture": "amd64", "os": "linux"}}}},
+            {{"digest": "sha256:{}", "size": 1, "platform": {{"architecture": "arm64", "os": "linux"}}}}
+        ]}}"#,
+        "0".repeat(64)
+    );
+    let http = Arc::new(FakeHttp::new().answer(
+        &format!("{REPO}/manifests/1"),
+        200,
+        &[],
+        index.as_bytes(),
+    ));
+    let pinned = oci(&http, FakeCredentials::new())
+        .pin("ghcr.io/x/feat:1", Some(Arch::X86_64))
+        .unwrap();
+    assert_eq!(pinned.digest, amd.to_string());
+}
+
+#[test]
+fn a_pinned_reference_pulls_what_it_was_pinned_to() {
+    let l = layer();
+    let manifest = image(&l.0, l.1.len());
+    let digest = Digest::of(&manifest);
+    let http = Arc::new(
+        FakeHttp::new()
+            .answer(&format!("{REPO}/manifests/1"), 200, &[], &manifest)
+            .answer(&format!("{REPO}/manifests/{digest}"), 200, &[], &manifest)
+            .answer(&format!("{REPO}/blobs/{}", l.0), 200, &[], &l.1),
+    );
+    let fetcher = oci(&http, FakeCredentials::new());
+    let pinned = fetcher.pin("ghcr.io/x/feat:1", None).unwrap();
+    let dir = crate::tmpfile::TempDir::new("oci-test").unwrap();
+    fetcher.pull(&pinned.reference, None, dir.path()).unwrap();
+    assert!(dir.path().join(l.0.file_name()).is_file());
+}

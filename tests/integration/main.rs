@@ -568,6 +568,51 @@ fn a_bundle_for_another_architecture_is_refused() {
 
 #[test]
 #[ignore = "needs docker"]
+fn a_bundle_in_a_registry_is_pulled_once_and_injected() {
+    let sb = Sandbox::new();
+    script_tool_config(&sb, "hello", "#!/bin/sh\necho from-registry\n");
+    let bundle = sb.root().join("b.tar");
+    assert!(sb.run(&["pack", "-o", &bundle.to_string_lossy()]).ok);
+
+    let registry = Registry::start();
+    registry.push("lodge", "1", &bundle);
+    let reference = registry.reference("lodge", "1");
+
+    let p = sb.project("registrybundle", &json(r#"{ "image": "@IMAGE@" }"#));
+    let first = p.ldg("up", &["--no-attach", "--bundle", &reference]);
+    assert!(
+        first.ok && first.has("pulling") && first.has("(extracted)"),
+        "the first up should pull the bundle:\n{}",
+        first.tail(8)
+    );
+    assert_eq!(p.exec(&[&root_tool("hello")]), "from-registry");
+
+    // The tag still points at the same image: it is looked up, not downloaded.
+    let again = p.ldg("up", &["--no-attach", "--reinject", "--bundle", &reference]);
+    assert!(
+        again.ok && again.has("(cached)") && !again.has("pulling"),
+        "an unchanged tag should come from the cache:\n{}",
+        again.tail(8)
+    );
+
+    // A registry that has no such tag is an error that says so.
+    let missing = p.ldg(
+        "up",
+        &[
+            "--no-attach",
+            "--bundle",
+            &registry.reference("lodge", "nope"),
+        ],
+    );
+    assert!(
+        !missing.ok && missing.has("not found"),
+        "expected a not-found error:\n{}",
+        missing.tail(6)
+    );
+}
+
+#[test]
+#[ignore = "needs docker"]
 fn a_repeated_up_reuses_the_cached_bundle_and_a_change_updates_the_container() {
     let sb = Sandbox::new();
     let script = script_tool_config(&sb, "hello", "#!/bin/sh\necho one\n");

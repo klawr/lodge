@@ -59,6 +59,21 @@ pub trait OciFetcher {
     /// machines, `arch` picks one (for Linux); without it the index must hold
     /// only one image.
     fn pull(&self, reference: &str, arch: Option<Arch>, into: &Path) -> Result<()>;
+
+    /// What `reference` points at right now, named by its content: pulling the
+    /// pinned reference gets the same bytes whatever the tag is moved to later,
+    /// and the digest changes exactly when the content does. For an index it is
+    /// the image for `arch`, so it holds one machine's artifact.
+    fn pin(&self, reference: &str, arch: Option<Arch>) -> Result<Pinned>;
+}
+
+/// A reference and the content it named when it was pinned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pinned {
+    /// `registry/repository@sha256:<hex>`: `pull` takes it as any reference.
+    pub reference: String,
+    /// `sha256:<hex>`.
+    pub digest: String,
 }
 
 /// The tools lodge uses on this machine. Built once, in `cmd/`.
@@ -76,6 +91,69 @@ pub(crate) struct NoRegistry;
 impl OciFetcher for NoRegistry {
     fn pull(&self, reference: &str, _arch: Option<Arch>, _into: &Path) -> Result<()> {
         anyhow::bail!("no registry in this test (pulling {reference})")
+    }
+
+    fn pin(&self, reference: &str, _arch: Option<Arch>) -> Result<Pinned> {
+        anyhow::bail!("no registry in this test (pinning {reference})")
+    }
+}
+
+/// A registry that holds what it is given, for tests of what is built on
+/// [`OciFetcher`]: each artifact is one layer, under a tag, with a digest.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct FakeRegistry {
+    artifacts: std::sync::Mutex<std::collections::BTreeMap<String, (String, Vec<u8>)>>,
+    pulled: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+impl FakeRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `reference` (as asked for, tag and all) now holds `layer`, with `digest`.
+    pub fn with(self, reference: &str, digest: &str, layer: &[u8]) -> Self {
+        self.artifacts
+            .lock()
+            .unwrap()
+            .insert(reference.into(), (digest.into(), layer.to_vec()));
+        self
+    }
+
+    /// What was pulled, in order.
+    pub fn pulled(&self) -> Vec<String> {
+        self.pulled.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+impl OciFetcher for FakeRegistry {
+    fn pull(&self, reference: &str, _arch: Option<Arch>, into: &Path) -> Result<()> {
+        self.pulled.lock().unwrap().push(reference.into());
+        let artifacts = self.artifacts.lock().unwrap();
+        // A pinned reference names the digest, a plain one the tag.
+        let (digest, layer) = artifacts
+            .iter()
+            .find(|(name, (digest, _))| {
+                name.as_str() == reference || reference == format!("{name}@{digest}")
+            })
+            .map(|(_, v)| v)
+            .ok_or_else(|| anyhow::anyhow!("not found: {reference}"))?;
+        std::fs::write(into.join(digest.replace(':', "-")), layer)?;
+        Ok(())
+    }
+
+    fn pin(&self, reference: &str, _arch: Option<Arch>) -> Result<Pinned> {
+        let artifacts = self.artifacts.lock().unwrap();
+        let (digest, _) = artifacts
+            .get(reference)
+            .ok_or_else(|| anyhow::anyhow!("not found: {reference}"))?;
+        Ok(Pinned {
+            reference: format!("{reference}@{digest}"),
+            digest: digest.clone(),
+        })
     }
 }
 

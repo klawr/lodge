@@ -1,7 +1,7 @@
 //! `ldg up`: get the project's container ready, inject if needed, open a session.
 
 use anyhow::Result;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use super::Ctx;
 use crate::config::Config;
@@ -21,12 +21,12 @@ pub fn up(
     build: bool,
     reinject: bool,
     no_attach: bool,
-    bundle_file: Option<&Path>,
+    bundle: Option<&str>,
 ) -> Result<()> {
     let project = ctx.project(path)?;
     let config = ctx.config()?;
     // Ready the bundle first, so a problem with it fails before anything starts.
-    let prepared = bundle::source::prepare(&config, bundle_file, &ctx.tools)?;
+    let prepared = bundle::source::prepare(&config, bundle, &ctx.bundles, &ctx.tools)?;
     // How an endpoint is made, or found, is the endpoints' business; which
     // endpoints is chosen once, in `cmd::run`.
     let attached = ctx.endpoints.provision(&project, build)?;
@@ -191,6 +191,7 @@ mod tests {
                 Arc::new(NoQuestions),
             )),
             tools: tools::external(),
+            bundles: crate::bundle::store::Stores::new(vec![]),
             config_path: dir.path().join("config.toml"),
         };
         let attached = Attached {

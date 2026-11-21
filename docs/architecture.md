@@ -61,7 +61,7 @@ every subcommand.
 | `cmd/` | One file per group of commands (`attach`: up/exec, `project`: down/status/rm/ls/ports/logs/clean, `doctor`, `init`, `bundle`: pack/bundle/cache), plus `prompt`, the terminal side of `devcontainer::Prompt`. The only layer that loads the config, prints reports and reads the terminal. |
 | `config/` | The user's `config.toml`: `[[inject]]`, `[session]`, `[git]`, `[[secret]]` (its declaration types are in `config/secret.rs`: `RawSecret` as written, `SecretDecl` once checked), `bundle`, `target` and `targets`, a table of settings per target (`[targets.docker]`, `[targets.podman]`; the chosen one is also readable on its own with `target_setting` and `target_settings`, because the target is built before a command loads the config; what is in a table is checked by its target). Unknown keys and wrong types are errors (with a "did you mean"); past those, every problem, secrets included, is reported at once. A relative `bundle =` resolves against the file's folder. The JSON schema in `docs/config.schema.json` is generated from these types. |
 | `devcontainer/` | Everything about running a `devcontainer.json` (see below). |
-| `bundle/` | A bundle is a portable tar of relinked binaries, their libraries and configs, with a manifest, and is tied to no install prefix (see "Injection"). `manifest` defines and validates it (paths derive from names, so a bundle can't point outside itself), `archive` writes, reads and verifies the tar, `pack` builds one from the config (the only step needing a relinker; `deps` asks a `DepReader` once per binary however often the answer is needed, `elf` reads a binary's architecture, as an `Arch` (see `arch.rs`), and writes the interpreter of a dynamic binary in place), `source` readies a bundle *directory* to inject from (extracted from a file, or packed live), keyed by the file's hash or a fingerprint of the live inputs, and `cache` keeps those directories under `~/.cache/lodge/bundles/`. `hash` is the content hash of a file or tree. |
+| `bundle/` | A bundle is a portable tar of relinked binaries, their libraries and configs, with a manifest, and is tied to no install prefix (see "Injection"). `manifest` defines and validates it (paths derive from names, so a bundle can't point outside itself), `archive` writes, reads and verifies the tar, `pack` builds one from the config (the only step needing a relinker; `deps` asks a `DepReader` once per binary however often the answer is needed, `elf` reads a binary's architecture, as an `Arch` (see `arch.rs`), and writes the interpreter of a dynamic binary in place), `source` readies a bundle *directory* to inject from (fetched and extracted through a store, or packed live), keyed by what the store identified or a fingerprint of the live inputs, `store/` is where a bundle comes from (see [`bundle/store/`](#bundlestore)), and `cache` keeps those directories under `~/.cache/lodge/bundles/`. `hash` is the content hash of a file or tree. |
 | `inject/` | Copies a bundle's binaries, libraries and configs into a container for one `ContainerUser`, reading only from the bundle directory and acting *as that user* (through `runtime::Acting`), so it never needs root: `prefix` (chooses and checks the prefix: the user's home, else a private `/tmp` directory; `installed`, in `state`, finds where it was installed), `binary` (rewrites a dynamic binary's interpreter for the prefix, and writes the wrapper a config asked for), `libs` (tracked by content hash), `config_files`, `git` (`safe.directory`), `installed` (a hash and the destination per installed piece; a record that can't be read means that piece is installed again, and the list of records `ldg clean` works from is an error when it can't be read, not "nothing installed"), `state` (the installed bundle id, and `installed`, which finds what was injected and where), `remove` (`ldg clean`; placed secrets are removed by `secret::place::clear`). |
 | `layout.rs` | Every path lodge writes inside a container: `Layout`, the paths inside the user's prefix (the table under "What lives where"); the provisioning state, which is the devcontainer's own and root-owned; and the secrets directory. Nothing else spells these paths out. |
 | `secret/` | Secrets that must not be in a bundle. Their `[[secret]]` declarations are config (`config/secret.rs`: validated; names reach shell scripts). `mod` is the `Secret` value type (redacted `Debug`, no `Display`), matching `targets` globs, and `resolve` (env, file or a command run on *this* machine with a timeout, with errors that never contain the value). `place` writes values into a container under `/dev/shm/lodge-secrets-<uid>/` and builds the session lines that export them; `clear` removes the user's (`ldg clean`). `deliver` picks the secrets whose `targets` match, resolves and places them (or clears them when none are declared), and prints names only. |
@@ -148,6 +148,34 @@ How a pull stays safe:
 
 What is not there: retries (a 429 or 5xx is an error), a credential helper, a push.
 
+### `bundle/store/`
+
+A bundle is named by a *reference* the user wrote (`--bundle`, `bundle =`), and a
+`BundleStore` is one kind of place it can be kept. `bundle::source` hands the
+reference to `Stores::find`, which returns the store that `handles` it, and never
+names a concrete store; `cmd::run` builds the list (`bundle_stores`), so a new
+place (an `https://` URL, a bucket) is one type and one line there. A reference
+without a scheme is a file; with one, it belongs to the store that reads that
+scheme, and a scheme nobody reads is an error that lists the forms that work. Two
+stores claiming a reference is a wiring error, reported and not resolved by order.
+
+Getting a bundle takes two calls, so the cache can skip the costly one:
+`identify` is cheap and names the content as it is now (a `key` the cache uses as
+its directory name, and the `pinned` reference to fetch), `fetch` returns the tar.
+
+| Store | Reference | `identify` | `fetch` |
+| --- | --- | --- | --- |
+| `FileStore` | no scheme: a path | `f-<hash of the file>` | the file itself, nothing copied |
+| `OciStore` | `oci://registry/name[:tag\|@digest]` | `OciFetcher::pin`: one manifest request, `o-<digest of the image for this machine>` | `OciFetcher::pull` of the pinned reference; one layer, which is the tar |
+| `FakeStore` (tests) | `fake://name` | a scripted key | a scripted tar, recording what was fetched |
+
+`OciStore` is built on `OciFetcher` and knows nothing of HTTP or registries;
+`FileStore` knows nothing of the cache. What comes out of either is a tar that
+`archive::extract` unpacks and checks, so a layer that is not a bundle fails there,
+whoever published it. *Enforced:* `conventions.rs` allows the concrete stores to be
+named only in `bundle/store/` and `cmd/`, and the `oci://` scheme to be spelled
+only in `oci.rs`.
+
 ## What `ldg up` does, step by step
 
 `up` is two halves. **Provision** (steps 1–9) makes the endpoint ready and hands
@@ -195,14 +223,16 @@ provisioner feeding the same attach half.
 ## Injection
 
 Injection reads only from a **bundle directory** (`bundle/source`), never from the
-host's own files. The directory comes from a bundle file (`--bundle`, or `bundle =`
-in the config), extracted once and cached by the file's hash, or from a live pack of
+host's own files. The directory comes from a bundle reference (`--bundle`, or
+`bundle =` in the config: a file, a registry; see `bundle/store/`), identified,
+fetched and extracted once and cached by what it identified as (a file's hash, an
+image's digest), or from a live pack of
 the `[[inject]]` entries, cached by a fingerprint of the config and of each source
 file's size and mtime and the libraries `ldd` finds. Working out that fingerprint
 runs `ldd` (so a live config needs it on every `up`); if nothing changed, the
 cached directory is reused and nothing is copied or relinked (`patchelf` does
-not run). With a bundle file neither tool is needed. The live path and the
-bundle-file path end in the same place, so there is one injector. It is prepared
+not run). With a stored bundle neither tool is needed. The live path and the
+stored-bundle path end in the same place, so there is one injector. It is prepared
 *before* anything starts, so a problem with it fails without leaving a half-started
 container.
 
@@ -452,6 +482,7 @@ just how it is done.
 | The build-time helpers | `tools::DepReader`, `ElfEditor`, `OciFetcher` (a `Toolchain`) | `Ldd`, `Patchelf`, `NativeOci` (on `Http` and `Credentials`: `UreqHttp`, `DockerConfig`); a test passes fakes |
 | Making an endpoint ready, and finding it again | `provision::Endpoints` | `devcontainer::Devcontainer` (a devcontainer on an engine), `plain_host::PlainHostEndpoints` (the machine itself), `kube::KubeEndpoints` (a running pod, through `kubectl` on a `Host`) |
 | Port forwarding for a container | `forward::ForwardDaemon` (and `Forwarders` for one tunnel) | `DetachedDaemon`, `HostForwarders`; a test passes fakes |
+| Where a bundle comes from | `bundle::store::BundleStore` (the `Stores` in `Ctx`) | `FileStore`, `OciStore` (on `OciFetcher`); `FakeStore` for tests; a new place is one type and one line in `cmd::bundle_stores` |
 | What is injected | `[[inject]]` data | multiplexers and other tools are injected like any other, never named in code |
 
 The pieces compose instead of branching. The engine is built *on* a host

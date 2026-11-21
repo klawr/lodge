@@ -83,7 +83,7 @@ fn unpack(layer: &Path, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::Arch;
+    use crate::tools::{Arch, Pinned};
 
     /// A registry that holds one feature, as a plain-tar layer.
     struct OneFeature;
@@ -106,6 +106,10 @@ mod tests {
             add("install.sh", "#!/bin/sh\n");
             std::fs::write(into.join("sha256-abc"), layer.into_inner().unwrap())?;
             Ok(())
+        }
+
+        fn pin(&self, reference: &str, _arch: Option<Arch>) -> Result<Pinned> {
+            bail!("not pinned in this test ({reference})")
         }
     }
 
@@ -130,6 +134,10 @@ mod tests {
             std::fs::write(into.join("sha256-a"), b"")?;
             std::fs::write(into.join("sha256-b"), b"")?;
             Ok(())
+        }
+
+        fn pin(&self, reference: &str, _arch: Option<Arch>) -> Result<Pinned> {
+            bail!("not pinned in this test ({reference})")
         }
     }
 

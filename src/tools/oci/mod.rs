@@ -19,7 +19,9 @@ pub use credentials::{Credentials, DockerConfig};
 pub use http::{Http, UreqHttp};
 
 use crate::arch::Arch;
+use crate::tools::Pinned;
 use anyhow::{Context, Result, bail};
+use digest::Digest;
 use manifest::Manifest;
 use reference::Reference;
 use registry::Registry;
@@ -65,6 +67,25 @@ impl super::OciFetcher for NativeOci {
                 .with_context(|| format!("pulling {reference}"))?;
         }
         Ok(())
+    }
+
+    fn pin(&self, reference: &str, arch: Option<Arch>) -> Result<Pinned> {
+        let r = Reference::parse(reference)?;
+        let mut registry = Registry::new(
+            self.http.as_ref(),
+            self.credentials.as_ref(),
+            &r.registry,
+            &r.repository,
+        );
+        let bytes = registry.manifest(&r.target)?;
+        let digest = match Manifest::parse(&bytes)? {
+            Manifest::Image(_) => Digest::of(&bytes),
+            Manifest::Index(entries) => Digest::parse(&manifest::select(&entries, arch)?.digest)?,
+        };
+        Ok(Pinned {
+            reference: format!("{}/{}@{digest}", r.registry, r.repository),
+            digest: digest.to_string(),
+        })
     }
 }
 

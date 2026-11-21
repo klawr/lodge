@@ -113,7 +113,7 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
 
     if let Ok(cfg) = &config {
         if let Some(bundle) = &cfg.bundle {
-            checks.push(bundle_check(bundle));
+            checks.push(bundle_check(bundle, ctx));
         }
         for item in &cfg.inject {
             if let Some(binary) = &item.binary {
@@ -208,17 +208,21 @@ fn config_check(path: &Path, config: &Result<Config>) -> Check {
     }
 }
 
-fn bundle_check(file: &Path) -> Check {
-    match crate::bundle::archive::read_manifest(file) {
-        Ok(m) => Check::new(
+/// Readies the bundle the config names, as `up` would, so a reference that
+/// cannot be read (a missing file, a registry that says no) shows up here and not
+/// in the middle of `ldg up`. A bundle that is not cached yet is fetched.
+fn bundle_check(reference: &str, ctx: &Ctx) -> Check {
+    let prepared = crate::bundle::cache::root()
+        .and_then(|root| crate::bundle::source::from_store(&root, &ctx.bundles, reference));
+    match prepared {
+        Ok(p) => Check::new(
             "bundle",
             Level::Ok,
             format!(
-                "{} ({}, {}, id {})",
-                file.display(),
-                m.arch,
-                plural(m.tools.len(), "tool", "tools"),
-                m.id()
+                "{reference} ({}, {}, id {})",
+                p.manifest.arch,
+                plural(p.manifest.tools.len(), "tool", "tools"),
+                p.manifest.id()
             ),
         ),
         Err(e) => Check::new("bundle", Level::Missing, format!("{e:#}")),

@@ -60,7 +60,7 @@ reads the login from docker's config file (`~/.docker/config.json`, or
 `$DOCKER_CONFIG`), but not from a credential helper (`credsStore`), so a private
 registry whose login lives in a helper is not reachable yet. Everything pulled is
 checked against its digest. If a pull fails, see
-[Troubleshooting](troubleshooting.md#a-feature-cannot-be-pulled).
+[Troubleshooting](troubleshooting.md#a-bundle-or-a-feature-cannot-be-pulled).
 
 Order: `dependsOn` features are installed too (with the options it gives, unless
 you list the feature yourself), and before the feature that needs them; one that

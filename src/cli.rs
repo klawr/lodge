@@ -102,9 +102,9 @@ pub enum Command {
         /// Set everything up, but don't open a shell (for scripts and CI)
         #[arg(long)]
         no_attach: bool,
-        /// Inject from this bundle file instead of packing your config
-        #[arg(long, value_name = "FILE")]
-        bundle: Option<PathBuf>,
+        /// Inject from this bundle instead of packing your config
+        #[arg(long, value_name = "FILE|oci://REF")]
+        bundle: Option<String>,
     },
     /// Stop a project's devcontainer
     #[command(

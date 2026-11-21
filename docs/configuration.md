@@ -245,7 +245,9 @@ session. A pod is someone's workload, so, as for `host`:
 
 A top-level `bundle = "path/to/lodge.tar"` injects from that bundle instead of
 packing the `[[inject]]` entries. A relative path is relative to the config
-file's folder. `--bundle FILE` on the command line overrides it. See
+file's folder. A reference with a scheme is not a path: `bundle =
+"oci://ghcr.io/me/lodge:1"` reads the bundle from a registry. `--bundle` on the
+command line (a file or such a reference) overrides it. See
 [Bundles and secrets](bundles-and-secrets.md).
 
 ## `[[secret]]`

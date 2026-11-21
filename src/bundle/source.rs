@@ -4,23 +4,25 @@
 //! and `config/`. This module produces one, from either source, and keeps it in
 //! the [`cache`] so work is not repeated:
 //!
-//! - a bundle **file** (`--bundle`, or `bundle = …` in the config) is extracted
-//!   once, keyed by the hash of the file;
+//! - a bundle **reference** (`--bundle`, or `bundle = …` in the config: a file, a
+//!   registry, whatever a [`store`](super::store) handles) is identified, and
+//!   fetched and extracted once, keyed by what it identified as (the hash of a
+//!   file, the digest of an image);
 //! - otherwise the config is **packed live**, keyed by a fingerprint of everything
 //!   it depends on (the config entries, each source file's size and mtime, the
 //!   libraries `ldd` finds). Working out that fingerprint runs `ldd`; if it is
 //!   unchanged the cached bundle is reused and nothing is copied or relinked
 //!   (`patchelf` does not run).
 //!
-//! So the live path and the bundle-file path end in the same place, and there is a
-//! single injector.
+//! So the live path and the stored-bundle path end in the same place, and there is
+//! a single injector.
 
 use anyhow::Result;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use super::hash::hash_path;
 use super::manifest::{BIN_DIR, CONFIG_DIR, LIB_DIR, Manifest};
+use super::store::Stores;
 use super::{archive, cache, deps, elf, pack};
 use crate::arch::Arch;
 use crate::config::Config;
@@ -42,7 +44,7 @@ pub enum Origin {
     Cached,
     /// Packed from the config just now.
     Packed,
-    /// Extracted from a bundle file just now.
+    /// Fetched from a store (a file, a registry) and extracted just now.
     Extracted,
 }
 
@@ -60,27 +62,31 @@ impl Prepared {
     }
 }
 
-/// Readies the bundle to inject from: `file` if given, else the config's
+/// Readies the bundle to inject from: `reference` if given, else the config's
 /// `bundle`, else a live pack of the config.
-pub fn prepare(config: &Config, file: Option<&Path>, tools: &Toolchain) -> Result<Prepared> {
-    prepare_in(&cache::root()?, config, file, tools)
+pub fn prepare(
+    config: &Config,
+    reference: Option<&str>,
+    stores: &Stores,
+    tools: &Toolchain,
+) -> Result<Prepared> {
+    prepare_in(&cache::root()?, config, reference, stores, tools)
 }
 
 pub(crate) fn prepare_in(
     root: &Path,
     config: &Config,
-    file: Option<&Path>,
+    reference: Option<&str>,
+    stores: &Stores,
     tools: &Toolchain,
 ) -> Result<Prepared> {
-    let explicit = file
-        .map(Path::to_path_buf)
-        .or_else(|| config.bundle.clone());
+    let explicit = reference.or(config.bundle.as_deref());
     let prepared = match explicit {
-        Some(file) => {
+        Some(reference) => {
             if !config.inject.is_empty() {
                 warning!("a bundle is in use, so the [[inject]] entries in the config are ignored");
             }
-            from_file(root, &file)?
+            from_store(root, stores, reference)?
         }
         None => live(root, config, tools)?,
     };
@@ -95,8 +101,13 @@ pub(crate) fn prepare_in(
     Ok(prepared)
 }
 
-fn from_file(root: &Path, file: &Path) -> Result<Prepared> {
-    let dir = root.join(format!("f-{}", hash_path(file)?));
+/// The bundle `reference` names, from whichever store owns it: identified
+/// first (cheap), and only fetched when the cache has not got that content.
+pub(crate) fn from_store(root: &Path, stores: &Stores, reference: &str) -> Result<Prepared> {
+    let store = stores.find(reference)?;
+    // A CPU lodge does not know cannot pick an image, but can read a file.
+    let identity = store.identify(reference, Arch::host().ok())?;
+    let dir = root.join(&identity.key);
     if let Some(manifest) = cache::load(&dir) {
         return Ok(Prepared {
             dir,
@@ -104,8 +115,10 @@ fn from_file(root: &Path, file: &Path) -> Result<Prepared> {
             origin: Origin::Cached,
         });
     }
+    let fetched = cache::staging(root, "fetch")?;
+    let tar = store.fetch(&identity, fetched.path())?;
     let staging = cache::staging(root, "extract")?;
-    let manifest = archive::extract(file, staging.path())?;
+    let manifest = archive::extract(&tar, staging.path())?;
     Ok(Prepared {
         dir: cache::install(staging, &dir)?,
         manifest,
@@ -216,9 +229,24 @@ fn stat_tree(root: &Path, out: &mut Vec<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bundle::store::fake::FakeStore;
+    use crate::bundle::store::{FileStore, OciStore};
     use crate::config::Injectable;
     use crate::tmpfile::TempDir;
-    use crate::tools::{self, Ldd};
+    use crate::tools::{self, FakeRegistry, Ldd};
+    use std::sync::Arc;
+
+    fn files() -> Stores {
+        Stores::new(vec![Box::new(FileStore)])
+    }
+
+    /// A packed bundle, as the bytes of its tar.
+    fn bundle_tar(dir: &Path, body: &str) -> Vec<u8> {
+        let out = dir.join("packed.tar");
+        let cfg = config(vec![script_tool(dir, "t", body)]);
+        pack::pack_to_file(&cfg, &out, &tools::external()).unwrap();
+        std::fs::read(out).unwrap()
+    }
 
     fn script_tool(dir: &Path, name: &str, body: &str) -> Injectable {
         let bin = dir.join(format!("{name}-src"));
@@ -246,9 +274,9 @@ mod tests {
         let cache = TempDir::new("cache").unwrap();
         let cfg = config(vec![script_tool(work.path(), "t", "#!/bin/sh\necho 1\n")]);
 
-        let first = prepare_in(cache.path(), &cfg, None, &tools::external()).unwrap();
+        let first = prepare_in(cache.path(), &cfg, None, &files(), &tools::external()).unwrap();
         assert_eq!(first.origin, Origin::Packed);
-        let second = prepare_in(cache.path(), &cfg, None, &tools::external()).unwrap();
+        let second = prepare_in(cache.path(), &cfg, None, &files(), &tools::external()).unwrap();
         assert_eq!(second.origin, Origin::Cached);
         assert_eq!(first.dir, second.dir);
         assert_eq!(first.manifest.id(), second.manifest.id());
@@ -262,10 +290,10 @@ mod tests {
         let source = tool.binary.clone().unwrap();
         let cfg = config(vec![tool]);
 
-        let first = prepare_in(cache.path(), &cfg, None, &tools::external()).unwrap();
+        let first = prepare_in(cache.path(), &cfg, None, &files(), &tools::external()).unwrap();
         // A different size, so the change is noticed whatever the mtime resolution.
         std::fs::write(&source, "#!/bin/sh\necho changed, and longer\n").unwrap();
-        let second = prepare_in(cache.path(), &cfg, None, &tools::external()).unwrap();
+        let second = prepare_in(cache.path(), &cfg, None, &files(), &tools::external()).unwrap();
         assert_eq!(second.origin, Origin::Packed);
         assert_ne!(first.dir, second.dir);
         assert_ne!(first.manifest.id(), second.manifest.id());
@@ -282,9 +310,9 @@ mod tests {
         tool.config = Some(cfg_dir.clone());
         let cfg = config(vec![tool]);
 
-        let first = prepare_in(cache.path(), &cfg, None, &tools::external()).unwrap();
+        let first = prepare_in(cache.path(), &cfg, None, &files(), &tools::external()).unwrap();
         std::fs::write(cfg_dir.join("added"), "new file").unwrap();
-        let second = prepare_in(cache.path(), &cfg, None, &tools::external()).unwrap();
+        let second = prepare_in(cache.path(), &cfg, None, &files(), &tools::external()).unwrap();
         assert_eq!(second.origin, Origin::Packed);
         assert_ne!(first.dir, second.dir);
     }
@@ -335,11 +363,25 @@ mod tests {
 
         // The config used to *inject* has no tools: the bundle supplies them.
         let empty = config(vec![]);
-        let first = prepare_in(cache.path(), &empty, Some(&file), &tools::external()).unwrap();
+        let first = prepare_in(
+            cache.path(),
+            &empty,
+            Some(file.to_str().unwrap()),
+            &files(),
+            &tools::external(),
+        )
+        .unwrap();
         assert_eq!(first.origin, Origin::Extracted);
         assert_eq!(first.manifest.tools.len(), 1);
         assert!(first.bin("t").exists());
-        let second = prepare_in(cache.path(), &empty, Some(&file), &tools::external()).unwrap();
+        let second = prepare_in(
+            cache.path(),
+            &empty,
+            Some(file.to_str().unwrap()),
+            &files(),
+            &tools::external(),
+        )
+        .unwrap();
         assert_eq!(second.origin, Origin::Cached);
     }
 
@@ -363,7 +405,8 @@ mod tests {
         let err = prepare_in(
             cache.path(),
             &config(vec![]),
-            Some(&file),
+            Some(file.to_str().unwrap()),
+            &files(),
             &tools::external(),
         )
         .err()
@@ -382,7 +425,14 @@ mod tests {
         let tmp = TempDir::new("cache-list").unwrap();
         let root = tmp.path().join("bundles");
         let script = script_tool(tmp.path(), "hello", "echo hi");
-        prepare_in(&root, &config(vec![script]), None, &tools::external()).unwrap();
+        prepare_in(
+            &root,
+            &config(vec![script]),
+            None,
+            &files(),
+            &tools::external(),
+        )
+        .unwrap();
         let entries = cache::entries(&root);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].manifest.is_some());
@@ -403,7 +453,8 @@ mod tests {
                 "t",
                 &format!("#!/bin/sh\necho {i}{}\n", "x".repeat(i)),
             )]);
-            last = Some(prepare_in(cache.path(), &cfg, None, &tools::external()).unwrap());
+            last =
+                Some(prepare_in(cache.path(), &cfg, None, &files(), &tools::external()).unwrap());
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let kept = std::fs::read_dir(cache.path()).unwrap().count();
@@ -412,5 +463,99 @@ mod tests {
             last.unwrap().dir.exists(),
             "the bundle in use must survive pruning"
         );
+    }
+
+    #[test]
+    fn a_bundle_from_a_store_is_fetched_once_then_found_in_the_cache() {
+        let work = TempDir::new("store1").unwrap();
+        let cache = TempDir::new("cache-s1").unwrap();
+        let tar = bundle_tar(work.path(), "#!/bin/sh\n");
+        let fake = FakeStore::new().with("a", "x-1", tar);
+        let fetched = fake.fetched();
+        let stores = Stores::new(vec![Box::new(fake)]);
+        let empty = config(vec![]);
+
+        let first = prepare_in(
+            cache.path(),
+            &empty,
+            Some("fake://a"),
+            &stores,
+            &tools::external(),
+        )
+        .unwrap();
+        assert_eq!(first.origin, Origin::Extracted);
+        assert!(first.bin("t").exists());
+        assert!(first.dir.ends_with("x-1"), "{}", first.dir.display());
+        let second = prepare_in(
+            cache.path(),
+            &empty,
+            Some("fake://a"),
+            &stores,
+            &tools::external(),
+        )
+        .unwrap();
+        assert_eq!(second.origin, Origin::Cached);
+        assert_eq!(fetched.lock().unwrap().len(), 1);
+        // Nothing is left from fetching.
+        let names: Vec<_> = std::fs::read_dir(cache.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+    }
+
+    #[test]
+    fn a_bundle_in_a_registry_is_pulled_once_per_digest() {
+        let work = TempDir::new("store2").unwrap();
+        let cache = TempDir::new("cache-s2").unwrap();
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let registry = Arc::new(FakeRegistry::new().with(
+            "ghcr.io/me/lodge:1",
+            &digest,
+            &bundle_tar(work.path(), "#!/bin/sh\n"),
+        ));
+        let stores = Stores::new(vec![
+            Box::new(FileStore),
+            Box::new(OciStore::new(registry.clone())),
+        ]);
+        let empty = config(vec![]);
+        let reference = "oci://ghcr.io/me/lodge:1";
+
+        let first = prepare_in(
+            cache.path(),
+            &empty,
+            Some(reference),
+            &stores,
+            &tools::external(),
+        )
+        .unwrap();
+        assert_eq!(first.origin, Origin::Extracted);
+        assert!(first.bin("t").exists());
+        let second = prepare_in(
+            cache.path(),
+            &empty,
+            Some(reference),
+            &stores,
+            &tools::external(),
+        )
+        .unwrap();
+        assert_eq!(second.origin, Origin::Cached);
+        assert_eq!(
+            registry.pulled(),
+            vec![format!("ghcr.io/me/lodge:1@{digest}")]
+        );
+    }
+
+    #[test]
+    fn the_config_names_a_bundle_too_and_an_unknown_scheme_is_refused() {
+        let cache = TempDir::new("cache-s3").unwrap();
+        let cfg = Config {
+            bundle: Some("ftp://host/b.tar".into()),
+            ..Config::default()
+        };
+        let err = prepare_in(cache.path(), &cfg, None, &files(), &tools::external())
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("a file path"), "{err:#}");
     }
 }

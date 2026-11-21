@@ -201,6 +201,90 @@ impl Drop for Daemon {
     }
 }
 
+/// A real OCI registry (`registry:2`) on a loopback port, removed when dropped.
+/// Bundles are published with [`Registry::push`], in the shape the docs describe:
+/// one layer holding the tar, which is what `oras push` makes of a file.
+pub struct Registry {
+    container: String,
+    pub port: u16,
+}
+
+impl Registry {
+    pub fn start() -> Self {
+        let port = free_port();
+        let container = docker(&[
+            "run",
+            "-d",
+            "--rm",
+            "-p",
+            &format!("127.0.0.1:{port}:5000"),
+            "registry:2",
+        ]);
+        let registry = Self { container, port };
+        assert!(
+            wait_until(20, || std::net::TcpStream::connect(("127.0.0.1", port))
+                .is_ok()),
+            "the registry did not come up"
+        );
+        registry
+    }
+
+    /// `oci://` reference to `name:tag` on this registry.
+    pub fn reference(&self, name: &str, tag: &str) -> String {
+        format!("oci://localhost:{}/{name}:{tag}", self.port)
+    }
+
+    /// Publishes `file` as `name:tag`: an empty config and the file as the one
+    /// layer. Plain HTTP, since this registry is on loopback.
+    pub fn push(&self, name: &str, tag: &str, file: &Path) {
+        const SCRIPT: &str = r#"
+import hashlib, json, sys, urllib.request
+base, repo, tag, path = sys.argv[1:5]
+def blob(data):
+    digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    started = urllib.request.urlopen(
+        urllib.request.Request(f"{base}/v2/{repo}/blobs/uploads/", method="POST"))
+    where = started.headers["Location"]
+    if where.startswith("/"):
+        where = base + where
+    sep = "&" if "?" in where else "?"
+    urllib.request.urlopen(urllib.request.Request(
+        f"{where}{sep}digest={digest}", data=data, method="PUT",
+        headers={"Content-Type": "application/octet-stream"}))
+    return digest, len(data)
+config = blob(b"{}")
+layer = blob(open(path, "rb").read())
+manifest = {
+    "schemaVersion": 2,
+    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    "config": {"mediaType": "application/vnd.oci.empty.v1+json",
+               "digest": config[0], "size": config[1]},
+    "layers": [{"mediaType": "application/vnd.lodge.bundle.v1.tar",
+                "digest": layer[0], "size": layer[1]}],
+}
+urllib.request.urlopen(urllib.request.Request(
+    f"{base}/v2/{repo}/manifests/{tag}", data=json.dumps(manifest).encode(), method="PUT",
+    headers={"Content-Type": manifest["mediaType"]}))
+"#;
+        let base = format!("http://127.0.0.1:{}", self.port);
+        let mut cmd = Command::new("python3");
+        cmd.args(["-c", SCRIPT, &base, name, tag]).arg(file);
+        let out = capture(cmd);
+        assert!(out.ok, "pushing to the registry failed:\n{}", out.text);
+    }
+}
+
+impl Drop for Registry {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &self.container])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 fn which(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|d| d.join(name))

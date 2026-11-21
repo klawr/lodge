@@ -35,10 +35,11 @@ pub struct Config<S = SecretDecl> {
         schemars(with = "BTreeMap<String, serde_json::Map<String, serde_json::Value>>")
     )]
     pub targets: BTreeMap<String, toml::Table>,
-    /// A bundle file to inject from instead of packing the `[[inject]]` entries.
-    /// A relative path is relative to this file's folder.
+    /// A bundle to inject from instead of packing the `[[inject]]` entries: a
+    /// file, or a registry as `oci://ghcr.io/me/lodge:1`. A relative file path is
+    /// relative to this file's folder.
     #[serde(default)]
-    pub bundle: Option<PathBuf>,
+    pub bundle: Option<String>,
     /// Tools to inject: a binary, a config file or directory, or both.
     #[serde(default)]
     pub inject: Vec<Injectable>,
@@ -172,6 +173,18 @@ pub fn path_for(flag: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 /// A relative path in the config is relative to the config file's folder.
+/// A bundle reference as the config wrote it: a path is resolved against the
+/// config file's folder, anything with a scheme (`oci://…`) is not a path and is
+/// kept as it is. Which scheme means what is the bundle stores' business.
+fn resolve_reference(config_file: &Path, reference: String) -> String {
+    if reference.contains("://") {
+        return reference;
+    }
+    resolve_against(config_file, PathBuf::from(reference))
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn resolve_against(config_file: &Path, path: PathBuf) -> PathBuf {
     let path = expand_tilde(path);
     if path.is_absolute() {
@@ -280,7 +293,7 @@ impl Config {
         Self {
             target,
             targets,
-            bundle: bundle.map(|b| resolve_against(path, b)),
+            bundle: bundle.map(|b| resolve_reference(path, b)),
             inject,
             session,
             git,
@@ -488,7 +501,18 @@ mod tests {
         );
         assert_eq!(
             parse("bundle = \"b.tar\"").unwrap().bundle.unwrap(),
-            Path::new("/srv/lodge/b.tar")
+            "/srv/lodge/b.tar"
+        );
+    }
+
+    #[test]
+    fn a_bundle_with_a_scheme_is_not_a_path_and_is_left_alone() {
+        assert_eq!(
+            parse("bundle = \"oci://ghcr.io/me/lodge:1\"")
+                .unwrap()
+                .bundle
+                .unwrap(),
+            "oci://ghcr.io/me/lodge:1"
         );
     }
 
