@@ -14,7 +14,7 @@ use super::create::{CreateSettings, Mount, parse_app_ports};
 use super::spec::{CreateConfig, SourceConfig};
 use super::vars::{Vars, path_tag};
 use crate::host::HostRef;
-use crate::runtime::{BuildSpec, Containers, Runtime};
+use crate::runtime::{BuildSpec, Containers, RunSpec, Runtime};
 use crate::shell::slug;
 
 /// Label on every container lodge creates for a devcontainer: the project's
@@ -159,7 +159,8 @@ pub(super) enum ImageSource {
 pub(super) struct ContainerBackend {
     pub(super) name: String,
     pub(super) source: ImageSource,
-    pub(super) run_args: Vec<String>,
+    /// What every run of it has, before what features add and the image.
+    pub(super) run: RunSpec,
     // `overrideCommand` (default true): keep the container alive with
     // `sleep infinity` instead of running the image's own command.
     pub(super) override_command: bool,
@@ -199,15 +200,13 @@ impl Backend for ContainerBackend {
 
         let image = self.resolve_image(rt)?;
         info!("creating container {}", self.name);
-        let mut run_args = self.run_args.clone();
-        run_args.extend(extra.to_args());
-        let command: &[&str] = if self.override_command {
-            &["sleep", "infinity"]
-        } else {
-            &[]
-        };
-        rt.run_detached(&self.name, &run_args, &image, command)
-            .context("creating container")?;
+        let mut spec = self.run.clone();
+        extra.apply(&mut spec);
+        spec.image = image;
+        if self.override_command {
+            spec.command = vec!["sleep".into(), "infinity".into()];
+        }
+        rt.run_detached(&spec).context("creating container")?;
         self.id(rt)
     }
 }
@@ -244,42 +243,42 @@ impl ContainerBackend {
     }
 }
 
-// Builds the `docker run` arguments for a ContainerBackend: the workspace mount
-// (or a default bind), the working dir, the settings that devcontainer.json
-// states directly (its `mounts` among them), and finally the user's `runArgs`
-// (last, so they can override).
-fn build_run_args(
+// What a ContainerBackend asks the engine for: the workspace mount (or a
+// default bind), the working dir, the settings that devcontainer.json states
+// directly (its `mounts` among them), and the user's `runArgs`, which the engine
+// passes through last so they can override.
+fn build_run_spec(
+    name: &str,
     user_args: Option<Vec<String>>,
     workspace_mount: Option<String>,
     settings: &CreateSettings,
     vars: &Vars,
     project_path: &Path,
     workspace_folder: &str,
-) -> Vec<String> {
-    let mut args = vec![
-        "--label".to_string(),
-        format!("{LABEL_PROJECT}={}", project_path.display()),
-    ];
+) -> RunSpec {
+    let mut spec = RunSpec {
+        name: name.to_string(),
+        labels: vec![(
+            LABEL_PROJECT.to_string(),
+            project_path.display().to_string(),
+        )],
+        workdir: Some(workspace_folder.to_string()),
+        ..RunSpec::default()
+    };
     match workspace_mount {
-        Some(m) => {
-            args.push("--mount".into());
-            args.push(vars.apply(&m));
-        }
-        None => {
-            args.push("-v".into());
-            args.push(format!("{}:{}", project_path.display(), workspace_folder));
-        }
+        Some(m) => spec.mounts.push(vars.apply(&m)),
+        None => spec.binds.push((
+            project_path.display().to_string(),
+            workspace_folder.to_string(),
+        )),
     }
-    args.push("-w".into());
-    args.push(workspace_folder.to_string());
-    args.extend(settings.to_args());
-    args.extend(
-        user_args
-            .unwrap_or_default()
-            .into_iter()
-            .map(|a| vars.apply(&a)),
-    );
-    args
+    settings.apply(&mut spec);
+    spec.engine_args = user_args
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| vars.apply(&a))
+        .collect();
+    spec
 }
 
 // ── construction from devcontainer.json ────────────────────────────────────────
@@ -370,7 +369,8 @@ fn container_backend(
         container_user,
         published_ports: parse_app_ports(create.app_port),
     };
-    let run_args = build_run_args(
+    let run = build_run_spec(
+        &name,
         create.run_args,
         create.workspace_mount,
         &settings,
@@ -392,7 +392,7 @@ fn container_backend(
         backend: Box::new(ContainerBackend {
             name,
             source: image_source,
-            run_args,
+            run,
             override_command: create.override_command.unwrap_or(true),
         }),
         hash_extra,
@@ -441,9 +441,10 @@ mod tests {
     use crate::host::local;
 
     #[test]
-    fn user_run_args_come_last_so_they_can_override() {
+    fn the_run_spec_has_the_workspace_the_settings_and_the_user_args_last() {
         let p = Path::new("/home/me/proj");
-        let args = build_run_args(
+        let spec = build_run_spec(
+            "lodge-proj",
             Some(vec!["--cap-drop=ALL".into()]),
             None,
             &CreateSettings {
@@ -455,18 +456,63 @@ mod tests {
             "/workspaces/proj",
         );
         assert_eq!(
-            args,
-            [
-                "--label",
-                "dev.lodge.project=/home/me/proj",
-                "-v",
-                "/home/me/proj:/workspaces/proj",
-                "-w",
-                "/workspaces/proj",
-                "--privileged",
-                "--cap-drop=ALL"
-            ]
+            spec,
+            RunSpec {
+                name: "lodge-proj".into(),
+                labels: vec![("dev.lodge.project".into(), "/home/me/proj".into())],
+                workdir: Some("/workspaces/proj".into()),
+                binds: vec![("/home/me/proj".into(), "/workspaces/proj".into())],
+                privileged: true,
+                engine_args: vec!["--cap-drop=ALL".into()],
+                ..Default::default()
+            }
         );
+    }
+
+    #[test]
+    fn a_container_is_created_from_the_spec_plus_what_features_add_and_kept_alive() {
+        use crate::runtime::fake::{FakeEnv, FakeRuntime};
+        let rt = FakeRuntime::new(FakeEnv::new);
+        let backend = |override_command| ContainerBackend {
+            name: "lodge-p".into(),
+            source: ImageSource::Image("img:1".into()),
+            run: RunSpec {
+                name: "lodge-p".into(),
+                cap_add: vec!["A".into()],
+                ..Default::default()
+            },
+            override_command,
+        };
+        let features = CreateSettings {
+            cap_add: vec!["B".into()],
+            ..Default::default()
+        };
+        backend(true).up(&rt, None, false, &features).unwrap();
+        let spec = &rt.runs()[0];
+        assert_eq!(spec.image, "img:1");
+        assert_eq!(spec.cap_add, ["A", "B"]);
+        assert_eq!(spec.command, ["sleep", "infinity"]);
+
+        backend(false)
+            .up(&rt, Some("lodge-p"), true, &features)
+            .unwrap();
+        assert!(rt.runs()[1].command.is_empty(), "the image's own command");
+    }
+
+    #[test]
+    fn a_workspace_mount_replaces_the_default_bind() {
+        let p = Path::new("/home/me/proj");
+        let spec = build_run_spec(
+            "n",
+            None,
+            Some("type=bind,source=${localWorkspaceFolder},target=/w".into()),
+            &CreateSettings::default(),
+            &Vars::new(p),
+            p,
+            "/w",
+        );
+        assert!(spec.binds.is_empty());
+        assert_eq!(spec.mounts, ["type=bind,source=/home/me/proj,target=/w"]);
     }
 
     #[test]

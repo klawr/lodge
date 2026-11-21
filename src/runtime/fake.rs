@@ -28,8 +28,8 @@ use std::path::Path;
 use std::rc::Rc;
 
 use super::{
-    BuildSpec, Compose, Container, ContainerUser, Containers, Env, ExecOpts, Listed, Output,
-    Runtime, User,
+    BuildSpec, Compose, Container, ContainerUser, Containers, Env, ExecOpts, Listed, Output, Reach,
+    RunSpec, Runtime, User,
 };
 use crate::tree::{self, Denied, Links};
 
@@ -61,6 +61,8 @@ pub struct FakeEnv {
     owners: RefCell<HashMap<String, (u32, u32)>>,
     /// Every command run, with whom it ran as.
     calls: RefCell<Vec<(Vec<String>, Who)>>,
+    /// How [`Container::reach`] answers, by peer (`None`: the container itself).
+    reach: HashMap<Option<String>, Reach>,
 }
 
 impl FakeEnv {
@@ -73,7 +75,15 @@ impl FakeEnv {
             modes: RefCell::default(),
             owners: RefCell::default(),
             calls: RefCell::default(),
+            reach: HashMap::new(),
         }
+    }
+
+    /// Makes the container reachable at `reach` (for `peer`, a peer by name;
+    /// `None` is the container itself). Any other peer is not found.
+    pub fn with_reach(mut self, peer: Option<&str>, reach: Reach) -> Self {
+        self.reach.insert(peer.map(str::to_string), reach);
+        self
     }
 
     /// Makes the exact command `argv` print `stdout` and succeed.
@@ -355,6 +365,7 @@ pub struct FakeRuntime {
     /// Compose projects that are up.
     projects: RefCell<Vec<String>>,
     ops: RefCell<Vec<String>>,
+    runs: RefCell<Vec<RunSpec>>,
 }
 
 impl FakeRuntime {
@@ -365,6 +376,7 @@ impl FakeRuntime {
             containers: RefCell::default(),
             projects: RefCell::default(),
             ops: RefCell::default(),
+            runs: RefCell::default(),
         }
     }
 
@@ -387,6 +399,11 @@ impl FakeRuntime {
             .with_context(|| format!("no such container: {id}"))?;
         c.running.set(running);
         Ok(())
+    }
+
+    /// What each container created so far was asked to be.
+    pub fn runs(&self) -> Vec<RunSpec> {
+        self.runs.borrow().clone()
     }
 
     /// The engine operations so far.
@@ -467,11 +484,13 @@ impl Runtime for FakeRuntime {
         Ok(())
     }
 
-    fn run_detached(&self, name: &str, _: &[String], _: &str, _: &[&str]) -> Result<()> {
+    fn run_detached(&self, spec: &RunSpec) -> Result<()> {
+        let name = spec.name.as_str();
         if self.exists(name).is_ok() {
             anyhow::bail!("the container name {name} is already in use");
         }
         self.op(format!("run {name}"));
+        self.runs.borrow_mut().push(spec.clone());
         self.containers
             .borrow_mut()
             .insert(name.to_string(), self.create());
@@ -626,12 +645,8 @@ impl Container for FakeContainer {
         self.fake.env.read_file(path)
     }
 
-    fn ip_address(&self) -> Option<String> {
-        None
-    }
-
-    fn resolve_peer(&self, _host: &str) -> Option<String> {
-        None
+    fn reach(&self, peer: Option<&str>) -> Option<Reach> {
+        self.fake.env.reach.get(&peer.map(str::to_string)).cloned()
     }
 }
 

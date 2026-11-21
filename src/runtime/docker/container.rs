@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 
 use super::DockerCli;
 use crate::host::Repeat;
-use crate::runtime::{Container, ContainerUser, Env, ExecOpts, Output, User};
+use crate::runtime::{Container, ContainerUser, Env, ExecOpts, Output, Reach, User};
 
 /// One container, driven through the docker CLI.
 pub struct DockerContainer {
@@ -246,6 +246,17 @@ impl Container for DockerContainer {
         self.copy_out(path)
     }
 
+    fn reach(&self, peer: Option<&str>) -> Option<Reach> {
+        match peer {
+            None => self.ip_address(),
+            Some(host) => self.resolve_peer(host),
+        }
+        .map(Reach::Address)
+    }
+}
+
+impl DockerContainer {
+    /// The container's address on its first network.
     fn ip_address(&self) -> Option<String> {
         let out = self.cli.capture_ok(&[
             "inspect",

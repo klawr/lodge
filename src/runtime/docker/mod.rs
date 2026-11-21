@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use super::{BuildSpec, Compose, Container, Containers, Listed, Runtime};
+use super::{BuildSpec, Compose, Container, Containers, Listed, RunSpec, Runtime};
 use crate::host::{HostRef, Repeat};
 
 mod container;
@@ -160,6 +160,44 @@ fn docker_argv<'a>(args: &[&'a str]) -> Vec<&'a str> {
     v
 }
 
+/// The `docker run` flags for `spec`, ahead of the image. `engine_args` come
+/// last, so they can override the rest.
+fn run_flags(spec: &RunSpec) -> Vec<String> {
+    let mut args = Vec::new();
+    for (k, v) in &spec.labels {
+        args.extend(["--label".into(), format!("{k}={v}")]);
+    }
+    for (source, target) in &spec.binds {
+        args.extend(["-v".into(), format!("{source}:{target}")]);
+    }
+    for mount in &spec.mounts {
+        args.extend(["--mount".into(), mount.clone()]);
+    }
+    if let Some(dir) = &spec.workdir {
+        args.extend(["-w".into(), dir.clone()]);
+    }
+    if spec.privileged {
+        args.push("--privileged".into());
+    }
+    if spec.init {
+        args.push("--init".into());
+    }
+    for cap in &spec.cap_add {
+        args.extend(["--cap-add".into(), cap.clone()]);
+    }
+    for opt in &spec.security_opt {
+        args.extend(["--security-opt".into(), opt.clone()]);
+    }
+    if let Some(user) = &spec.user {
+        args.extend(["-u".into(), user.clone()]);
+    }
+    for port in &spec.publish {
+        args.extend(["-p".into(), port.clone()]);
+    }
+    args.extend(spec.engine_args.iter().cloned());
+    args
+}
+
 impl Runtime for DockerCli {
     fn container(&self, id: &str) -> Box<dyn Container> {
         Box::new(DockerContainer {
@@ -227,17 +265,13 @@ impl Runtime for DockerCli {
         self.run_with(|| self.command_in(None, &args), &args, Repeat::Safe)
     }
 
-    fn run_detached(
-        &self,
-        name: &str,
-        run_args: &[String],
-        image: &str,
-        command: &[&str],
-    ) -> Result<()> {
+    fn run_detached(&self, spec: &RunSpec) -> Result<()> {
+        let name = spec.name.as_str();
+        let flags = run_flags(spec);
         let mut args: Vec<&str> = vec!["run", "-d", "--name", name];
-        args.extend(run_args.iter().map(String::as_str));
-        args.push(image);
-        args.extend_from_slice(command);
+        args.extend(flags.iter().map(String::as_str));
+        args.push(&spec.image);
+        args.extend(spec.command.iter().map(String::as_str));
         // `docker run` is not repeatable as such: a second one fails on the name
         // the first took, if it got that far. So a try after a lost connection
         // first looks for the container, and starts what it finds (it may have
@@ -351,7 +385,50 @@ fn parse_listed(out: &str) -> Vec<Listed> {
 
 #[cfg(test)]
 mod tests {
-    use super::{docker_argv, parse_listed, subcommand};
+    use super::{RunSpec, docker_argv, parse_listed, run_flags, subcommand};
+
+    #[test]
+    fn a_run_spec_becomes_docker_flags_with_the_pass_through_ones_last() {
+        let spec = RunSpec {
+            labels: vec![("a".into(), "b".into())],
+            binds: vec![("/src".into(), "/dst".into())],
+            mounts: vec!["type=volume,source=v,target=/d".into()],
+            workdir: Some("/w".into()),
+            privileged: true,
+            init: true,
+            cap_add: vec!["SYS_PTRACE".into()],
+            security_opt: vec!["seccomp=unconfined".into()],
+            user: Some("dev".into()),
+            publish: vec!["127.0.0.1:3000:3000".into()],
+            engine_args: vec!["--cap-drop=ALL".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            run_flags(&spec),
+            [
+                "--label",
+                "a=b",
+                "-v",
+                "/src:/dst",
+                "--mount",
+                "type=volume,source=v,target=/d",
+                "-w",
+                "/w",
+                "--privileged",
+                "--init",
+                "--cap-add",
+                "SYS_PTRACE",
+                "--security-opt",
+                "seccomp=unconfined",
+                "-u",
+                "dev",
+                "-p",
+                "127.0.0.1:3000:3000",
+                "--cap-drop=ALL"
+            ]
+        );
+        assert!(run_flags(&RunSpec::default()).is_empty());
+    }
 
     #[test]
     fn parses_listed_containers() {

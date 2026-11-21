@@ -5,8 +5,8 @@
 //! - [`Env`]: a place you can run commands in and copy files into. Injection,
 //!   features, lifecycle hooks and the stored config hash only need this, so
 //!   they work the same for a container, and later for a plain host.
-//! - [`Container`]: an `Env` that can also be inspected (name, mounts, address,
-//!   files even while stopped). Port forwarding, workdir selection, drift and
+//! - [`Container`]: an `Env` that can also be inspected (name, mounts, how to
+//!   reach its ports, files even while stopped). Port forwarding, workdir selection, drift and
 //!   status need this.
 //! - [`Runtime`]: the engine itself: find, build, run, start, stop. Devcontainer
 //!   backends need this.
@@ -51,6 +51,24 @@ pub const READ_FILE_SCRIPT: &str = "if [ -f \"$1\" ]; then printf y; cat \"$1\";
 /// The script behind [`Env::exists`]: `$1` is the path. Prints `y` or `n` and
 /// exits 0 either way, so a non-zero exit means the check itself failed.
 pub const EXISTS_SCRIPT: &str = "if [ -e \"$1\" ]; then printf y; else printf n; fi";
+
+/// The script behind [`Env::can_run_in`]: `$1` is a directory; `$2` is `own` when
+/// the caller must own it (a shared `/tmp` is not trusted otherwise). Makes the
+/// directory, refuses a symlink, and checks that a script can be written there
+/// and run from there (a `noexec` mount refuses the run even when the write
+/// works). Exits 0 only if all of that works.
+pub const RUN_PROBE_SCRIPT: &str = r#"d=$1
+mkdir -p "$d" 2>/dev/null || exit 1
+[ -d "$d" ] && [ ! -L "$d" ] || exit 1
+if [ "$2" = own ]; then
+  [ -O "$d" ] && chmod 700 "$d" 2>/dev/null || exit 1
+fi
+t="$d/.probe.$$"
+printf '#!/bin/sh\nexit 0\n' > "$t" 2>/dev/null || exit 1
+chmod +x "$t" 2>/dev/null || { rm -f "$t"; exit 1; }
+"$t" 2>/dev/null; r=$?
+rm -f "$t"
+exit $r"#;
 
 /// How a command is run: as whom, from where, with what extra environment.
 #[derive(Debug, Default, Clone, Copy)]
@@ -132,6 +150,19 @@ pub trait Env {
     /// running `inner` (a `sh -c` script) as `user` from `workdir`. Built afresh
     /// on each call, so a session can be started again.
     fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> Command;
+
+    /// Whether `user` can write a program into `dir` (made if need be) and run it
+    /// from there; with `private`, also that `user` owns `dir`, which is then
+    /// made owner-only (a shared directory is not trusted otherwise). An error
+    /// means it could not be found out, which is not "no". This is a capability:
+    /// the default asks by trying, which any environment that can run commands
+    /// can do; one that knows better (a read-only root, say) overrides it.
+    fn can_run_in(&self, dir: &str, private: bool, user: &ContainerUser) -> Result<bool> {
+        let mode = if private { "own" } else { "any" };
+        let opts = ExecOpts::as_user(user.exec_as()).repeatable();
+        let out = self.output(&script_argv(RUN_PROBE_SCRIPT, &[dir, mode]), &opts)?;
+        Ok(out.success)
+    }
 
     /// Who the provided helpers below act as, and who owns what they create:
     /// root, unless this is an [`Acting`] view of another user.
@@ -280,6 +311,10 @@ impl Env for Acting<'_> {
         self.env.interactive_command(user, workdir, inner)
     }
 
+    fn can_run_in(&self, dir: &str, private: bool, user: &ContainerUser) -> Result<bool> {
+        self.env.can_run_in(dir, private, user)
+    }
+
     fn actor(&self) -> ContainerUser {
         self.user.clone()
     }
@@ -310,17 +345,43 @@ pub trait Container: Env {
     /// Read through the engine, so it works for a stopped container.
     fn configured_user(&self) -> Option<String>;
 
-    /// The container's address on its first network, reachable from the host
-    /// that runs the engine.
-    fn ip_address(&self) -> Option<String>;
-
-    /// Resolves a peer by name (a compose service, container name or network
-    /// alias) to an address reachable from the engine host.
-    fn resolve_peer(&self, host: &str) -> Option<String>;
+    /// How to reach this container's ports (`peer` is `None`), or a peer's (a
+    /// compose service, container name or network alias), from the host that
+    /// runs the engine; `None` when that can't be told (not up yet). Asked
+    /// again over time, because a restarted container may come back elsewhere.
+    fn reach(&self, peer: Option<&str>) -> Option<Reach>;
 
     /// The name to show for it: its name, or its id when it has none.
     fn display_name(&self) -> String {
         self.name().unwrap_or_else(|| self.id().to_string())
+    }
+}
+
+/// How the ports of a container can be reached from the host that runs its
+/// engine. What a forward does with it (the built-in proxy, or the host's own
+/// tunnel) is decided from the host, not from the answer. A published port or a
+/// `port-forward` is another variant, added with the engine that needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reach {
+    /// Every port the container listens on is open at this address (an IP on
+    /// the container network).
+    Address(String),
+}
+
+impl Reach {
+    /// `host:port` to connect to for `port` of the container.
+    pub fn destination(&self, port: u16) -> String {
+        match self {
+            Reach::Address(ip) => format!("{ip}:{port}"),
+        }
+    }
+}
+
+impl std::fmt::Display for Reach {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Reach::Address(ip) => f.write_str(ip),
+        }
     }
 }
 
@@ -332,6 +393,35 @@ pub struct BuildSpec {
     pub stage: Option<String>,
     pub args: BTreeMap<String, String>,
     pub tag: String,
+}
+
+/// A container to create and start, in terms every engine has. An engine turns
+/// it into its own flags or API calls; nothing outside it spells those.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RunSpec {
+    pub name: String,
+    pub image: String,
+    /// Replaces the image's own command; empty keeps it.
+    pub command: Vec<String>,
+    pub labels: Vec<(String, String)>,
+    pub workdir: Option<String>,
+    /// Bind mounts, as (source on the engine's host, target in the container).
+    pub binds: Vec<(String, String)>,
+    /// Mounts in the devcontainer spec's own syntax
+    /// (`type=bind,source=/a,target=/b`).
+    pub mounts: Vec<String>,
+    pub privileged: bool,
+    pub init: bool,
+    pub cap_add: Vec<String>,
+    pub security_opt: Vec<String>,
+    /// The user to run as (`-u`): a name, uid or `user:group`.
+    pub user: Option<String>,
+    /// Published ports as `[ip:]host:container`.
+    pub publish: Vec<String>,
+    /// Arguments for the engine's own command line, passed through after all
+    /// the above so they can override them: a devcontainer's `runArgs`, which
+    /// the spec defines as the engine's CLI flags.
+    pub engine_args: Vec<String>,
 }
 
 /// Which containers a lookup considers.
@@ -390,15 +480,8 @@ pub trait Runtime {
     /// Builds an image. Reads the build context on the engine's host.
     fn build_image(&self, spec: &BuildSpec) -> Result<()>;
 
-    /// Creates and starts a detached container. `run_args` are engine CLI flags
-    /// (a devcontainer's `runArgs` are passed through).
-    fn run_detached(
-        &self,
-        name: &str,
-        run_args: &[String],
-        image: &str,
-        command: &[&str],
-    ) -> Result<()>;
+    /// Creates and starts a detached container.
+    fn run_detached(&self, spec: &RunSpec) -> Result<()>;
 
     fn start(&self, id: &str) -> Result<()>;
     fn stop(&self, id: &str) -> Result<()>;
@@ -515,6 +598,43 @@ mod tests {
         let acting = Acting::new(&env, &user);
         acting.mkdir_p(&["/x"]).unwrap();
         assert_eq!(env.ran_as(&["mkdir", "-p", "/x"]), Some(Who::Default));
+    }
+
+    /// An environment that answers [`Env::can_run_in`] itself and can run nothing.
+    struct Sealed;
+
+    impl Env for Sealed {
+        fn exec(&self, _: &[&str], _: &ExecOpts) -> anyhow::Result<()> {
+            unreachable!("nothing runs here")
+        }
+        fn output(&self, _: &[&str], _: &ExecOpts) -> anyhow::Result<super::Output> {
+            unreachable!("nothing runs here")
+        }
+        fn put(&self, _: &str, _: &str, _: &ContainerUser) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn write_secret(&self, _: &str, _: &[u8], _: u32, _: User) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        fn interactive_command(&self, _: User, _: &str, _: &str) -> std::process::Command {
+            unreachable!()
+        }
+        fn can_run_in(
+            &self,
+            dir: &str,
+            private: bool,
+            user: &ContainerUser,
+        ) -> anyhow::Result<bool> {
+            Ok(dir == "/opt" && !private && user.name == "dev")
+        }
+    }
+
+    #[test]
+    fn an_acting_env_leaves_the_capability_to_the_env_it_wraps() {
+        let user = dev();
+        let acting = Acting::new(&Sealed, &user);
+        assert!(acting.can_run_in("/opt", false, &user).unwrap());
+        assert!(!acting.can_run_in("/opt", true, &user).unwrap());
     }
 
     #[test]

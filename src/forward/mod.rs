@@ -15,6 +15,7 @@ use crate::host::Host;
 use crate::runtime::Runtime;
 
 pub use daemon::run_daemon;
+pub use tunnel::HostForwarders;
 
 use crate::port::PortForward;
 

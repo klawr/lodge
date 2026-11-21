@@ -9,9 +9,15 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use crate::host::Host;
+
+macro_rules! log {
+    ($($arg:tt)*) => { $crate::output::scoped!("lodge forward", $($arg)*) };
+}
+
 // ── Forwarder ─────────────────────────────────────────────────────────────────
 
-pub(super) enum Forwarder {
+enum Forwarder {
     Proxy(ProxyHandle),
     Tunnel {
         child: Child,
@@ -23,34 +29,72 @@ pub(super) enum Forwarder {
     },
 }
 
-impl Forwarder {
+/// One running forward. Dropping it stops it.
+pub trait Forward {
     /// `local<TAB>dest`, for the ports file.
-    pub(super) fn describe(&self) -> String {
-        match self {
-            Forwarder::Proxy(h) => format!("{}\t{}", h.bound.port(), h.dest),
-            Forwarder::Tunnel { local, dest, .. } => format!("{local}\t{dest}"),
-        }
-    }
+    fn describe(&self) -> String;
 
     /// Where it forwards to: `ip:port` as reachable from the engine's host.
-    pub(super) fn dest(&self) -> &str {
-        match self {
-            Forwarder::Proxy(h) => &h.dest,
-            Forwarder::Tunnel { dest, .. } => dest,
-        }
+    fn dest(&self) -> &str;
+
+    /// How long a host tunnel has been running, `None` for one with no
+    /// connection to lose (the in-process proxy).
+    fn ran_for(&self) -> Option<Duration>;
+
+    /// Whether it still forwards. One that can't be asked counts as dead, so it
+    /// is replaced.
+    fn is_alive(&mut self) -> bool;
+}
+
+/// Starts forwards from a local port to an address on the engine's network.
+pub trait Forwarders {
+    /// Forwards `127.0.0.1:local` to `dest` (`ip:port`, reachable from the
+    /// engine's host).
+    fn start(&self, local: u16, dest: &str) -> std::io::Result<Box<dyn Forward>>;
+
+    /// `" on <host>"` for a forward that runs on another machine, for the log.
+    fn on_host(&self) -> String {
+        String::new()
+    }
+}
+
+/// The forwards a [`Host`] provides: its own tunnel process when what the engine
+/// reaches is not reachable from here (`ssh -L`), else the built-in proxy.
+pub struct HostForwarders<'a> {
+    host: &'a dyn Host,
+}
+
+impl<'a> HostForwarders<'a> {
+    pub fn new(host: &'a dyn Host) -> Self {
+        Self { host }
+    }
+}
+
+impl Forwarders for HostForwarders<'_> {
+    fn start(&self, local: u16, dest: &str) -> std::io::Result<Box<dyn Forward>> {
+        let forward = if let Some(cmd) = self.host.tunnel(local, dest) {
+            log!("port {local} — tunnel to {dest}{}", self.on_host());
+            Forwarder::tunnel(cmd, local, dest)?
+        } else {
+            log!("port {local} — proxy 127.0.0.1:{local} → {dest}");
+            Forwarder::proxy(local, dest.to_string())?
+        };
+        Ok(Box::new(forward))
     }
 
+    fn on_host(&self) -> String {
+        self.host.on_host()
+    }
+}
+
+impl Forwarder {
     // `dest` is "ip:port" as reachable from the engine's host.
-    pub(super) fn proxy(local: u16, dest: String) -> std::io::Result<Self> {
+    fn proxy(local: u16, dest: String) -> std::io::Result<Self> {
         ProxyHandle::spawn(local, dest).map(Forwarder::Proxy)
     }
 
     /// `cmd` is the host's own tunnel process for `local` to `dest`.
-    pub(super) fn tunnel(
-        mut cmd: std::process::Command,
-        local: u16,
-        dest: &str,
-    ) -> std::io::Result<Self> {
+    fn tunnel(mut cmd: std::process::Command, local: u16, dest: &str) -> std::io::Result<Self> {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             // With --verbose, let the tunnel's own chatter land in the daemon log.
@@ -67,20 +111,33 @@ impl Forwarder {
             since: Instant::now(),
         })
     }
+}
 
-    /// How long a host tunnel has been running, `None` for the in-process proxy
-    /// (which has no connection to lose).
-    pub(super) fn ran_for(&self) -> Option<Duration> {
+impl Forward for Forwarder {
+    fn describe(&self) -> String {
+        match self {
+            Forwarder::Proxy(h) => format!("{}\t{}", h.bound.port(), h.dest),
+            Forwarder::Tunnel { local, dest, .. } => format!("{local}\t{dest}"),
+        }
+    }
+
+    fn dest(&self) -> &str {
+        match self {
+            Forwarder::Proxy(h) => &h.dest,
+            Forwarder::Tunnel { dest, .. } => dest,
+        }
+    }
+
+    fn ran_for(&self) -> Option<Duration> {
         match self {
             Forwarder::Proxy(_) => None,
             Forwarder::Tunnel { since, .. } => Some(since.elapsed()),
         }
     }
 
-    pub(super) fn is_alive(&mut self) -> bool {
+    fn is_alive(&mut self) -> bool {
         match self {
             Forwarder::Proxy(h) => !h.stop.load(Ordering::Relaxed),
-            // A tunnel we can't query is treated as dead, so it is replaced.
             Forwarder::Tunnel { child, .. } => {
                 child.try_wait().map(|s| s.is_none()).unwrap_or(false)
             }

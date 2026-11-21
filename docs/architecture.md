@@ -65,7 +65,7 @@ every subcommand.
 | `layout.rs` | Every path lodge writes inside a container: `Layout`, the paths inside the user's prefix (the table under "What lives where"); the provisioning state, which is the devcontainer's own and root-owned; and the secrets directory. Nothing else spells these paths out. |
 | `secret/` | Secrets that must not be in a bundle. Their `[[secret]]` declarations are config (`config/secret.rs`: validated; names reach shell scripts). `mod` is the `Secret` value type (redacted `Debug`, no `Display`), matching `targets` globs, and `resolve` (env, file or a command run on *this* machine with a timeout, with errors that never contain the value). `place` writes values into a container under `/dev/shm/lodge-secrets-<uid>/` and builds the session lines that export them; `clear` removes the user's (`ldg clean`). `deliver` picks the secrets whose `targets` match, resolves and places them (or clears them when none are declared), and prints names only. |
 | `session/` | Opens the interactive session: `docker exec -it`, and nothing around it; after a lost `--remote` connection it offers to reconnect. Its start-up script (`startup_script`) starts the shell as a login shell, so the profile scripts run, then puts the user's prefix `bin/` first on `PATH` and restores what the profile dropped before running the shell interactively; that is how the injected tools reach the session without any file outside the prefix. `terminfo` makes the terminal the session is opened from work in the container (copies its entry from this machine into the prefix when the container lacks it, and sets `TERM`). |
-| `forward/` | Port forwarding. `mod` spawns the daemon and owns its state files (log, lock, and the ports file `ldg ports` reads, which starts with the daemon's pid so a dead daemon's file is ignored), `daemon` is the `_forward` loop (declared ports plus whatever starts listening), `tunnel` one forward: the in-process TCP proxy, or the tunnel process the `Host` provides (`ssh -L` for `SshHost`). The daemon decodes its own `--port` flags, re-points a forward when its destination's address changes (looked up again every 30 s), and exits when the container stops, not when the engine merely can't be reached for a while. |
+| `forward/` | Port forwarding. `mod` spawns the daemon and owns its state files (log, lock, and the ports file `ldg ports` reads, which starts with the daemon's pid so a dead daemon's file is ignored), `daemon` is the `_forward` loop (declared ports plus whatever starts listening), `tunnel` one forward behind the `Forward` and `Forwarders` traits: `HostForwarders` starts the tunnel process the `Host` provides (`ssh -L` for `SshHost`) or else the in-process TCP proxy; the daemon's start, restart, re-point and cooldown logic is tested with a fake `Forwarders`. The daemon decodes its own `--port` flags, re-points a forward when its destination's address changes (looked up again every 30 s), and exits when the container stops, not when the engine merely can't be reached for a while. |
 | `port.rs` | `PortForward`, a port to forward: what the devcontainer spec declares and the daemon carries out, so neither depends on the other. |
 | `tools/` | The build-time helpers behind interfaces: `DepReader` (which libraries a binary needs), `ElfEditor` (relink a copy of a binary for the bundle's prefix) and `OciFetcher` (pull a feature's layer), bundled as a `Toolchain` that `cmd::run` builds. `external` has the implementations that run the programs (`Ldd`, `Patchelf`, `Oras`, parsing `ldd`'s output); a native one is one more type. Packing, the bundle cache and feature fetching take the interfaces and are tested with fakes. |
 | `host_tools.rs` | The helper programs lodge may run here (`ssh`, `ldd`, `patchelf`, `oras`): what each is needed for (a `Need`, which decides when `doctor` requires it) and how to get it. `doctor` reports from this table and each tool is started only through it (the `tools` implementations and `host/ssh.rs`). |
@@ -87,7 +87,7 @@ every subcommand.
 | `mod.rs` | `start` / `stop` / `remove` / `status` / `find`, the `Started` result, whether the container was created, and `Prompt`, the questions only a person can answer (the command layer implements it). Drift and the installed bundle are read with `Container::read_stored_file`, which works on a stopped container too. |
 | `spec.rs` | Find the config on the project's host (through `Host`, so every host shares one lookup order); parse `devcontainer.json` (JSONC) into a backend-agnostic `Spec`; derive the session name. |
 | `backend.rs` | Picks and builds the backend from the parsed config (with the stable container name, and the files outside the hashed folder that count toward drift: a Dockerfile, compose files). The `Backend` trait with two implementations: `ComposeBackend` (`docker compose`, run on the project's host) and `ContainerBackend` (`docker run` of an image or a local build). Both label the container `dev.lodge.project=<path>`. |
-| `create.rs` | `CreateSettings`, how a container is created (privileged, capabilities, mounts, published `appPort`s, …), from devcontainer.json and from features alike, rendered as `docker run` flags or a compose override. |
+| `create.rs` | `CreateSettings`, how a container is created (privileged, capabilities, mounts, published `appPort`s, …), from devcontainer.json and from features alike, applied to a `runtime::RunSpec` (the engine-neutral description of a container; `runtime/docker` renders it as `docker run` flags, and a devcontainer's `runArgs` ride along in `engine_args`, last, because the spec defines them as the engine's own flags) or rendered as a compose override (compose-file YAML, which is not docker's). |
 | `features/` | Devcontainer *features*: `fetch` (OCI with `oras`, or a local folder from the project's host; a feature's `id` must be a plain name, since it names a folder), and in `mod.rs` the order, the creation settings they ask for, and the install (as root, told `_REMOTE_USER`), with one env profile per feature. |
 | `lifecycle.rs` | The `Hook` type (string / argv / named map, all run as the same steps), running hooks on the host or in the container (as `remoteUser`), and the create-time hooks that run once successfully (`run_create_hooks`). |
 | `profile.rs` | The env profiles written into the container (`containerEnv`/`remoteEnv`, and what features add): literals quoted, variable references left for the login shell. |
@@ -308,8 +308,8 @@ small traits from narrow to broad, plus one for compose:
 | Trait | A… | Used by |
 |---|---|---|
 | `Env` | place you can run commands in and copy files into | injection, features, lifecycle hooks, markers, the stored config hash |
-| `Container: Env` | `Env` that can also be inspected (name, mounts, address, peers, running: `Result<bool>`, so "stopped" and "couldn't ask" differ) and read while stopped (`read_stored_file`, through `docker cp`) | port forwarding, workdir selection, the session, drift, `ldg status` |
-| `Runtime` | container engine: find, build, run, start, stop | devcontainer backends, `start`/`stop` |
+| `Container: Env` | `Env` that can also be inspected (name, mounts, `reach`, running: `Result<bool>`, so "stopped" and "couldn't ask" differ) and read while stopped (`read_stored_file`, through `docker cp`) | port forwarding, workdir selection, the session, drift, `ldg status` |
+| `Runtime` | container engine: find, build (`BuildSpec`), run (`RunSpec`), start, stop | devcontainer backends, `start`/`stop` |
 | `Compose` | an engine's compose support (`Runtime::compose()`, an error where there is none): up, down, ps | the compose backend, `doctor` |
 
 `Env` carries the primitives (`exec`, `output`, `put`, plus `write_secret` and
@@ -322,6 +322,21 @@ layout: markers, hashes and profiles live in the modules that use them. An
 `Env` doesn't say whether it is local or remote either; code that needs to
 know (matching a secret's `targets`, diagnosing a refused PTY) is handed the
 `Host` by the command and asks it (`names`, `pty_denied`).
+
+**Capabilities.** Generic code never asks an engine's name; it asks the
+endpoint, through methods with a default that an implementation may override:
+
+| Question | Where | Docker's answer |
+|---|---|---|
+| Can this user write and run a program in a directory? (`inject/prefix` picks the home, else a private `/tmp` directory) | `Env::can_run_in`, by default a probe script run as that user | the default |
+| How do I reach the container's ports, or a peer's, from the engine's host? (the forwarder) | `Container::reach` -> `Reach` (today `Address`: an IP on the container network; the forwarder then uses the host's tunnel or the built-in proxy) | its first network's IP; a peer by container DNS, else by network |
+| How do files get in? | `Env::put`, below | an in-process tar to `docker cp` |
+
+Left for the Podman step, which is what needs them: whether the filesystem is
+shared with other things (stricter idempotency on a plain host), and uid mapping
+and mount labels. Both are decided when a container is *provisioned*
+(`Runtime::run_detached` arguments, `devcontainer/uid.rs`), no generic code reads
+them yet, and a query with no caller would be a guess.
 
 `put` behaves the same on every endpoint: a file becomes `dest`, and a
 directory's *contents* are merged into `dest`; every missing directory down to

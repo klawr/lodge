@@ -3,43 +3,25 @@
 //! The user's home when it can hold programs, else a private directory in
 //! `/tmp`. "Can hold programs" is tested the only reliable way: write a tiny
 //! script there and run it, because a `noexec` mount (hardened hosts, some
-//! volumes) refuses the run even when the write works. Everything is done as the
-//! user, so what is chosen is somewhere that user can really use.
+//! volumes) refuses the run even when the write works. That is the environment's
+//! own capability ([`Env::can_run_in`]), asked as the user, so what is chosen is
+//! somewhere that user can really use.
 
 use anyhow::{Result, bail};
 
 use crate::layout::Layout;
 use crate::output::info;
-use crate::runtime::{Acting, ContainerUser, Env, ExecOpts};
-use crate::shell::script_argv;
-
-/// `$1` is a directory; `$2` is `own` when the caller must own it (a shared
-/// `/tmp` is not trusted otherwise). Makes the directory, refuses a symlink, and
-/// checks that a script can be written there and run from there. Exits 0 only if
-/// all of that works.
-pub(super) const PROBE_SCRIPT: &str = r#"d=$1
-mkdir -p "$d" 2>/dev/null || exit 1
-[ -d "$d" ] && [ ! -L "$d" ] || exit 1
-if [ "$2" = own ]; then
-  [ -O "$d" ] && chmod 700 "$d" 2>/dev/null || exit 1
-fi
-t="$d/.probe.$$"
-printf '#!/bin/sh\nexit 0\n' > "$t" 2>/dev/null || exit 1
-chmod +x "$t" 2>/dev/null || { rm -f "$t"; exit 1; }
-"$t" 2>/dev/null; r=$?
-rm -f "$t"
-exit $r"#;
+use crate::runtime::{ContainerUser, Env};
 
 /// The prefix to install into for `user`, made and checked. An error when
 /// neither the home nor `/tmp` can hold one, or when the target can't be asked.
 pub fn resolve(container: &dyn Env, user: &ContainerUser) -> Result<Layout> {
-    let env = Acting::new(container, user);
     let preferred = Layout::preferred(user);
-    if usable(&env, &preferred, false)? {
+    if container.can_run_in(preferred.prefix(), false, user)? {
         return Ok(preferred);
     }
     let fallback = Layout::fallback(user);
-    if usable(&env, &fallback, true)? {
+    if container.can_run_in(fallback.prefix(), true, user)? {
         info!(
             "{} can't hold programs for {}, so lodge uses {} instead",
             user.home,
@@ -58,19 +40,12 @@ pub fn resolve(container: &dyn Env, user: &ContainerUser) -> Result<Layout> {
     )
 }
 
-fn usable(env: &dyn Env, layout: &Layout, own: bool) -> Result<bool> {
-    let mode = if own { "own" } else { "any" };
-    let out = env.output(
-        &script_argv(PROBE_SCRIPT, &[layout.prefix(), mode]),
-        &ExecOpts::default().repeatable(),
-    )?;
-    Ok(out.success)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::RUN_PROBE_SCRIPT;
     use crate::runtime::fake::{FakeEnv, Who};
+    use crate::shell::script_argv;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
@@ -85,7 +60,7 @@ mod tests {
     }
 
     fn probe(prefix: &str, mode: &str) -> Vec<String> {
-        script_argv(PROBE_SCRIPT, &[prefix, mode])
+        script_argv(RUN_PROBE_SCRIPT, &[prefix, mode])
             .iter()
             .map(|s| s.to_string())
             .collect()
@@ -135,7 +110,7 @@ mod tests {
 
     fn run(dir: &std::path::Path, mode: &str) -> bool {
         let dir = dir.to_string_lossy();
-        let argv = script_argv(PROBE_SCRIPT, &[&dir, mode]);
+        let argv = script_argv(RUN_PROBE_SCRIPT, &[&dir, mode]);
         Command::new(argv[0])
             .args(&argv[1..])
             .status()

@@ -5,11 +5,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use super::tunnel::Forwarder;
+use super::tunnel::{Forward, Forwarders};
 use super::{acquire_lock, lock_path, ports_path, truncate_log, write_ports};
-use crate::host::Host;
 use crate::port::PortForward;
-use crate::runtime::{Container, ExecOpts, Runtime};
+use crate::runtime::{Container, ExecOpts, Reach, Runtime};
 
 /// A line in the daemon's log (its stderr).
 macro_rules! log {
@@ -37,8 +36,13 @@ const UNREACHABLE_POLLS: u32 = 150;
 /// can't be reached.
 ///
 /// `ports` are the declared forwards as `spawn_daemon` encoded them on the
-/// command line; `rt` is the engine on `host`.
-pub fn run_daemon(rt: &dyn Runtime, host: &dyn Host, container_id: &str, ports: &[String]) {
+/// command line; `rt` is the engine, and `forwarders` starts each forward.
+pub fn run_daemon(
+    rt: &dyn Runtime,
+    forwarders: &dyn Forwarders,
+    container_id: &str,
+    ports: &[String],
+) {
     let declared = decode_ports(ports);
     let (lock_file, ports_file) = match (lock_path(container_id), ports_path(container_id)) {
         (Ok(l), Ok(p)) => (l, p),
@@ -64,7 +68,7 @@ pub fn run_daemon(rt: &dyn Runtime, host: &dyn Host, container_id: &str, ports: 
         log!("could not start a new log ({e}); appending");
     }
     let container = rt.container(container_id);
-    let mut forwards = Forwards::new(container.as_ref(), host, ports_file);
+    let mut forwards = Forwards::new(container.as_ref(), forwarders, ports_file);
     let mut unreachable = 0;
 
     loop {
@@ -151,9 +155,9 @@ impl Cooldown {
 
 /// The forwarders kept for one container, and the ports file that reports them.
 struct Forwards<'a> {
-    host: &'a dyn Host,
+    forwarders: &'a dyn Forwarders,
     addresses: Addresses<'a>,
-    active: HashMap<u16, Forwarder>,
+    active: HashMap<u16, Box<dyn Forward>>,
     /// Local ports whose forwarder failed to start, so the retry every 2 s
     /// (likely failing the same way, e.g. host port occupied) doesn't spam the
     /// log.
@@ -168,13 +172,14 @@ struct Forwards<'a> {
 }
 
 impl<'a> Forwards<'a> {
-    fn new(container: &'a dyn Container, host: &'a dyn Host, ports_file: PathBuf) -> Self {
-        let lookup = move |host: Option<&str>| match host {
-            None => container.ip_address(),
-            Some(h) => container.resolve_peer(h),
-        };
+    fn new(
+        container: &'a dyn Container,
+        forwarders: &'a dyn Forwarders,
+        ports_file: PathBuf,
+    ) -> Self {
+        let lookup = move |peer: Option<&str>| container.reach(peer);
         Self {
-            host,
+            forwarders,
             addresses: Addresses::new(Box::new(lookup), REFRESH),
             active: HashMap::new(),
             failed: HashSet::new(),
@@ -190,8 +195,8 @@ impl<'a> Forwards<'a> {
     fn update(&mut self, wanted: HashMap<u16, PortForward>) {
         let mut dests = HashMap::new();
         for (&local, f) in &wanted {
-            if let Some(ip) = self.addresses.get(f.host.as_deref()) {
-                dests.insert(local, format!("{ip}:{}", f.port));
+            if let Some(reach) = self.addresses.get(f.host.as_deref()) {
+                dests.insert(local, reach.destination(f.port));
             }
         }
         let cooling = &mut self.cooling;
@@ -223,14 +228,7 @@ impl<'a> Forwards<'a> {
         if self.cooling.get(&local).is_some_and(|c| !c.over()) {
             return;
         }
-        let fwd = if let Some(cmd) = self.host.tunnel(local, &dest) {
-            log!("port {local} — tunnel to {dest}{}", self.host.on_host());
-            Forwarder::tunnel(cmd, local, &dest)
-        } else {
-            log!("port {local} — proxy 127.0.0.1:{local} → {dest}");
-            Forwarder::proxy(local, dest)
-        };
-        match fwd {
+        match self.forwarders.start(local, &dest) {
             Ok(fw) => {
                 log!("forwarding port {local}");
                 self.active.insert(local, fw);
@@ -246,7 +244,7 @@ impl<'a> Forwards<'a> {
 
     /// Rewrites the ports file when what is forwarded changed.
     fn publish(&mut self) {
-        let mut now: Vec<String> = self.active.values().map(Forwarder::describe).collect();
+        let mut now: Vec<String> = self.active.values().map(|f| f.describe()).collect();
         now.sort();
         if self.published.as_ref() != Some(&now) {
             if let Err(e) = write_ports(&self.ports_file, &now) {
@@ -262,18 +260,17 @@ impl<'a> Forwards<'a> {
     }
 }
 
-/// Looks up an address on the container network: the primary container's
-/// (`None`) or a peer's by name.
-type Lookup<'a> = Box<dyn Fn(Option<&str>) -> Option<String> + 'a>;
+/// Asks how to reach the primary container's ports (`None`) or a peer's by name.
+type Lookup<'a> = Box<dyn Fn(Option<&str>) -> Option<Reach> + 'a>;
 
-/// Addresses on the container network, as reachable from the engine's host:
-/// the primary container's (`None`) and its peers' by name. Each is looked up
+/// How the container's ports and its peers' can be reached from the engine's
+/// host: the primary container's (`None`) and its peers' by name. Each is looked up
 /// again after `refresh`, so a restarted container or service is followed; a
 /// failed lookup keeps the last known address.
 struct Addresses<'a> {
     lookup: Lookup<'a>,
     refresh: Duration,
-    known: HashMap<Option<String>, (String, Instant)>,
+    known: HashMap<Option<String>, (Reach, Instant)>,
     /// Names already reported as unresolvable (reported once).
     unresolved: HashSet<Option<String>>,
 }
@@ -288,7 +285,7 @@ impl<'a> Addresses<'a> {
         }
     }
 
-    fn get(&mut self, host: Option<&str>) -> Option<String> {
+    fn get(&mut self, host: Option<&str>) -> Option<Reach> {
         let key = host.map(str::to_string);
         if let Some((ip, at)) = self.known.get(&key)
             && at.elapsed() < self.refresh
@@ -298,13 +295,15 @@ impl<'a> Addresses<'a> {
         let found = (self.lookup)(host);
         let name = host.unwrap_or("the container");
         match found {
-            Some(ip) => {
-                let previous = self.known.insert(key.clone(), (ip.clone(), Instant::now()));
-                if previous.is_none_or(|(old, _)| old != ip) {
-                    log!("{name} is at {ip}");
+            Some(reach) => {
+                let previous = self
+                    .known
+                    .insert(key.clone(), (reach.clone(), Instant::now()));
+                if previous.is_none_or(|(old, _)| old != reach) {
+                    log!("{name} is at {reach}");
                 }
                 self.unresolved.remove(&key);
-                Some(ip)
+                Some(reach)
             }
             None => {
                 if self.unresolved.insert(key.clone()) {
@@ -312,7 +311,7 @@ impl<'a> Addresses<'a> {
                         "cannot find {name} on the container network (not up yet?); will keep trying"
                     );
                 }
-                self.known.get(&key).map(|(ip, _)| ip.clone())
+                self.known.get(&key).map(|(reach, _)| reach.clone())
             }
         }
     }
@@ -387,11 +386,17 @@ fn is_loopback_hex(addr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::fake::{FakeEnv, FakeRuntime};
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
 
     #[test]
     fn addresses_follow_a_move_and_survive_a_failed_lookup() {
+        fn at(ip: &str) -> Option<Reach> {
+            Some(Reach::Address(ip.into()))
+        }
         // The container and its peer `db`, at an address the test moves.
-        let ip = std::cell::RefCell::new(Some("10.0.0.2".to_string()));
+        let ip = std::cell::RefCell::new(at("10.0.0.2"));
         let lookup = || -> Lookup<'_> {
             Box::new(|host| match host {
                 None | Some("db") => ip.borrow().clone(),
@@ -400,24 +405,262 @@ mod tests {
         };
         let mut fresh = Addresses::new(lookup(), Duration::ZERO);
         let mut cached = Addresses::new(lookup(), Duration::from_secs(3600));
-        assert_eq!(fresh.get(None).as_deref(), Some("10.0.0.2"));
-        assert_eq!(cached.get(Some("db")).as_deref(), Some("10.0.0.2"));
+        assert_eq!(fresh.get(None), at("10.0.0.2"));
+        assert_eq!(cached.get(Some("db")), at("10.0.0.2"));
 
-        *ip.borrow_mut() = Some("10.0.0.9".into());
-        assert_eq!(fresh.get(None).as_deref(), Some("10.0.0.9"), "moved");
-        assert_eq!(
-            cached.get(Some("db")).as_deref(),
-            Some("10.0.0.2"),
-            "not yet due"
-        );
+        *ip.borrow_mut() = at("10.0.0.9");
+        assert_eq!(fresh.get(None), at("10.0.0.9"), "moved");
+        assert_eq!(cached.get(Some("db")), at("10.0.0.2"), "not yet due");
 
         *ip.borrow_mut() = None;
-        assert_eq!(
-            fresh.get(None).as_deref(),
-            Some("10.0.0.9"),
-            "last known kept"
-        );
+        assert_eq!(fresh.get(None), at("10.0.0.9"), "last known kept");
         assert_eq!(fresh.get(Some("nowhere")), None);
+    }
+
+    #[test]
+    fn a_forward_goes_to_the_port_on_the_address_the_container_says() {
+        let rt = FakeRuntime::new(FakeEnv::new).with_container(
+            "web",
+            FakeEnv::new()
+                .with_reach(None, Reach::Address("10.0.0.2".into()))
+                .with_reach(Some("db"), Reach::Address("10.0.0.7".into())),
+        );
+        let container = rt.container("web");
+        let fake = FakeForwarders::default();
+        let mut forwards = Forwards::new(container.as_ref(), &fake, PathBuf::new());
+        let own = forwards.addresses.get(None).unwrap().destination(8080);
+        let peer = forwards
+            .addresses
+            .get(Some("db"))
+            .unwrap()
+            .destination(5432);
+        assert_eq!(
+            (own.as_str(), peer.as_str()),
+            ("10.0.0.2:8080", "10.0.0.7:5432")
+        );
+        assert_eq!(forwards.addresses.get(Some("cache")), None);
+    }
+
+    /// A forward the test controls: alive until told otherwise, and it records
+    /// when it is dropped.
+    struct FakeForward {
+        dest: String,
+        local: u16,
+        alive: Rc<Cell<bool>>,
+        stopped: Rc<Cell<bool>>,
+        ran: Option<Duration>,
+    }
+
+    impl Forward for FakeForward {
+        fn describe(&self) -> String {
+            format!("{}\t{}", self.local, self.dest)
+        }
+        fn dest(&self) -> &str {
+            &self.dest
+        }
+        fn ran_for(&self) -> Option<Duration> {
+            self.ran
+        }
+        fn is_alive(&mut self) -> bool {
+            self.alive.get()
+        }
+    }
+
+    impl Drop for FakeForward {
+        fn drop(&mut self) {
+            self.stopped.set(true);
+        }
+    }
+
+    /// A forward started: its local port, destination, alive flag and stopped
+    /// flag.
+    type Started = (u16, String, Rc<Cell<bool>>, Rc<Cell<bool>>);
+
+    /// Starts [`FakeForward`]s, remembering each, and refuses the local ports
+    /// it was told to.
+    #[derive(Default)]
+    struct FakeForwarders {
+        refuse: RefCell<HashSet<u16>>,
+        /// Each forward started: its local port and destination, whether it is
+        /// alive, whether it was stopped.
+        started: RefCell<Vec<Started>>,
+        /// How long a started forward claims to have run when it dies.
+        ran: Cell<Option<Duration>>,
+    }
+
+    impl Forwarders for FakeForwarders {
+        fn start(&self, local: u16, dest: &str) -> std::io::Result<Box<dyn Forward>> {
+            if self.refuse.borrow().contains(&local) {
+                return Err(std::io::Error::other("port in use"));
+            }
+            let (alive, stopped) = (Rc::new(Cell::new(true)), Rc::new(Cell::new(false)));
+            self.started
+                .borrow_mut()
+                .push((local, dest.into(), alive.clone(), stopped.clone()));
+            Ok(Box::new(FakeForward {
+                dest: dest.into(),
+                local,
+                alive,
+                stopped,
+                ran: self.ran.get(),
+            }))
+        }
+    }
+
+    impl FakeForwarders {
+        fn starts(&self) -> Vec<(u16, String)> {
+            self.started
+                .borrow()
+                .iter()
+                .map(|(l, d, ..)| (*l, d.clone()))
+                .collect()
+        }
+    }
+
+    /// A forward daemon's state for a container reachable at 10.0.0.2.
+    fn daemon_state<'a>(
+        container: &'a dyn Container,
+        fake: &'a FakeForwarders,
+        dir: &crate::tmpfile::TempDir,
+    ) -> Forwards<'a> {
+        let mut forwards = Forwards::new(container, fake, dir.path().join("ports"));
+        forwards.addresses = Addresses::new(Box::new(move |p| container.reach(p)), Duration::ZERO);
+        forwards
+    }
+
+    fn web() -> FakeRuntime {
+        FakeRuntime::new(FakeEnv::new).with_container(
+            "web",
+            FakeEnv::new().with_reach(None, Reach::Address("10.0.0.2".into())),
+        )
+    }
+
+    fn wanted_ports(ports: &[u16]) -> HashMap<u16, PortForward> {
+        ports.iter().map(|&p| (p, PortForward::same(p))).collect()
+    }
+
+    #[test]
+    fn a_wanted_port_is_forwarded_once_to_the_container_and_stopped_when_unwanted() {
+        let (rt, fake, dir) = (
+            web(),
+            FakeForwarders::default(),
+            crate::tmpfile::TempDir::new("fwd").unwrap(),
+        );
+        let container = rt.container("web");
+        let mut forwards = daemon_state(container.as_ref(), &fake, &dir);
+        forwards.update(wanted_ports(&[8080]));
+        forwards.update(wanted_ports(&[8080]));
+        assert_eq!(
+            fake.starts(),
+            [(8080, "10.0.0.2:8080".to_string())],
+            "started once"
+        );
+        assert!(
+            std::fs::read_to_string(dir.path().join("ports"))
+                .unwrap()
+                .contains("8080\t10.0.0.2:8080")
+        );
+
+        forwards.update(wanted_ports(&[]));
+        assert!(
+            fake.started.borrow()[0].3.get(),
+            "stopped when no longer wanted"
+        );
+    }
+
+    #[test]
+    fn a_forward_whose_destination_moved_is_stopped_and_started_again() {
+        let (rt, fake, dir) = (
+            web(),
+            FakeForwarders::default(),
+            crate::tmpfile::TempDir::new("fwd").unwrap(),
+        );
+        let container = rt.container("web");
+        let mut forwards = daemon_state(container.as_ref(), &fake, &dir);
+        forwards.update(wanted_ports(&[8080]));
+        let moved = PortForward {
+            local: 8080,
+            host: None,
+            port: 9090,
+        };
+        forwards.update(HashMap::from([(8080, moved)]));
+        assert_eq!(
+            fake.starts(),
+            [
+                (8080, "10.0.0.2:8080".to_string()),
+                (8080, "10.0.0.2:9090".to_string())
+            ]
+        );
+        assert!(fake.started.borrow()[0].3.get(), "the old one was stopped");
+    }
+
+    #[test]
+    fn a_forward_that_died_is_not_restarted_until_its_cooldown_is_over() {
+        let (rt, fake, dir) = (
+            web(),
+            FakeForwarders::default(),
+            crate::tmpfile::TempDir::new("fwd").unwrap(),
+        );
+        fake.ran.set(Some(Duration::from_secs(1)));
+        let container = rt.container("web");
+        let mut forwards = daemon_state(container.as_ref(), &fake, &dir);
+        forwards.update(wanted_ports(&[8080]));
+        fake.started.borrow()[0].2.set(false); // the tunnel died
+        forwards.update(wanted_ports(&[8080]));
+        forwards.update(wanted_ports(&[8080]));
+        assert_eq!(fake.starts().len(), 1, "cooling down, not hammered");
+
+        forwards.cooling.get_mut(&8080).unwrap().until = std::time::Instant::now();
+        forwards.update(wanted_ports(&[8080]));
+        assert_eq!(
+            fake.starts().len(),
+            2,
+            "started again once the wait was over"
+        );
+    }
+
+    #[test]
+    fn a_forward_that_cannot_start_is_retried_and_one_without_a_connection_is_replaced_at_once() {
+        let (rt, fake, dir) = (
+            web(),
+            FakeForwarders::default(),
+            crate::tmpfile::TempDir::new("fwd").unwrap(),
+        );
+        fake.refuse.borrow_mut().insert(8080);
+        let container = rt.container("web");
+        let mut forwards = daemon_state(container.as_ref(), &fake, &dir);
+        forwards.update(wanted_ports(&[8080]));
+        assert!(fake.starts().is_empty());
+        assert!(forwards.failed.contains(&8080));
+
+        fake.refuse.borrow_mut().clear();
+        forwards.update(wanted_ports(&[8080]));
+        assert_eq!(fake.starts().len(), 1);
+        assert!(!forwards.failed.contains(&8080));
+
+        // The in-process proxy has no connection to lose (`ran_for` is `None`):
+        // when it dies it is replaced without a wait.
+        fake.started.borrow()[0].2.set(false);
+        forwards.update(wanted_ports(&[8080]));
+        assert_eq!(fake.starts().len(), 2);
+    }
+
+    #[test]
+    fn a_peer_that_cannot_be_found_gets_no_forward() {
+        let (rt, fake, dir) = (
+            web(),
+            FakeForwarders::default(),
+            crate::tmpfile::TempDir::new("fwd").unwrap(),
+        );
+        let container = rt.container("web");
+        let mut forwards = daemon_state(container.as_ref(), &fake, &dir);
+        let to_db = PortForward {
+            local: 5432,
+            host: Some("db".into()),
+            port: 5432,
+        };
+        forwards.update(HashMap::from([(5432, to_db)]));
+        assert!(fake.starts().is_empty());
     }
 
     #[test]

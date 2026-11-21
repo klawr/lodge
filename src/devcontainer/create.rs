@@ -1,6 +1,9 @@
 //! How a devcontainer's container is created: what devcontainer.json states
 //! directly (privileged, capabilities, mounts, published ports, …) and what
-//! features ask for, rendered as `docker run` flags or as a compose override.
+//! features ask for, applied to a [`RunSpec`] or rendered as a compose override.
+//! The engine turns a spec into its own flags; nothing here spells them.
+
+use crate::runtime::RunSpec;
 
 /// How a container is created: what devcontainer.json states directly (for the
 /// image/Dockerfile backend; with compose these belong in the compose file),
@@ -13,7 +16,7 @@ pub(super) struct CreateSettings {
     pub(super) security_opt: Vec<String>,
     pub(super) mounts: Vec<Mount>,
     pub(super) container_user: Option<String>,
-    /// `-p` values, from `appPort`.
+    /// Published ports (`[ip:]host:container`), from `appPort`.
     pub(super) published_ports: Vec<String>,
 }
 
@@ -29,31 +32,18 @@ impl CreateSettings {
         self.published_ports.extend(other.published_ports);
     }
 
-    /// The `docker run` flags these settings stand for.
-    pub(super) fn to_args(&self) -> Vec<String> {
-        let mut args = Vec::new();
-        if self.privileged {
-            args.push("--privileged".into());
-        }
-        if self.init {
-            args.push("--init".into());
-        }
-        for cap in &self.cap_add {
-            args.extend(["--cap-add".into(), cap.clone()]);
-        }
-        for opt in &self.security_opt {
-            args.extend(["--security-opt".into(), opt.clone()]);
-        }
-        for m in &self.mounts {
-            args.extend(["--mount".into(), m.spec.clone()]);
-        }
+    /// Adds these settings to a container about to be created.
+    pub(super) fn apply(&self, spec: &mut RunSpec) {
+        spec.privileged |= self.privileged;
+        spec.init |= self.init;
+        spec.cap_add.extend(self.cap_add.iter().cloned());
+        spec.security_opt.extend(self.security_opt.iter().cloned());
+        spec.mounts
+            .extend(self.mounts.iter().map(|m| m.spec.clone()));
         if let Some(user) = &self.container_user {
-            args.extend(["-u".into(), user.clone()]);
+            spec.user = Some(user.clone());
         }
-        for port in &self.published_ports {
-            args.extend(["-p".into(), port.clone()]);
-        }
-        args
+        spec.publish.extend(self.published_ports.iter().cloned());
     }
 
     /// A compose override adding these settings and `labels` to `service`.
@@ -242,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_become_run_flags() {
+    fn settings_are_added_to_a_run_spec_and_never_remove_what_is_there() {
         let s = CreateSettings {
             privileged: true,
             init: true,
@@ -252,24 +242,29 @@ mod tests {
             container_user: Some("dev".into()),
             published_ports: vec!["127.0.0.1:3000:3000".into()],
         };
+        let mut spec = RunSpec {
+            privileged: true,
+            cap_add: vec!["NET_ADMIN".into()],
+            user: Some("other".into()),
+            ..Default::default()
+        };
+        s.apply(&mut spec);
         assert_eq!(
-            s.to_args(),
-            [
-                "--privileged",
-                "--init",
-                "--cap-add",
-                "SYS_PTRACE",
-                "--security-opt",
-                "seccomp=unconfined",
-                "--mount",
-                "type=volume,source=v,target=/d",
-                "-u",
-                "dev",
-                "-p",
-                "127.0.0.1:3000:3000"
-            ]
+            spec,
+            RunSpec {
+                privileged: true,
+                init: true,
+                cap_add: vec!["NET_ADMIN".into(), "SYS_PTRACE".into()],
+                security_opt: vec!["seccomp=unconfined".into()],
+                mounts: vec!["type=volume,source=v,target=/d".into()],
+                user: Some("dev".into()),
+                publish: vec!["127.0.0.1:3000:3000".into()],
+                ..Default::default()
+            }
         );
-        assert!(CreateSettings::default().to_args().is_empty());
+        let mut untouched = RunSpec::default();
+        CreateSettings::default().apply(&mut untouched);
+        assert_eq!(untouched, RunSpec::default());
     }
 
     #[test]
