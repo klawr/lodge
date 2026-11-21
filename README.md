@@ -155,5 +155,5 @@ gate, the integration tests, the MSRV build, `cargo deny` and the static musl
 builds on every push and PR. Releases come from conventional
 commits through [release-please](https://github.com/googleapis/release-please):
 on `master` it keeps a release PR open with the next version, and merging it
-tags the release, attaches the binaries (`ldg-<target>.tar.gz`) to a draft and
+tags the release, attaches the binaries (`ldg-<target>.tar.gz`, which also holds the shell completions and the man page) to a draft and
 publishes it once they are all there.

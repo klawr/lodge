@@ -76,7 +76,7 @@ create-time hook or feature is retried on the next `ldg up`. Hooks run as
 ## Removing lodge from a container
 
 `ldg clean` removes lodge's directory (`~/.local/share/lodge` of the container
-user, or `/tmp/lodge-<uid>`), the wrapper scripts it wrote and the placed secrets,
-and lists the configs it left in place. `ldg rm` removes the whole container. lodge keeps nothing about a container on the host except the
+user, or `/tmp/lodge-<uid>`), the wrapper scripts it wrote, the git `safe.directory` entries it added and the
+placed secrets, and lists the configs it left in place. `ldg rm` removes the whole container. lodge keeps nothing about a container on the host except the
 bundle cache (`ldg cache clear`) and the forwarding logs in
 `~/.local/share/lodge/`.

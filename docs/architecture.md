@@ -224,7 +224,7 @@ what `ldg clean` removes:
 | --- | --- |
 | `<prefix>/bin/` | The injected binaries; first on the session's `PATH`. |
 | `<prefix>/lib/` | Copied libraries and the dynamic linker, one copy. |
-| `<prefix>/injected` | The id of the bundle last injected, and the wrappers and configs placed outside the prefix. `ldg status` shows the id, `ldg clean` removes the wrappers and reports the configs, and its presence is how both find the prefix. |
+| `<prefix>/injected` | The id of the bundle last injected, and the wrappers, configs and git `safe.directory` entries placed outside the prefix. `ldg status` shows the id, `ldg clean` removes the wrappers and the `safe.directory` entries lodge added (never one that was already there) and reports the configs, and its presence is how both find the prefix. |
 | `<prefix>/terminfo/` | The user's terminfo entry, when the container lacked it. |
 
 Provisioning state, which is the devcontainer's own and written as root when the
@@ -244,12 +244,13 @@ Elsewhere:
 | --- | --- |
 | `/dev/shm/lodge-secrets-<uid>/` | Placed secret values (memory only, 0700 directory, 0600 files); see `secret/`. |
 | the `target_config` / `target_binary` paths | What the config asked to be placed there; `ldg clean` removes the wrappers and keeps the configs. |
+| `~/.gitconfig` (`safe.directory`) | The entries the bundle lists; `ldg clean` unsets the ones lodge added. |
 
 Because all state is *in* the container, it survives reboots and disappears
 when the container is recreated, with no host bookkeeping to go stale. Every
 container lodge creates also carries the label `dev.lodge.project=<path>`.
-`ldg clean` removes the injection (the prefix, the wrappers it wrote and the user's
-secrets) and keeps the devcontainer's state (markers, hash, `containerEnv`).
+`ldg clean` removes the injection (the prefix, the wrappers it wrote, the
+`safe.directory` entries it added and the user's secrets) and keeps the devcontainer's state (markers, hash, `containerEnv`).
 
 **On the host**
 
@@ -589,7 +590,7 @@ x86_64 and aarch64. On `master`, once all of those pass, release-please
 open that bumps the version in `Cargo.toml` from the conventional commits (`feat`
 the minor version, `fix` the patch, a breaking change the minor before 1.0; no
 changelog file). Merging it tags the version and creates a *draft* release; the
-binaries (`ldg-<target>.tar.gz`, what `install.sh` downloads) are attached, and
+binaries (`ldg-<target>.tar.gz`, what `install.sh` downloads, with the shell completions and the man page beside `ldg`) are attached, and
 only then is the release published, so "latest" never lacks them. `make check` runs the same gate locally, `make deny`
 the dependency check.
 

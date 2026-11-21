@@ -285,6 +285,9 @@ pub fn clean(ctx: &Ctx, path: Option<PathBuf>) -> Result<()> {
     for w in &removed.wrappers {
         line!("wrapper  {w}");
     }
+    for d in &removed.safe_directories {
+        line!("git safe.directory  {d}");
+    }
     if !removed.configs_kept.is_empty() {
         note!(
             "injected configs were left in place (remove them by hand if unwanted):\n  {}",

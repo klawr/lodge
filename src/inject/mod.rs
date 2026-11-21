@@ -78,9 +78,12 @@ pub fn run(
     }
     // What an earlier injection placed outside the prefix, to tell it from what
     // was already there.
-    let placed_before = state::previous(&env, layout)?
-        .map(|p| p.configs)
+    let previous = state::previous(&env, layout)?;
+    let placed_before = previous
+        .as_ref()
+        .map(|p| p.configs.clone())
         .unwrap_or_default();
+    let safe_before = previous.map(|p| p.safe_directories).unwrap_or_default();
     // `bin/` and `lib/` are replaced as a whole, so nothing of an earlier
     // injection is left behind. (A running binary can be unlinked, but not
     // overwritten.)
@@ -109,7 +112,8 @@ pub fn run(
             )?);
         }
     }
-    configure_git_safe(&env, &bundle.manifest.git_safe_directories)?;
+    let safe_directories =
+        configure_git_safe(&env, &bundle.manifest.git_safe_directories, &safe_before)?;
 
     state::record(
         &env,
@@ -118,6 +122,7 @@ pub fn run(
             bundle: bundle.manifest.id(),
             wrappers,
             configs,
+            safe_directories,
         },
     )
 }
@@ -176,7 +181,16 @@ mod tests {
         };
         let env = FakeEnv::new()
             .with_output(&["uname", "-m"], "x86_64\n")
-            .with_commands(&["git"]);
+            .with_commands(&["git"])
+            .with_output(
+                &[
+                    "sh",
+                    "-c",
+                    "git config --global --get-all safe.directory 2>/dev/null | grep -qxF '*' \
+                     || { git config --global --add safe.directory '*' && echo added; }",
+                ],
+                "added\n",
+            );
         let layout = Layout::preferred(&dev());
 
         run(&env, &dev(), &layout, &bundle).unwrap();
@@ -189,7 +203,9 @@ mod tests {
         );
         assert_eq!(
             env.file(&format!("{p}/injected")),
-            Some(format!("bundle {id}\nconfig /home/dev/.hellorc\n")),
+            Some(format!(
+                "bundle {id}\nconfig /home/dev/.hellorc\nsafe_directory *\n"
+            )),
             "the record names the bundle and what was placed outside the prefix"
         );
         // `bin/` and `lib/` are replaced and refilled by the one copy into the

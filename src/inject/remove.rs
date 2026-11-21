@@ -10,6 +10,7 @@
 
 use anyhow::{Result, bail};
 
+use super::git::UNSET_SCRIPT;
 use super::state::Installed;
 use crate::runtime::{Acting, ContainerUser, Env, ExecOpts};
 use crate::shell::{script_argv, shell_quote};
@@ -21,6 +22,8 @@ pub struct Removed {
     pub wrappers: Vec<String>,
     /// Injected config files and directories, left in place.
     pub configs_kept: Vec<String>,
+    /// Git `safe.directory` entries that were unset.
+    pub safe_directories: Vec<String>,
 }
 
 /// The script: `$@` are recorded wrapper paths. Removes the ones that are lodge's
@@ -47,6 +50,21 @@ fn script(prefix: &str, marker: &str) -> String {
 pub fn remove(container: &dyn Env, user: &ContainerUser, installed: &Installed) -> Result<Removed> {
     let env = Acting::new(container, user);
     let layout = &installed.layout;
+    // First: the record that lists these entries goes with the prefix below.
+    if !installed.safe_directories.is_empty() {
+        let dirs: Vec<&str> = installed
+            .safe_directories
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let out = env.output(
+            &script_argv(UNSET_SCRIPT, &dirs),
+            &ExecOpts::default().repeatable(),
+        )?;
+        if !out.success {
+            bail!("unsetting git safe.directory failed: {}", out.stderr.trim());
+        }
+    }
     let marker = format!("exec {}/", layout.bin());
     let script = script(layout.prefix(), &marker);
     let recorded: Vec<&str> = installed.wrappers.iter().map(String::as_str).collect();
@@ -63,6 +81,7 @@ pub fn remove(container: &dyn Env, user: &ContainerUser, installed: &Installed) 
     Ok(Removed {
         wrappers,
         configs_kept: installed.configs.clone(),
+        safe_directories: installed.safe_directories.clone(),
     })
 }
 
@@ -162,10 +181,14 @@ mod tests {
             bundle: "abc".into(),
             wrappers: vec![],
             configs: vec!["/home/dev/.config/nvim".into()],
+            safe_directories: vec!["/w".into()],
         };
         let removal = script(layout.prefix(), &format!("exec {}/", layout.bin()));
-        let env = FakeEnv::new().with_output(&script_argv(&removal, &[]), "");
+        let env = FakeEnv::new()
+            .with_output(&script_argv(&removal, &[]), "")
+            .with_output(&script_argv(UNSET_SCRIPT, &["/w"]), "");
         let removed = remove(&env, &dev(), &installed).unwrap();
+        assert_eq!(removed.safe_directories, ["/w"]);
         assert_eq!(removed.configs_kept, ["/home/dev/.config/nvim"]);
         assert!(removed.wrappers.is_empty());
         for (call, who) in env.calls() {

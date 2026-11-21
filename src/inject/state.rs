@@ -2,7 +2,8 @@
 //! which bundle was injected, and what lodge placed *outside* the prefix, so
 //! `ldg status` can show the first and `ldg clean` can act on the second.
 //!
-//! One line per fact: `bundle <id>`, `wrapper <path>`, `config <path>`.
+//! One line per fact: `bundle <id>`, `wrapper <path>`, `config <path>`,
+//! `safe_directory <dir>` (a git `safe.directory` entry lodge added).
 
 use anyhow::Result;
 
@@ -19,6 +20,8 @@ pub struct Installed {
     pub wrappers: Vec<String>,
     /// Config files and directories copied into place.
     pub configs: Vec<String>,
+    /// Git `safe.directory` entries lodge added (not ones that were already there).
+    pub safe_directories: Vec<String>,
 }
 
 fn render(installed: &Installed) -> String {
@@ -28,6 +31,9 @@ fn render(installed: &Installed) -> String {
     }
     for path in &installed.configs {
         text.push_str(&format!("config {path}\n"));
+    }
+    for dir in &installed.safe_directories {
+        text.push_str(&format!("safe_directory {dir}\n"));
     }
     text
 }
@@ -40,6 +46,7 @@ fn parse(layout: &Layout, text: &str) -> Option<Installed> {
         bundle: String::new(),
         wrappers: Vec::new(),
         configs: Vec::new(),
+        safe_directories: Vec::new(),
     };
     for line in text.lines() {
         let Some((key, value)) = line.split_once(' ') else {
@@ -50,6 +57,7 @@ fn parse(layout: &Layout, text: &str) -> Option<Installed> {
             "bundle" => installed.bundle = value.to_string(),
             "wrapper" => installed.wrappers.push(value.to_string()),
             "config" => installed.configs.push(value.to_string()),
+            "safe_directory" => installed.safe_directories.push(value.to_string()),
             _ => {}
         }
     }
@@ -104,6 +112,7 @@ mod tests {
             bundle: "abc".into(),
             wrappers: vec!["/home/dev/.local/bin/nvim".into()],
             configs: vec!["/home/dev/.config/nvim".into(), "/home/dev/.hellorc".into()],
+            safe_directories: vec!["/w".into()],
         }
     }
 
@@ -160,7 +169,8 @@ mod tests {
         assert_eq!(
             env.file("/p/injected").unwrap(),
             "bundle abc\nwrapper /home/dev/.local/bin/nvim\n\
-             config /home/dev/.config/nvim\nconfig /home/dev/.hellorc\n"
+             config /home/dev/.config/nvim\nconfig /home/dev/.hellorc\n\
+             safe_directory /w\n"
         );
     }
 }
