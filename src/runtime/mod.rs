@@ -377,6 +377,13 @@ pub trait Container: Env {
         None
     }
 
+    /// Whether there is anything for a port-forward daemon to do: `false` for an
+    /// endpoint whose ports are already on this machine, where a daemon would sit
+    /// idle for as long as the machine is up.
+    fn forwards_ports(&self) -> bool {
+        true
+    }
+
     /// The name to show for it: its name, or its id when it has none.
     fn display_name(&self) -> String {
         self.name().unwrap_or_else(|| self.id().to_string())

@@ -1281,6 +1281,78 @@ fn remote_mode_works_against_a_real_ssh_server() {
     );
 }
 
+#[test]
+#[ignore = "needs docker"]
+fn forwards_wait_for_a_login_after_the_link_is_lost_and_return_when_it_is_given() {
+    let mut sb = Sandbox::new();
+    let host = sb.use_real_sshd();
+    let port = free_port();
+    let p = sb
+        .project(
+            "relogin",
+            &json(&format!(
+                r#"{{ "image": "@IMAGE@", "forwardPorts": [{port}] }}"#
+            )),
+        )
+        .remote_via(host.dest());
+    let _login = host.accept_login_when_done();
+    p.up();
+    let id = container_id(&p.container());
+    assert!(
+        wait_until(8, || !listeners(port).is_empty()),
+        "the tunnel never came up"
+    );
+
+    // Swap the daemon `up` started for one that gives up after 3 failed polls
+    // (6 s) instead of 150.
+    stop_forward_daemons(&id);
+    // A forward lives in the shared connection, which outlasts the tunnel
+    // process that asked for it.
+    sb.drop_ssh_master();
+    assert!(
+        wait_until(8, || forward_daemons(&id) == 0
+            && listeners(port).is_empty()),
+        "still there: {} daemons, listening on {:?}",
+        forward_daemons(&id),
+        listeners(port)
+    );
+    let log = sb.root().join("daemon.log");
+    let mut daemon = sb.spawn_daemon(host.dest(), &id, port, 3, &log);
+    assert!(
+        wait_until(8, || !listeners(port).is_empty()),
+        "the new daemon forwards nothing:\n{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    // The link is lost for good and the server wants a login: the key is no
+    // longer accepted, and nothing the daemon can do without a terminal gets in.
+    host.require_login();
+    sb.drop_ssh_master();
+    let said = || std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        wait_until(60, || said().contains("needs a login")),
+        "the daemon did not say it waits for a login:\n{}",
+        said()
+    );
+    // Well past the 3 polls it would have given up after.
+    std::thread::sleep(std::time::Duration::from_secs(10));
+    assert!(daemon.running(), "the daemon gave up:\n{}", said());
+    assert!(listeners(port).is_empty(), "a forward outlived its link");
+
+    // The login is given, and any command run with a terminal opens the
+    // connection again: the forward comes back by itself.
+    host.accept_login();
+    let status = p.ldg("status", &[]);
+    assert!(status.ok, "ldg status failed:\n{}", status.tail(15));
+    assert!(
+        wait_until(60, || !listeners(port).is_empty()),
+        "the forward did not return:\n{}",
+        said()
+    );
+    assert!(said().contains("connection is back"), "{}", said());
+    assert!(daemon.running());
+}
+
 /// A plain host: lodge injects into the machine itself, as the user, and never
 /// overwrites that user's own files.
 fn plain_host_round_trip(sb: &Sandbox, remote: Option<&str>) {
@@ -1330,12 +1402,32 @@ fn plain_host_round_trip(sb: &Sandbox, remote: Option<&str>) {
     let status = run(&["status"]);
     assert!(status.ok && status.has("bundle"), "{}", status.tail(10));
 
+    // Another machine's ports are forwarded by a daemon; this machine's are
+    // already here, so there is nothing for one to do.
+    if remote.is_some() {
+        assert!(
+            wait_until(10, || sb.has_running_daemons()),
+            "no forward daemon for the remote machine"
+        );
+    } else {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        assert!(
+            !sb.has_running_daemons(),
+            "a forward daemon with nothing to forward"
+        );
+    }
+
     // Nothing to stop or remove on a machine.
     assert!(run(&["down"]).has("nothing to stop"));
     assert!(run(&["rm"]).has("ldg clean"));
 
     let clean = run(&["clean"]);
     assert!(clean.ok, "{}", clean.tail(10));
+    // A machine is always up, so nothing but `clean` ends its forwarding.
+    assert!(
+        wait_until(10, || !sb.has_running_daemons()),
+        "the forward daemon outlived `ldg clean`"
+    );
     assert!(
         !home.join(".local/share/lodge").exists(),
         "the prefix stays"

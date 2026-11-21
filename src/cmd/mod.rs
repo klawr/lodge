@@ -169,14 +169,17 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
     // else takes; a new way of reaching a machine or a new target is one more arm.
     // The helper tools (`ldd`, `patchelf`, `oras`) are chosen here too.
     let remote = cli.remote.clone();
+    // The forward daemon has no terminal, so its ssh commands must never prompt.
+    let daemon = matches!(cli.command, Command::Forward { .. });
     let host: HostRef = match cli.remote {
+        Some(remote) if daemon => Arc::new(SshHost::unattended(remote)),
         Some(remote) => Arc::new(SshHost::new(remote)),
         None => Arc::new(LocalHost),
     };
     // Open the connection while the terminal is ours, so a password or 2FA prompt
     // is answered once and everything after reuses it. The forward daemon has no
     // terminal: it joins the connection that is already there.
-    if !matches!(cli.command, Command::Forward { .. }) {
+    if !daemon {
         host.connect()?;
     }
     let config_path = crate::config::path_for(cli.config)?;
@@ -245,9 +248,19 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
                 .render(&mut std::io::stdout())
                 .context("writing the man page")?;
         }
-        Command::Forward { container, port } => {
+        Command::Forward {
+            container,
+            port,
+            unreachable_polls,
+        } => {
             let forwarders = crate::forward::HostForwarders::new(ctx.host.as_ref());
-            crate::forward::run_daemon(ctx.endpoints.as_ref(), &forwarders, &container, &port);
+            crate::forward::run_daemon(
+                ctx.endpoints.as_ref(),
+                &forwarders,
+                &container,
+                &port,
+                unreachable_polls,
+            );
         }
     }
     Ok(ExitCode::SUCCESS)

@@ -64,7 +64,7 @@ for where to put them). Man page: `ldg man | man -l -`.
 | `ldg ls` | Every container lodge created, across projects. |
 | `ldg ports [PATH]` | The ports forwarded to this machine for the project's container. |
 | `ldg logs [PATH]` | The port-forwarding log (`-f` to follow). |
-| `ldg clean [PATH]` | Remove what lodge injected from the container (configs are kept and listed). |
+| `ldg clean [PATH]` | Remove what lodge injected from the container (configs are kept and listed), and stop its port forwarding. |
 | `ldg init` | Write a starting config (`--print` to see it first). |
 | `ldg doctor [PATH]` | Check the host, the config, and what the project's devcontainer needs. |
 | `ldg pack` | Pack your tools and configs into a portable bundle (`lodge-<arch>.tar`). |

@@ -67,6 +67,12 @@ pub trait Forwarders {
     fn on_host(&self) -> String {
         String::new()
     }
+
+    /// Whether the machine the forwards run on waits for a login the daemon
+    /// cannot give, so that being unable to reach it is no reason to stop.
+    fn awaiting_login(&self) -> bool {
+        false
+    }
 }
 
 /// Where a host's own processes put their errors: in the daemon log with
@@ -171,6 +177,10 @@ impl Forwarders for HostForwarders<'_> {
 
     fn on_host(&self) -> String {
         self.host.on_host()
+    }
+
+    fn awaiting_login(&self) -> bool {
+        self.host.awaiting_login()
     }
 }
 
@@ -325,6 +335,14 @@ fn proxy_conn(client: TcpStream, server: TcpStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_forwarders_say_whether_their_host_waits_for_a_login() {
+        let waiting = crate::host::fake::FakeHost::remote("h").awaiting_login();
+        assert!(HostForwarders::new(&waiting).awaiting_login());
+        let fine = crate::host::fake::FakeHost::remote("h");
+        assert!(!HostForwarders::new(&fine).awaiting_login());
+    }
 
     #[test]
     fn a_host_with_tunnels_gets_a_tunnel_that_stops_when_dropped() {

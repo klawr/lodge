@@ -68,6 +68,8 @@ pub struct FakeEnv {
     reach: HashMap<Option<String>, Reach>,
     /// Whether this stands in for a machine that is not thrown away.
     shared: bool,
+    /// Whether [`Container::forwards_ports`] says yes.
+    forwarding: bool,
     /// The relays [`Container::relay`] started: local port, container port, and
     /// whether each was stopped.
     relays: RefCell<Vec<(u16, u16, Arc<AtomicBool>)>>,
@@ -103,6 +105,7 @@ impl FakeEnv {
             calls: RefCell::default(),
             reach: HashMap::new(),
             shared: false,
+            forwarding: true,
             relays: RefCell::default(),
         }
     }
@@ -119,6 +122,12 @@ impl FakeEnv {
     /// Ends the relay started `index`th, as a process that died would.
     pub fn end_relay(&self, index: usize) {
         self.relays.borrow()[index].2.store(true, Ordering::Relaxed);
+    }
+
+    /// Stands in for an endpoint whose ports are already on this machine.
+    pub fn without_forwarding(mut self) -> Self {
+        self.forwarding = false;
+        self
     }
 
     /// Stands in for a real machine, which injection treats with more care.
@@ -750,6 +759,10 @@ impl Container for FakeContainer {
     /// failure declared for it), whether the container runs or not.
     fn read_stored_file(&self, path: &str) -> Result<Option<String>> {
         self.fake.env.read_file(path)
+    }
+
+    fn forwards_ports(&self) -> bool {
+        self.fake.env.forwarding
     }
 
     fn reach(&self, peer: Option<&str>) -> Option<Reach> {

@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::tunnel::{Forward, Forwarders, Relayed, chatter};
-use super::{acquire_lock, lock_path, ports_path, truncate_log, write_ports};
+use super::{
+    acquire_lock, lock_path, ports_path, stop_path, stop_requested, truncate_log, write_ports,
+};
 use crate::port::PortForward;
 use crate::provision::Endpoints;
 use crate::runtime::{Container, ExecOpts, Reach};
@@ -18,13 +20,18 @@ macro_rules! log {
 
 /// How often the daemon looks at the container.
 const POLL: Duration = Duration::from_secs(2);
+/// How often the daemon looks while it waits for a login: every look is a failed
+/// login attempt, which a server may take for an attack and answer by refusing
+/// the machine altogether, the person's own logins included.
+const WAITING_POLL: Duration = Duration::from_secs(20);
 /// How long a resolved address is trusted before it is looked up again, so a
 /// restarted service (with a new address) is followed.
 const REFRESH: Duration = Duration::from_secs(30);
 /// How many polls in a row may fail to reach the engine before the daemon
 /// gives up (about five minutes): a dropped connection is retried, a host that
-/// is gone for good is not.
-const UNREACHABLE_POLLS: u32 = 150;
+/// is gone for good is not. A host that waits for a login is waited for: see
+/// [`Patience`].
+pub const UNREACHABLE_POLLS: u32 = 150;
 
 /// Port-forwarding daemon. Forwards declared in `forwardPorts` are set up
 /// eagerly, from startup — connections just fail until the service listens.
@@ -43,6 +50,7 @@ pub fn run_daemon(
     forwarders: &dyn Forwarders,
     container_id: &str,
     ports: &[String],
+    unreachable_polls: u32,
 ) {
     let declared = decode_ports(ports);
     let (lock_file, ports_file) = match (lock_path(container_id), ports_path(container_id)) {
@@ -65,16 +73,29 @@ pub fn run_daemon(
             None
         }
     };
+    // A note left for an earlier daemon is not for this one.
+    let stop_file = stop_path(container_id).ok();
+    if let Some(note) = &stop_file {
+        stop_requested(note);
+    }
     if let Err(e) = truncate_log(container_id) {
         log!("could not start a new log ({e}); appending");
     }
     let container = endpoints.container(container_id);
     let mut forwards = Forwards::new(container.as_ref(), forwarders, ports_file);
     let mut unreachable = 0;
+    let mut patience = Patience::new(unreachable_polls);
 
     loop {
+        if stop_file.as_deref().is_some_and(stop_requested) {
+            log!("asked to stop, exiting");
+            break;
+        }
         match container.is_running() {
-            Ok(true) => unreachable = 0,
+            Ok(true) => {
+                patience.reached();
+                unreachable = 0;
+            }
             Ok(false) => {
                 log!("container stopped, exiting");
                 break;
@@ -84,11 +105,10 @@ pub fn run_daemon(
                 if unreachable == 1 {
                     log!("cannot reach the container engine ({e:#}); retrying");
                 }
-                if unreachable >= UNREACHABLE_POLLS {
-                    log!("the container engine has been unreachable for too long, exiting");
+                if patience.is_out(unreachable, forwarders) {
                     break;
                 }
-                std::thread::sleep(POLL);
+                std::thread::sleep(patience.pause());
                 continue;
             }
         }
@@ -96,6 +116,70 @@ pub fn run_daemon(
         std::thread::sleep(POLL);
     }
     forwards.shut_down();
+}
+
+/// How the daemon decides to stop when it cannot reach the engine: after `limit`
+/// polls in a row ([`UNREACHABLE_POLLS`]), unless the machine is there and wants a
+/// login. That needs a person, and the next command they run in a terminal opens
+/// the connection again, so the daemon stays and keeps polling.
+struct Patience {
+    limit: u32,
+    /// Whether the machine was found to want a login, and it has been said.
+    waiting: bool,
+    /// Checks in a row since then that found something else.
+    doubts: u32,
+}
+
+/// How many checks in a row must find the machine no longer wanting a login
+/// before a daemon that was waiting for one gives up: a single check can fail
+/// for its own reasons (two ssh processes racing for the connection's socket).
+const DOUBTS: u32 = 3;
+
+impl Patience {
+    fn new(limit: u32) -> Self {
+        Self {
+            limit,
+            waiting: false,
+            doubts: 0,
+        }
+    }
+
+    /// How long to wait before the next poll.
+    fn pause(&self) -> Duration {
+        if self.waiting { WAITING_POLL } else { POLL }
+    }
+
+    /// The engine could be reached again.
+    fn reached(&mut self) {
+        if self.waiting {
+            log!("the connection is back");
+        }
+        *self = Self::new(self.limit);
+    }
+
+    /// Whether to stop, after `unreachable` polls in a row that failed.
+    fn is_out(&mut self, unreachable: u32, forwarders: &dyn Forwarders) -> bool {
+        if unreachable < self.limit {
+            return false;
+        }
+        if forwarders.awaiting_login() {
+            if !self.waiting {
+                log!(
+                    "the connection{} was lost and needs a login; run any ldg command in a terminal to restore it. Waiting",
+                    forwarders.on_host()
+                );
+                self.waiting = true;
+            }
+            self.doubts = 0;
+            return false;
+        }
+        self.doubts += 1;
+        if self.waiting && self.doubts < DOUBTS {
+            return false;
+        }
+        log!("the container engine has been unreachable for too long, exiting");
+        true
+    }
 }
 
 fn decode_ports(ports: &[String]) -> Vec<PortForward> {
@@ -556,9 +640,15 @@ mod tests {
         started: RefCell<Vec<Started>>,
         /// How long a started forward claims to have run when it dies.
         ran: Cell<Option<Duration>>,
+        /// Whether the machine waits for a login.
+        login: Cell<bool>,
     }
 
     impl Forwarders for FakeForwarders {
+        fn awaiting_login(&self) -> bool {
+            self.login.get()
+        }
+
         fn start(&self, local: u16, dest: &str) -> std::io::Result<Box<dyn Forward>> {
             if self.refuse.borrow().contains(&local) {
                 return Err(std::io::Error::other("port in use"));
@@ -951,5 +1041,53 @@ mod tests {
         assert_eq!(long_wait.delay, Duration::from_secs(4));
         let after_a_good_run = Cooldown::after(Some(&long_wait), Duration::from_secs(61));
         assert_eq!(after_a_good_run.delay, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn the_daemon_gives_up_on_a_machine_that_stays_unreachable_but_waits_for_one_that_wants_a_login()
+     {
+        let fake = FakeForwarders::default();
+        let mut patience = Patience::new(10);
+        assert!(!patience.is_out(9, &fake));
+        assert!(patience.is_out(10, &fake));
+
+        let mut patience = Patience::new(10);
+        fake.login.set(true);
+        assert!(!patience.is_out(10, &fake));
+        assert!(patience.waiting, "it said why it waits");
+        assert!(!patience.is_out(1000, &fake), "for as long as it takes");
+    }
+
+    #[test]
+    fn a_daemon_waiting_for_a_login_looks_less_often() {
+        let fake = FakeForwarders::default();
+        let mut patience = Patience::new(1);
+        assert_eq!(patience.pause(), POLL);
+        fake.login.set(true);
+        patience.is_out(1, &fake);
+        assert_eq!(patience.pause(), WAITING_POLL);
+        patience.reached();
+        assert_eq!(patience.pause(), POLL);
+    }
+
+    #[test]
+    fn a_daemon_that_waited_for_a_login_rides_out_a_check_that_found_nothing_but_not_three() {
+        let fake = FakeForwarders::default();
+        let mut patience = Patience::new(1);
+        fake.login.set(true);
+        assert!(!patience.is_out(1, &fake));
+
+        fake.login.set(false);
+        assert!(!patience.is_out(2, &fake));
+        assert!(!patience.is_out(3, &fake));
+        fake.login.set(true);
+        assert!(
+            !patience.is_out(4, &fake),
+            "wanting a login again starts over"
+        );
+        fake.login.set(false);
+        assert!(!patience.is_out(5, &fake));
+        assert!(!patience.is_out(6, &fake));
+        assert!(patience.is_out(7, &fake), "the host is gone");
     }
 }

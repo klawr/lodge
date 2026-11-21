@@ -425,6 +425,15 @@ pub trait Host: Send + Sync {
         Ok(())
     }
 
+    /// Whether the host is there but asks for a login that only a person at a
+    /// terminal can give (a password, a second factor), as opposed to being
+    /// gone. A process with no terminal (the forward daemon) uses it to wait for
+    /// the next command that has one to open the connection again, rather than
+    /// give up. Asks the host, so it is slow; quiet; `false` when unsure.
+    fn awaiting_login(&self) -> bool {
+        false
+    }
+
     /// Whether the host refuses a terminal, which makes
     /// [`interactive`](Self::interactive) fail at once. Best effort.
     fn pty_denied(&self) -> bool {

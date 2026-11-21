@@ -24,12 +24,28 @@ use crate::shell::shell_quote;
 /// jump hosts and agents are the user's ssh configuration's business.
 pub struct SshHost {
     remote: String,
+    /// Whether a command may ask for a password or a second factor on the
+    /// terminal. Off for a process that has none (the forward daemon): a prompt
+    /// there would hang, or stop the process, instead of failing.
+    prompts: bool,
 }
 
 impl SshHost {
+    /// A host whose commands may prompt on the terminal.
     pub fn new(remote: impl Into<String>) -> Self {
         Self {
             remote: remote.into(),
+            prompts: true,
+        }
+    }
+
+    /// A host for a process with no terminal: every command it runs fails when
+    /// it would need a login, and rides on the connection [`connect`] opened
+    /// otherwise.
+    pub fn unattended(remote: impl Into<String>) -> Self {
+        Self {
+            prompts: false,
+            ..Self::new(remote)
         }
     }
 }
@@ -119,9 +135,13 @@ fn base(remote: &str) -> (Command, String) {
 }
 
 /// A command that runs `remote_command` (a string for the remote login shell)
-/// on `remote`. The caller sets stdio and runs it.
-fn command(remote: &str, remote_command: &str) -> Command {
+/// on `remote`, never prompting if `prompts` is false. The caller sets stdio and
+/// runs it.
+fn command(remote: &str, remote_command: &str, prompts: bool) -> Command {
     let (mut c, dest) = base(remote);
+    if !prompts {
+        c.args(["-o", "BatchMode=yes"]);
+    }
     c.arg(dest).arg(remote_command);
     c
 }
@@ -227,6 +247,31 @@ fn connect(remote: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether a connection attempt that could not prompt ended because the server
+/// wants a login (a password, a second factor, a key that is not loaded) rather
+/// than because it could not be reached. Only a person at a terminal can answer
+/// that, and doing so opens the shared connection for everyone else.
+fn login_wanted(status: ExitStatus, stderr: &[u8]) -> bool {
+    !status.success() && String::from_utf8_lossy(stderr).contains("Permission denied")
+}
+
+/// Whether `remote` answers but would need a login to let us in: a connection
+/// that cannot prompt (`BatchMode`) is tried, and fails with the server's
+/// refusal. Succeeds (so `false`) while the shared connection is up or a key
+/// gets through. Best-effort and quiet: a spawn error or a timeout yields `false`.
+fn awaiting_login(remote: &str) -> bool {
+    let (mut c, dest) = base(remote);
+    c.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
+        .arg(dest)
+        .arg("true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    c.output()
+        .map(|out| login_wanted(out.status, &out.stderr))
+        .unwrap_or(false)
+}
+
 /// Whether the remote SSH server denies PTY allocation, which makes an
 /// interactive `docker exec -it` shell impossible. Forces a PTY (`-tt`) and runs
 /// `tty`: a server that refuses it makes ssh fail with "Pseudo-terminal
@@ -276,7 +321,7 @@ impl SshHost {
             Some(dir) => format!("cd {} && {body}", shell_quote(&dir.to_string_lossy())),
             None => body,
         };
-        command(&self.remote, &script)
+        command(&self.remote, &script, self.prompts)
     }
 }
 
@@ -343,6 +388,10 @@ impl Host for SshHost {
 
     fn connect(&self) -> anyhow::Result<()> {
         connect(&self.remote)
+    }
+
+    fn awaiting_login(&self) -> bool {
+        awaiting_login(&self.remote)
     }
 
     fn pty_denied(&self) -> bool {
@@ -417,9 +466,18 @@ mod tests {
 
     #[test]
     fn a_remote_command_ends_with_the_destination_and_the_script() {
-        let a = args(&command("user@host:2222", "docker ps"));
+        let a = args(&command("user@host:2222", "docker ps", true));
         assert_eq!(&a[..2], ["-p", "2222"]);
         assert_eq!(&a[a.len() - 2..], ["user@host", "docker ps"]);
+    }
+
+    #[test]
+    fn an_unattended_host_never_prompts_and_an_ordinary_one_may() {
+        let line = Line::Shell("true".into());
+        let quiet = args(&SshHost::unattended("h").command(&line, None));
+        assert!(quiet.contains(&"BatchMode=yes".to_string()), "{quiet:?}");
+        let a = args(&SshHost::new("h").command(&line, None));
+        assert!(!a.contains(&"BatchMode=yes".to_string()), "{a:?}");
     }
 
     #[test]
@@ -469,6 +527,18 @@ mod tests {
             !connection_lost(ExitStatus::from_raw(9), b""),
             "killed by a signal"
         );
+    }
+
+    #[test]
+    fn only_a_server_that_wants_a_login_is_awaiting_one() {
+        let wants = |code, err: &str| login_wanted(exit(code), err.as_bytes());
+        assert!(wants(255, "u@h: Permission denied (publickey,password)."));
+        assert!(!wants(0, ""), "connected");
+        assert!(!wants(
+            255,
+            "ssh: connect to host h port 22: Connection refused"
+        ));
+        assert!(!wants(255, "Host key verification failed."));
     }
 
     #[test]

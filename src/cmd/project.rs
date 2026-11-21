@@ -280,6 +280,9 @@ pub fn clean(ctx: &Ctx, path: Option<PathBuf>) -> Result<()> {
         container,
         remote_user,
     } = require(ctx, path)?;
+    // Lodge's forwarding is part of what is taken out, and on a machine that is
+    // always up nothing else would end it.
+    ctx.forwarder.stop(container.id());
     if !container.is_running()? {
         bail!("the container is not running; start it first (`ldg up --no-attach`)");
     }

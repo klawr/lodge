@@ -47,7 +47,9 @@ fn attach(
     let container = attached.container.as_ref();
     // After provisioning, which may have changed the user's uid.
     let user = ContainerUser::resolve(container, attached.remote_user.as_deref())?;
-    ctx.forwarder.start(container.id(), &attached.forward_ports);
+    if container.forwards_ports() {
+        ctx.forwarder.start(container.id(), &attached.forward_ports);
+    }
 
     let installed = if attached.created || reinject {
         None
@@ -124,6 +126,10 @@ mod tests {
                 .borrow_mut()
                 .push(format!("{container} {}", ports.len()));
         }
+
+        fn stop(&self, container: &str) {
+            self.0.borrow_mut().push(format!("stop {container}"));
+        }
     }
 
     fn user() -> ContainerUser {
@@ -156,10 +162,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn attaching_to_a_container_that_exists_forwards_and_injects_without_a_provisioner() {
+    /// Attaches to a container made from `env` and says what was forwarded for it
+    /// and whether the bundle was injected.
+    fn attach_to(env: FakeEnv) -> (Vec<String>, bool) {
         let dir = TempDir::new("attach").unwrap();
-        let env = FakeEnv::new()
+        let env = env
             .with_output(
                 &["sh", "-c", crate::runtime::PROBE_SCRIPT],
                 "1000\n1000\ndev\n/home/dev\n",
@@ -202,12 +209,25 @@ mod tests {
 
         attach(&ctx, &attached, &Config::default(), &prepared, false, true).unwrap();
 
-        assert_eq!(*forwarded.borrow(), ["c1 0"]);
+        let injected = inject::installed(attached.container.as_ref(), &user())
+            .unwrap()
+            .is_some();
+        let forwarded = forwarded.borrow().clone();
+        (forwarded, injected)
+    }
+
+    #[test]
+    fn attaching_to_a_container_that_exists_forwards_and_injects_without_a_provisioner() {
+        let (forwarded, injected) = attach_to(FakeEnv::new());
+        assert_eq!(forwarded, ["c1 0"]);
         // Nothing was injected before, so the bundle was injected now.
-        assert!(
-            inject::installed(attached.container.as_ref(), &user())
-                .unwrap()
-                .is_some()
-        );
+        assert!(injected);
+    }
+
+    #[test]
+    fn an_endpoint_whose_ports_are_already_here_gets_no_forwarding_daemon() {
+        let (forwarded, injected) = attach_to(FakeEnv::new().without_forwarding());
+        assert!(forwarded.is_empty(), "{forwarded:?}");
+        assert!(injected);
     }
 }

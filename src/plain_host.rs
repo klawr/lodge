@@ -100,6 +100,12 @@ impl Container for PlainHost {
         Ok(true)
     }
 
+    /// Another machine's ports are forwarded here; this machine's are already
+    /// here.
+    fn forwards_ports(&self) -> bool {
+        self.host.label().is_some()
+    }
+
     fn read_stored_file(&self, path: &str) -> Result<Option<String>> {
         Ok(self
             .host
@@ -357,6 +363,12 @@ mod tests {
         assert_eq!(remote.reach(Some("db")), None);
         let local = PlainHost::new(Arc::new(FakeHost::new()));
         assert_eq!(local.reach(None), None);
+    }
+
+    #[test]
+    fn only_another_machine_needs_a_forwarding_daemon() {
+        assert!(machine().1.forwards_ports());
+        assert!(!PlainHost::new(Arc::new(FakeHost::new())).forwards_ports());
     }
 
     #[test]

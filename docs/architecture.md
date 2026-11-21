@@ -33,7 +33,7 @@ ldg rm [PATH]        Lifecycle::remove (container, and the compose project)
 ldg ls               Lifecycle::list (every container with lodge's project label)
 ldg ports [PATH]     forward::active_ports (what the daemon reports)
 ldg logs [PATH]      the daemon's log file
-ldg clean [PATH]     ContainerUser::resolve → inject::installed → inject::remove
+ldg clean [PATH]     ForwardDaemon::stop → ContainerUser::resolve → inject::installed → inject::remove
 ldg init             a commented config from the tools found on PATH
 ldg doctor [PATH]    host tools, engine, compose, config, binaries, secrets
 ldg pack             bundle::pack::pack_to_file (config → bundle tar)
@@ -66,7 +66,7 @@ every subcommand.
 | `layout.rs` | Every path lodge writes inside a container: `Layout`, the paths inside the user's prefix (the table under "What lives where"); the provisioning state, which is the devcontainer's own and root-owned; and the secrets directory. Nothing else spells these paths out. |
 | `secret/` | Secrets that must not be in a bundle. Their `[[secret]]` declarations are config (`config/secret.rs`: validated; names reach shell scripts). `mod` is the `Secret` value type (redacted `Debug`, no `Display`), matching `targets` globs, and `resolve` (env, file or a command run on *this* machine with a timeout, with errors that never contain the value). `place` writes values into a container under `/dev/shm/lodge-secrets-<uid>/` and builds the session lines that export them; `clear` removes the user's (`ldg clean`). `deliver` picks the secrets whose `targets` match, resolves and places them (or clears them when none are declared), and prints names only. |
 | `session/` | Opens the interactive session: `docker exec -it`, and nothing around it; after a lost `--remote` connection it offers to reconnect. Its start-up script (`startup_script`) starts the shell as a login shell, so the profile scripts run, then puts the user's prefix `bin/` first on `PATH` and restores what the profile dropped before running the shell interactively; that is how the injected tools reach the session without any file outside the prefix. `terminfo` makes the terminal the session is opened from work in the container (copies its entry from this machine into the prefix when the container lacks it, and sets `TERM`). |
-| `forward/` | Port forwarding. `mod` has the `ForwardDaemon` trait (`DetachedDaemon` spawns the daemon; a test records instead) and owns its state files (log, lock, and the ports file `ldg ports` reads, which starts with the daemon's pid so a dead daemon's file is ignored), `daemon` is the `_forward` loop (declared ports plus whatever starts listening), `tunnel` one forward behind the `Forward` and `Forwarders` traits: `HostForwarders` starts the tunnel process the `Host` provides (`ssh -L` for `SshHost`) or else the in-process TCP proxy; the daemon's start, restart, re-point and cooldown logic is tested with a fake `Forwarders`. The daemon decodes its own `--port` flags, re-points a forward when its destination's address changes (looked up again every 30 s), and exits when the container stops, not when the engine merely can't be reached for a while. |
+| `forward/` | Port forwarding. `mod` has the `ForwardDaemon` trait (`start`, `stop`; `DetachedDaemon` spawns the daemon, and `stop` leaves it a note to end, which it looks for between polls; a test records instead) and owns its state files (log, lock, and the ports file `ldg ports` reads, which starts with the daemon's pid so a dead daemon's file is ignored), `daemon` is the `_forward` loop (declared ports plus whatever starts listening), `tunnel` one forward behind the `Forward` and `Forwarders` traits: `HostForwarders` starts the tunnel process the `Host` provides (`ssh -L` for `SshHost`) or else the in-process TCP proxy; the daemon's start, restart, re-point and cooldown logic is tested with a fake `Forwarders`. The daemon decodes its own `--port` flags, re-points a forward when its destination's address changes (looked up again every 30 s), and exits when the container stops, not when the engine merely can't be reached for a while, or when `ldg clean` asks it to (a machine is always up, so nothing else ends the daemon for a plain host). `up` starts none for an endpoint that says it has nothing to forward (`Container::forwards_ports`: this machine as a plain host). |
 | `provision.rs` | `TargetKind` (one kind of endpoint the user can name: its name, its one-line description, and how to build its `Endpoints` from the `Wiring` and the `[targets.<name>]` settings it was given; the whole of what is particular to a target outside its endpoint) and the seam between making an endpoint and working in one: `Endpoints` (provision a project's endpoint, find it, its status, hand out a handle by id for the forward daemon, which engine is behind it, whether `--remote` needs a project path, and an optional `Lifecycle`) returns `Attached` (the endpoint, its user, workdir, forward ports, whether it was just created, and the post-attach hook). `cmd::attach::up` is `provision` then `attach`, and `attach` takes only an `Attached`, so it is tested with a fake container and no provisioner. |
 | `plain_host.rs` | A machine you can reach as an endpoint (`--target host`): `PlainHost` is an `Env` and `Container` built on a `Host` only (commands and `tar` through `Host::exec`, secrets on stdin, the session through `Host::interactive`), acting as the user the host connects as and not [disposable](#capabilities); `PlainHostEndpoints` is its `Endpoints`: nothing to create, so it has no `Lifecycle` (`down`, `rm` and `ls` say so). |
 | `port.rs` | `PortForward`, a port to forward: what the devcontainer spec declares and the daemon carries out, so neither depends on the other. |
@@ -260,7 +260,7 @@ container lodge creates also carries the label `dev.lodge.project=<path>`.
 | --- | --- |
 | `~/.config/lodge/config.toml` | Your configuration. |
 | `~/.cache/lodge/bundles/` | Extracted or packed bundles, the four most recently used. |
-| `~/.local/share/lodge/forward-<id>.log`, `.lock`, `.ports` | Log of the port-forward daemon (started afresh by each daemon that takes over), the lock that keeps it to one per container, and its active forwards (for `ldg ports`, replaced whole on every change). |
+| `~/.local/share/lodge/forward-<id>.log`, `.lock`, `.ports`, `.stop` | Log of the port-forward daemon (started afresh by each daemon that takes over), the lock that keeps it to one per container, its active forwards (for `ldg ports`, replaced whole on every change), and the note `ldg clean` leaves for it to end (taken away when answered). |
 | `$TMPDIR/lodge-ssh/*.sock` | SSH `ControlMaster` sockets (`--remote` only). |
 | `$TMPDIR/lodge-<pid>-*` | Short-lived staging files and folders, removed when done. Each is created new and private to the user (0600 / 0700), never opened if the name is already taken. On a remote host the compose override comes from `mktemp`. |
 
@@ -299,7 +299,16 @@ does behind the `Host` trait. Four things make it work:
   container by name and starts what it finds. The forward daemon restarts a dead
   tunnel with a wait that doubles from 2 s to a minute. It has no
   terminal, so its tunnels never prompt: they ride on the connection `connect`
-  opened, or on key or agent auth.
+  opened, or on key or agent auth (`SshHost::unattended`, which `cmd::run`
+  gives the daemon, adds `BatchMode` to every command, not only the tunnels).
+  When that connection is gone and the host
+  wants a login only a person can give (`Host::awaiting_login`: for `SshHost` a
+  `BatchMode` attempt refused with "Permission denied"), the daemon does not
+  give up after its five minutes of failed polls (`--unreachable-polls`, a
+  setting of the hidden `_forward` command); it logs why once and polls every 20 s
+  until any command with a terminal runs `connect` again. A daemon that was
+  waiting rides out two checks that find nothing before it concludes the host is
+  gone, since one check can fail for its own reasons.
 - **Local bytes → container.** The remote docker can't see local paths, so
   `put` streams a tar to `docker cp -q -a - <id>:<dir>`, locally and over SSH alike,
   packed in-process (`runtime::tarball`), so no local `tar` is needed, none in the

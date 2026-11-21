@@ -11,7 +11,7 @@ use crate::output::{info, warning};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-pub use daemon::run_daemon;
+pub use daemon::{UNREACHABLE_POLLS, run_daemon};
 pub use tunnel::HostForwarders;
 
 use crate::port::PortForward;
@@ -23,6 +23,11 @@ pub trait ForwardDaemon {
     /// Starts forwarding for `container` and returns at once; what it does with
     /// `static_ports` (the declared forwards) is its own business.
     fn start(&self, container: &str, static_ports: &[PortForward]);
+
+    /// Ends the forwarding for `container`, if there is any, and returns at once.
+    /// What has no end of its own (a machine that is always up) is ended only by
+    /// this.
+    fn stop(&self, container: &str);
 }
 
 /// Spawns a detached `ldg _forward` daemon per container. It outlives the
@@ -93,6 +98,24 @@ impl ForwardDaemon for DetachedDaemon {
         {
             warning!("could not start the port-forwarding daemon: {e}");
         }
+    }
+
+    fn stop(&self, container: &str) {
+        if let Err(e) = Self::ask_to_stop(container) {
+            warning!("could not stop the port-forwarding daemon: {e}");
+        }
+    }
+}
+
+impl DetachedDaemon {
+    /// Asks the daemon for `container` to end, by leaving a note it looks for
+    /// between polls. Only when one is running: a note left for none would end the
+    /// next one at birth.
+    fn ask_to_stop(container: &str) -> std::io::Result<()> {
+        if active_ports(container)?.is_some() {
+            std::fs::write(stop_path(container)?, b"")?;
+        }
+        Ok(())
     }
 }
 
@@ -192,6 +215,16 @@ fn ports_path(container: &str) -> std::io::Result<PathBuf> {
     state_path(container, "ports")
 }
 
+/// The note `ldg` leaves for the daemon of `container` to end.
+fn stop_path(container: &str) -> std::io::Result<PathBuf> {
+    state_path(container, "stop")
+}
+
+/// Whether a stop was asked for, taking the note away so it is answered once.
+fn stop_requested(path: &std::path::Path) -> bool {
+    std::fs::remove_file(path).is_ok()
+}
+
 fn lock_path(container: &str) -> std::io::Result<PathBuf> {
     state_path(container, "lock")
 }
@@ -244,6 +277,16 @@ mod tests {
         assert!(parse_ports(text, |_| false).is_none());
         assert!(parse_ports("8080\tx\n", |_| true).is_none());
         assert_eq!(parse_ports("pid 1\n", |_| true), Some(vec![]));
+    }
+
+    #[test]
+    fn a_request_to_stop_is_answered_once() {
+        let dir = crate::tmpfile::TempDir::new("stop").unwrap();
+        let note = dir.path().join("forward-x.stop");
+        assert!(!stop_requested(&note), "nothing asked");
+        std::fs::write(&note, b"").unwrap();
+        assert!(stop_requested(&note));
+        assert!(!stop_requested(&note), "the note is taken away");
     }
 
     #[test]

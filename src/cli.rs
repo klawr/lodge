@@ -239,5 +239,9 @@ pub enum Command {
         /// (local:port or local:host:port)
         #[arg(long)]
         port: Vec<String>,
+        /// How many polls in a row (2 s apart) may fail to reach the engine
+        /// before the daemon exits, unless the host waits for a login
+        #[arg(long, default_value_t = crate::forward::UNREACHABLE_POLLS)]
+        unreachable_polls: u32,
     },
 }

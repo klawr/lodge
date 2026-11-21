@@ -112,6 +112,17 @@ pub fn listeners(port: u16) -> Vec<String> {
         .collect()
 }
 
+/// Polls `done` every 100 ms for up to `secs` seconds; whether it became true.
+pub fn wait_until(secs: u64, mut done: impl FnMut() -> bool) -> bool {
+    for _ in 0..secs * 10 {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    done()
+}
+
 /// The full id of `container` (a name or id).
 pub fn container_id(container: &str) -> String {
     let out = Command::new("docker")
@@ -125,22 +136,69 @@ pub fn container_id(container: &str) -> String {
 /// by any prefix of its id, as the daemon may be given either). For a removed
 /// container, pass its full id.
 pub fn forward_daemons(container: &str) -> usize {
+    forward_daemon_pids(container).len()
+}
+
+/// The pids of the processes whose command line (its arguments, split apart)
+/// `matches`.
+fn processes_with(matches: impl Fn(&[&[u8]]) -> bool) -> Vec<u32> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return vec![];
+    };
+    dir.filter_map(|e| {
+        let path = e.ok()?.path();
+        let pid = path.file_name()?.to_str()?.parse().ok()?;
+        let raw = std::fs::read(path.join("cmdline")).ok()?;
+        let args: Vec<&[u8]> = raw.split(|&b| b == 0).collect();
+        matches(&args).then_some(pid)
+    })
+    .collect()
+}
+
+fn forward_daemon_pids(container: &str) -> Vec<u32> {
     let id = match container_id(container) {
         id if id.is_empty() => container.to_string(),
         id => id,
     };
-    let Ok(dir) = std::fs::read_dir("/proc") else {
-        return 0;
-    };
-    dir.filter_map(|e| std::fs::read(e.ok()?.path().join("cmdline")).ok())
-        .filter(|raw| {
-            let args: Vec<&[u8]> = raw.split(|&b| b == 0).collect();
-            let names_it = |a: &&[u8]| {
-                *a == container.as_bytes() || (a.len() >= 12 && id.as_bytes().starts_with(a))
-            };
-            args.contains(&&b"_forward"[..]) && args.iter().any(names_it)
-        })
-        .count()
+    processes_with(|args| {
+        let names_it = |a: &&[u8]| {
+            *a == container.as_bytes() || (a.len() >= 12 && id.as_bytes().starts_with(a))
+        };
+        args.contains(&&b"_forward"[..]) && args.iter().any(names_it)
+    })
+}
+
+/// Stops the forward daemons of `container` and the tunnels they started (each
+/// daemon leads its own process group).
+pub fn stop_forward_daemons(container: &str) {
+    for pid in forward_daemon_pids(container) {
+        kill_group(pid);
+    }
+}
+
+fn kill_group(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-TERM", "--", &format!("-{pid}")])
+        .output();
+}
+
+/// A forward daemon the test started itself, so as to give it settings `up`
+/// does not; stopped, with its tunnels, when dropped.
+pub struct Daemon {
+    child: std::process::Child,
+}
+
+impl Daemon {
+    pub fn running(&mut self) -> bool {
+        self.child.try_wait().expect("asking the daemon").is_none()
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        kill_group(self.child.id());
+        let _ = self.child.wait();
+    }
 }
 
 fn which(name: &str) -> Option<PathBuf> {
@@ -152,9 +210,36 @@ fn which(name: &str) -> Option<PathBuf> {
 /// A real sshd container; removed when dropped.
 pub struct SshHost {
     container: String,
+    /// The server's `authorized_keys`, a file the test owns and can empty.
+    authorized_keys: PathBuf,
+    public_key: String,
 }
 
 impl SshHost {
+    /// The server stops accepting the test's key, as a host that needs a password
+    /// does for a connection that cannot ask for one.
+    pub fn require_login(&self) {
+        std::fs::write(&self.authorized_keys, "").expect("emptying authorized_keys");
+    }
+
+    /// Lets the key in again when the returned guard is dropped, so that what a
+    /// test cleans up over this connection afterwards still can, even if the test
+    /// failed while the key was refused. Declare it after the project.
+    pub fn accept_login_when_done(&self) -> impl Drop + '_ {
+        struct Guard<'a>(&'a SshHost);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.accept_login();
+            }
+        }
+        Guard(self)
+    }
+
+    /// The server accepts the key again: the login was given.
+    pub fn accept_login(&self) {
+        std::fs::write(&self.authorized_keys, &self.public_key).expect("restoring authorized_keys");
+    }
+
     /// The `--remote` destination.
     pub fn dest(&self) -> &'static str {
         "lodge-it-sshd"
@@ -274,7 +359,10 @@ impl Sandbox {
             "RUN apk add --no-cache --upgrade openssh-server openssh-client && ssh-keygen -A",
             " && sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config",
             // authorized_keys is bind-mounted from the sandbox, owned by the test's uid.
-            " && echo 'StrictModes no' >> /etc/ssh/sshd_config\n",
+            " && echo 'StrictModes no' >> /etc/ssh/sshd_config",
+            // The test refuses logins on purpose; the server must not answer by
+            // refusing the machine, as a default sshd does.
+            " && echo 'PerSourcePenalties no' >> /etc/ssh/sshd_config\n",
         );
         let mut build = Command::new("docker")
             .args(["build", "-q", "-t", image, "-"])
@@ -298,7 +386,12 @@ impl Sandbox {
 
         let port = free_port();
         let root = self.root.to_string_lossy().into_owned();
-        let pubkey = format!("{}.pub", key.display());
+        let public_key =
+            std::fs::read_to_string(format!("{}.pub", key.display())).expect("reading the key");
+        // Bind-mounted as a file: the test rewrites it in place to let the key in
+        // or out.
+        let authorized_keys = self.root.join("authorized_keys");
+        std::fs::write(&authorized_keys, &public_key).expect("writing authorized_keys");
         let name = format!(
             "lodge-it-sshd-{}",
             self.root.file_name().expect("a name").to_string_lossy()
@@ -315,14 +408,21 @@ impl Sandbox {
             "-v",
             &format!("{root}:{root}"),
             "-v",
-            &format!("{pubkey}:/root/.ssh/authorized_keys:ro"),
+            &format!(
+                "{}:/root/.ssh/authorized_keys:ro",
+                authorized_keys.display()
+            ),
             image,
             "/usr/sbin/sshd",
             "-D",
             "-e",
         ]);
         // From here on the container is removed even if the test panics.
-        let host = SshHost { container: name };
+        let host = SshHost {
+            container: name,
+            authorized_keys,
+            public_key,
+        };
 
         let config = self.root.join("ssh_config");
         std::fs::write(
@@ -364,6 +464,49 @@ impl Sandbox {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
         panic!("sshd in {} never answered", host.container);
+    }
+
+    /// Runs `ldg --remote <remote> _forward <container> --port <port>
+    /// --unreachable-polls <polls>` in the background, its log in `log`.
+    pub fn spawn_daemon(
+        &self,
+        remote: &str,
+        container: &str,
+        port: u16,
+        polls: u32,
+        log: &Path,
+    ) -> Daemon {
+        use std::os::unix::process::CommandExt as _;
+        let log = std::fs::File::create(log).expect("creating the daemon log");
+        let child = self
+            .command()
+            .args(["--remote", remote, "_forward", container])
+            .args(["--port", &format!("{port}:{port}")])
+            .args(["--unreachable-polls", &polls.to_string()])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .expect("starting the daemon");
+        Daemon { child }
+    }
+
+    /// Ends the shared ssh connection to the test's server, as a link that is lost
+    /// for good does: its tunnels end with it, and a new one needs a login.
+    pub fn drop_ssh_master(&self) {
+        let sockets = self.root.join("tmp/lodge-ssh");
+        let sockets = sockets.to_string_lossy().into_owned();
+        for pid in processes_with(|args| {
+            args.iter().any(|a| {
+                let a = String::from_utf8_lossy(a);
+                a.contains("[mux]") && a.contains(&sockets)
+            })
+        }) {
+            let _ = Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .output();
+        }
     }
 
     fn command(&self) -> Command {
@@ -489,10 +632,17 @@ impl Sandbox {
 
 impl Sandbox {
     /// Whether any `ldg _forward` daemon started inside this sandbox is running.
-    fn has_running_daemons(&self) -> bool {
+    /// Whether a forward daemon that belongs to this sandbox is running.
+    pub fn has_running_daemons(&self) -> bool {
+        !self.daemon_pids().is_empty()
+    }
+
+    /// The forward daemons that belong to this sandbox (they have its data
+    /// directory in their environment).
+    fn daemon_pids(&self) -> Vec<u32> {
         let marker = format!("XDG_DATA_HOME={}", self.root.join("data").display());
         let Ok(dir) = std::fs::read_dir("/proc") else {
-            return false;
+            return vec![];
         };
         dir.filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
@@ -500,11 +650,13 @@ impl Sandbox {
                     .map(|c| c.split(|&b| b == 0).any(|a| a == b"_forward"))
                     .unwrap_or(false)
             })
-            .any(|p| {
+            .filter(|p| {
                 std::fs::read(p.join("environ"))
                     .map(|e| e.split(|&b| b == 0).any(|v| v == marker.as_bytes()))
                     .unwrap_or(false)
             })
+            .filter_map(|p| p.file_name()?.to_str()?.parse().ok())
+            .collect()
     }
 }
 
@@ -519,6 +671,12 @@ impl Drop for Sandbox {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // One that is left has lost what it forwards for (its sshd is gone before
+        // it noticed its container was) and would wait minutes to give up: no test
+        // leaves a process behind.
+        for pid in self.daemon_pids() {
+            kill_group(pid);
         }
         let _ = std::fs::remove_dir_all(&self.root);
     }

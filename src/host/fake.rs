@@ -61,6 +61,7 @@ struct State {
 pub struct FakeHost {
     label: Option<String>,
     tunnels: bool,
+    login: bool,
     state: Mutex<State>,
 }
 
@@ -70,6 +71,7 @@ impl FakeHost {
         FakeHost {
             label: None,
             tunnels: false,
+            login: false,
             state: Mutex::default(),
         }
     }
@@ -85,6 +87,13 @@ impl FakeHost {
     /// Provides tunnels, as a host whose network the caller cannot reach does.
     pub fn with_tunnels(mut self) -> Self {
         self.tunnels = true;
+        self
+    }
+
+    /// Wants a login only a person can give, as a password host whose
+    /// connection dropped does.
+    pub fn awaiting_login(mut self) -> Self {
+        self.login = true;
         self
     }
 
@@ -348,6 +357,10 @@ impl Host for FakeHost {
     /// is tried again at once, three times in all.
     fn link_lost(&self, status: ExitStatus, _stderr: &[u8]) -> bool {
         self.label.is_some() && status.code() == Some(255)
+    }
+
+    fn awaiting_login(&self) -> bool {
+        self.login
     }
 
     fn retry_policy(&self) -> RetryPolicy {

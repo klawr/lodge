@@ -28,7 +28,12 @@ single `ldg up` issues (a `ControlMaster` socket under `$TMPDIR/lodge-ssh/`, kep
 for 10 minutes after the last use). It opens it before anything else, with your
 terminal available, so a password, passphrase or 2FA prompt is answered once.
 The port-forwarding daemon has no terminal: it rides on that connection, or on
-key or agent auth if it has to reconnect.
+key or agent auth if it has to reconnect. None of its ssh commands ever prompts. If the
+connection is lost for good on a host that needs a password or a second factor,
+the daemon cannot log in again. It says so in its log and waits instead of
+exiting, looking every 20 s (each look is a failed login, which a server may
+count against you); the next `ldg` command you run in a terminal opens the
+connection again, and the forwards come back by themselves.
 
 A link that goes quiet is dropped after about 45 seconds (`ServerAliveInterval=15`,
 `ServerAliveCountMax=3`). When the connection is lost during a step that is safe
