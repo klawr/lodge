@@ -148,6 +148,13 @@ This is covered by an integration test, so it keeps working.
 | ------------------ | ------- | ------- |
 | `safe_directories` | `["*"]` | directories registered as git `safe.directory` for the container user; `[]` disables it |
 
+## `engine`
+
+A top-level `engine = "docker"` names the container engine lodge drives. `--engine`
+on the command line overrides it, and without either it is `docker`, which is the
+only engine so far. The engine runs on the machine `--remote` names, or on this
+one. A value that is not an engine is an error.
+
 ## `bundle`
 
 A top-level `bundle = "path/to/lodge.tar"` injects from that bundle instead of

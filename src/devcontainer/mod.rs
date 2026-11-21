@@ -34,9 +34,9 @@ use crate::output::{note, warning};
 use anyhow::Result;
 use std::path::Path;
 
+use crate::host::HostRef;
 use crate::port::PortForward;
 use crate::runtime::{Container, Env, Runtime};
-use crate::target::Target;
 use drift::{config_state, hash_inputs, write_hash};
 use lifecycle::{Hook, HookCtx, exec_env, run_create_hooks, run_in_container, run_on_host};
 use profile::write_env_profile;
@@ -85,17 +85,17 @@ impl Started {
     }
 }
 
-/// Brings up the devcontainer of `project_path`, whose files are on `target`
+/// Brings up the devcontainer of `project_path`, whose files are on `host`
 /// (where the engine `rt` runs too).
 pub fn start(
     project_path: &Path,
-    target: &Target,
+    host: &HostRef,
     build: bool,
     rt: &dyn Runtime,
     prompt: &dyn Prompt,
 ) -> Result<Started> {
-    let (spec, existing) = locate(project_path, target, rt)?;
-    let current_hash = hash_inputs(&spec.config_path, &spec.hash_extra, target)?;
+    let (spec, existing) = locate(project_path, host, rt)?;
+    let current_hash = hash_inputs(&spec.config_path, &spec.hash_extra, host.as_ref())?;
 
     // Has the config drifted since the existing container was created? It is
     // only reported: `--build` is what recreates.
@@ -113,12 +113,12 @@ pub fn start(
 
     // initializeCommand runs on the host before the container is created/started.
     if let Some(cmd) = &spec.lifecycle.initialize {
-        run_on_host(&spec.base_dir, "initializeCommand", cmd, target)?;
+        run_on_host(&spec.base_dir, "initializeCommand", cmd, host.as_ref())?;
     }
 
     let features_ctx = features::Context {
         base_dir: &spec.base_dir,
-        target,
+        host: host.as_ref(),
     };
 
     // A new container needs every feature, resolved up front so their
@@ -146,7 +146,7 @@ pub fn start(
     // workspace is writable. Only when the container was just created.
     if created
         && spec.sync_uid
-        && let Err(e) = target
+        && let Err(e) = host
             .uid_gid()
             .and_then(|(uid, gid)| uid::sync_user_uid(env, spec.remote_user.as_deref(), uid, gid))
     {
@@ -189,12 +189,8 @@ pub fn start(
 }
 
 /// The project's spec and the id of its existing container, if there is one.
-fn locate(
-    project_path: &Path,
-    target: &Target,
-    rt: &dyn Runtime,
-) -> Result<(Spec, Option<String>)> {
-    let spec = load_spec(project_path, target)?;
+fn locate(project_path: &Path, host: &HostRef, rt: &dyn Runtime) -> Result<(Spec, Option<String>)> {
+    let spec = load_spec(project_path, host)?;
     let existing = spec.backend.existing(rt)?;
     Ok((spec, existing))
 }
@@ -207,8 +203,8 @@ pub struct Found {
 }
 
 /// Finds the container `ldg up` manages for this project.
-pub fn find(project_path: &Path, target: &Target, rt: &dyn Runtime) -> Result<Option<Found>> {
-    let (spec, existing) = locate(project_path, target, rt)?;
+pub fn find(project_path: &Path, host: &HostRef, rt: &dyn Runtime) -> Result<Option<Found>> {
+    let (spec, existing) = locate(project_path, host, rt)?;
     Ok(existing.map(|id| Found {
         container: rt.container(&id),
         remote_user: spec.remote_user,
@@ -217,8 +213,8 @@ pub fn find(project_path: &Path, target: &Target, rt: &dyn Runtime) -> Result<Op
 
 /// Stops the container `ldg up` manages for this project, if one exists, and
 /// returns its id. The container is kept so `ldg up` can resume it.
-pub fn stop(project_path: &Path, target: &Target, rt: &dyn Runtime) -> Result<Option<String>> {
-    let (_, existing) = locate(project_path, target, rt)?;
+pub fn stop(project_path: &Path, host: &HostRef, rt: &dyn Runtime) -> Result<Option<String>> {
+    let (_, existing) = locate(project_path, host, rt)?;
     if let Some(id) = &existing {
         rt.stop(id)?;
     }
@@ -227,8 +223,8 @@ pub fn stop(project_path: &Path, target: &Target, rt: &dyn Runtime) -> Result<Op
 
 /// Removes the project's container (and compose project), throwing away
 /// everything installed in it, and returns its id.
-pub fn remove(project_path: &Path, target: &Target, rt: &dyn Runtime) -> Result<Option<String>> {
-    let (spec, existing) = locate(project_path, target, rt)?;
+pub fn remove(project_path: &Path, host: &HostRef, rt: &dyn Runtime) -> Result<Option<String>> {
+    let (spec, existing) = locate(project_path, host, rt)?;
     if existing.is_some() {
         spec.backend.remove(rt)?;
     }
@@ -245,14 +241,14 @@ pub struct Status {
 
 /// The project's container, if it has one: whether it runs, and whether its
 /// config drifted.
-pub fn status(project_path: &Path, target: &Target, rt: &dyn Runtime) -> Result<Option<Status>> {
-    let (spec, existing) = locate(project_path, target, rt)?;
+pub fn status(project_path: &Path, host: &HostRef, rt: &dyn Runtime) -> Result<Option<Status>> {
+    let (spec, existing) = locate(project_path, host, rt)?;
     let Some(id) = existing else {
         return Ok(None);
     };
     let container = rt.container(&id);
     let running = container.is_running()?;
-    let current = hash_inputs(&spec.config_path, &spec.hash_extra, target)?;
+    let current = hash_inputs(&spec.config_path, &spec.hash_extra, host.as_ref())?;
     let config = config_state(container.as_ref(), &current);
     Ok(Some(Status {
         found: Found {
@@ -276,8 +272,8 @@ pub struct Needs {
 
 /// What the devcontainer in `project_path` needs. An error when there is no
 /// config there, or it can't be read.
-pub fn needs(project_path: &Path, target: &Target) -> Result<Needs> {
-    let spec = load_spec(project_path, target)?;
+pub fn needs(project_path: &Path, host: &HostRef) -> Result<Needs> {
+    let spec = load_spec(project_path, host)?;
     Ok(Needs {
         compose: spec.backend.uses_compose(),
         registry_features: spec
@@ -291,6 +287,7 @@ pub fn needs(project_path: &Path, target: &Target) -> Result<Needs> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::local;
     use crate::runtime::fake::{FakeEnv, FakeRuntime};
     use crate::tmpfile::TempDir;
 
@@ -337,17 +334,14 @@ mod tests {
     }
 
     fn state(dir: &TempDir, rt: &FakeRuntime) -> ConfigState {
-        status(dir.path(), &Target::Local, rt)
-            .unwrap()
-            .unwrap()
-            .config
+        status(dir.path(), &local(), rt).unwrap().unwrap().config
     }
 
     #[test]
     fn a_new_container_is_created_and_records_its_config() {
         let dir = project(PLAIN);
         let rt = engine(&dir, false);
-        let started = start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
+        let started = start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
         assert_eq!(started.workdir, "/w");
         assert!(started.created);
         assert!(
@@ -362,8 +356,8 @@ mod tests {
     fn an_unchanged_container_is_started_not_created() {
         let dir = project(PLAIN);
         let rt = engine(&dir, false);
-        start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
-        let again = start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
+        start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
+        let again = start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
         assert!(!again.created);
         let ops = rt.ops();
         assert_eq!(
@@ -378,11 +372,11 @@ mod tests {
     fn a_changed_config_is_reported_and_the_container_kept() {
         let dir = project(PLAIN);
         let rt = engine(&dir, false);
-        start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
+        start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
         write_config(&dir, EDITED);
         assert_eq!(state(&dir, &rt), ConfigState::Changed);
 
-        let again = start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
+        let again = start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
         assert!(!again.created);
         assert!(!rt.ops().iter().any(|o| o.starts_with("remove")));
         assert_eq!(state(&dir, &rt), ConfigState::Changed, "kept as it was");
@@ -392,7 +386,7 @@ mod tests {
     fn a_container_without_a_recorded_config_is_kept_and_reported_unknown() {
         let dir = project(PLAIN);
         let rt = engine(&dir, true);
-        let started = start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
+        let started = start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
         assert!(!started.created, "not knowing is not drift");
         let ops = rt.ops();
         assert!(ops.len() == 1 && ops[0].starts_with("start "), "{ops:?}");
@@ -403,12 +397,12 @@ mod tests {
     fn a_stopped_container_whose_config_changed_is_still_noticed() {
         let dir = project(PLAIN);
         let rt = engine(&dir, false);
-        let started = start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
+        let started = start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
         rt.stop(started.container.id()).unwrap();
         write_config(&dir, EDITED);
         // The fake refuses commands in a stopped container, so the record is
         // read without one.
-        let s = status(dir.path(), &Target::Local, &rt).unwrap().unwrap();
+        let s = status(dir.path(), &local(), &rt).unwrap().unwrap();
         assert!(!s.running);
         assert_eq!(s.config, ConfigState::Changed);
     }
@@ -417,7 +411,7 @@ mod tests {
     fn build_recreates_the_container() {
         let dir = project(PLAIN);
         let rt = engine(&dir, true);
-        let started = start(dir.path(), &Target::Local, true, &rt, &Nothing).unwrap();
+        let started = start(dir.path(), &local(), true, &rt, &Nothing).unwrap();
         assert!(started.created);
         let ops = rt.ops();
         assert!(
@@ -432,13 +426,13 @@ mod tests {
         let dir =
             project(r#"{"dockerComposeFile": "c.yml", "service": "app", "workspaceFolder": "/w"}"#);
         let rt = FakeRuntime::new(container);
-        let first = start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
+        let first = start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
         assert!(
             first.container.id().ends_with("-app-1"),
             "{}",
             first.container.id()
         );
-        let again = start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
+        let again = start(dir.path(), &local(), false, &rt, &Nothing).unwrap();
         assert_eq!(again.container.id(), first.container.id());
         assert!(!again.created);
         assert_eq!(state(&dir, &rt), ConfigState::UpToDate);

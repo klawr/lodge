@@ -40,14 +40,14 @@ impl Check {
 /// passed.
 pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
     let mut checks = Vec::new();
-    let remote = ctx.target.ssh_host();
+    let remote = ctx.host.label();
 
     let engine = ctx.rt.version();
     checks.push(match &engine {
         Ok(v) => Check::new(
             "container engine",
             Level::Ok,
-            format!("{v}{}", ctx.target.on_host()),
+            format!("{v}{}", ctx.host.on_host()),
         ),
         Err(e) => Check::new("container engine", Level::Missing, e.to_string()),
     });
@@ -55,7 +55,7 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
     // The devcontainer here (if any) decides whether compose and oras matter.
     let needs = ctx
         .project(path)
-        .and_then(|p| crate::devcontainer::needs(&p, &ctx.target));
+        .and_then(|p| crate::devcontainer::needs(&p, &ctx.host));
     checks.push(match &needs {
         Ok(n) => Check::new(
             "devcontainer",

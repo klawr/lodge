@@ -11,15 +11,13 @@
 pub mod terminfo;
 
 use crate::config::SessionConfig;
+use crate::host::Host;
 use crate::layout::Layout;
 use crate::output::{info, note, prompt, warning};
 use crate::runtime::{Acting, Container, ContainerUser};
 use crate::shell::shell_quote;
-use crate::ssh::Outcome as _;
-use crate::target::Target;
 use anyhow::Result;
 use std::io::IsTerminal as _;
-use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 /// Where and how to open the session.
@@ -72,11 +70,11 @@ fn path_script(layout: &Layout) -> String {
     )
 }
 
-/// Opens an interactive login shell in `container` (on the engine at `target`),
+/// Opens an interactive login shell in `container` (on the engine on `host`),
 /// wrapped as `config` says.
 pub fn enter(
     container: &dyn Container,
-    target: &Target,
+    host: &dyn Host,
     config: &SessionConfig,
     s: &Session,
 ) -> Result<()> {
@@ -109,31 +107,33 @@ pub fn enter(
         &format!("{}{term_setup}{set_title}; ", s.setup),
     );
 
-    // The local command line that opens the interactive session; how it reaches
-    // the container (docker exec, over ssh -tt for a remote engine) is the
-    // environment's business.
-    let run_cmd = container.interactive_command(s.user.exec_as(), s.workdir, &inner);
+    // The local command that opens the interactive session; how it reaches the
+    // container (docker exec, through the host's terminal) is the environment's
+    // business. Built afresh for each start.
+    let start = || {
+        let mut cmd = container.interactive_command(s.user.exec_as(), s.workdir, &inner);
+        crate::output::trace(&cmd);
+        cmd.status()
+    };
     let container_id = container.id();
 
     info!("entering {container_id}");
-    crate::output::trace_line(&run_cmd);
 
     let mut started = Instant::now();
-    let mut status = run_shell(&run_cmd)?;
+    let mut status = start()?;
     // The connection dropped under a session that had been in use. The shell on
     // the other side is gone (or going), so the only thing to offer is a new one;
     // if the user's shell setup attaches to something that outlived the
     // disconnect, that is where they land. Not offered after an instant failure,
     // which is the connection never coming up, and not without a terminal to ask.
-    while let Some(host) = target.ssh_host()
-        && status.connection_lost()
+    while host.link_lost(status, &[])
         && started.elapsed() >= Duration::from_secs(2)
         && ask_to_reconnect(host)
     {
-        crate::ssh::connect(host)?;
+        host.connect()?;
         info!("entering {container_id}");
         started = Instant::now();
-        status = run_shell(&run_cmd)?;
+        status = start()?;
     }
     let result = if status.success() {
         Ok(())
@@ -141,17 +141,13 @@ pub fn enter(
         Err(anyhow::anyhow!("session exited with failure"))
     };
 
-    // A remote session that fails almost instantly is the signature of the SSH
-    // server refusing a PTY: `docker exec -it` then has no tty on its stdin and
+    // A remote session that fails almost instantly is the signature of the host
+    // refusing a PTY: `docker exec -it` then has no tty on its stdin and
     // bails the moment the shell opens. Probe for it (only on a fast failure, so
     // a normal shell exiting non-zero after real use doesn't trigger an extra
     // connection) and point at the fix, which is server-side — no client flag,
     // not even `-tt`, can override it.
-    if result.is_err()
-        && started.elapsed() < Duration::from_secs(2)
-        && let Some(host) = target.ssh_host()
-        && crate::ssh::pty_denied(host)
-    {
+    if result.is_err() && started.elapsed() < Duration::from_secs(2) && host.pty_denied() {
         warning!(
             "the remote SSH server refused a PTY for this connection, so the\n\
              interactive shell (`docker exec -it`) was dropped immediately. Fix it\n\
@@ -165,11 +161,12 @@ pub fn enter(
 
 /// Asks whether to open a new shell after the connection to `host` was lost.
 /// Without a terminal to ask on, no.
-fn ask_to_reconnect(host: &str) -> bool {
+fn ask_to_reconnect(host: &dyn Host) -> bool {
     if !std::io::stdin().is_terminal() {
         return false;
     }
-    note!("lost the connection to {host}");
+    let to = host.label().map(|h| format!(" to {h}")).unwrap_or_default();
+    note!("lost the connection{to}");
     prompt!("reconnect and open a new shell? [Y/n] ");
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).is_ok() && !declined(&line)
@@ -178,12 +175,6 @@ fn ask_to_reconnect(host: &str) -> bool {
 /// Whether an answer to a yes-by-default question is a no.
 fn declined(answer: &str) -> bool {
     answer.trim().to_ascii_lowercase().starts_with('n')
-}
-
-// Runs the session command (`docker exec -it`, over `ssh -tt` for a remote
-// engine) and returns how it ended.
-fn run_shell(run_cmd: &str) -> Result<ExitStatus> {
-    Ok(Command::new("sh").arg("-c").arg(run_cmd).status()?)
 }
 
 #[cfg(test)]

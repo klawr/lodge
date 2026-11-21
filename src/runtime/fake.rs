@@ -331,8 +331,15 @@ impl Env for FakeEnv {
         Ok(())
     }
 
-    fn interactive_command(&self, _user: User, workdir: &str, inner: &str) -> String {
-        format!("fake-shell {workdir} {inner}")
+    fn interactive_command(
+        &self,
+        _user: User,
+        workdir: &str,
+        inner: &str,
+    ) -> std::process::Command {
+        let mut c = std::process::Command::new("fake-shell");
+        c.arg(workdir).arg(inner);
+        c
     }
 }
 
@@ -416,6 +423,10 @@ impl Fake {
 }
 
 impl Runtime for FakeRuntime {
+    fn respawn_args(&self) -> Vec<String> {
+        vec![]
+    }
+
     /// Panics for a container that doesn't exist: lodge only asks for handles
     /// to containers it found.
     fn container(&self, id: &str) -> Box<dyn Container> {
@@ -583,7 +594,7 @@ impl Env for FakeContainer {
         self.env()?.write_secret(dest, contents, mode, user)
     }
 
-    fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> String {
+    fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> std::process::Command {
         self.fake.env.interactive_command(user, workdir, inner)
     }
 }

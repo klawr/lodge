@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 pub mod secret;
 
+use crate::runtime::Engine;
 use crate::shell::{container_path_problem, is_plain_name};
 use secret::{RawSecret, SecretDecl};
 
@@ -24,6 +25,10 @@ use secret::{RawSecret, SecretDecl};
     schemars(rename = "Config")
 )]
 pub struct Config<S = SecretDecl> {
+    /// The container engine to drive, unless `--engine` says otherwise
+    /// (default: docker).
+    #[serde(default)]
+    pub engine: Option<Engine>,
     /// A bundle file to inject from instead of packing the `[[inject]]` entries.
     /// A relative path is relative to this file's folder.
     #[serde(default)]
@@ -47,6 +52,7 @@ pub struct Config<S = SecretDecl> {
 impl<S> Default for Config<S> {
     fn default() -> Self {
         Self {
+            engine: None,
             bundle: None,
             inject: Vec::new(),
             session: SessionConfig::default(),
@@ -169,6 +175,25 @@ fn resolve_against(config_file: &Path, path: PathBuf) -> PathBuf {
         .map_or(path.clone(), |dir| dir.join(&path))
 }
 
+/// The `engine` the config at `path` names, if it does. Read on its own, before
+/// the whole config is loaded, because the engine is chosen before a command
+/// loads the config. A file that is missing or is not valid TOML names none:
+/// the command that loads the config reports that. A value that is not an
+/// engine is an error here.
+pub fn engine_setting(path: &Path) -> Result<Option<Engine>> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    let Ok(table) = raw.parse::<toml::Table>() else {
+        return Ok(None);
+    };
+    table
+        .get("engine")
+        .map(|v| v.clone().try_into::<Engine>())
+        .transpose()
+        .with_context(|| format!("invalid `engine` in {}", path.display()))
+}
+
 impl Config {
     /// Reads and validates the config at `path`. A missing file is an empty
     /// config: nothing is injected, and you still get a shell.
@@ -204,6 +229,7 @@ impl Config {
     /// `[[secret]]` checked; what is wrong with a secret goes to `problems`.
     fn from_file(file: Config<RawSecret>, path: &Path, problems: &mut Vec<String>) -> Self {
         let Config {
+            engine,
             bundle,
             mut inject,
             session,
@@ -225,6 +251,7 @@ impl Config {
             })
             .collect();
         Self {
+            engine,
             bundle: bundle.map(|b| resolve_against(path, b)),
             inject,
             session,
@@ -350,6 +377,33 @@ mod tests {
         assert!(c.inject[0].copy_deps); // defaults to true
         assert_eq!(c.session.shell, "/bin/zsh");
         assert_eq!(c.git.safe_directories, vec!["/work".to_string()]);
+    }
+
+    #[test]
+    fn the_engine_is_a_known_name_or_an_error() {
+        assert_eq!(
+            parse("engine = \"docker\"").unwrap().engine,
+            Some(Engine::Docker)
+        );
+        assert_eq!(parse("").unwrap().engine, None);
+        let err = format!("{:#}", parse("engine = \"nonesuch\"").unwrap_err());
+        assert!(
+            err.contains("nonesuch") || err.contains("unknown variant"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_engine_alone_can_be_read_from_a_file_that_is_otherwise_unchecked() {
+        let dir = crate::tmpfile::TempDir::new("engine-peek").unwrap();
+        let path = dir.path().join("c.toml");
+        // Wrong in other ways (an unknown key): not this function's business.
+        std::fs::write(&path, "engine = \"docker\"\nbogus = 1\n").unwrap();
+        assert_eq!(engine_setting(&path).unwrap(), Some(Engine::Docker));
+        // Not TOML at all: no engine named; loading the config reports it.
+        std::fs::write(&path, "= = =").unwrap();
+        assert_eq!(engine_setting(&path).unwrap(), None);
+        assert_eq!(engine_setting(&dir.path().join("none.toml")).unwrap(), None);
     }
 
     #[test]

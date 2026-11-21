@@ -18,7 +18,7 @@ pub(super) fn fetch(ctx: &Context, reference: &str, work: &Path) -> Result<(Feat
     let dir = if is_local_ref(reference) {
         // Relative to the devcontainer folder, on the project's host: with
         // `--remote` that is the remote machine, so the folder is copied over.
-        ctx.target
+        ctx.host
             .fetch_dir(&ctx.base_dir.join(reference), work)
             .with_context(|| format!("reading local feature {reference}"))?
     } else {

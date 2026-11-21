@@ -11,9 +11,9 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::fingerprint::Fingerprint;
+use crate::host::Host;
 use crate::output::warning;
 use crate::runtime::{Container, Env};
-use crate::target::Target;
 use crate::tree::{self, Denied, Links};
 
 use crate::layout::DEVCONTAINER_HASH as HASH_PATH;
@@ -71,7 +71,7 @@ pub(super) fn config_state(container: &dyn Container, current: &str) -> ConfigSt
 pub(super) fn hash_inputs(
     config_path: &Path,
     extra: &[PathBuf],
-    target: &Target,
+    host: &dyn Host,
 ) -> Result<String> {
     let mut entries: Vec<(String, Vec<u8>)> = vec![];
     let devcontainer_dir = config_folder(config_path);
@@ -80,7 +80,7 @@ pub(super) fn hash_inputs(
     // Kept alive until hashing is done: a remote directory is copied into it.
     let scratch = crate::tmpfile::TempDir::new("dchash").context("creating a scratch folder")?;
     if let Some(root) = devcontainer_dir {
-        let local = target.fetch_dir(root, &scratch.path().join("dir"))?;
+        let local = host.fetch_dir(root, &scratch.path().join("dir"))?;
         collect_dir(&local, &mut entries)?;
     } else {
         files.push(config_path.to_path_buf());
@@ -93,7 +93,7 @@ pub(super) fn hash_inputs(
             .filter(|f| devcontainer_dir.is_none_or(|root| !f.starts_with(lexical(root)))),
     );
     for f in files {
-        if let Some(bytes) = target.read_file(&f)? {
+        if let Some(bytes) = host.read_file(&f)? {
             let name = f
                 .file_name()
                 .unwrap_or_default()
@@ -176,6 +176,7 @@ fn lexical(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::LocalHost;
     use crate::runtime::Runtime;
     use crate::runtime::fake::{FakeEnv, FakeRuntime};
 
@@ -192,12 +193,12 @@ mod tests {
             std::fs::write(dc.join(f), body).unwrap();
         }
         let config = dc.join("py/devcontainer.json");
-        let before = hash_inputs(&config, &[], &Target::Local).unwrap();
+        let before = hash_inputs(&config, &[], &LocalHost).unwrap();
         std::fs::write(dc.join("go/devcontainer.json"), r#"{"a":1}"#).unwrap();
-        assert_eq!(hash_inputs(&config, &[], &Target::Local).unwrap(), before);
+        assert_eq!(hash_inputs(&config, &[], &LocalHost).unwrap(), before);
         std::fs::write(dc.join("py/Dockerfile"), "FROM b\n").unwrap();
         assert_ne!(
-            hash_inputs(&config, &[], &Target::Local).unwrap(),
+            hash_inputs(&config, &[], &LocalHost).unwrap(),
             before,
             "the Dockerfile beside the config counts"
         );
@@ -236,13 +237,13 @@ mod tests {
         let config = dc.join("devcontainer.json");
         let inside = [dc.join("compose.yml")];
         let outside = [dc.join("../outside.yml")];
-        let none = hash_inputs(&config, &[], &Target::Local).unwrap();
-        assert_eq!(hash_inputs(&config, &inside, &Target::Local).unwrap(), none);
-        let with_outside = hash_inputs(&config, &outside, &Target::Local).unwrap();
+        let none = hash_inputs(&config, &[], &LocalHost).unwrap();
+        assert_eq!(hash_inputs(&config, &inside, &LocalHost).unwrap(), none);
+        let with_outside = hash_inputs(&config, &outside, &LocalHost).unwrap();
         assert_ne!(with_outside, none);
         std::fs::write(tmp.path().join("outside.yml"), "y").unwrap();
         assert_ne!(
-            hash_inputs(&config, &outside, &Target::Local).unwrap(),
+            hash_inputs(&config, &outside, &LocalHost).unwrap(),
             with_outside
         );
     }

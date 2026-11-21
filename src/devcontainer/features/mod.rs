@@ -12,9 +12,9 @@ mod fetch;
 
 use super::create::{CreateSettings, Mount};
 use super::markers;
+use crate::host::Host;
 use crate::output::{info, plural, warning};
 use crate::runtime::{ContainerUser, Env, ExecOpts, User};
-use crate::target::Target;
 use crate::tmpfile::TempDir;
 use anyhow::Result;
 use serde::Deserialize;
@@ -83,7 +83,7 @@ pub struct Context<'a> {
     /// relative to it.
     pub base_dir: &'a Path,
     /// The project's host, where local features are read from.
-    pub target: &'a Target,
+    pub host: &'a dyn Host,
 }
 
 /// A user an install script is told about. Falls back to root when the
@@ -271,7 +271,7 @@ fn install_one(env: &dyn Env, r: &Resolved, users: &[ContainerUser; 2]) -> Resul
             workdir: Some(&dest),
             env: &vars,
             // An installer may do anything, so it is not run a second time.
-            repeat: crate::ssh::Repeat::Never,
+            repeat: crate::host::Repeat::Never,
         },
     )
 }

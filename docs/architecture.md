@@ -43,8 +43,8 @@ ldg _forward …       forward::run_daemon (internal; spawned by `up`)
 ```
 
 `src/main.rs` only parses the arguments and hands them to `cmd::run`. `cmd/` is
-the command layer: it builds a `Ctx` (the `Target`, the `Runtime` and the config
-path), loads the config **once** per command, resolves the container user once
+the command layer: it builds a `Ctx` (the `Host`, the `Runtime` and the config
+path; see "Hosts and injection"), loads the config **once** per command, resolves the container user once
 (`ContainerUser`), and decides what to print (`--json` included) and how to ask
 the person at the terminal (`cmd::prompt`). The modules below it take what they
 need as arguments, don't read the config themselves, report progress with
@@ -58,25 +58,24 @@ every subcommand.
 | --- | --- |
 | `cli.rs` | `clap` definitions: subcommands and the global flags. |
 | `cmd/` | One file per group of commands (`attach`: up/exec, `project`: down/status/rm/ls/ports/logs/clean, `doctor`, `init`, `bundle`: pack/bundle/cache), plus `prompt`, the terminal side of `devcontainer::Prompt`. The only layer that loads the config, prints reports and reads the terminal. |
-| `config/` | The user's `config.toml`: `[[inject]]`, `[session]`, `[git]`, `[[secret]]` (its declaration types are in `config/secret.rs`: `RawSecret` as written, `SecretDecl` once checked), `bundle`. Unknown keys and wrong types are errors (with a "did you mean"); past those, every problem, secrets included, is reported at once. A relative `bundle =` resolves against the file's folder. The JSON schema in `docs/config.schema.json` is generated from these types. |
+| `config/` | The user's `config.toml`: `[[inject]]`, `[session]`, `[git]`, `[[secret]]` (its declaration types are in `config/secret.rs`: `RawSecret` as written, `SecretDecl` once checked), `bundle`, `engine` (also readable on its own with `engine_setting`, because the engine is chosen before a command loads the config). Unknown keys and wrong types are errors (with a "did you mean"); past those, every problem, secrets included, is reported at once. A relative `bundle =` resolves against the file's folder. The JSON schema in `docs/config.schema.json` is generated from these types. |
 | `devcontainer/` | Everything about running a `devcontainer.json` (see below). |
 | `bundle/` | A bundle is a portable tar of relinked binaries, their libraries and configs, with a manifest, and is tied to no install prefix (see "Injection"). `manifest` defines and validates it (paths derive from names, so a bundle can't point outside itself), `archive` writes, reads and verifies the tar, `pack` builds one from the config (the only step needing `patchelf`; `deps` parses `ldd`, asking it once per binary however often the answer is needed, `elf` reads a binary's architecture, as an `arch::Arch`, the one name for a CPU that bundles, binaries and machines are compared by, and `Arch::host()` is this machine's, and writes the interpreter of a dynamic binary in place), `source` readies a bundle *directory* to inject from (extracted from a file, or packed live), keyed by the file's hash or a fingerprint of the live inputs, and `cache` keeps those directories under `~/.cache/lodge/bundles/`. `hash` is the content hash of a file or tree. |
 | `inject/` | Copies a bundle's binaries, libraries and configs into a container for one `ContainerUser`, reading only from the bundle directory and acting *as that user* (through `runtime::Acting`), so it never needs root: `prefix` (chooses and checks the prefix: the user's home, else a private `/tmp` directory; `installed`, in `state`, finds where it was installed), `binary` (rewrites a dynamic binary's interpreter for the prefix, and writes the wrapper a config asked for), `libs` (tracked by content hash), `config_files`, `git` (`safe.directory`), `installed` (a hash and the destination per installed piece; a record that can't be read means that piece is installed again, and the list of records `ldg clean` works from is an error when it can't be read, not "nothing installed"), `state` (the installed bundle id, and `installed`, which finds what was injected and where), `remove` (`ldg clean`; placed secrets are removed by `secret::place::clear`). |
 | `layout.rs` | Every path lodge writes inside a container: `Layout`, the paths inside the user's prefix (the table under "What lives where"); the provisioning state, which is the devcontainer's own and root-owned; and the secrets directory. Nothing else spells these paths out. |
 | `secret/` | Secrets that must not be in a bundle. Their `[[secret]]` declarations are config (`config/secret.rs`: validated; names reach shell scripts). `mod` is the `Secret` value type (redacted `Debug`, no `Display`), matching `targets` globs, and `resolve` (env, file or a command run on *this* machine with a timeout, with errors that never contain the value). `place` writes values into a container under `/dev/shm/lodge-secrets-<uid>/` and builds the session lines that export them; `clear` removes the user's (`ldg clean`). `deliver` picks the secrets whose `targets` match, resolves and places them (or clears them when none are declared), and prints names only. |
 | `session/` | Opens the interactive session: `docker exec -it`, and nothing around it; after a lost `--remote` connection it offers to reconnect. Its start-up script (`startup_script`) starts the shell as a login shell, so the profile scripts run, then puts the user's prefix `bin/` first on `PATH` and restores what the profile dropped before running the shell interactively; that is how the injected tools reach the session without any file outside the prefix. `terminfo` makes the terminal the session is opened from work in the container (copies its entry from this machine into the prefix when the container lacks it, and sets `TERM`). |
-| `forward/` | Port forwarding. `mod` spawns the daemon and owns its state files (log, lock, and the ports file `ldg ports` reads, which starts with the daemon's pid so a dead daemon's file is ignored), `daemon` is the `_forward` loop (declared ports plus whatever starts listening), `tunnel` one forward: the in-process TCP proxy or an `ssh -L` tunnel. The daemon decodes its own `--port` flags, re-points a forward when its destination's address changes (looked up again every 30 s), and exits when the container stops, not when the engine merely can't be reached for a while. |
+| `forward/` | Port forwarding. `mod` spawns the daemon and owns its state files (log, lock, and the ports file `ldg ports` reads, which starts with the daemon's pid so a dead daemon's file is ignored), `daemon` is the `_forward` loop (declared ports plus whatever starts listening), `tunnel` one forward: the in-process TCP proxy, or the tunnel process the `Host` provides (`ssh -L` for `SshHost`). The daemon decodes its own `--port` flags, re-points a forward when its destination's address changes (looked up again every 30 s), and exits when the container stops, not when the engine merely can't be reached for a while. |
 | `port.rs` | `PortForward`, a port to forward: what the devcontainer spec declares and the daemon carries out, so neither depends on the other. |
 | `host_tools.rs` | The helper programs lodge may run here (`ssh`, `ldd`, `patchelf`, `oras`): what each is needed for (a `Need`, which decides when `doctor` requires it) and how to get it. `doctor` reports from this table and each tool is started only through it. |
-| `target.rs` | `Target` (`Local` or `Ssh(host)`): the one place that decides local vs remote, plus host-side file helpers (`read_first` finds files by pattern and reads the first in one round trip, `read_file` reads one, `fetch_dir` copies a folder from the project's host). |
-| `runtime/` | The seam to whatever runs the workload: the `Env`, `Container`, `Runtime` and `Compose` traits (see below), `User` (who a command runs as) and `ContainerUser` (the session user's name, uid, gid and home, looked up once), `Acting` (an `Env` seen as one user, below), `tarball` (packs files as a tar owned by a user), the docker CLI implementation (`docker/`: the engine, the per-container `Env`, and the file-copy streaming), and strict in-memory fakes for tests (`FakeEnv`, and `FakeRuntime`, whose containers each run in one). |
-| `ssh.rs` | `--remote` destination parsing; the shared connection (`connect` opens it up front with the terminal available, `ControlMaster` multiplexes everything after); `retry`, which reruns a step after a lost connection if it is marked `Repeat::Safe`; the few ssh invocations lodge needs. |
+| `host/` | How a machine is reached. `mod` is the `Host` trait (a local process that runs a command on the host, one with a terminal, a tunnel, the connection hooks) with everything built on those provided: running a script, `read_first` (finds files by pattern and reads the first in one round trip), `read_file`, `canonical_dir`, `fetch_dir` (copies a folder from the project's host), `write_scratch`, `uid_gid`; and `attempt`, which reruns a step after a lost connection if it is marked `Repeat::Safe`. `local` is `LocalHost`, this machine. `ssh` is `SshHost`: `--remote` destination parsing, the shared connection (`connect` opens it up front with the terminal available, `ControlMaster` multiplexes everything after), and the few ssh invocations lodge needs, all built from one private `base`. |
+| `runtime/` | The seam to whatever runs the workload: the `Env`, `Container`, `Runtime` and `Compose` traits (see below), `User` (who a command runs as) and `ContainerUser` (the session user's name, uid, gid and home, looked up once), `Acting` (an `Env` seen as one user, below), `tarball` (packs files as a tar owned by a user), the docker CLI implementation (`docker/`: the engine, which runs on a `Host` it is given, the per-container `Env`, and the file-copy streaming), and strict in-memory fakes for tests (`FakeEnv`, and `FakeRuntime`, whose containers each run in one). |
 | `shell.rs` | POSIX `shell_quote`, which everything that builds a command string goes through; `script_argv`, how every script with arguments is started (`sh -c <script> sh <args…>`, so arguments are `$1`, `$2`, …); the rules for names written into scripts unquoted (`is_plain_name`, `is_var_name`) and for destinations in a container (`container_path_problem`); `slug` for container names; and `CmdLine`, a command as `sh -c` script or argv. |
 | `fingerprint.rs` | The small content hash used to notice changes (devcontainer inputs, updated libraries, bundle contents), as a `Fingerprint` builder. Its values are stored, so a test pins them. |
 | `tmpfile.rs` | Self-deleting staging files for `docker cp`. |
 | `tree.rs` | Walking a file tree on this machine in one stable order (name order, a directory before its contents), with an explicit choice about symlinks (a followed link loop is entered once) and unreadable directories. Every hash, fingerprint and copy of a tree goes through it. |
 | `output.rs` | Everything lodge says (`info!`, `note!`, `warning!`, `error!`, `prompt!`, `line!` for reports, and `line_err!`, `scoped!`, `raw_stdout`, `raw_stderr` for the special cases), the `[lodge]` prefix on every line, `plural`, and the verbosity setting with command tracing (`trace`, `trace_line`). |
-| `conventions.rs`, `doc_facts.rs` | Test-only: architecture rules (one place per external program, the direction of dependencies), and facts the docs state checked against the code. |
+| `conventions.rs`, `doc_facts.rs` | Test-only: architecture rules (one place per external program, only `cmd/` chooses implementations, the direction of dependencies), and facts the docs state checked against the code. |
 
 ### `devcontainer/`
 
@@ -85,14 +84,14 @@ every subcommand.
 | File | Responsibility |
 | --- | --- |
 | `mod.rs` | `start` / `stop` / `remove` / `status` / `find`, the `Started` result, whether the container was created, and `Prompt`, the questions only a person can answer (the command layer implements it). Drift and the installed bundle are read with `Container::read_stored_file`, which works on a stopped container too. |
-| `spec.rs` | Find the config on the project's host (through `Target`, so local and `--remote` share one lookup order); parse `devcontainer.json` (JSONC) into a backend-agnostic `Spec`; derive the session name. |
+| `spec.rs` | Find the config on the project's host (through `Host`, so every host shares one lookup order); parse `devcontainer.json` (JSONC) into a backend-agnostic `Spec`; derive the session name. |
 | `backend.rs` | Picks and builds the backend from the parsed config (with the stable container name, and the files outside the hashed folder that count toward drift: a Dockerfile, compose files). The `Backend` trait with two implementations: `ComposeBackend` (`docker compose`, run on the project's host) and `ContainerBackend` (`docker run` of an image or a local build). Both label the container `dev.lodge.project=<path>`. |
 | `create.rs` | `CreateSettings`, how a container is created (privileged, capabilities, mounts, published `appPort`s, …), from devcontainer.json and from features alike, rendered as `docker run` flags or a compose override. |
 | `features/` | Devcontainer *features*: `fetch` (OCI with `oras`, or a local folder from the project's host; a feature's `id` must be a plain name, since it names a folder), and in `mod.rs` the order, the creation settings they ask for, and the install (as root, told `_REMOTE_USER`), with one env profile per feature. |
 | `lifecycle.rs` | The `Hook` type (string / argv / named map, all run as the same steps), running hooks on the host or in the container (as `remoteUser`), and the create-time hooks that run once successfully (`run_create_hooks`). |
 | `profile.rs` | The env profiles written into the container (`containerEnv`/`remoteEnv`, and what features add): literals quoted, variable references left for the login shell. |
 | `markers.rs` | One-shot markers: which create-time hooks and feature installs already succeeded. |
-| `drift.rs` | Drift detection: fingerprint the folder the config is in (`.devcontainer/`, or `.devcontainer/<name>/`), or a standalone `.devcontainer.json`, plus the files the backend names outside it (a Dockerfile, compose files), and compare with the value stored in the container. `config_state` is the one comparison, used by `ldg up` and `ldg status` alike: `UpToDate`, `Changed`, or `Unknown` when no hash is recorded or it can't be read, which is not drift. The files are read through `Target` (`fetch_dir`, `read_file`), so a remote project is hashed exactly like a local one. |
+| `drift.rs` | Drift detection: fingerprint the folder the config is in (`.devcontainer/`, or `.devcontainer/<name>/`), or a standalone `.devcontainer.json`, plus the files the backend names outside it (a Dockerfile, compose files), and compare with the value stored in the container. `config_state` is the one comparison, used by `ldg up` and `ldg status` alike: `UpToDate`, `Changed`, or `Unknown` when no hash is recorded or it can't be read, which is not drift. The files are read through `Host` (`fetch_dir`, `read_file`), so a remote project is hashed exactly like a local one. |
 | `workdir.rs` | The directory a session lands in: `workspaceFolder`, or one the person picks when it doesn't exist. |
 | `uid.rs` | Lines the container user's uid/gid up with the host user's so a bind-mounted workspace is writable. Worked out in Rust from `/etc/passwd`, applied by a small script. |
 | `vars.rs` | `${localEnv:X:default}`, `${containerWorkspaceFolder}`, `${devcontainerId}` and friends, and `path_tag`, the short hash of the project path behind `${devcontainerId}` and the container and session names. |
@@ -107,7 +106,7 @@ and hooks all work from the resulting container id.
 
 0. **Load the config and ready the bundle** (`cmd::attach`), so a broken config or
    bundle fails before anything starts. The project path is made canonical on
-   the project's host (`Target::canonical_dir`; with `--remote`, `pwd -P`
+   the project's host (`Host::canonical_dir`; on another machine, `pwd -P`
    there), so one folder is one container however it is spelled.
 1. **Load the spec.** Find and parse `devcontainer.json`; pick a backend.
 2. **Detect drift.** Fingerprint the inputs and compare with the hash stored in
@@ -254,17 +253,20 @@ secrets) and keeps the devcontainer's state (markers, hash, `containerEnv`).
 
 ## Remote mode
 
-With `--remote <dest>`, the docker CLI runs *on the remote host* over SSH, so no
-local Docker is needed. Three things make that work:
+With `--remote <dest>`, `cmd::run` builds an `SshHost` instead of a `LocalHost`
+and the docker CLI runs *on the remote host* over SSH, so no local Docker is
+needed. Nothing but `host/ssh.rs` knows that; this section is what `SshHost`
+does behind the `Host` trait. Four things make it work:
 
-- `DockerCli::command` wraps every `docker …` in `ssh <dest> …`, shell-quoting each
+- `DockerCli` asks its host for a process that runs `docker …`
+  (`Host::command`), and `SshHost` answers with `ssh <dest> …`, shell-quoting each
   argument. Anything that reads **files** (compose projects, build contexts)
-  goes through `DockerCli::command_in`, which also `cd`s into the project
-  directory *on the remote*.
+  goes through `DockerCli::command_in`, which hands the host the project
+  directory too, so `SshHost` `cd`s into it *on the remote*.
 - **Connection reuse.** A single `ldg up` issues dozens of SSH calls.
-  `ssh::connect` opens one connection first (a password or 2FA prompt is
-  answered once, with the terminal available) and `ssh::base` multiplexes
-  every later call over its `ControlMaster` socket, one per destination, with
+  `Host::connect` opens one connection first (a password or 2FA prompt is
+  answered once, with the terminal available) and every later call is
+  multiplexed over its `ControlMaster` socket, one per destination, with
   `ServerAliveInterval=15` so a dead link fails in about 45 s instead of
   hanging.
 - **Lost connections and repeat-safety.** ssh exiting 255 says the connection
@@ -275,11 +277,14 @@ local Docker is needed. Three things make that work:
   default (user hooks, a feature's `install.sh`, the uid change,
   `initializeCommand`, scratch files, the interactive session). Exec steps set it
   with `ExecOpts::repeatable()`, everything else goes through
-  `Target::attempt`; a safe step is retried up to three times, waiting 1 s then
-  2 s, after the dead master is dropped. A rejected login or host key is never
-  retried. `docker run` is not repeatable as such, so a retry first looks for the
+  `Host::attempt`. The host decides what counts as a lost connection
+  (`Host::link_lost`: for `SshHost` exit 255, unless ssh says the login or host
+  key was refused), how often to retry and how to reset (`retry_policy`,
+  `reset_link`); a safe step is retried up to three times, waiting 1 s then
+  2 s, after the dead master is dropped. A host whose connection cannot be lost
+  (`LocalHost`) never retries. `docker run` is not repeatable as such, so a retry first looks for the
   container by name and starts what it finds. The forward daemon restarts a dead
-  `ssh -L` tunnel with a wait that doubles from 2 s to a minute. It has no
+  tunnel with a wait that doubles from 2 s to a minute. It has no
   terminal, so its tunnels never prompt: they ride on the connection `connect`
   opened, or on key or agent auth.
 - **Local bytes → container.** The remote docker can't see local paths, so
@@ -287,12 +292,12 @@ local Docker is needed. Three things make that work:
   packed in-process (`runtime::tarball`), so no local `tar` is needed, none in the
   container, and the entries carry the owner's uid and gid, which `-a` makes the
   daemon honour. The devcontainer config is found with
-  `Target::read_first` (one probe script remotely, which also returns the
+  `Host::read_first` (one probe script remotely, which also returns the
   file, with the same lookup order as locally); its inputs are fetched for
-  hashing with `Target::fetch_dir`.
+  hashing with `Host::fetch_dir`.
 
 The destination accepts a `~/.ssh/config` alias, `user@host`, `user@host:port`,
-`[v6]:port` and an `ssh://` prefix (`ssh::split`).
+`[v6]:port` and an `ssh://` prefix (`ssh::split`, private to `host/ssh.rs`).
 
 ## Runtime traits
 
@@ -315,9 +320,9 @@ primitives gets the rest for free. The traits know nothing of lodge's own
 layout: markers, hashes and profiles live in the modules that use them. An
 `Env` doesn't say whether it is local or remote either; code that needs to
 know (matching a secret's `targets`, diagnosing a refused PTY) is handed the
-`Target` by the command.
+`Host` by the command and asks it (`names`, `pty_denied`).
 
-`put` behaves the same on every target: a file becomes `dest`, and a
+`put` behaves the same on every endpoint: a file becomes `dest`, and a
 directory's *contents* are merged into `dest`; every missing directory down to
 it is made, and everything created is owned by the `owner` it is given. Callers
 that want an exact copy remove `dest` first.
@@ -330,30 +335,62 @@ does *for a user* (inject, write their state, open their session) goes through
 theirs. So the injector and the code under it have no way to need root: asking
 for it takes an explicit `exec_root`, which none of them contain.
 
-`runtime::docker` implements all four over the `docker` CLI, locally or on a
-remote host over SSH. `runtime::fake::FakeEnv` is an in-memory `Env` that
+`runtime::docker` implements all four over the `docker` CLI, run on whichever
+`Host` it is given. `runtime::fake::FakeEnv` is an in-memory `Env` that
 records commands and keeps a virtual filesystem, which is what the injection
 tests run against; `FakeRuntime` is an engine (with compose) that keeps its
 containers by name, each in its own `FakeEnv`, and refuses to act on one that
 doesn't exist, which is what `devcontainer::start`'s create / reuse / recreate decisions are
-tested against. Another engine, or a plain host with no engine at all, would
+tested against. Another engine (Podman, kubectl), or a plain host with no engine at all, would
 implement the same traits.
 
 Backends (`devcontainer/backend.rs`) are plain data: the `Runtime` is passed in
 rather than stored.
 
-## Local vs remote
+## Hosts and injection
 
-`--remote` is parsed once, in `cmd::run`, into a `Target` (`Local` or
-`Ssh(host)`), which the `Runtime` is built from. The command hands the `Target`
-to whatever needs it (`devcontainer`, `forward`, `secret`, `session`); the
-`Runtime` doesn't give it out. From there on nothing handles a
-bare `Option<String>`. Code that must behave differently does a single `match` on
-the `Target` at the boundary (reading the config, hashing it, running
-`initializeCommand`) and is otherwise written once. `Target` also owns host-side
-file operations (`canonical_dir`, `read_first`, `read_file`, `fetch_dir`,
-`write_scratch`, `remove_file`); the compose backend writes its temporary
-override with `write_scratch`, whose guard removes it again.
+Every dependency sits behind an interface and is injected, so a new
+implementation is one new type handed in at one place:
+
+| Dependency | Interface | Implementations |
+| --- | --- | --- |
+| How a machine is reached | `host::Host` | `LocalHost`, `SshHost`; anything else that can run a command implements the two primitives |
+| The container engine | `runtime::Runtime`, `Compose`, `Container`, `Env` | `runtime::docker`, and the in-memory `FakeRuntime` for tests |
+| Helper tools and what is injected | `host_tools` (a registry) and `[[inject]]` data | multiplexers and other tools are injected like any other, never named in code |
+
+The pieces compose instead of branching. The engine is built *on* a host
+(`DockerCli::new(host)`), so "docker over ssh" is the same engine with a different
+host, not a third case; a remote Podman would be a second engine on the same
+host. `Host` has two primitives, `command` (a local process that runs a command
+on the host) and `interactive` (the same with a terminal), plus the connection
+hooks (`connect`, `link_lost`, `reset_link`, `retry_policy`, `pty_denied`,
+`tunnel`); everything else (`sh_output`, `run_in`, `canonical_dir`, `read_first`,
+`read_file`, `fetch_dir`, `write_scratch`, `remove_file`, `uid_gid`) is provided on
+top of them, so an implementation gets it by writing the primitives and
+overrides only what it can do better (`LocalHost` reads files directly). The
+compose backend writes its temporary override with `write_scratch`, whose guard
+removes it again.
+
+`--remote` and `--engine` (or `engine` in the config, `choose_engine`) are read once, in
+`cmd::run`, which is the composition root: the only place that picks `LocalHost` or `SshHost` and, with
+`build_engine`, the engine built on it (`DockerCli`, for `--engine docker`), then
+puts both in the `Ctx`. A child lodge (the forward daemon) is pointed at the same
+pair through `Host::respawn_args` and `Runtime::respawn_args`. From there on nothing handles a bare `Option<String>`
+or matches on a kind of host. The command hands `&dyn Host` (or `HostRef`, where a
+backend keeps one) to whatever needs it (`devcontainer`, `forward`, `secret`,
+`session`) and the `Runtime` as `&dyn Runtime`. What differs between hosts is
+asked as a capability, not by name: `shares_cwd` (may the project path be left
+out), `names` (what a secret's `targets` match), `respawn_args` (how the forward
+daemon reaches the same host), `tunnel` (the process that forwards a port, or
+`None` when the engine's addresses are reachable from here and the in-process
+proxy is used).
+
+To add a way of reaching machines (an ssh successor, `gh codespace ssh`, an
+agent), implement `Host` in a new file under `host/` and add one arm to the
+choice in `cmd::run`. To add an engine, implement `Runtime` (and `Env`,
+`Container`) under `runtime/`, add a variant to `cli::Engine` and an arm to
+`cmd::build_engine`. Nothing else changes, and
+`conventions.rs` fails if anything else starts to name the new type.
 
 ## Conventions
 
@@ -373,20 +410,27 @@ erode.
   every command lodge spawns, in shell-pasteable form; `-vv` / `-vvv` pass `-v`
   to ssh. Reports and questions belong to `cmd/`. *Enforced:* clippy denies
   `println!` and friends outside `output.rs`.
-- **One place per external program.** `ssh` is started only in `ssh.rs`,
-  `docker` only in `runtime/docker/`, a local `sh` only in `target.rs` (scripts
-  on the project's host), `secret/` (a secret's `command` source, which is on
-  this machine whatever the target) and `session/` (launching the user's
-  session), and the helper tools (`ldd`, `patchelf`, `oras`) only
-  through `host_tools`. lodge never runs a local `tar`; tar streams are built and
-  unpacked in-process. `ssh.rs` offers `connect`, `retry`, `command`, `sh_output`,
-  `write_scratch`, `tunnel`, `pty_denied` and `interactive_line`, all built on one private
-  `base`; nothing else builds an `ssh` command. *Enforced:* the tests in
+- **Every dependency is injected.** The way a machine is reached is a `Host`, the
+  engine a `Runtime`, and only `cmd/` (the composition root, `cmd::run`) names a
+  concrete one (`SshHost`, `LocalHost`, `DockerCli`); everything else takes the
+  interface. No code matches on a kind of host or engine or compares one's name:
+  it asks a capability (see "Hosts and injection"). Each interface has a fake or
+  a test host, so a branch is tested without docker, ssh or a network.
+  *Enforced:* `conventions.rs` fails if a concrete host or engine is named
+  outside its own module and `cmd/`.
+- **One place per external program.** `ssh` is started only in `host/ssh.rs`;
+  `docker` is never started directly: `runtime/docker/` asks its `Host` to run it,
+  and no other module spells it out; a local `sh` only in `host/local.rs` (scripts
+  on this machine as the project's host) and `secret/` (a secret's `command`
+  source, which is on this machine whatever the host); and the helper tools
+  (`ldd`, `patchelf`, `oras`) only through `host_tools`. lodge never runs a local
+  `tar`; tar streams are built and unpacked in-process. `host/ssh.rs` builds
+  every `ssh` command from one private `base`. *Enforced:* the tests in
   `conventions.rs`.
 - **Dependencies point one way.** `cmd/` on top (the only layer that knows
   `cli`), lodge's features below it (`config`, `devcontainer`, `bundle`,
   `inject`, `secret`, `session`, `forward`), and a foundation (`runtime`,
-  `target`, `ssh`, `shell`, `layout`, `output`, `tmpfile`, `tree`,
+  `host`, `shell`, `layout`, `output`, `tmpfile`, `tree`,
   `fingerprint`, `host_tools`, `port`) that names none of them. *Enforced:* the
   tests in `conventions.rs`.
 - **Paths in the container** come from `layout.rs`; **the container user** is a
@@ -398,7 +442,7 @@ erode.
   `shell::container_path_problem`. Anything read from a bundle or a feature's
   metadata is checked the same way before it becomes a path.
 - **Running commands.** In a container through an `Env`; engine operations
-  through a `Runtime`; on the project's host through `Target` (`sh_output`,
+  through a `Runtime`; on the project's host through `Host` (`sh_output`,
   `run_in`, `canonical_dir`, `read_first`, `read_file`, `write_scratch`, `remove_file`,
   `uid_gid`).
 - **Quoting.** Anything interpolated into `sh -c` or an SSH command string goes

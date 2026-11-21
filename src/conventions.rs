@@ -1,10 +1,15 @@
 //! Architecture rules, checked by the test suite so they can't quietly erode.
 //!
-//! Each external program lodge runs on the user's behalf is started from one
-//! place. That keeps quoting, tracing, connection reuse and the local/remote
-//! decision in one spot instead of copied around. And dependencies point one
-//! way: the command layer on top, lodge's features below it, and a foundation
-//! (running things, quoting, paths, output) that knows none of them.
+//! Every dependency sits behind an interface and is injected: the way a machine
+//! is reached (`host::Host`), the container engine (`runtime::Runtime`), the
+//! helper tools. Each external program lodge runs on the user's behalf is started
+//! from one place, and only the command layer chooses implementations. That
+//! keeps quoting, tracing, connection reuse and the local/remote decision in one
+//! spot instead of copied around, and makes a new implementation (another way of
+//! reaching a machine, another engine) one new type handed in at one place. And
+//! dependencies point one way: the command layer on top, lodge's features below
+//! it, and a foundation (running things, quoting, paths, output) that knows none
+//! of them.
 
 #![cfg(test)]
 
@@ -50,24 +55,44 @@ fn spawners(program: &str) -> Vec<String> {
 }
 
 #[test]
-fn only_ssh_rs_starts_ssh() {
-    assert_eq!(spawners("ssh"), ["ssh.rs"]);
+fn only_the_ssh_host_starts_ssh() {
+    assert_eq!(spawners("ssh"), ["host/ssh.rs"]);
 }
 
 #[test]
-fn only_the_docker_runtime_starts_docker() {
-    assert_eq!(spawners("docker"), ["runtime/docker/mod.rs"]);
-}
-
-#[test]
-fn local_shells_are_started_by_target_secrets_and_the_session_launcher_only() {
-    // `target.rs` runs scripts on the project's host; `secret/` runs a secret's
-    // `command` source, which is on this machine whatever the target;
-    // `session/` launches the user's interactive session, which is a local
-    // command line by nature.
+fn docker_is_run_through_a_host_and_named_only_by_the_docker_runtime() {
+    // The engine never starts a process itself: it asks its `Host` to run
+    // `docker …`, so it works the same on every host.
+    assert_eq!(spawners("docker"), Vec::<String>::new());
     assert_eq!(
-        spawners("sh"),
-        ["secret/mod.rs", "session/mod.rs", "target.rs"]
+        files_containing(&["\"docker\""], &["runtime/docker/"]),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn local_shells_are_started_by_the_local_host_and_secrets_only() {
+    // `host/local.rs` runs scripts on this machine as the project's host;
+    // `secret/` runs a secret's `command` source, which is on this machine
+    // whatever the host is.
+    assert_eq!(spawners("sh"), ["host/local.rs", "secret/mod.rs"]);
+}
+
+#[test]
+fn only_the_command_layer_chooses_implementations() {
+    // The composition root (`cmd/`) builds the concrete host and engine; every
+    // other module takes `&dyn Host`, `HostRef` or `&dyn Runtime`, so swapping an
+    // implementation (or adding one) touches that one place.
+    assert_eq!(
+        files_containing(&["SshHost", "LocalHost"], &["host/", "cmd/"]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        files_containing(
+            &["DockerCli", "DockerContainer"],
+            &["runtime/docker/", "cmd/"]
+        ),
+        Vec::<String>::new()
     );
 }
 
@@ -137,14 +162,13 @@ fn dependencies() -> Vec<(String, String, String)> {
 /// None of it knows about lodge's features.
 const FOUNDATION: &[&str] = &[
     "fingerprint",
+    "host",
     "host_tools",
     "layout",
     "output",
     "port",
     "runtime",
     "shell",
-    "ssh",
-    "target",
     "tmpfile",
     "tree",
 ];

@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use super::backend::{Backend, BackendContext, build_backend, project_basename};
 use super::lifecycle::{Hook, Lifecycle};
 use super::vars::Vars;
+use crate::host::{Host, HostRef};
 use crate::port::PortForward;
-use crate::target::Target;
 
 /// A parsed devcontainer.json, grouped by what the fields are for.
 #[derive(Debug, Deserialize)]
@@ -140,9 +140,9 @@ pub(super) struct Spec {
     pub(super) backend: Box<dyn Backend>,
 }
 
-pub(super) fn load_spec(project_path: &Path, target: &Target) -> Result<Spec> {
-    let (config_path, raw) = find_config(project_path, target)?;
-    build_spec(parse_config(&raw)?, config_path, project_path, target)
+pub(super) fn load_spec(project_path: &Path, host: &HostRef) -> Result<Spec> {
+    let (config_path, raw) = find_config(project_path, host.as_ref())?;
+    build_spec(parse_config(&raw)?, config_path, project_path, host)
 }
 
 fn parse_config(raw: &str) -> Result<DevcontainerConfig> {
@@ -150,13 +150,13 @@ fn parse_config(raw: &str) -> Result<DevcontainerConfig> {
 }
 
 /// Turns a parsed config into the backend-agnostic [`Spec`] for the project at
-/// `project_path` on `target`. Pure: it touches no file and no container, so it
+/// `project_path` on `host`. Pure: it touches no file and no container, so it
 /// can be tested on its own.
 fn build_spec(
     config: DevcontainerConfig,
     config_path: PathBuf,
     project_path: &Path,
-    target: &Target,
+    host: &HostRef,
 ) -> Result<Spec> {
     let DevcontainerConfig {
         workspace_folder,
@@ -187,7 +187,7 @@ fn build_spec(
         container_user.clone(),
         &BackendContext {
             project_path,
-            target,
+            host,
             base_dir: &base_dir,
             workspace_folder: &workspace_folder,
             vars: &vars,
@@ -296,7 +296,7 @@ fn normalize_env_value(v: &str, vars: &Vars) -> String {
 // deep). With several subfolder configs the first (alphabetically) wins, with a
 // warning — lodge has no UI to pick one. The files are looked for on the
 // project's host, local or remote alike.
-fn find_config(project_path: &Path, target: &Target) -> Result<(PathBuf, String)> {
+fn find_config(project_path: &Path, host: &dyn Host) -> Result<(PathBuf, String)> {
     let fixed = [
         project_path.join(".devcontainer").join("devcontainer.json"),
         project_path.join(".devcontainer.json"),
@@ -306,9 +306,9 @@ fn find_config(project_path: &Path, target: &Target) -> Result<(PathBuf, String)
         .join("*")
         .join("devcontainer.json");
     let patterns = [fixed[0].clone(), fixed[1].clone(), subfolders];
-    let found = target.read_first(&patterns)?;
+    let found = host.read_first(&patterns)?;
     let (Some(first), Some(bytes)) = (found.paths.first(), found.contents) else {
-        let place = target.on_host();
+        let place = host.on_host();
         bail!(
             "no devcontainer config found in {}{place} (looked for \
              .devcontainer/devcontainer.json, .devcontainer.json, and \
@@ -330,12 +330,13 @@ fn find_config(project_path: &Path, target: &Target) -> Result<(PathBuf, String)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::{LocalHost, local};
 
     #[test]
     fn the_config_is_found_in_spec_order() {
         let tmp = crate::tmpfile::TempDir::new("find-config").unwrap();
         let p = tmp.path();
-        assert!(find_config(p, &Target::Local).is_err());
+        assert!(find_config(p, &LocalHost).is_err());
         for f in [
             ".devcontainer/b/devcontainer.json",
             ".devcontainer/a/devcontainer.json",
@@ -345,17 +346,17 @@ mod tests {
         }
         // Subfolders: the first alphabetically.
         assert_eq!(
-            find_config(p, &Target::Local).unwrap().0,
+            find_config(p, &LocalHost).unwrap().0,
             p.join(".devcontainer/a/devcontainer.json")
         );
         std::fs::write(p.join(".devcontainer.json"), "{}").unwrap();
         assert_eq!(
-            find_config(p, &Target::Local).unwrap().0,
+            find_config(p, &LocalHost).unwrap().0,
             p.join(".devcontainer.json")
         );
         std::fs::write(p.join(".devcontainer/devcontainer.json"), "{}").unwrap();
         assert_eq!(
-            find_config(p, &Target::Local).unwrap().0,
+            find_config(p, &LocalHost).unwrap().0,
             p.join(".devcontainer/devcontainer.json")
         );
     }
@@ -391,7 +392,7 @@ mod tests {
             parse_config(json)?,
             PathBuf::from("/home/me/proj/.devcontainer/devcontainer.json"),
             Path::new("/home/me/proj"),
-            &Target::Local,
+            &local(),
         )
     }
 

@@ -69,8 +69,10 @@ for where to put them). Man page: `ldg man | man -l -`.
 | `ldg cache [clear]` | Show or clear the cache of prepared bundles. |
 | `ldg completions SHELL`, `ldg man` | Shell completions and the man page. |
 
-Global flags, on every command: `-r/--remote HOST` runs against a docker engine
-over SSH, `-c/--config FILE` uses another config file, and `-v/--verbose` prints
+Global flags, on every command: `-r/--remote HOST` runs against an engine on
+another machine over SSH, `--engine docker` picks the container engine (also
+`engine = "docker"` in the config; docker is the only one so far, and the default), `-c/--config FILE` uses another config
+file, and `-v/--verbose` prints
 every docker/ssh command lodge runs (`-vv`, `-vvv` add ssh's own debug output).
 `status`, `ls`, `ports` and `doctor` take `--json`.
 

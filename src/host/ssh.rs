@@ -1,21 +1,42 @@
-//! Everything about `ssh`: parsing a `--remote` destination, connection
-//! multiplexing, and the few ssh invocations lodge needs. Every ssh command is
-//! built from [`base`] here, so port, multiplexing and `-v` are applied once.
+//! A machine reached over the system `ssh`: [`SshHost`] is the [`Host`] for it.
+//!
+//! This module holds everything about `ssh`: parsing a `--remote` destination,
+//! connection multiplexing, and the few ssh invocations lodge needs. Every ssh
+//! command is built from [`base`] here, so port, multiplexing and `-v` are
+//! applied once. Nothing outside this module names `ssh`.
 
 use anyhow::Context as _;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::os::unix::fs::DirBuilderExt;
-use std::path::PathBuf;
-use std::process::{Command, ExitStatus, Output, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
+
+use super::{Host, Repeat, RetryPolicy};
+use crate::shell::{CmdLine, shell_quote};
+
+/// A host reached with `ssh <destination>`: a `~/.ssh/config` alias, `user@host`,
+/// `user@host:port`, `[v6]:port`, with or without an `ssh://` prefix. Proxies,
+/// jump hosts and agents are the user's ssh configuration's business.
+pub struct SshHost {
+    remote: String,
+}
+
+impl SshHost {
+    pub fn new(remote: impl Into<String>) -> Self {
+        Self {
+            remote: remote.into(),
+        }
+    }
+}
 
 /// Splits a `--remote` destination into the ssh destination and an optional
 /// port. Accepted forms: a `~/.ssh/config` Host alias, `user@host`,
 /// `user@host:port`, `[v6addr]:port`, and any of those with an `ssh://`
 /// prefix. A bare IPv6 address (more than one `:` and no brackets) is left
 /// untouched rather than misread as host:port.
-pub fn split(remote: &str) -> (String, Option<u16>) {
+fn split(remote: &str) -> (String, Option<u16>) {
     let remote = remote.strip_prefix("ssh://").unwrap_or(remote);
     let host_start = remote.rfind('@').map(|i| i + 1).unwrap_or(0);
     let (user, host) = remote.split_at(host_start);
@@ -96,62 +117,10 @@ fn base(remote: &str) -> (Command, String) {
 
 /// A command that runs `remote_command` (a string for the remote login shell)
 /// on `remote`. The caller sets stdio and runs it.
-pub fn command(remote: &str, remote_command: &str) -> Command {
+fn command(remote: &str, remote_command: &str) -> Command {
     let (mut c, dest) = base(remote);
     c.arg(dest).arg(remote_command);
     c
-}
-
-/// Runs `sh -c <script>` on the remote and returns its output; the command line
-/// is traced at `-v`. The script is rerun if the connection drops, so it must be
-/// safe to run twice (a read, a probe).
-pub fn sh_output(host: &str, script: &str) -> anyhow::Result<std::process::Output> {
-    let out = retry(host, Repeat::Safe, || {
-        let mut cmd = command(
-            host,
-            &format!("sh -c {}", crate::shell::shell_quote(script)),
-        );
-        crate::output::trace(&cmd);
-        cmd.output()
-    })
-    .context("spawning ssh")?;
-    // With ssh -v the debug chatter lands on stderr; surface it.
-    if crate::output::is_verbose() && !out.stderr.is_empty() {
-        crate::output::raw_stderr(&String::from_utf8_lossy(&out.stderr));
-    }
-    Ok(out)
-}
-
-/// The remote script behind [`write_scratch`]: a new owner-only file from
-/// `mktemp`, filled from stdin, its path printed. Removed again if filling it
-/// fails.
-pub(crate) const WRITE_SCRATCH_SCRIPT: &str = "f=$(mktemp \"${TMPDIR:-/tmp}/lodge-XXXXXXXXXX\") \
-     && { cat > \"$f\" || { rm -f \"$f\"; exit 1; }; } && printf '%s' \"$f\"";
-
-/// Writes `content` to a new scratch file on the remote host, made with
-/// `mktemp` (unique and owner-only, whatever else is in the remote `/tmp`), and
-/// returns its path.
-pub fn write_scratch(host: &str, content: &str) -> anyhow::Result<String> {
-    use std::io::Write as _;
-    let mut cmd = command(
-        host,
-        &format!("sh -c {}", crate::shell::shell_quote(WRITE_SCRATCH_SCRIPT)),
-    );
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
-    crate::output::trace(&cmd);
-    let mut child = cmd.spawn().context("spawning ssh")?;
-    child
-        .stdin
-        .take()
-        .context("ssh stdin was not piped")?
-        .write_all(content.as_bytes())
-        .context("writing to ssh stdin")?;
-    let out = child.wait_with_output().context("waiting for ssh")?;
-    let path = String::from_utf8_lossy(&out.stdout).into_owned();
-    if !out.status.success() || path.is_empty() {
-        anyhow::bail!("writing a scratch file on {host} failed");
-    }
-    Ok(path)
 }
 
 /// A tunnel from local port `local` to `to` ("ip:port", as reachable from the
@@ -160,7 +129,7 @@ pub fn write_scratch(host: &str, content: &str) -> anyhow::Result<String> {
 /// It is started by the forward daemon, which cannot ask for a password, so it
 /// never prompts (`BatchMode`) and relies on the connection [`connect`] opened,
 /// or on key or agent auth, to get through.
-pub fn tunnel(remote: &str, local: u16, to: &str) -> Command {
+fn tunnel(remote: &str, local: u16, to: &str) -> Command {
     let (mut c, dest) = base(remote);
     c.args([
         "-N",
@@ -175,112 +144,27 @@ pub fn tunnel(remote: &str, local: u16, to: &str) -> Command {
     c
 }
 
-/// Whether running a step a second time, after the connection dropped while it
-/// ran, does no harm. A dropped connection (ssh exits 255) says nothing about
-/// whether the remote command ran: it may have finished with only its reply
-/// lost. Only a [`Repeat::Safe`] step is rerun; the rest report the failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Repeat {
-    /// Reads, probes and steps that leave the same state when run again
-    /// (`mkdir -p`, `rm -rf`, a file replaced whole).
-    Safe,
-    /// Everything else: user hooks, installers, anything that creates.
-    #[default]
-    Never,
-}
-
-/// What a finished ssh step says about the connection.
-pub trait Outcome {
-    /// Whether ssh itself failed (exit 255) rather than the remote command.
-    fn connection_lost(&self) -> bool;
-}
-
-impl Outcome for ExitStatus {
-    fn connection_lost(&self) -> bool {
-        self.code() == Some(255)
-    }
-}
-
-impl Outcome for Output {
-    /// A failure that trying again cannot change (bad credentials, an unknown
-    /// or changed host key, a configuration ssh rejects) is not a lost
-    /// connection.
-    fn connection_lost(&self) -> bool {
-        const PERMANENT: [&str; 4] = [
-            "Permission denied",
-            "Host key verification failed",
-            "ControlPath too long",
-            "Bad configuration option",
-        ];
-        let err = String::from_utf8_lossy(&self.stderr);
-        self.status.connection_lost() && !PERMANENT.iter().any(|m| err.contains(m))
-    }
-}
-
-/// A step that also sent data, with how sending went.
-impl<T> Outcome for (ExitStatus, T) {
-    fn connection_lost(&self) -> bool {
-        self.0.connection_lost()
-    }
-}
-
-/// How often and how fast a lost connection is retried.
-struct Policy {
-    tries: u32,
-    first_delay: Duration,
-}
-
-const POLICY: Policy = Policy {
+/// How often and how fast a lost connection is retried: a link that goes quiet
+/// is declared dead by `ServerAlive*` after about 45 s, then a step is tried up
+/// to three times, waiting 1 s, then 2 s.
+const POLICY: RetryPolicy = RetryPolicy {
     tries: 3,
     first_delay: Duration::from_secs(1),
 };
 
-/// Runs `op` (one ssh invocation) and, if the connection was lost and the step
-/// is [`Repeat::Safe`], drops the dead master connection and runs it again,
-/// waiting 1 s, then 2 s, up to three tries. `op` is called afresh each time, so
-/// it builds its command (and any stdin) anew. A step that is not safe to repeat
-/// is run once and the loss reported.
-pub fn retry<T: Outcome>(
-    remote: &str,
-    repeat: Repeat,
-    op: impl FnMut() -> std::io::Result<T>,
-) -> std::io::Result<T> {
-    retry_with(&POLICY, remote, repeat, || drop_master(remote), op)
-}
-
-fn retry_with<T: Outcome>(
-    policy: &Policy,
-    remote: &str,
-    repeat: Repeat,
-    mut reset: impl FnMut(),
-    mut op: impl FnMut() -> std::io::Result<T>,
-) -> std::io::Result<T> {
-    let mut delay = policy.first_delay;
-    let mut attempt = 1;
-    loop {
-        let out = op()?;
-        if !out.connection_lost() {
-            return Ok(out);
-        }
-        if repeat == Repeat::Never {
-            crate::output::warning!(
-                "lost the connection to {remote} during a step that is not safe to repeat; \
-                 run the command again"
-            );
-            return Ok(out);
-        }
-        if attempt >= policy.tries {
-            return Ok(out);
-        }
-        attempt += 1;
-        crate::output::warning!(
-            "lost the connection to {remote}; retrying ({attempt}/{})",
-            policy.tries
-        );
-        std::thread::sleep(delay);
-        delay *= 2;
-        reset();
-    }
+/// Whether a finished step lost the connection (ssh exits 255) rather than the
+/// remote command failing. A failure that trying again cannot change (bad
+/// credentials, an unknown or changed host key, a configuration ssh rejects) is
+/// not a lost connection.
+fn connection_lost(status: ExitStatus, stderr: &[u8]) -> bool {
+    const PERMANENT: [&str; 4] = [
+        "Permission denied",
+        "Host key verification failed",
+        "ControlPath too long",
+        "Bad configuration option",
+    ];
+    let err = String::from_utf8_lossy(stderr);
+    status.code() == Some(255) && !PERMANENT.iter().any(|m| err.contains(m))
 }
 
 /// Asks the master connection to `remote` to exit, so the next ssh opens a new
@@ -305,8 +189,8 @@ fn drop_master(remote: &str) {
 /// terminal available, and every later ssh (and the forward daemon's tunnels)
 /// rides on it. Runs a no-op remote command and leaves the master in the
 /// background (`ControlPersist`); a connection that is down is retried.
-pub fn connect(remote: &str) -> anyhow::Result<()> {
-    let out = retry(remote, Repeat::Safe, || {
+fn connect(remote: &str) -> anyhow::Result<()> {
+    let out = crate::host::attempt(&SshHost::new(remote), Repeat::Safe, || {
         let (mut c, dest) = base(remote);
         // Prompts are read from the terminal, not stdin, so ssh's stderr can be
         // captured to be reported (or judged) afterwards.
@@ -333,7 +217,7 @@ pub fn connect(remote: &str) -> anyhow::Result<()> {
 /// `tty`: a server that refuses it makes ssh fail with "Pseudo-terminal
 /// allocation request failed" (or, if it proceeds without one, `tty` prints "not
 /// a tty"). Best-effort and quiet: any spawn error just yields `false`.
-pub fn pty_denied(remote: &str) -> bool {
+fn pty_denied(remote: &str) -> bool {
     let (mut cmd, dest) = base(remote);
     cmd.arg("-tt")
         .arg(dest)
@@ -352,26 +236,98 @@ pub fn pty_denied(remote: &str) -> bool {
     combined.contains("allocation request failed") || combined.contains("not a tty")
 }
 
-/// A local command line that opens an interactive session on `remote` running
-/// `remote_command`, with a PTY forced (`-tt`). It is meant to be run by `sh -c`,
-/// so it is a string rather than a [`Command`].
-pub fn interactive_line(remote: &str, remote_command: &str) -> String {
+/// A local command that opens an interactive session on `remote` running
+/// `remote_command`, with a PTY forced (`-tt`).
+fn interactive(remote: &str, remote_command: &str) -> Command {
     let (mut cmd, dest) = base(remote);
     cmd.arg("-tt").arg(dest).arg(remote_command);
-    let mut line = cmd.get_program().to_string_lossy().into_owned();
-    for a in cmd.get_args() {
-        line.push(' ');
-        line.push_str(&crate::shell::shell_quote(&a.to_string_lossy()));
+    cmd
+}
+
+impl Host for SshHost {
+    fn label(&self) -> Option<String> {
+        Some(self.remote.clone())
     }
-    line
+
+    fn names(&self) -> Vec<String> {
+        let mut names = vec![self.remote.clone()];
+        let (host, _port) = split(&self.remote);
+        for n in [
+            host.clone(),
+            host.rsplit('@').next().unwrap_or("").to_string(),
+        ] {
+            if !n.is_empty() && !names.contains(&n) {
+                names.push(n);
+            }
+        }
+        names
+    }
+
+    fn shares_cwd(&self) -> bool {
+        false
+    }
+
+    fn respawn_args(&self) -> Vec<String> {
+        vec!["--remote".into(), self.remote.clone()]
+    }
+
+    /// `ssh <host> <line>`, the line run by the remote login shell. A script is
+    /// forced to `sh` semantics rather than the remote user's own shell, and a
+    /// working directory becomes a `cd` in front.
+    fn command(&self, line: &CmdLine, dir: Option<&Path>) -> Command {
+        let body = match line {
+            CmdLine::Shell(script) => format!("sh -c {}", shell_quote(script)),
+            CmdLine::Argv(argv) => argv
+                .iter()
+                .map(|a| shell_quote(a))
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        let script = match dir {
+            Some(dir) => format!("cd {} && {body}", shell_quote(&dir.to_string_lossy())),
+            None => body,
+        };
+        command(&self.remote, &script)
+    }
+
+    fn interactive(&self, argv: &[&str]) -> Command {
+        let line = argv
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        interactive(&self.remote, &line)
+    }
+
+    fn tunnel(&self, local: u16, to: &str) -> Option<Command> {
+        Some(tunnel(&self.remote, local, to))
+    }
+
+    fn connect(&self) -> anyhow::Result<()> {
+        connect(&self.remote)
+    }
+
+    fn pty_denied(&self) -> bool {
+        pty_denied(&self.remote)
+    }
+
+    fn link_lost(&self, status: ExitStatus, stderr: &[u8]) -> bool {
+        connection_lost(status, stderr)
+    }
+
+    fn reset_link(&self) {
+        drop_master(&self.remote);
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        POLICY
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Outcome, Policy, Repeat, command, interactive_line, retry_with, split, tunnel};
+    use super::*;
     use std::os::unix::process::ExitStatusExt;
-    use std::process::ExitStatus;
-    use std::time::Duration;
 
     #[test]
     fn plain_alias_and_user_host_pass_through() {
@@ -438,90 +394,66 @@ mod tests {
     }
 
     #[test]
-    fn the_interactive_line_forces_a_pty_reuses_the_connection_and_quotes_the_command() {
-        let line = interactive_line("user@host:2222", "docker exec -it c sh");
-        assert!(line.starts_with("ssh '-p' '2222' "), "{line}");
-        assert!(line.contains("'ControlMaster=auto'"), "{line}");
-        assert!(
-            line.ends_with(" '-tt' 'user@host' 'docker exec -it c sh'"),
-            "{line}"
+    fn an_interactive_session_forces_a_pty_reuses_the_connection_and_quotes_the_command() {
+        let c = SshHost::new("user@host:2222").interactive(&["docker", "exec", "-it", "c", "a b"]);
+        let a = args(&c);
+        assert_eq!(&a[..2], ["-p", "2222"]);
+        assert!(a.contains(&"ControlMaster=auto".to_string()), "{a:?}");
+        assert_eq!(
+            &a[a.len() - 3..],
+            ["-tt", "user@host", "'docker' 'exec' '-it' 'c' 'a b'"]
         );
     }
-
-    const FAST: Policy = Policy {
-        tries: 3,
-        first_delay: Duration::ZERO,
-    };
 
     fn exit(code: i32) -> ExitStatus {
         ExitStatus::from_raw(code << 8)
     }
 
-    /// Runs a step that answers with `codes` in turn; returns the last status,
-    /// how often it ran and how often the connection was reset.
-    fn run(repeat: Repeat, codes: &[i32]) -> (i32, usize, usize) {
-        let (mut ran, mut resets) = (0, 0);
-        let status = retry_with(
-            &FAST,
-            "h",
-            repeat,
-            || resets += 1,
-            || {
-                ran += 1;
-                Ok(exit(codes[(ran - 1).min(codes.len() - 1)]))
-            },
-        )
-        .unwrap();
-        (status.code().unwrap(), ran, resets)
-    }
-
     #[test]
     fn only_ssh_exiting_255_is_a_lost_connection() {
-        assert!(exit(255).connection_lost());
-        assert!(!exit(0).connection_lost());
-        assert!(!exit(1).connection_lost());
+        assert!(connection_lost(exit(255), b""));
+        assert!(!connection_lost(exit(0), b""));
+        assert!(!connection_lost(exit(1), b""));
         assert!(
-            !ExitStatus::from_raw(9).connection_lost(),
+            !connection_lost(ExitStatus::from_raw(9), b""),
             "killed by a signal"
         );
     }
 
     #[test]
     fn a_refused_login_is_not_a_lost_connection() {
-        let out = |code, err: &str| std::process::Output {
-            status: exit(code),
-            stdout: vec![],
-            stderr: err.as_bytes().to_vec(),
-        };
-        assert!(out(255, "ssh: connect to host h port 22: Connection refused").connection_lost());
-        assert!(!out(255, "u@h: Permission denied (publickey).").connection_lost());
-        assert!(!out(255, "Host key verification failed.").connection_lost());
-        assert!(!out(255, "ControlPath too long ('/x' >= 108 bytes)").connection_lost());
-        assert!(!out(1, "Connection refused").connection_lost());
+        let lost = |code, err: &str| connection_lost(exit(code), err.as_bytes());
+        assert!(lost(
+            255,
+            "ssh: connect to host h port 22: Connection refused"
+        ));
+        assert!(!lost(255, "u@h: Permission denied (publickey)."));
+        assert!(!lost(255, "Host key verification failed."));
+        assert!(!lost(255, "ControlPath too long ('/x' >= 108 bytes)"));
+        assert!(!lost(1, "Connection refused"));
     }
 
     #[test]
-    fn a_repeatable_step_is_rerun_after_the_connection_drops() {
-        assert_eq!(run(Repeat::Safe, &[255, 255, 0]), (0, 3, 2));
+    fn a_host_runs_commands_through_ssh_with_sh_semantics_and_a_directory() {
+        let host = SshHost::new("user@host:2222");
+        let a = args(&host.command(&CmdLine::Shell("echo hi"), None));
+        assert_eq!(&a[..2], ["-p", "2222"]);
+        assert_eq!(&a[a.len() - 2..], ["user@host", "sh -c 'echo hi'"]);
+        let argv = ["docker".to_string(), "ps -a".to_string()];
+        let a = args(&host.command(&CmdLine::Argv(&argv), Some(Path::new("/p q"))));
+        assert_eq!(a.last().unwrap(), "cd '/p q' && 'docker' 'ps -a'");
     }
 
     #[test]
-    fn a_step_that_works_is_run_once_and_the_connection_left_alone() {
-        assert_eq!(run(Repeat::Safe, &[0]), (0, 1, 0));
+    fn the_host_names_cover_the_alias_the_user_and_the_machine() {
+        assert_eq!(SshHost::new("build").names(), ["build"]);
         assert_eq!(
-            run(Repeat::Safe, &[1]),
-            (1, 1, 0),
-            "the command's own failure"
+            SshHost::new("me@build.example:2222").names(),
+            ["me@build.example:2222", "me@build.example", "build.example"]
         );
-    }
-
-    #[test]
-    fn retrying_gives_up_after_three_tries() {
-        assert_eq!(run(Repeat::Safe, &[255]), (255, 3, 2));
-    }
-
-    #[test]
-    fn a_step_that_is_not_safe_to_repeat_runs_once_even_when_the_connection_drops() {
-        assert_eq!(run(Repeat::Never, &[255, 0]), (255, 1, 0));
+        assert_eq!(
+            SshHost::new("h").respawn_args(),
+            ["--remote".to_string(), "h".to_string()]
+        );
     }
 }

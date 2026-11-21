@@ -13,9 +13,9 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::host::Host;
 use crate::runtime::{Env, ExecOpts};
 use crate::shell::CmdLine;
-use crate::target::Target;
 
 // A devcontainer lifecycle command in any of its three spec shapes.
 #[derive(Debug, Clone, Deserialize)]
@@ -154,13 +154,13 @@ pub(super) fn run_create_hooks(env: &dyn Env, lifecycle: &Lifecycle, ctx: &HookC
 // Runs initializeCommand on the host, with the .devcontainer dir as cwd. The
 // "host" is wherever the project files live: the local machine, or — with
 // --remote — the remote host, over ssh (the dir doesn't exist locally there).
-pub(super) fn run_on_host(dir: &Path, label: &str, cmd: &Hook, target: &Target) -> Result<()> {
+pub(super) fn run_on_host(dir: &Path, label: &str, cmd: &Hook, host: &dyn Host) -> Result<()> {
     info!("{label} (host)");
     for (name, step) in cmd.steps() {
         if let Some(name) = name {
             info!("  {name}");
         }
-        if !target.run_in(dir, &step)?.success() {
+        if !host.run_in(dir, &step)?.success() {
             bail!("{} failed", name.unwrap_or(label));
         }
     }

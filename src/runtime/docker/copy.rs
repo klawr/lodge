@@ -17,6 +17,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use super::container::DockerContainer;
+use crate::host::Repeat;
 use crate::runtime::{ContainerUser, Env, ExecOpts, tarball};
 
 impl DockerContainer {
@@ -53,12 +54,12 @@ impl DockerContainer {
         // connection reruns the whole send, packing the tar afresh.
         let (status, packed) =
             self.cli
-                .target
-                .attempt(crate::ssh::Repeat::Safe, || {
+                .host
+                .attempt(Repeat::Safe, || {
                     // `-q`: on a terminal docker otherwise prints "Successfully copied …"
                     // for every file, which would bury lodge's own output.
                     let mut cmd = self.cli.command(&["cp", "-q", "-a", "-", &target]);
-                    // `command` closes stdin for ssh; this one streams, so override it.
+                    // `command` closes stdin; this one streams, so override it.
                     cmd.stdin(Stdio::piped());
                     let mut child = cmd.spawn()?;
                     // Dropping the writer closes the pipe, so docker sees the end of input.
@@ -84,8 +85,8 @@ impl DockerContainer {
         let from = format!("{}:{path}", self.id);
         let out = self
             .cli
-            .target
-            .attempt(crate::ssh::Repeat::Safe, || {
+            .host
+            .attempt(Repeat::Safe, || {
                 self.cli.command(&["cp", &from, "-"]).output()
             })
             .context("spawning docker cp")?;

@@ -98,9 +98,9 @@ fn run_command(script: &str) -> Result<Vec<u8>> {
 /// Runs `sh -c <script>` on *this* machine with no stdin, capturing stdout and
 /// letting stderr through to the terminal, and kills it after `timeout`.
 ///
-/// A secret's source is on the machine running lodge whatever the target is
-/// (`pass show x`), so this is deliberately not [`Target`](crate::target::Target)
-/// — which runs on the project's host. The returned `Output` has an empty
+/// A secret's source is on the machine running lodge whatever the host is
+/// (`pass show x`), so this is deliberately not a [`Host`](crate::host::Host)
+/// command, which runs on the project's host. The returned `Output` has an empty
 /// `stderr`.
 fn local_sh_capture(script: &str, timeout: Duration) -> Result<Output> {
     use std::io::Read;

@@ -29,7 +29,7 @@ pub fn up(
     let prepared = bundle::source::prepare(&config, bundle_file)?;
     let started = devcontainer::start(
         &project,
-        &ctx.target,
+        &ctx.host,
         build,
         ctx.rt.as_ref(),
         &super::prompt::Terminal,
@@ -37,7 +37,12 @@ pub fn up(
     let container = started.container.as_ref();
     // After `start`, which may have changed the user's uid.
     let user = ContainerUser::resolve(container, started.remote_user.as_deref())?;
-    forward::spawn_daemon(container.id(), &ctx.target, &started.forward_ports);
+    forward::spawn_daemon(
+        container.id(),
+        ctx.host.as_ref(),
+        ctx.rt.as_ref(),
+        &started.forward_ports,
+    );
 
     let installed = if started.created || reinject {
         None
@@ -76,10 +81,10 @@ fn attach(
     layout: &Layout,
     workdir: &str,
 ) -> Result<()> {
-    let setup = secret::deliver::deliver(container, &ctx.target, user, &config.secret)?;
+    let setup = secret::deliver::deliver(container, ctx.host.as_ref(), user, &config.secret)?;
     session::enter(
         container,
-        &ctx.target,
+        ctx.host.as_ref(),
         &config.session,
         &Session {
             workdir,

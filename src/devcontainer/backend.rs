@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 use super::create::{CreateSettings, Mount, parse_app_ports};
 use super::spec::{CreateConfig, SourceConfig};
 use super::vars::{Vars, path_tag};
+use crate::host::HostRef;
 use crate::runtime::{BuildSpec, Containers, Runtime};
 use crate::shell::slug;
-use crate::target::Target;
 
 /// Label on every container lodge creates for a devcontainer: the project's
 /// path on its host. `ldg ls` lists containers by it.
@@ -63,7 +63,7 @@ pub(super) struct ComposeBackend {
     pub(super) project_path: PathBuf,
     /// The project's host, where compose runs and reads its files (and so
     /// where the override file is written).
-    pub(super) target: Target,
+    pub(super) host: HostRef,
 }
 
 impl Backend for ComposeBackend {
@@ -105,13 +105,13 @@ impl Backend for ComposeBackend {
         // lodge's label and the features' settings go in a temporary compose
         // override, appended as the last `-f` so it layers over the project's
         // files without changing the project identity (the first file still
-        // sets the project dir). Compose reads it client-side, so with a remote
-        // target it is written on the remote host (where compose runs).
+        // sets the project dir). Compose reads it client-side, so it is
+        // written on the project's host (where compose runs).
         let mut files = self.files.clone();
         let project_path = self.project_path.to_string_lossy();
         let content = extra.compose_override(&self.service, &[(LABEL_PROJECT, &project_path)]);
         let override_file = self
-            .target
+            .host
             .write_scratch("compose-override.yml", &content)
             .context("writing compose override")?;
         files.push(override_file.path().to_string());
@@ -288,7 +288,7 @@ fn build_run_args(
 pub(super) struct BackendContext<'a> {
     pub(super) project_path: &'a Path,
     /// The project's host.
-    pub(super) target: &'a Target,
+    pub(super) host: &'a HostRef,
     pub(super) base_dir: &'a Path,
     pub(super) workspace_folder: &'a str,
     pub(super) vars: &'a Vars<'a>,
@@ -342,7 +342,7 @@ fn compose_backend(source: SourceConfig, ctx: &BackendContext) -> Result<BuiltBa
             // Compose project names must be lowercase.
             project: container_name(ctx.project_path).to_lowercase(),
             project_path: ctx.project_path.to_path_buf(),
-            target: ctx.target.clone(),
+            host: ctx.host.clone(),
         }),
         hash_extra,
     })
@@ -438,6 +438,7 @@ pub(super) fn project_basename(project_path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::local;
 
     #[test]
     fn user_run_args_come_last_so_they_can_override() {
@@ -506,7 +507,7 @@ mod tests {
         let vars = Vars::new(p).with_container_workspace("/workspaces/proj");
         let ctx = BackendContext {
             project_path: p,
-            target: &Target::Local,
+            host: &local(),
             base_dir: &base,
             workspace_folder: "/workspaces/proj",
             vars: &vars,

@@ -1,5 +1,5 @@
-//! One forward: the built-in TCP proxy (local engine) or an `ssh -L` tunnel
-//! (`--remote`).
+//! One forward: the built-in TCP proxy (the engine's addresses are reachable
+//! from here) or the tunnel process the host provides (they are not).
 
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Stdio};
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 pub(super) enum Forwarder {
     Proxy(ProxyHandle),
-    Ssh {
+    Tunnel {
         child: Child,
         local: u16,
         dest: String,
@@ -28,7 +28,7 @@ impl Forwarder {
     pub(super) fn describe(&self) -> String {
         match self {
             Forwarder::Proxy(h) => format!("{}\t{}", h.bound.port(), h.dest),
-            Forwarder::Ssh { local, dest, .. } => format!("{local}\t{dest}"),
+            Forwarder::Tunnel { local, dest, .. } => format!("{local}\t{dest}"),
         }
     }
 
@@ -36,7 +36,7 @@ impl Forwarder {
     pub(super) fn dest(&self) -> &str {
         match self {
             Forwarder::Proxy(h) => &h.dest,
-            Forwarder::Ssh { dest, .. } => dest,
+            Forwarder::Tunnel { dest, .. } => dest,
         }
     }
 
@@ -45,18 +45,22 @@ impl Forwarder {
         ProxyHandle::spawn(local, dest).map(Forwarder::Proxy)
     }
 
-    pub(super) fn ssh_tunnel(local: u16, dest: &str, remote: &str) -> std::io::Result<Self> {
-        let mut cmd = crate::ssh::tunnel(remote, local, dest);
+    /// `cmd` is the host's own tunnel process for `local` to `dest`.
+    pub(super) fn tunnel(
+        mut cmd: std::process::Command,
+        local: u16,
+        dest: &str,
+    ) -> std::io::Result<Self> {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
-            // With --verbose, let ssh's own chatter land in the daemon log.
+            // With --verbose, let the tunnel's own chatter land in the daemon log.
             .stderr(if crate::output::is_verbose() {
                 Stdio::inherit()
             } else {
                 Stdio::null()
             });
         crate::output::trace(&cmd);
-        cmd.spawn().map(|child| Forwarder::Ssh {
+        cmd.spawn().map(|child| Forwarder::Tunnel {
             child,
             local,
             dest: dest.to_string(),
@@ -64,12 +68,12 @@ impl Forwarder {
         })
     }
 
-    /// How long an ssh tunnel has been running, `None` for the in-process proxy
+    /// How long a host tunnel has been running, `None` for the in-process proxy
     /// (which has no connection to lose).
     pub(super) fn ran_for(&self) -> Option<Duration> {
         match self {
             Forwarder::Proxy(_) => None,
-            Forwarder::Ssh { since, .. } => Some(since.elapsed()),
+            Forwarder::Tunnel { since, .. } => Some(since.elapsed()),
         }
     }
 
@@ -77,7 +81,9 @@ impl Forwarder {
         match self {
             Forwarder::Proxy(h) => !h.stop.load(Ordering::Relaxed),
             // A tunnel we can't query is treated as dead, so it is replaced.
-            Forwarder::Ssh { child, .. } => child.try_wait().map(|s| s.is_none()).unwrap_or(false),
+            Forwarder::Tunnel { child, .. } => {
+                child.try_wait().map(|s| s.is_none()).unwrap_or(false)
+            }
         }
     }
 }
@@ -86,7 +92,7 @@ impl Drop for Forwarder {
     fn drop(&mut self) {
         match self {
             Forwarder::Proxy(h) => h.stop.store(true, Ordering::Relaxed),
-            Forwarder::Ssh { child, .. } => {
+            Forwarder::Tunnel { child, .. } => {
                 #[allow(
                     clippy::let_underscore_must_use,
                     reason = "the tunnel may already have exited"

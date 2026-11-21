@@ -11,7 +11,8 @@ use crate::output::{info, warning};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::target::Target;
+use crate::host::Host;
+use crate::runtime::Runtime;
 
 pub use daemon::run_daemon;
 
@@ -20,7 +21,12 @@ use crate::port::PortForward;
 /// Spawns a detached `ldg _forward` daemon that manages port forwarding for
 /// `container`. Returns immediately; the daemon outlives the calling process.
 /// Daemon stderr goes to a log file; the path is printed so the user can tail it.
-pub fn spawn_daemon(container: &str, target: &Target, static_ports: &[PortForward]) {
+pub fn spawn_daemon(
+    container: &str,
+    host: &dyn Host,
+    rt: &dyn Runtime,
+    static_ports: &[PortForward],
+) {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(e) => {
@@ -47,10 +53,10 @@ pub fn spawn_daemon(container: &str, target: &Target, static_ports: &[PortForwar
     info!("port forwarding log: {}", log.display());
 
     let mut cmd = Command::new(exe);
-    if let Some(host) = target.ssh_host() {
-        cmd.args(["--remote", host]);
-    }
-    // Forward verbosity to the daemon so its ssh tunnels log into the log file.
+    // The daemon reaches the same host and drives the same engine as this process.
+    cmd.args(host.respawn_args());
+    cmd.args(rt.respawn_args());
+    // Forward verbosity to the daemon so its tunnels log into the log file.
     for _ in 0..crate::output::verbosity() {
         cmd.arg("-v");
     }

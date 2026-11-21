@@ -11,6 +11,18 @@
       ],
       "default": null
     },
+    "engine": {
+      "description": "The container engine to drive, unless `--engine` says otherwise\n(default: docker).",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Engine"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "git": {
       "description": "Git settings applied in the container.",
       "$ref": "#/$defs/GitConfig",
@@ -46,6 +58,16 @@
   },
   "additionalProperties": false,
   "$defs": {
+    "Engine": {
+      "description": "The container engines lodge can drive, as the user names them: `--engine`, and\n`engine` in the config. Each is an implementation of [`Runtime`]; the command\nlayer builds the one chosen.",
+      "oneOf": [
+        {
+          "description": "The `docker` CLI (with `docker compose`).",
+          "type": "string",
+          "const": "docker"
+        }
+      ]
+    },
     "GitConfig": {
       "type": "object",
       "properties": {

@@ -17,6 +17,7 @@ mod devcontainer;
 mod doc_facts;
 mod fingerprint;
 mod forward;
+mod host;
 mod host_tools;
 mod inject;
 mod layout;
@@ -26,8 +27,6 @@ mod runtime;
 mod secret;
 mod session;
 mod shell;
-mod ssh;
-mod target;
 mod tmpfile;
 mod tree;
 

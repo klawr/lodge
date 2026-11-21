@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 
 use super::tunnel::Forwarder;
 use super::{acquire_lock, lock_path, ports_path, truncate_log, write_ports};
+use crate::host::Host;
 use crate::port::PortForward;
 use crate::runtime::{Container, ExecOpts, Runtime};
-use crate::target::Target;
 
 /// A line in the daemon's log (its stderr).
 macro_rules! log {
@@ -32,13 +32,13 @@ const UNREACHABLE_POLLS: u32 = 150;
 /// `cat /proc/net/tcp`) and targets other than the primary container (compose
 /// services). On top of that, the daemon polls `/proc/net/tcp` and
 /// `/proc/net/tcp6` every 2 s and keeps one forwarder per listening port. For
-/// local Docker, a built-in Rust TCP proxy is used; for `--remote`, an `ssh -L`
-/// tunnel. Exits when the container stops, and keeps trying while the engine
+/// an engine whose addresses are reachable from here, a built-in Rust TCP proxy
+/// is used; otherwise the host's own tunnel (`ssh -L` over ssh). Exits when the container stops, and keeps trying while the engine
 /// can't be reached.
 ///
 /// `ports` are the declared forwards as `spawn_daemon` encoded them on the
-/// command line; `rt` is the engine at `target`.
-pub fn run_daemon(rt: &dyn Runtime, target: &Target, container_id: &str, ports: &[String]) {
+/// command line; `rt` is the engine on `host`.
+pub fn run_daemon(rt: &dyn Runtime, host: &dyn Host, container_id: &str, ports: &[String]) {
     let declared = decode_ports(ports);
     let (lock_file, ports_file) = match (lock_path(container_id), ports_path(container_id)) {
         (Ok(l), Ok(p)) => (l, p),
@@ -64,7 +64,7 @@ pub fn run_daemon(rt: &dyn Runtime, target: &Target, container_id: &str, ports: 
         log!("could not start a new log ({e}); appending");
     }
     let container = rt.container(container_id);
-    let mut forwards = Forwards::new(container.as_ref(), target, ports_file);
+    let mut forwards = Forwards::new(container.as_ref(), host, ports_file);
     let mut unreachable = 0;
 
     loop {
@@ -151,7 +151,7 @@ impl Cooldown {
 
 /// The forwarders kept for one container, and the ports file that reports them.
 struct Forwards<'a> {
-    target: &'a Target,
+    host: &'a dyn Host,
     addresses: Addresses<'a>,
     active: HashMap<u16, Forwarder>,
     /// Local ports whose forwarder failed to start, so the retry every 2 s
@@ -168,13 +168,13 @@ struct Forwards<'a> {
 }
 
 impl<'a> Forwards<'a> {
-    fn new(container: &'a dyn Container, target: &'a Target, ports_file: PathBuf) -> Self {
+    fn new(container: &'a dyn Container, host: &'a dyn Host, ports_file: PathBuf) -> Self {
         let lookup = move |host: Option<&str>| match host {
             None => container.ip_address(),
             Some(h) => container.resolve_peer(h),
         };
         Self {
-            target,
+            host,
             addresses: Addresses::new(Box::new(lookup), REFRESH),
             active: HashMap::new(),
             failed: HashSet::new(),
@@ -223,9 +223,9 @@ impl<'a> Forwards<'a> {
         if self.cooling.get(&local).is_some_and(|c| !c.over()) {
             return;
         }
-        let fwd = if let Some(r) = self.target.ssh_host() {
-            log!("port {local} — ssh -L {local}:{dest} {r}");
-            Forwarder::ssh_tunnel(local, &dest, r)
+        let fwd = if let Some(cmd) = self.host.tunnel(local, &dest) {
+            log!("port {local} — tunnel to {dest}{}", self.host.on_host());
+            Forwarder::tunnel(cmd, local, &dest)
         } else {
             log!("port {local} — proxy 127.0.0.1:{local} → {dest}");
             Forwarder::proxy(local, dest)

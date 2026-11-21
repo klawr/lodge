@@ -1,62 +1,47 @@
 //! The `docker` CLI as a [`Runtime`], [`Compose`], [`Container`] and
 //! [`Env`](super::Env).
 //!
-//! Locally this runs `docker …`. For a remote target it runs the docker CLI *on
-//! the remote host* over SSH (`ssh <host> docker …`), so no local docker CLI is
-//! needed for `--remote`: only `ssh` must exist locally.
+//! It runs `docker …` *on a [`Host`](crate::host::Host)* it is given: this machine, or another one
+//! the host reaches (so a remote engine needs no local docker CLI, only whatever
+//! the host needs). It never starts a process itself and does not know which kind
+//! of host it has.
 //!
-//! The trade-off versus `DOCKER_HOST=ssh://…` is that the client no longer runs
+//! The trade-off versus `DOCKER_HOST=ssh://…` is that the client does not run
 //! locally, so file copies can't be passed by path: the source files live on
-//! *this* machine, not the remote. `cp_in` therefore streams the bytes through
-//! the SSH pipe instead.
+//! *this* machine, not the host's. `cp_in` therefore streams the bytes through
+//! the host's pipe instead.
 
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::ssh::Repeat;
-
 use super::{BuildSpec, Compose, Container, Containers, Listed, Runtime};
-use crate::shell::shell_quote;
-use crate::target::Target;
+use crate::host::{HostRef, Repeat};
 
 mod container;
 mod copy;
 
 pub use container::DockerContainer;
 
-/// The docker CLI, pointed at a [`Target`].
+/// The docker CLI, run on a [`Host`](crate::host::Host).
 #[derive(Clone)]
 pub struct DockerCli {
-    target: Target,
+    host: HostRef,
 }
 
 impl DockerCli {
-    pub fn new(target: &Target) -> Self {
-        Self {
-            target: target.clone(),
-        }
+    pub fn new(host: HostRef) -> Self {
+        Self { host }
     }
 
-    /// Builds a command that runs `docker <args>` against the target's daemon.
-    /// Locally that's a plain `docker` invocation; for a remote target it becomes
-    /// `ssh <host> docker <args>`. For remote commands stdin is closed
-    /// (`/dev/null`) so ssh doesn't swallow the terminal; callers that need to
-    /// stream data override it. Traced at `-v`. Every `docker` lodge runs is
-    /// built here or in [`command_in`](Self::command_in).
+    /// Builds a command that runs `docker <args>` on the host. Stdin is closed
+    /// (`/dev/null`) so a remote hop doesn't swallow the terminal; callers that
+    /// need to stream data override it. Traced at `-v`. Every `docker` lodge runs
+    /// is built here, in [`command_in`](Self::command_in) or in
+    /// [`interactive`](Self::interactive).
     pub(super) fn command(&self, args: &[&str]) -> Command {
-        let c = match &self.target {
-            Target::Local => {
-                let mut c = Command::new("docker");
-                c.args(args);
-                c
-            }
-            Target::Ssh(host) => {
-                let mut c = crate::ssh::command(host, &docker_line(args));
-                c.stdin(Stdio::null());
-                c
-            }
-        };
+        let mut c = self.host.argv(&docker_argv(args), None);
+        c.stdin(Stdio::null());
         crate::output::trace(&c);
         c
     }
@@ -64,26 +49,17 @@ impl DockerCli {
     /// Like [`command`](Self::command) for operations that read *files* from
     /// disk (a compose project, a build context). Those are read client-side,
     /// i.e. on the host where the docker CLI runs, so the working directory has
-    /// to be the project dir *there*: a `cd` over ssh when remote.
+    /// to be the project dir *there*.
     fn command_in(&self, dir: Option<&Path>, args: &[&str]) -> Command {
-        let c = match &self.target {
-            Target::Local => {
-                let mut c = Command::new("docker");
-                c.args(args);
-                if let Some(d) = dir {
-                    c.current_dir(d);
-                }
-                c
-            }
-            Target::Ssh(host) => {
-                let cd = dir.map_or_else(String::new, |d| {
-                    format!("cd {} && ", shell_quote(&d.to_string_lossy()))
-                });
-                crate::ssh::command(host, &format!("{cd}{}", docker_line(args)))
-            }
-        };
+        let c = self.host.argv(&docker_argv(args), dir);
         crate::output::trace(&c);
         c
+    }
+
+    /// A command that opens an interactive `docker <args>` on the host, with a
+    /// terminal.
+    pub(super) fn interactive(&self, args: &[&str]) -> Command {
+        self.host.interactive(&docker_argv(args))
     }
 
     /// `docker compose -p <project> -f <file>… <tail…>`, run in `dir`.
@@ -106,7 +82,7 @@ impl DockerCli {
     fn run_with(&self, make: impl Fn() -> Command, args: &[&str], repeat: Repeat) -> Result<()> {
         let what = subcommand(args);
         let status = self
-            .target
+            .host
             .attempt(repeat, || make().status())
             .with_context(|| format!("spawning docker {what}"))?;
         if !status.success() {
@@ -120,7 +96,7 @@ impl DockerCli {
     fn checked(&self, make: impl Fn() -> Command, args: &[&str], repeat: Repeat) -> Result<String> {
         let what = subcommand(args);
         let out = self
-            .target
+            .host
             .attempt(repeat, || make().output())
             .with_context(|| format!("spawning docker {what}"))?;
         if !out.status.success() {
@@ -137,7 +113,7 @@ impl DockerCli {
     /// A probe changes nothing, so a dropped connection reruns it.
     fn capture_ok(&self, args: &[&str]) -> Option<String> {
         let out = self
-            .target
+            .host
             .attempt(Repeat::Safe, || {
                 let mut cmd = self.command(args);
                 cmd.stdout(Stdio::piped()).stderr(Stdio::null());
@@ -177,15 +153,11 @@ fn subcommand(args: &[&str]) -> String {
     }
 }
 
-/// Joins `docker <args>` into a single shell-quoted command line: what ssh
-/// hands the remote login shell, or what a local `sh -c` runs.
-pub(super) fn docker_line(args: &[&str]) -> String {
-    let mut s = String::from("docker");
-    for a in args {
-        s.push(' ');
-        s.push_str(&shell_quote(a));
-    }
-    s
+/// `docker <args>` as an argument vector.
+fn docker_argv<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut v = vec!["docker"];
+    v.extend_from_slice(args);
+    v
 }
 
 impl Runtime for DockerCli {
@@ -194,6 +166,10 @@ impl Runtime for DockerCli {
             cli: self.clone(),
             id: id.to_string(),
         })
+    }
+
+    fn respawn_args(&self) -> Vec<String> {
+        vec!["--engine".into(), "docker".into()]
     }
 
     fn version(&self) -> Result<String> {
@@ -244,8 +220,8 @@ impl Runtime for DockerCli {
             a.push(format!("{k}={v}"));
         }
         a.push(spec.context.to_string_lossy().into_owned());
-        // The build context (and -f dockerfile) are read client-side, so with a
-        // remote target the build runs on the remote host via ssh.
+        // The build context (and -f dockerfile) are read client-side, so the
+        // build runs on the host that has them (through `command_in`).
         let args: Vec<&str> = a.iter().map(String::as_str).collect();
         // A build is cached layer by layer, so doing it again is harmless.
         self.run_with(|| self.command_in(None, &args), &args, Repeat::Safe)
@@ -268,7 +244,7 @@ impl Runtime for DockerCli {
         // been created but not started) instead of running again.
         let mut first = true;
         let status = self
-            .target
+            .host
             .attempt(Repeat::Safe, || {
                 if !std::mem::take(&mut first)
                     && let Ok(Some(_)) = self.find_by_name(name)
@@ -375,7 +351,7 @@ fn parse_listed(out: &str) -> Vec<Listed> {
 
 #[cfg(test)]
 mod tests {
-    use super::{docker_line, parse_listed, subcommand};
+    use super::{docker_argv, parse_listed, subcommand};
 
     #[test]
     fn parses_listed_containers() {
@@ -395,10 +371,10 @@ mod tests {
     }
 
     #[test]
-    fn docker_line_quotes_each_arg() {
+    fn docker_runs_as_the_first_word_of_the_argument_vector() {
         assert_eq!(
-            docker_line(&["exec", "my container", "sh"]),
-            "docker 'exec' 'my container' 'sh'"
+            docker_argv(&["exec", "my container", "sh"]),
+            ["docker", "exec", "my container", "sh"]
         );
     }
 

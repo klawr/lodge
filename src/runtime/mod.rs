@@ -28,12 +28,13 @@ pub(crate) use user::PROBE_SCRIPT;
 pub use user::{ContainerUser, User};
 
 use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::shell::{script_argv, shell_quote};
-use crate::target::Target;
 use crate::tmpfile::TempFile;
 
 /// The script behind [`Env::write_secret`]: `$1` is the destination, the value
@@ -60,7 +61,7 @@ pub struct ExecOpts<'a> {
     /// Whether the command may be run again if the connection to a remote
     /// engine drops while it runs. Off unless the caller knows that running it
     /// twice is harmless.
-    pub repeat: crate::ssh::Repeat,
+    pub repeat: crate::host::Repeat,
 }
 
 impl<'a> ExecOpts<'a> {
@@ -70,14 +71,14 @@ impl<'a> ExecOpts<'a> {
             user,
             workdir: None,
             env: &[],
-            repeat: crate::ssh::Repeat::Never,
+            repeat: crate::host::Repeat::Never,
         }
     }
 
     /// This command is safe to run again; see [`ExecOpts::repeat`].
     pub fn repeatable(self) -> Self {
         ExecOpts {
-            repeat: crate::ssh::Repeat::Safe,
+            repeat: crate::host::Repeat::Safe,
             ..self
         }
     }
@@ -127,9 +128,10 @@ pub trait Env {
     /// atomically. The parent directory must already exist.
     fn write_secret(&self, dest: &str, contents: &[u8], mode: u32, user: User) -> Result<()>;
 
-    /// A local shell command line that opens an interactive session in the
-    /// environment, running `inner` (a `sh -c` script) as `user` from `workdir`.
-    fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> String;
+    /// A local command that opens an interactive session in the environment,
+    /// running `inner` (a `sh -c` script) as `user` from `workdir`. Built afresh
+    /// on each call, so a session can be started again.
+    fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> Command;
 
     /// Who the provided helpers below act as, and who owns what they create:
     /// root, unless this is an [`Acting`] view of another user.
@@ -274,7 +276,7 @@ impl Env for Acting<'_> {
         self.env.write_secret(dest, contents, mode, user)
     }
 
-    fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> String {
+    fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> Command {
         self.env.interactive_command(user, workdir, inner)
     }
 
@@ -351,10 +353,26 @@ pub struct Listed {
     pub label: String,
 }
 
+/// The container engines lodge can drive, as the user names them: `--engine`, and
+/// `engine` in the config. Each is an implementation of [`Runtime`]; the command
+/// layer builds the one chosen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub enum Engine {
+    /// The `docker` CLI (with `docker compose`).
+    #[default]
+    Docker,
+}
+
 /// A container engine.
 pub trait Runtime {
     /// A handle for the container with this id or name.
     fn container(&self, id: &str) -> Box<dyn Container>;
+
+    /// The arguments that make a child lodge (the forward daemon is one) drive
+    /// this same engine, in front of its subcommand.
+    fn respawn_args(&self) -> Vec<String>;
 
     /// The engine's server version; errors if the engine can't be reached.
     fn version(&self) -> Result<String>;
@@ -409,11 +427,6 @@ pub trait Compose {
         service: &str,
         which: Containers,
     ) -> Result<Option<String>>;
-}
-
-/// Connects to the container engine at `target`.
-pub fn connect(target: &Target) -> Box<dyn Runtime> {
-    Box::new(docker::DockerCli::new(target))
 }
 
 #[cfg(test)]

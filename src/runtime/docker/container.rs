@@ -3,9 +3,9 @@
 
 use anyhow::{Context, Result, bail};
 
-use super::{DockerCli, docker_line};
+use super::DockerCli;
+use crate::host::Repeat;
 use crate::runtime::{Container, ContainerUser, Env, ExecOpts, Output, User};
-use crate::target::Target;
 
 /// One container, driven through the docker CLI.
 pub struct DockerContainer {
@@ -113,7 +113,7 @@ impl Env for DockerContainer {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let status = self
             .cli
-            .target
+            .host
             .attempt(opts.repeat, || self.cli.command(&refs).status())
             .context("spawning docker exec")?;
         if !status.success() {
@@ -127,7 +127,7 @@ impl Env for DockerContainer {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = self
             .cli
-            .target
+            .host
             .attempt(opts.repeat, || self.cli.command(&refs).output())
             .context("spawning docker exec")?;
         Ok(Output {
@@ -154,9 +154,9 @@ impl Env for DockerContainer {
         // sending the secret again after a lost connection is harmless.
         let (status, written) = self
             .cli
-            .target
-            .attempt(crate::ssh::Repeat::Safe, || {
-                // `command` closes stdin for ssh; this one streams, so override it.
+            .host
+            .attempt(Repeat::Safe, || {
+                // `command` closes stdin; this one streams, so override it.
                 let mut cmd = self.cli.command(&refs);
                 cmd.stdin(std::process::Stdio::piped());
                 let mut child = cmd.spawn()?;
@@ -174,7 +174,7 @@ impl Env for DockerContainer {
         written.context("sending secret to docker exec")
     }
 
-    fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> String {
+    fn interactive_command(&self, user: User, workdir: &str, inner: &str) -> std::process::Command {
         let opts = ExecOpts {
             workdir: Some(workdir),
             ..ExecOpts::as_user(user)
@@ -182,12 +182,8 @@ impl Env for DockerContainer {
         let mut args = self.exec_args(&["sh", "-c", inner], &opts);
         args.insert(1, "-it".into());
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let exec = docker_line(&refs);
-        match &self.cli.target {
-            Target::Local => exec,
-            // Run the docker CLI *on the remote* over `ssh -tt`.
-            Target::Ssh(host) => crate::ssh::interactive_line(host, &exec),
-        }
+        // The host decides how a terminal reaches the docker CLI.
+        self.cli.interactive(&refs)
     }
 }
 
@@ -232,10 +228,8 @@ impl Container for DockerContainer {
         let args = ["inspect", "--format", "{{.State.Running}}", &self.id];
         let out = self
             .cli
-            .target
-            .attempt(crate::ssh::Repeat::Safe, || {
-                self.cli.command(&args).output()
-            })
+            .host
+            .attempt(Repeat::Safe, || self.cli.command(&args).output())
             .context("spawning docker inspect")?;
         if out.status.success() {
             return Ok(String::from_utf8_lossy(&out.stdout).trim() == "true");
@@ -274,29 +268,50 @@ impl Container for DockerContainer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::{LocalHost, SshHost};
+    use std::sync::Arc;
+
+    /// The program and arguments of a command, as one list.
+    fn words(c: &std::process::Command) -> Vec<String> {
+        std::iter::once(c.get_program())
+            .chain(c.get_args())
+            .map(|w| w.to_string_lossy().into_owned())
+            .collect()
+    }
 
     #[test]
-    fn the_interactive_command_is_the_exec_command_with_a_tty() {
-        let c = DockerContainer {
-            cli: DockerCli::new(&Target::Local),
+    fn the_interactive_command_is_the_exec_command_with_a_tty_run_on_the_host() {
+        let local = DockerContainer {
+            cli: DockerCli::new(Arc::new(LocalHost)),
             id: "abc".into(),
         };
         assert_eq!(
-            c.interactive_command(User::Named("dev"), "/w", "exec bash -l"),
-            "docker 'exec' '-it' '-u' 'dev' '--workdir' '/w' 'abc' 'sh' '-c' 'exec bash -l'"
+            words(&local.interactive_command(User::Named("dev"), "/w", "exec bash -l")),
+            [
+                "docker",
+                "exec",
+                "-it",
+                "-u",
+                "dev",
+                "--workdir",
+                "/w",
+                "abc",
+                "sh",
+                "-c",
+                "exec bash -l"
+            ]
         );
-        let line = DockerContainer {
-            cli: DockerCli::new(&Target::Ssh("h".into())),
+        // On another host it is the host that decides how the terminal gets there.
+        let remote = DockerContainer {
+            cli: DockerCli::new(Arc::new(SshHost::new("h"))),
             id: "abc".into(),
-        }
-        .interactive_command(User::Root, "/", "x");
-        // The same exec command, run on the remote through `ssh -tt`.
+        };
+        let line = words(&remote.interactive_command(User::Root, "/", "x"));
+        assert_eq!(line[0], "ssh");
+        assert!(line.contains(&"-tt".to_string()), "{line:?}");
         assert_eq!(
-            line,
-            crate::ssh::interactive_line(
-                "h",
-                "docker 'exec' '-it' '-u' '0' '--workdir' '/' 'abc' 'sh' '-c' 'x'"
-            )
+            line.last().unwrap(),
+            "'docker' 'exec' '-it' '-u' '0' '--workdir' '/' 'abc' 'sh' '-c' 'x'"
         );
     }
 
