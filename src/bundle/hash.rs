@@ -68,21 +68,6 @@ mod tests {
     }
 
     #[test]
-    fn the_hash_of_a_tree_is_stable_across_releases() {
-        // Bundle manifests record these hashes: a change here would make every
-        // existing bundle fail verification.
-        let t = TempDir::new("golden").unwrap();
-        let p = t.path();
-        std::fs::create_dir_all(p.join("d/e")).unwrap();
-        std::fs::write(p.join("a"), "1").unwrap();
-        std::fs::write(p.join("d/e/x"), "2").unwrap();
-        std::fs::write(p.join("d/run"), "3").unwrap();
-        std::fs::set_permissions(p.join("d/run"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::os::unix::fs::symlink("a", p.join("l")).unwrap();
-        assert_eq!(hash_path(p).unwrap(), "715bc939815d54cd");
-    }
-
-    #[test]
     fn the_same_tree_hashes_the_same_wherever_it_lives() {
         let a = tree(&[("init.lua", "x"), ("lua/p.lua", "y")]);
         let b = tree(&[("lua/p.lua", "y"), ("init.lua", "x")]);

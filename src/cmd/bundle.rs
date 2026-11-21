@@ -52,8 +52,7 @@ fn inspect(file: &Path) -> Result<()> {
     line!("bundle    {} ({})", file.display(), human_size(size));
     line!("id        {}", manifest.id());
     line!(
-        "format    {} · {} · packed by ldg {}",
-        manifest.format,
+        "packed    {} by ldg {}",
         manifest.arch,
         manifest.lodge_version
     );

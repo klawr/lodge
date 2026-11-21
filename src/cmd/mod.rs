@@ -2,7 +2,7 @@
 //! the work. This is the only layer that loads the config (once per command) and
 //! decides what to print.
 //!
-//! - [`attach`]: `up` and `exec`, which end in an interactive session
+//! - [`attach`]: `up`, which ends in an interactive session
 //! - [`project`]: `down`, `status`, `rm`, `ls`, `ports`, `logs`, `clean`
 //! - [`doctor`]: the `doctor` command
 //! - [`init`]: the `init` command
@@ -23,7 +23,6 @@ use std::process::ExitCode;
 
 use crate::cli::{Cli, Command};
 use crate::config::Config;
-use crate::devcontainer::{Recreate, StartOpts};
 use crate::runtime::Runtime;
 use crate::target::Target;
 
@@ -68,37 +67,14 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Up {
             project,
             build,
-            yes,
-            no_recreate,
+            reinject,
             no_attach,
             bundle,
-        } => {
-            let recreate = if yes {
-                Recreate::Yes
-            } else if no_recreate {
-                Recreate::No
-            } else {
-                Recreate::Ask
-            };
-            attach::up(
-                &ctx,
-                project.path,
-                StartOpts { build, recreate },
-                no_attach,
-                bundle.as_deref(),
-            )?;
-        }
-        Command::Exec {
-            container,
-            user,
-            workdir,
-            no_attach,
-            bundle,
-        } => attach::exec(
+        } => attach::up(
             &ctx,
-            &container,
-            user.as_deref(),
-            &workdir,
+            project.path,
+            build,
+            reinject,
             no_attach,
             bundle.as_deref(),
         )?,
@@ -108,11 +84,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         Command::Ls { json } => project::ls(&ctx, json)?,
         Command::Ports { project, json } => project::ports(&ctx, project.path, json)?,
         Command::Logs { project, follow } => project::logs(&ctx, project.path, follow)?,
-        Command::Clean {
-            project,
-            container,
-            user,
-        } => project::clean(&ctx, project.path, container.as_deref(), user.as_deref())?,
+        Command::Clean { project } => project::clean(&ctx, project.path)?,
         Command::Pack { output } => bundle::pack(&ctx, output)?,
         Command::Bundle { command } => bundle::bundle(command)?,
         Command::Cache { command } => bundle::cache(command)?,

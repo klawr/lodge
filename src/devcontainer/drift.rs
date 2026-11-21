@@ -180,23 +180,6 @@ mod tests {
     use crate::runtime::fake::{FakeEnv, FakeRuntime};
 
     #[test]
-    fn the_hash_is_stable_across_releases() {
-        // Recorded in every container: a change here would make every existing
-        // container look changed.
-        let t = crate::tmpfile::TempDir::new("dc-golden").unwrap();
-        let dc = t.path().join("proj/.devcontainer");
-        std::fs::create_dir_all(dc.join("sub")).unwrap();
-        std::fs::write(dc.join("devcontainer.json"), "{\"image\": \"x\" /* c */}").unwrap();
-        std::fs::write(dc.join("Dockerfile"), "FROM x\n").unwrap();
-        std::fs::write(dc.join("sub/s.sh"), "echo\n").unwrap();
-        std::os::unix::fs::symlink("Dockerfile", dc.join("link")).unwrap();
-        assert_eq!(
-            hash_inputs(&dc.join("devcontainer.json"), &[], &Target::Local).unwrap(),
-            "2b104ffc92d7fc62"
-        );
-    }
-
-    #[test]
     fn a_subfolder_config_hashes_its_folder_not_its_siblings() {
         let tmp = crate::tmpfile::TempDir::new("dc-sub").unwrap();
         let dc = tmp.path().join(".devcontainer");

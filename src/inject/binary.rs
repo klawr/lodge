@@ -145,7 +145,7 @@ fn install_wrapper(env: &dyn Env, lodge_binary: &str, dest: &str) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle::manifest::{FORMAT, Lib};
+    use crate::bundle::manifest::Lib;
     use crate::bundle::source::Origin;
     use crate::runtime::Acting;
     use crate::runtime::fake::FakeEnv;
@@ -184,7 +184,6 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("bin")).unwrap();
         std::fs::write(dir.path().join("bin/hello"), "#!/bin/sh\necho hi\n").unwrap();
         let manifest = Manifest {
-            format: FORMAT,
             lodge_version: "0".into(),
             created: 0,
             arch: arch.into(),
@@ -272,7 +271,7 @@ mod tests {
         let (_dir, b) = bundle(tool(false, "aaaaaaaaaaaaaaaa", None), "x86_64");
         let env = FakeEnv::new()
             .with_file("/p/bin/hello", "old contents")
-            .with_file("/p/installed/hello.bin", "aaaaaaaaaaaaaaaa\n");
+            .with_file("/p/installed/hello.bin", "aaaaaaaaaaaaaaaa\n/p/bin/hello");
         inject(&env, &b);
         assert_eq!(env.file("/p/bin/hello").unwrap(), "old contents");
     }

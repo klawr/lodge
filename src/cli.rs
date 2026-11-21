@@ -77,7 +77,10 @@ pub enum Command {
         long_about = "Read the project's devcontainer config — looked up under PATH (default: \
             current directory) as .devcontainer/devcontainer.json, .devcontainer.json, or \
             .devcontainer/<folder>/devcontainer.json — bring the container up, run lifecycle \
-            hooks and features, inject your environment, then open an interactive shell.\n\n\
+            hooks and features, then open an interactive shell. Your environment is injected \
+            when the container is created; after that `ldg up` only attaches, and says when \
+            what is injected is out of date (`--reinject` updates it, `--build` recreates \
+            the container).\n\n\
             Supports dockerComposeFile, image, build, and dockerFile backends. \
             Forwards ports declared in forwardPorts and any port that starts \
             listening at runtime."
@@ -88,12 +91,9 @@ pub enum Command {
         /// Force-rebuild images and recreate the container from scratch
         #[arg(long)]
         build: bool,
-        /// Recreate the container without asking when its config changed
-        #[arg(long, short, conflicts_with = "no_recreate")]
-        yes: bool,
-        /// Keep the container without asking when its config changed
+        /// Inject again even though something is already injected
         #[arg(long)]
-        no_recreate: bool,
+        reinject: bool,
         /// Set everything up, but don't open a shell (for scripts and CI)
         #[arg(long)]
         no_attach: bool,
@@ -137,28 +137,6 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Inject your environment into an already-running container
-    #[command(
-        long_about = "Inject your environment into a container that is already running, \
-            then open an interactive shell. The container is identified by name or ID \
-            as shown by `docker ps`."
-    )]
-    Exec {
-        /// Container name or ID
-        container: String,
-        /// Open the shell as this user (default: the container's user)
-        #[arg(long, short)]
-        user: Option<String>,
-        /// Open the shell in this directory (default: /)
-        #[arg(long, short, value_name = "DIR", default_value = "/")]
-        workdir: String,
-        /// Inject, but don't open a shell (for scripts and CI)
-        #[arg(long)]
-        no_attach: bool,
-        /// Inject from this bundle file instead of packing your config
-        #[arg(long, value_name = "FILE")]
-        bundle: Option<PathBuf>,
-    },
     /// Show the ports forwarded for a project's container
     Ports {
         #[command(flatten)]
@@ -180,18 +158,11 @@ pub enum Command {
         long_about = "Remove what lodge injected: binaries, libraries, the wrappers it \
             installed, its shell setup and any placed secrets. Injected configs are left \
             in place (you may have changed them) and listed. The devcontainer's own state \
-            (hook markers, recorded config) is kept. Acts on the project's container, or \
-            on --container."
+            (hook markers, recorded config) is kept."
     )]
     Clean {
         #[command(flatten)]
         project: ProjectArg,
-        /// A running container (name or ID) instead of the project's
-        #[arg(long, value_name = "NAME", conflicts_with = "path")]
-        container: Option<String>,
-        /// Clean what was injected for this user (default: the container's user)
-        #[arg(long, short, requires = "container")]
-        user: Option<String>,
     },
     /// Pack your tools and configs into a portable bundle
     #[command(

@@ -58,19 +58,6 @@ pub fn resolve(container: &dyn Env, user: &ContainerUser) -> Result<Layout> {
     )
 }
 
-/// The prefix `user` was injected into, without making anything: where lodge's
-/// version stamp is, the user's home first and then the fallback. When there is
-/// none, the preferred one, which then has nothing in it.
-pub fn existing(container: &dyn Env, user: &ContainerUser) -> Result<Layout> {
-    let env = Acting::new(container, user);
-    for layout in Layout::candidates(user) {
-        if env.exists(&layout.version())? {
-            return Ok(layout);
-        }
-    }
-    Ok(Layout::preferred(user))
-}
-
 fn usable(env: &dyn Env, layout: &Layout, own: bool) -> Result<bool> {
     let mode = if own { "own" } else { "any" };
     let out = env.output(
@@ -129,23 +116,6 @@ mod tests {
             env.ran_as(&argv(&tmp)),
             Some(Who::Named("dev".into())),
             "even the fallback is probed as the user"
-        );
-    }
-
-    #[test]
-    fn the_existing_prefix_is_the_one_with_a_version_stamp() {
-        let user = dev();
-        let home = FakeEnv::new().with_file("/home/dev/.local/share/lodge/version", "2\n");
-        assert_eq!(
-            existing(&home, &user).unwrap().prefix(),
-            "/home/dev/.local/share/lodge"
-        );
-        let tmp = FakeEnv::new().with_file("/tmp/lodge-1000/version", "2\n");
-        assert_eq!(existing(&tmp, &user).unwrap().prefix(), "/tmp/lodge-1000");
-        assert_eq!(
-            existing(&FakeEnv::new(), &user).unwrap().prefix(),
-            "/home/dev/.local/share/lodge",
-            "with nothing injected, the preferred one, and nothing is made"
         );
     }
 

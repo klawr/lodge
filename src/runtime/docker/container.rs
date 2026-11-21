@@ -95,7 +95,7 @@ fn is_no_such_container(stderr: &str) -> bool {
 }
 
 // True if `name` follows the compose container naming convention
-// <project>-<service>-<index> (or the legacy underscore form) for `service`.
+// <project>-<service>-<index> (or the underscore form of older compose) for `service`.
 fn compose_service_matches(name: &str, service: &str) -> bool {
     ['-', '_'].iter().any(|&sep| {
         name.rsplit_once(sep).is_some_and(|(stem, index)| {

@@ -23,16 +23,16 @@ the host, and nothing is installed in the image.
 
 ```
 ldg up [PATH]        devcontainer::start → ContainerUser::resolve → forward::spawn_daemon
-                     → inject::resolve_layout → inject::run → Started::run_post_attach → secret::deliver → session::enter
-ldg exec <ctr>       ContainerUser::resolve → inject::resolve_layout → inject::run
-                     → secret::deliver → session::enter (no devcontainer)
+                     → inject::installed (skipped for a new container or --reinject)
+                     → inject::resolve_layout → inject::run (only when nothing is injected)
+                     → Started::run_post_attach → secret::deliver → session::enter
 ldg down [PATH]      devcontainer::stop
 ldg status [PATH]    devcontainer::status (state, drift) + installed bundle + placed secrets
 ldg rm [PATH]        devcontainer::remove (container, and the compose project)
 ldg ls               Runtime::list_labeled (every container with lodge's project label)
 ldg ports [PATH]     forward::active_ports (what the daemon reports)
 ldg logs [PATH]      the daemon's log file
-ldg clean [PATH]     ContainerUser::resolve → inject::existing_layout → inject::remove
+ldg clean [PATH]     ContainerUser::resolve → inject::installed → inject::remove
 ldg init             a commented config from the tools found on PATH
 ldg doctor [PATH]    host tools, engine, compose, config, binaries, secrets
 ldg pack             bundle::pack::pack_to_file (config → bundle tar)
@@ -61,7 +61,7 @@ every subcommand.
 | `config/` | The user's `config.toml`: `[[inject]]`, `[session]`, `[git]`, `[[secret]]` (its declaration types are in `config/secret.rs`: `RawSecret` as written, `SecretDecl` once checked), `bundle`. Unknown keys and wrong types are errors (with a "did you mean"); past those, every problem, secrets included, is reported at once. A relative `bundle =` resolves against the file's folder. The JSON schema in `docs/config.schema.json` is generated from these types. |
 | `devcontainer/` | Everything about running a `devcontainer.json` (see below). |
 | `bundle/` | A bundle is a portable tar of relinked binaries, their libraries and configs, with a manifest, and is tied to no install prefix (see "Injection"). `manifest` defines and validates it (paths derive from names, so a bundle can't point outside itself), `archive` writes, reads and verifies the tar, `pack` builds one from the config (the only step needing `patchelf`; `deps` parses `ldd`, asking it once per binary however often the answer is needed, `elf` reads a binary's architecture, as an `arch::Arch`, the one name for a CPU that bundles, binaries and machines are compared by, and `Arch::host()` is this machine's, and writes the interpreter of a dynamic binary in place), `source` readies a bundle *directory* to inject from (extracted from a file, or packed live), keyed by the file's hash or a fingerprint of the live inputs, and `cache` keeps those directories under `~/.cache/lodge/bundles/`. `hash` is the content hash of a file or tree. |
-| `inject/` | Copies a bundle's binaries, libraries and configs into a container for one `ContainerUser`, reading only from the bundle directory and acting *as that user* (through `runtime::Acting`), so it never needs root: `prefix` (chooses and checks the prefix: the user's home, else a private `/tmp` directory; `existing` finds where it was installed), `binary` (rewrites a dynamic binary's interpreter for the prefix, and writes the wrapper a config asked for), `libs` (tracked by content hash), `config_files`, `git` (`safe.directory`), `installed` (a hash and the destination per installed piece; a record that can't be read means that piece is installed again, and the list of records `ldg clean` works from is an error when it can't be read, not "nothing installed"), `state` (format version, installed bundle id), `remove` (`ldg clean`; placed secrets are removed by `secret::place::clear`). |
+| `inject/` | Copies a bundle's binaries, libraries and configs into a container for one `ContainerUser`, reading only from the bundle directory and acting *as that user* (through `runtime::Acting`), so it never needs root: `prefix` (chooses and checks the prefix: the user's home, else a private `/tmp` directory; `installed`, in `state`, finds where it was installed), `binary` (rewrites a dynamic binary's interpreter for the prefix, and writes the wrapper a config asked for), `libs` (tracked by content hash), `config_files`, `git` (`safe.directory`), `installed` (a hash and the destination per installed piece; a record that can't be read means that piece is installed again, and the list of records `ldg clean` works from is an error when it can't be read, not "nothing installed"), `state` (the installed bundle id, and `installed`, which finds what was injected and where), `remove` (`ldg clean`; placed secrets are removed by `secret::place::clear`). |
 | `layout.rs` | Every path lodge writes inside a container: `Layout`, the paths inside the user's prefix (the table under "What lives where"); the provisioning state, which is the devcontainer's own and root-owned; and the secrets directory. Nothing else spells these paths out. |
 | `secret/` | Secrets that must not be in a bundle. Their `[[secret]]` declarations are config (`config/secret.rs`: validated; names reach shell scripts). `mod` is the `Secret` value type (redacted `Debug`, no `Display`), matching `targets` globs, and `resolve` (env, file or a command run on *this* machine with a timeout, with errors that never contain the value). `place` writes values into a container under `/dev/shm/lodge-secrets-<uid>/` and builds the session lines that export them; `clear` removes the user's (`ldg clean`). `deliver` picks the secrets whose `targets` match, resolves and places them (or clears them when none are declared), and prints names only. |
 | `session/` | Opens the interactive session: `docker exec -it`, optionally inside tmux. Its start-up script (`startup_script`) starts the shell as a login shell, so the profile scripts run, then puts the user's prefix `bin/` first on `PATH` and restores what the profile dropped before running the shell interactively; that is how the injected tools reach the session without any file outside the prefix. `terminfo` makes the terminal the session is opened from work in the container (copies its entry from this machine into the prefix when the container lacks it, and sets `TERM`). |
@@ -84,7 +84,7 @@ every subcommand.
 
 | File | Responsibility |
 | --- | --- |
-| `mod.rs` | `start` / `stop` / `remove` / `status` / `find`, the `Started` result, the recreate policy (`--yes`, `--no-recreate`, or ask), and `Prompt`, the questions only a person can answer (the command layer implements it). Drift and the installed bundle are read with `Container::read_stored_file`, which works on a stopped container too. |
+| `mod.rs` | `start` / `stop` / `remove` / `status` / `find`, the `Started` result, whether the container was created, and `Prompt`, the questions only a person can answer (the command layer implements it). Drift and the installed bundle are read with `Container::read_stored_file`, which works on a stopped container too. |
 | `spec.rs` | Find the config on the project's host (through `Target`, so local and `--remote` share one lookup order); parse `devcontainer.json` (JSONC) into a backend-agnostic `Spec`; derive the session name. |
 | `backend.rs` | Picks and builds the backend from the parsed config (with the stable container name, and the files outside the hashed folder that count toward drift: a Dockerfile, compose files). The `Backend` trait with two implementations: `ComposeBackend` (`docker compose`, run on the project's host) and `ContainerBackend` (`docker run` of an image or a local build). Both label the container `dev.lodge.project=<path>`. |
 | `create.rs` | `CreateSettings`, how a container is created (privileged, capabilities, mounts, published `appPort`s, …), from devcontainer.json and from features alike, rendered as `docker run` flags or a compose override. |
@@ -111,10 +111,9 @@ and hooks all work from the resulting container id.
    there), so one folder is one container however it is spelled.
 1. **Load the spec.** Find and parse `devcontainer.json`; pick a backend.
 2. **Detect drift.** Fingerprint the inputs and compare with the hash stored in
-   the existing container. On a mismatch, recreate per `--yes` / `--no-recreate`,
-   or ask (without a TTY, keep the container). If no hash is recorded, or it
-   can't be read, the container is kept (`ldg status` says `unknown`). `--build`
-   forces a recreate.
+   the existing container. On a mismatch, say so and keep the container; only
+   `--build` recreates. If no hash is recorded, or it can't be read, the
+   container is kept (`ldg status` says `unknown`).
 3. **`initializeCommand`** runs on the host (the remote host with `--remote`).
    Unlike the other hooks, a failure stops `ldg up`, as the spec asks.
 4. **Resolve features** when (re)creating, so their container flags (mounts,
@@ -131,9 +130,12 @@ and hooks all work from the resulting container id.
    never aborts `ldg`.
 9. **Choose a working directory.** `workspaceFolder` if it exists, otherwise ask.
 10. **Look up the container user** (`remoteUser`, or the default user: name,
-    uid, gid, home) once, then **start the port-forward daemon**, choose the
-    **prefix** and **inject your environment** for that user into it, as that
-    user.
+    uid, gid, home) once, then **start the port-forward daemon**. Then **inject
+    your environment** for that user, as that user, into the **prefix**, but only
+    when the container was just created, `--reinject` was given, or nothing is
+    recorded as injected. Otherwise the prefix is found from the bundle record
+    and left alone; if the recorded bundle id differs from the current bundle's
+    (config or ldg changed), that is reported.
 11. **`postAttachCommand`**, then **deliver secrets** and **open the session**,
     which first copies in the terminfo entry of the terminal it is opened from
     and puts the prefix's `bin/` on the `PATH` of the shell it starts.
@@ -153,7 +155,7 @@ bundle-file path end in the same place, so there is one injector. It is prepared
 container.
 
 Injection is done **as the container user, into a prefix that user owns**, and
-never needs root (see `runtime::Acting`). `ldg up` and `ldg exec` first resolve the
+never needs root (see `runtime::Acting`). `ldg up` first resolves the
 user once (`ContainerUser`: the configured `remoteUser`, or the container's default
 user) and then the prefix: `~/.local/share/lodge`, or, when the home can't hold
 programs (none, not writable, mounted `noexec`: checked by writing a script there
@@ -209,8 +211,7 @@ what `ldg clean` removes:
 | `<prefix>/bin/` | The injected binaries; first on the session's `PATH`. |
 | `<prefix>/lib/` | Copied libraries and the dynamic linker, one copy; `.manifest` holds the hash of every library copied, so a changed host library is refreshed (names don't change across glibc versions). |
 | `<prefix>/installed/` | A content hash and the destination path per installed binary and config, so an unchanged piece is skipped, a changed one replaced (`skip_if_exists` protects a piece from replacement), and `ldg clean` knows what to remove. |
-| `<prefix>/bundle` | The id of the bundle last injected; `ldg status` shows it. |
-| `<prefix>/version` | Format version of this layout; a lodge older than the one that wrote it warns. |
+| `<prefix>/bundle` | The id of the bundle last injected; `ldg status` shows it, and its presence is how `ldg clean` finds the prefix. |
 | `<prefix>/terminfo/` | The user's terminfo entry, when the container lacked it. |
 
 Provisioning state, which is the devcontainer's own and written as root when the
@@ -454,8 +455,8 @@ mounted at the same path) and uses the real ssh client through a wrapper that
 adds a private `-F` config. A private `TMUX_TMPDIR` keeps tmux tests away from
 the tmux you may be running them in. A project removes its container
 when dropped, even if the test failed, and the sandbox waits for its forward
-daemons before deleting itself. `ldg up --no-attach` and `ldg exec --no-attach`
-do all the work and exit without opening a shell, which is what makes the exit
+daemons before deleting itself. `ldg up --no-attach`
+does all the work and exit without opening a shell, which is what makes the exit
 codes meaningful. Terminals are pseudo-terminals made by `script`; nothing
 checks what a person would see on screen.
 

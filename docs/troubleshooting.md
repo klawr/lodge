@@ -49,12 +49,11 @@ safe_directories`); if you set it to `[]`, add the directories you need.
   `<prefix>/share/nvim/runtime` to the same path (`ldg init` adds this entry).
 - Run `ldg cache clear` if you suspect a stale packed bundle.
 
-## The devcontainer is recreated (or the question asked) every time
+## The devcontainer is reported as changed every time
 
 Change detection hashes every file under `.devcontainer/`. A hook that writes
 there (for example `initializeCommand: touch .devcontainer/x`) changes the hash
-on every run. Write generated files elsewhere. In scripts, `--no-recreate` keeps
-the container without asking.
+on every run. Write generated files elsewhere.
 
 ## A lifecycle hook or feature failed
 
@@ -66,8 +65,6 @@ create-time hook or feature is retried on the next `ldg up`. Hooks run as
 
 `ldg clean` removes lodge's directory (`~/.local/share/lodge` of the container
 user, or `/tmp/lodge-<uid>`), the wrapper scripts it wrote and the placed secrets,
-and lists the configs it left in place. With `--container NAME` it cleans for the
-container's default user, or for the one given with `-u USER`. `ldg rm` removes the
-whole container. lodge keeps nothing about a container on the host except the
+and lists the configs it left in place. `ldg rm` removes the whole container. lodge keeps nothing about a container on the host except the
 bundle cache (`ldg cache clear`) and the forwarding logs in
 `~/.local/share/lodge/`.

@@ -1,9 +1,7 @@
-//! A small, stable, non-cryptographic content hash (FNV-1a, 64 bit).
+//! A small, non-cryptographic content hash (FNV-1a, 64 bit).
 //!
 //! Used to notice that something *changed* (a devcontainer's inputs, a library
-//! that was updated on the host), never to defend against an adversary. The
-//! values are stored (in containers, in bundle manifests), so the algorithm and
-//! the bytes each caller feeds it must not change.
+//! that was updated on the host), never to defend against an adversary.
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -55,7 +53,7 @@ pub fn content_hash(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Fingerprint, content_hash};
+    use super::content_hash;
 
     #[test]
     fn equal_bytes_hash_equal_and_different_bytes_differ() {
@@ -68,15 +66,5 @@ mod tests {
         let h = content_hash(b"");
         assert_eq!(h.len(), 16);
         assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn values_are_stable_across_releases() {
-        // Stored in containers and manifests: a change here would make every
-        // existing container look changed and every bundle look damaged.
-        assert_eq!(content_hash(b"libc 2.40"), "3f366fef88e3edcf");
-        let mut f = Fingerprint::new();
-        f.field(b"name").put(b"bytes").put(&[0xff]);
-        assert_eq!(f.hex(), "ee4f46835c57eeca");
     }
 }

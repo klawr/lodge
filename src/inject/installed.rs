@@ -73,14 +73,15 @@ pub(super) fn decide(
     }
 }
 
-// The hash is the record's first line (older records have only that).
+// A record is two lines: the hash, then where the piece was placed. Anything
+// else (including a missing or unreadable record) counts as unrecorded: the
+// piece is installed again, which is safe.
 fn recorded(env: &dyn Env, dir: &str, piece: Piece) -> Option<String> {
-    // Unreadable counts as unrecorded: the piece is installed again, which is safe.
-    env.read_file(&piece.path(dir))
-        .ok()
-        .flatten()
-        .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
-        .filter(|s| !s.is_empty())
+    let text = env.read_file(&piece.path(dir)).ok().flatten()?;
+    let mut lines = text.lines().map(str::trim);
+    let hash = lines.next().filter(|s| !s.is_empty())?;
+    lines.next().filter(|s| !s.is_empty())?;
+    Some(hash.to_string())
 }
 
 /// Records that `piece` is installed at `placed_at` (its path in the container)
@@ -187,8 +188,17 @@ mod tests {
     }
 
     #[test]
+    fn a_record_without_a_destination_counts_as_unrecorded() {
+        let env = FakeEnv::new().with_file(&bin("x").path(DIR), "aa\n");
+        assert_eq!(
+            decide(&env, DIR, bin("x"), "aa", true, false),
+            Decision::Install
+        );
+    }
+
+    #[test]
     fn something_present_but_never_recorded_counts_as_changed() {
-        // Installed by an older ldg, or by hand.
+        // Installed by hand.
         let env = FakeEnv::new();
         assert_eq!(
             decide(&env, DIR, bin("x"), "aa", true, false),

@@ -96,11 +96,6 @@ impl Layout {
         format!("{}/bundle", self.prefix)
     }
 
-    /// The format version of this layout.
-    pub fn version(&self) -> String {
-        format!("{}/version", self.prefix)
-    }
-
     /// Terminfo entries copied from the host, for [`TERMINFO_DIRS`](
     /// https://man7.org/linux/man-pages/man5/terminfo.5.html).
     pub fn terminfo(&self) -> String {
@@ -163,7 +158,6 @@ mod tests {
             l.lib_manifest(),
             l.installed(),
             l.bundle_id(),
-            l.version(),
             l.terminfo(),
         ] {
             assert!(path.starts_with("/home/dev/.local/share/lodge/"), "{path}");

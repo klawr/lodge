@@ -18,11 +18,6 @@ use crate::bundle::arch::Arch;
 use crate::fingerprint::content_hash;
 use crate::shell::{container_path_problem, is_plain_name};
 
-/// The bundle format this ldg writes and reads.
-///
-/// Format 2 bakes no install prefix into the binaries.
-pub const FORMAT: u32 = 2;
-
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const BIN_DIR: &str = "bin";
 pub const LIB_DIR: &str = "lib";
@@ -35,8 +30,8 @@ pub const CONFIG_DIR: &str = "config";
 pub const ORIGIN_RPATH: &str = "$ORIGIN/../lib";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
-    pub format: u32,
     pub lodge_version: String,
     /// Seconds since the Unix epoch. Informational: not part of the identity.
     pub created: u64,
@@ -52,12 +47,14 @@ pub struct Manifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Lib {
     pub name: String,
     pub hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Tool {
     pub name: String,
     pub binary: Option<Binary>,
@@ -67,6 +64,7 @@ pub struct Tool {
 
 /// A binary, stored at `bin/<tool name>`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Binary {
     /// Where an extra wrapper script goes (`~/` is the user's home), when the
     /// config asked for one with `target_binary`. Without it the binary is
@@ -81,6 +79,7 @@ pub struct Binary {
 
 /// A config file or tree, stored at `config/<tool name>`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigTree {
     /// Where it goes in the container (`~/` is the user's home). Called
     /// `target` in the manifest, after the config's `target_config`.
@@ -109,28 +108,14 @@ impl Manifest {
         serde_json::to_vec_pretty(self).context("writing the manifest")
     }
 
-    /// Parses and validates a manifest. The format version is checked first, so a
-    /// bundle from a newer ldg is refused with a clear message rather than a parse
-    /// error.
+    /// Parses and validates a manifest.
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
-        let value: serde_json::Value =
-            serde_json::from_slice(bytes).context("reading manifest.json")?;
-        let format = value
-            .get("format")
-            .and_then(serde_json::Value::as_u64)
-            .context("the manifest has no format version")?;
-        if format != u64::from(FORMAT) {
-            bail!("this bundle is format {format}; this ldg reads format {FORMAT} (update ldg?)");
-        }
-        let manifest: Manifest = serde_json::from_value(value).context("reading manifest.json")?;
+        let manifest: Manifest = serde_json::from_slice(bytes).context("reading manifest.json")?;
         manifest.validate()?;
         Ok(manifest)
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.format != FORMAT {
-            bail!("unsupported bundle format {}", self.format);
-        }
         self.arch()?;
 
         let mut lib_names = HashSet::new();
@@ -205,7 +190,6 @@ mod tests {
 
     fn sample() -> Manifest {
         Manifest {
-            format: FORMAT,
             lodge_version: "0.0.0".into(),
             created: 1_700_000_000,
             arch: "x86_64".into(),
@@ -276,21 +260,6 @@ mod tests {
         let mut other = sample();
         other.libs[1].hash = "1111111111111111".into();
         assert_ne!(a.id(), other.id());
-    }
-
-    #[test]
-    fn a_newer_format_is_refused_with_a_clear_message() {
-        let mut v: serde_json::Value =
-            serde_json::from_slice(&sample().to_json().unwrap()).unwrap();
-        v["format"] = 99.into();
-        v["somethingNew"] = true.into();
-        let err = Manifest::from_json(v.to_string().as_bytes())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("format 99") && err.contains("update ldg"),
-            "{err}"
-        );
     }
 
     fn invalid(edit: impl FnOnce(&mut Manifest)) -> String {

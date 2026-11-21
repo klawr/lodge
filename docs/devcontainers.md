@@ -76,9 +76,8 @@ bind-mounted workspace is writable.
 When the container already exists, lodge compares the current `.devcontainer/`
 contents (JSON canonicalized, so comments and formatting don't count; plus any
 compose files) with a hash recorded in the container at creation. If they
-differ, it asks whether to recreate the container. `--yes` recreates without
-asking, `--no-recreate` keeps it, and without a terminal the container is kept.
-`ldg up --build` rebuilds and recreates unconditionally.
+differ, it says so and keeps the container. `ldg up --build` rebuilds and
+recreates it.
 
 Known limit: every file under `.devcontainer/` counts, so a hook that writes
 there makes the next run report a change.

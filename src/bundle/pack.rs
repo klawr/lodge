@@ -12,8 +12,8 @@ use super::deps;
 use super::elf;
 use super::hash::hash_path;
 use super::manifest::{
-    BIN_DIR, Binary, CONFIG_DIR, ConfigTree, FORMAT, LIB_DIR, Lib, MANIFEST_FILE, Manifest,
-    ORIGIN_RPATH, Tool,
+    BIN_DIR, Binary, CONFIG_DIR, ConfigTree, LIB_DIR, Lib, MANIFEST_FILE, Manifest, ORIGIN_RPATH,
+    Tool,
 };
 use crate::config::{Config, Injectable};
 use crate::layout;
@@ -204,7 +204,6 @@ impl Packer<'_> {
 
     fn finish(self, config: &Config) -> Manifest {
         Manifest {
-            format: FORMAT,
             lodge_version: env!("CARGO_PKG_VERSION").to_string(),
             created: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

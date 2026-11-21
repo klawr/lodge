@@ -97,7 +97,7 @@ pub fn verify(dir: &Path, manifest: &Manifest) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::manifest::{Binary, ConfigTree, FORMAT, Lib, Tool};
+    use super::super::manifest::{Binary, ConfigTree, Lib, Tool};
     use super::*;
     use crate::tmpfile::TempDir;
 
@@ -114,7 +114,6 @@ mod tests {
         std::fs::write(p.join("config/hello/sub/rc"), "set x").unwrap();
 
         let manifest = Manifest {
-            format: FORMAT,
             lodge_version: "0".into(),
             created: 1,
             arch: "x86_64".into(),

@@ -38,9 +38,10 @@ ldg up            # start it, inject your tools, open a shell
 
 Inside, your editor and tools run as if they were installed in the image. Leave
 the shell and come back with `ldg up` again; the container, and everything
-installed in it, is kept until you `ldg rm` it.
-
-No devcontainer? `ldg exec <container>` injects into any running container.
+installed in it, is kept until you `ldg rm` it. Coming back only attaches: what
+was injected is left as it is, and `ldg up` says when your config (or ldg) has
+changed since. `ldg up --reinject` updates it, `ldg up --build` recreates the
+container.
 
 Shell completions: `ldg completions bash|zsh|fish` (see `ldg completions --help`
 for where to put them). Man page: `ldg man | man -l -`.
@@ -49,8 +50,7 @@ for where to put them). Man page: `ldg man | man -l -`.
 
 | Command | What it does |
 | --- | --- |
-| `ldg up [PATH]` | Start the project's devcontainer, inject your environment, open a shell. `--build` rebuilds; `--yes` / `--no-recreate` answer the "config changed" question; `--no-attach` sets up without a shell. |
-| `ldg exec CONTAINER` | Inject into an already-running container and open a shell (`-u USER`, `-w DIR`). |
+| `ldg up [PATH]` | Start the project's devcontainer and open a shell. The environment is injected when the container is created (or with `--reinject`). `--build` rebuilds and recreates; `--no-attach` sets up without a shell. |
 | `ldg down [PATH]` | Stop the project's container (resume later with `ldg up`). |
 | `ldg rm [PATH]` | Remove the project's container (the next `ldg up` starts fresh). |
 | `ldg status [PATH]` | The container's state, whether its config changed, the injected bundle, placed secrets. |
@@ -121,7 +121,7 @@ linked binaries are copied as they are.
 - Programs an injected tool starts but that weren't injected themselves (say,
   a Mason language server) run against the container's glibc. For language
   servers, prefer letting the container provide the toolchain.
-- Tools are on `PATH` in the sessions lodge opens (`ldg up`, `ldg exec`). Another
+- Tools are on `PATH` in the sessions lodge opens (`ldg up`). Another
   way into the same container (an IDE terminal, a hand-run `docker exec`) does not
   see them, unless an `[[inject]]` entry sets `target_binary`, which also writes a
   wrapper script at that path.
@@ -133,7 +133,7 @@ linked binaries are copied as they are.
 - Docker is the only container engine; the target must be a container.
 - `ldg` itself runs on Linux, macOS and WSL2, not natively on Windows.
 - Change detection hashes every file under `.devcontainer/`, so a hook that
-  writes there triggers a recreate prompt on the next run.
+  writes there is reported as a change on the next run.
 
 ## Development
 

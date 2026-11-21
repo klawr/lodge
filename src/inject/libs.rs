@@ -65,7 +65,7 @@ fn changed_libs<'a>(libs: &'a [Lib], manifest: &BTreeMap<String, String>) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle::manifest::{FORMAT, Manifest};
+    use crate::bundle::manifest::Manifest;
     use crate::bundle::source::Origin;
     use crate::runtime::fake::FakeEnv;
     use crate::tmpfile::TempDir;
@@ -126,7 +126,6 @@ mod tests {
             std::fs::write(dir.path().join("lib").join(name), contents).unwrap();
         }
         let manifest = Manifest {
-            format: FORMAT,
             lodge_version: "0".into(),
             created: 0,
             arch: "x86_64".into(),

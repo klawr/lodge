@@ -111,9 +111,9 @@ fn status_down_and_rm_follow_the_container_lifecycle() {
         &json(r#"{ "image": "@IMAGE@", "containerEnv": { "A": "2" } }"#),
     );
     assert!(p.ldg("status", &[]).has("changed since"));
-    let out = p.ldg("up", &["--no-attach", "--no-recreate"]);
+    let out = p.ldg("up", &["--no-attach"]);
     assert!(
-        out.ok && out.has("keeping it: --no-recreate"),
+        out.ok && out.has("changed since"),
         "`up` of a stopped container missed the drift:\n{}",
         out.tail(6)
     );
@@ -132,7 +132,6 @@ fn an_injected_binary_runs_against_the_injected_glibc() {
     p.up();
 
     assert_eq!(p.exec(&[&root_tool("hostsh"), "-c", "echo ok"]), "ok");
-    assert_eq!(p.sh(&format!("cat {ROOT_PREFIX}/version")).trim(), "2");
     assert!(
         p.sh(&format!("wc -l < {ROOT_PREFIX}/lib/.manifest"))
             .trim()
@@ -140,9 +139,17 @@ fn an_injected_binary_runs_against_the_injected_glibc() {
             .unwrap()
             > 0
     );
+    let again = p.up();
     assert!(
-        p.up().has("is up to date"),
-        "a second run should find nothing to do"
+        !again.has("injecting") && !again.has("is up to date"),
+        "a second run should only attach:\n{}",
+        again.tail(8)
+    );
+    let again = p.ldg("up", &["--no-attach", "--reinject"]);
+    assert!(
+        again.ok && again.has("is up to date"),
+        "--reinject found work to do:\n{}",
+        again.tail(8)
     );
 }
 
@@ -163,8 +170,7 @@ fn a_library_that_changed_on_the_host_is_refreshed() {
          sed -i 's/^[0-9a-f]* {libc}$/0000000000000000 {libc}/' {ROOT_PREFIX}/lib/.manifest"
     ));
 
-    let container = p.container();
-    let out = sb.run(&["exec", "--no-attach", &container]);
+    let out = p.ldg("up", &["--no-attach", "--reinject"]);
     assert!(out.ok, "re-injecting failed:\n{}", out.tail(10));
     assert_eq!(
         p.sh(&format!("head -c 4 {ROOT_PREFIX}/lib/{libc} | tail -c 3")),
@@ -200,8 +206,7 @@ fn packing_a_binary_for_another_architecture_than_this_machine_is_refused() {
         fake.display()
     ));
 
-    let container = p.container();
-    let out = sb.run(&["exec", "--no-attach", &container]);
+    let out = p.ldg("up", &["--no-attach"]);
     assert!(
         !out.ok && out.has("built for"),
         "expected an architecture refusal:\n{}",
@@ -551,14 +556,15 @@ fn a_bundle_for_another_architecture_is_refused() {
     };
     with_arch(&bundle, &foreign, other);
 
-    let container = p.container();
-    let out = sb.run(&[
-        "exec",
-        "--no-attach",
-        "--bundle",
-        &foreign.to_string_lossy(),
-        &container,
-    ]);
+    let out = p.ldg(
+        "up",
+        &[
+            "--no-attach",
+            "--reinject",
+            "--bundle",
+            &foreign.to_string_lossy(),
+        ],
+    );
     assert!(
         !out.ok && out.has("the bundle is for"),
         "expected an architecture refusal:\n{}",
@@ -581,16 +587,20 @@ fn a_repeated_up_reuses_the_cached_bundle_and_a_change_updates_the_container() {
         "unchanged inputs should reuse the bundle:\n{}",
         again.tail(8)
     );
-    assert!(again.has("is up to date"));
+    assert!(!again.has("injecting"), "an attach must not inject");
 
-    // A different script: the bundle is repacked and the container updated.
+    // A different script: the bundle is repacked, the container is left as it
+    // is and reported out of date, and `--reinject` updates it.
     std::fs::write(&script, "#!/bin/sh\necho two, and longer\n").unwrap();
     let changed = p.up();
     assert!(
-        changed.has("(packed)") && changed.has("injecting hello"),
+        changed.has("(packed)") && changed.has("out of date") && !changed.has("injecting"),
         "{}",
         changed.tail(8)
     );
+    assert_eq!(p.exec(&[&root_tool("hello")]), "one");
+    let updated = p.ldg("up", &["--no-attach", "--reinject"]);
+    assert!(updated.has("injecting hello"), "{}", updated.tail(8));
     assert_eq!(p.exec(&[&root_tool("hello")]), "two, and longer");
 }
 
@@ -1114,10 +1124,10 @@ fn a_user_without_root_gets_everything_in_their_own_prefix_and_nothing_elsewhere
         "0",
         "injection touched root-owned places"
     );
-    assert!(p.up().has("is up to date"), "a second run found work to do");
+    assert!(!p.up().has("injecting"), "a second run found work to do");
 
-    // `clean --container` finds what was injected for another user when told which.
-    let out = sb.run(&["clean", "--container", &container, "-u", "nobody"]);
+    // `clean` finds what was injected for the project's remote user.
+    let out = p.ldg("clean", &[]);
     assert!(out.ok, "{}", out.tail(10));
     assert_eq!(p.sh(&format!("ls -d {prefix} 2>/dev/null | wc -l")), "0");
 }

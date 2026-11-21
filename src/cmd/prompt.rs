@@ -9,23 +9,6 @@ use crate::output::{line_err, note, prompt, warning};
 pub struct Terminal;
 
 impl Prompt for Terminal {
-    fn confirm_recreate(&self, question: &str) -> bool {
-        if !io::stdin().is_terminal() {
-            note!(
-                "{question}\n(no TTY — keeping the existing container; \
-                 re-run with `ldg up --yes` or `--build` to recreate)"
-            );
-            return false;
-        }
-        prompt!("{question} [y/N] ");
-        let mut line = String::new();
-        if io::stdin().read_line(&mut line).is_err() {
-            return false;
-        }
-        let answer = line.trim().to_ascii_lowercase();
-        answer == "y" || answer == "yes"
-    }
-
     fn choose_workdir(&self, configured: &str, candidates: &[String]) -> String {
         if candidates.is_empty() || !io::stdin().is_terminal() {
             warning!(

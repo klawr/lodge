@@ -22,10 +22,10 @@ use binary::{check_architecture, inject_binary};
 use config_files::inject_config;
 use git::configure_git_safe;
 use libs::inject_libs;
-pub use prefix::{existing as existing_layout, resolve as resolve_layout};
+pub use prefix::resolve as resolve_layout;
 pub use remove::remove;
-pub use state::installed_bundle;
-use state::{ensure_state_version, record_bundle};
+pub use state::installed;
+use state::record_bundle;
 
 /// Injects `bundle` for `user` into the prefix `layout` (see [`resolve_layout`]):
 /// libraries first, then each tool's binary and config, then git's settings.
@@ -37,7 +37,6 @@ pub fn run(
 ) -> Result<()> {
     let env = Acting::new(container, user);
     check_architecture(&env, &bundle.manifest)?;
-    ensure_state_version(&env, layout)?;
 
     inject_libs(&env, layout, bundle)?;
     for tool in &bundle.manifest.tools {
@@ -56,7 +55,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle::manifest::{Binary, ConfigTree, FORMAT, Manifest, Tool};
+    use crate::bundle::manifest::{Binary, ConfigTree, Manifest, Tool};
     use crate::bundle::source::Origin;
     use crate::runtime::fake::{FakeEnv, Who};
     use crate::tmpfile::TempDir;
@@ -79,7 +78,6 @@ mod tests {
         std::fs::write(dir.path().join("bin/hello"), "#!/bin/sh\necho hi\n").unwrap();
         std::fs::write(dir.path().join("config/hello"), "greeting=hi").unwrap();
         let manifest = Manifest {
-            format: FORMAT,
             lodge_version: "0".into(),
             created: 0,
             arch: "x86_64".into(),
@@ -121,7 +119,6 @@ mod tests {
             Some("greeting=hi")
         );
         assert_eq!(env.file(&format!("{p}/bundle")), Some(format!("{id}\n")));
-        assert_eq!(env.file(&format!("{p}/version")).as_deref(), Some("2\n"));
         for (call, who) in env.calls() {
             assert_ne!(who, Who::Root, "{call:?} ran as root");
         }
@@ -137,7 +134,6 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("config")).unwrap();
         std::fs::write(dir.path().join("config/c"), "x").unwrap();
         let manifest = Manifest {
-            format: FORMAT,
             lodge_version: "0".into(),
             created: 0,
             arch: "x86_64".into(),

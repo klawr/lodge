@@ -45,30 +45,8 @@ use spec::{Spec, load_spec};
 pub use backend::LABEL_PROJECT;
 pub use drift::ConfigState;
 
-/// What to do when the config changed since the container was created.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Recreate {
-    /// Ask through the [`Prompt`].
-    Ask,
-    /// Recreate without asking (`--yes`).
-    Yes,
-    /// Keep the container without asking (`--no-recreate`).
-    No,
-}
-
-/// How `ldg up` should treat an existing container.
-#[derive(Debug, Clone, Copy)]
-pub struct StartOpts {
-    /// Rebuild images and recreate the container unconditionally (`--build`).
-    pub build: bool,
-    pub recreate: Recreate,
-}
-
 /// The questions [`start`] may need a person to answer.
 pub trait Prompt {
-    /// Whether to recreate a container whose config changed (`Recreate::Ask`).
-    fn confirm_recreate(&self, question: &str) -> bool;
-
     /// The directory to work in when the configured `workspaceFolder` doesn't
     /// exist in the container, offered `candidates` that do.
     fn choose_workdir(&self, configured: &str, candidates: &[String]) -> String;
@@ -78,6 +56,9 @@ pub trait Prompt {
 /// workspace folder to drop the user into, and the (deferred) postAttach hook.
 pub struct Started {
     pub container: Box<dyn Container>,
+    /// The container was created by this call (new, or rebuilt), so nothing has
+    /// been injected into it yet.
+    pub created: bool,
     pub session_name: String,
     pub workdir: String,
     pub forward_ports: Vec<PortForward>,
@@ -110,20 +91,26 @@ impl Started {
 pub fn start(
     project_path: &Path,
     target: &Target,
-    opts: StartOpts,
+    build: bool,
     rt: &dyn Runtime,
     prompt: &dyn Prompt,
 ) -> Result<Started> {
     let (spec, existing) = locate(project_path, target, rt)?;
     let current_hash = hash_inputs(&spec.config_path, &spec.hash_extra, target)?;
 
-    // Has the config drifted since the existing container was created?
-    let drifted = !opts.build
+    // Has the config drifted since the existing container was created? It is
+    // only reported: `--build` is what recreates.
+    if !build
         && existing.as_deref().is_some_and(|id| {
             config_state(rt.container(id).as_ref(), &current_hash) == ConfigState::Changed
-        });
-    let recreate = drifted && should_recreate(opts.recreate, prompt);
-    let created = opts.build || existing.is_none() || recreate;
+        })
+    {
+        note!(
+            ".devcontainer changed since this container was created \
+             (`ldg up --build` recreates it; anything installed in it is lost)"
+        );
+    }
+    let created = build || existing.is_none();
 
     // initializeCommand runs on the host before the container is created/started.
     if let Some(cmd) = &spec.lifecycle.initialize {
@@ -145,12 +132,9 @@ pub fn start(
         features::Plan::default()
     };
 
-    let id = spec.backend.up(
-        rt,
-        existing.as_deref(),
-        opts.build || recreate,
-        &plan.create_settings(),
-    )?;
+    let id = spec
+        .backend
+        .up(rt, existing.as_deref(), build, &plan.create_settings())?;
     let container = rt.container(&id);
     let env: &dyn Env = container.as_ref();
 
@@ -196,6 +180,7 @@ pub fn start(
     let workdir = workdir::resolve(container.as_ref(), &spec.workspace_folder, prompt);
     Ok(Started {
         container,
+        created,
         session_name: spec.session_name,
         workdir,
         forward_ports: spec.forward_ports,
@@ -305,57 +290,20 @@ pub fn needs(project_path: &Path, target: &Target) -> Result<Needs> {
     })
 }
 
-fn should_recreate(policy: Recreate, prompt: &dyn Prompt) -> bool {
-    let question = ".devcontainer changed since this container was created — recreate it? \
-                    (anything installed in it since will be lost)";
-    match policy {
-        Recreate::Yes => true,
-        Recreate::No => {
-            note!("{question}\n(keeping it: --no-recreate)");
-            false
-        }
-        Recreate::Ask => prompt.confirm_recreate(question),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::fake::{FakeEnv, FakeRuntime};
     use crate::tmpfile::TempDir;
-    use std::cell::Cell;
 
-    /// Answers the recreate question with `recreate` and counts how often it
-    /// was asked.
-    struct Answer {
-        recreate: bool,
-        asked: Cell<usize>,
-    }
+    /// The prompt for a workspace that exists: nothing to choose.
+    struct Nothing;
 
-    impl Answer {
-        fn new(recreate: bool) -> Self {
-            Self {
-                recreate,
-                asked: Cell::new(0),
-            }
-        }
-    }
-
-    impl Prompt for Answer {
-        fn confirm_recreate(&self, _question: &str) -> bool {
-            self.asked.set(self.asked.get() + 1);
-            self.recreate
-        }
-
+    impl Prompt for Nothing {
         fn choose_workdir(&self, configured: &str, _: &[String]) -> String {
             panic!("{configured} exists, nothing to choose")
         }
     }
-
-    const ASK: StartOpts = StartOpts {
-        build: false,
-        recreate: Recreate::Ask,
-    };
 
     /// A project whose devcontainer.json is `json`, plus an image-based
     /// devcontainer that needs nothing but the engine.
@@ -401,8 +349,9 @@ mod tests {
     fn a_new_container_is_created_and_records_its_config() {
         let dir = project(PLAIN);
         let rt = engine(&dir, false);
-        let started = start(dir.path(), &Target::Local, ASK, &rt, &Answer::new(false)).unwrap();
+        let started = start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
         assert_eq!(started.workdir, "/w");
+        assert!(started.created);
         assert!(
             rt.ops().iter().any(|o| o.starts_with("run lodge-")),
             "{:?}",
@@ -412,13 +361,12 @@ mod tests {
     }
 
     #[test]
-    fn an_unchanged_container_is_started_without_asking() {
+    fn an_unchanged_container_is_started_not_created() {
         let dir = project(PLAIN);
         let rt = engine(&dir, false);
-        start(dir.path(), &Target::Local, ASK, &rt, &Answer::new(true)).unwrap();
-        let prompt = Answer::new(true);
-        start(dir.path(), &Target::Local, ASK, &rt, &prompt).unwrap();
-        assert_eq!(prompt.asked.get(), 0);
+        start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
+        let again = start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
+        assert!(!again.created);
         let ops = rt.ops();
         assert_eq!(
             ops.iter().filter(|o| o.starts_with("run ")).count(),
@@ -429,49 +377,35 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_config_asks_and_the_answer_decides() {
+    fn a_changed_config_is_reported_and_the_container_kept() {
         let dir = project(PLAIN);
         let rt = engine(&dir, false);
-        start(dir.path(), &Target::Local, ASK, &rt, &Answer::new(false)).unwrap();
+        start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
         write_config(&dir, EDITED);
         assert_eq!(state(&dir, &rt), ConfigState::Changed);
 
-        let keep = Answer::new(false);
-        start(dir.path(), &Target::Local, ASK, &rt, &keep).unwrap();
-        assert_eq!(keep.asked.get(), 1);
+        let again = start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
+        assert!(!again.created);
         assert!(!rt.ops().iter().any(|o| o.starts_with("remove")));
         assert_eq!(state(&dir, &rt), ConfigState::Changed, "kept as it was");
-
-        let recreate = Answer::new(true);
-        start(dir.path(), &Target::Local, ASK, &rt, &recreate).unwrap();
-        assert_eq!(recreate.asked.get(), 1);
-        let ops = rt.ops();
-        assert!(ops.iter().any(|o| o.starts_with("remove")), "{ops:?}");
-        assert_eq!(
-            ops.iter().filter(|o| o.starts_with("run ")).count(),
-            2,
-            "{ops:?}"
-        );
-        assert_eq!(state(&dir, &rt), ConfigState::UpToDate);
     }
 
     #[test]
     fn a_container_without_a_recorded_config_is_kept_and_reported_unknown() {
         let dir = project(PLAIN);
         let rt = engine(&dir, true);
-        let prompt = Answer::new(true);
-        start(dir.path(), &Target::Local, ASK, &rt, &prompt).unwrap();
-        assert_eq!(prompt.asked.get(), 0, "not knowing is not drift");
+        let started = start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
+        assert!(!started.created, "not knowing is not drift");
         let ops = rt.ops();
         assert!(ops.len() == 1 && ops[0].starts_with("start "), "{ops:?}");
         assert_eq!(state(&dir, &rt), ConfigState::Unknown);
     }
 
     #[test]
-    fn a_stopped_container_whose_config_changed_is_offered_a_recreate() {
+    fn a_stopped_container_whose_config_changed_is_still_noticed() {
         let dir = project(PLAIN);
         let rt = engine(&dir, false);
-        let started = start(dir.path(), &Target::Local, ASK, &rt, &Answer::new(false)).unwrap();
+        let started = start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
         rt.stop(started.container.id()).unwrap();
         write_config(&dir, EDITED);
         // The fake refuses commands in a stopped container, so the record is
@@ -479,29 +413,20 @@ mod tests {
         let s = status(dir.path(), &Target::Local, &rt).unwrap().unwrap();
         assert!(!s.running);
         assert_eq!(s.config, ConfigState::Changed);
-
-        let recreate = Answer::new(true);
-        start(dir.path(), &Target::Local, ASK, &rt, &recreate).unwrap();
-        assert_eq!(recreate.asked.get(), 1, "the drift was noticed");
-        assert_eq!(state(&dir, &rt), ConfigState::UpToDate);
     }
 
     #[test]
-    fn build_recreates_without_asking() {
+    fn build_recreates_the_container() {
         let dir = project(PLAIN);
         let rt = engine(&dir, true);
-        let prompt = Answer::new(false);
-        let opts = StartOpts {
-            build: true,
-            recreate: Recreate::Ask,
-        };
-        start(dir.path(), &Target::Local, opts, &rt, &prompt).unwrap();
-        assert_eq!(prompt.asked.get(), 0);
+        let started = start(dir.path(), &Target::Local, true, &rt, &Nothing).unwrap();
+        assert!(started.created);
         let ops = rt.ops();
         assert!(
             ops[0].starts_with("remove ") && ops[1].starts_with("run "),
             "{ops:?}"
         );
+        assert_eq!(state(&dir, &rt), ConfigState::UpToDate);
     }
 
     #[test]
@@ -509,16 +434,15 @@ mod tests {
         let dir =
             project(r#"{"dockerComposeFile": "c.yml", "service": "app", "workspaceFolder": "/w"}"#);
         let rt = FakeRuntime::new(container);
-        let first = start(dir.path(), &Target::Local, ASK, &rt, &Answer::new(false)).unwrap();
+        let first = start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
         assert!(
             first.container.id().ends_with("-app-1"),
             "{}",
             first.container.id()
         );
-        let prompt = Answer::new(true);
-        let again = start(dir.path(), &Target::Local, ASK, &rt, &prompt).unwrap();
+        let again = start(dir.path(), &Target::Local, false, &rt, &Nothing).unwrap();
         assert_eq!(again.container.id(), first.container.id());
-        assert_eq!(prompt.asked.get(), 0);
+        assert!(!again.created);
         assert_eq!(state(&dir, &rt), ConfigState::UpToDate);
     }
 }

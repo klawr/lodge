@@ -161,7 +161,7 @@ fn render(found: &[Detected], home: &Path) -> String {
     let mut s = format!(
         "#:schema {SCHEMA_URL}\n\
          #\n\
-         # lodge config: what `ldg up` / `ldg exec` bring into a container.\n\
+         # lodge config: what `ldg up` brings into a container.\n\
          # Reference: https://github.com/klawr/lodge/blob/master/docs/configuration.md\n\
          # Check it with `ldg doctor`.\n\n"
     );

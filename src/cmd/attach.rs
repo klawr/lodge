@@ -1,20 +1,25 @@
-//! `ldg up` and `ldg exec`: get a container ready, inject, open a session.
+//! `ldg up`: get the project's container ready, inject if needed, open a session.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 use super::Ctx;
 use crate::config::Config;
-use crate::devcontainer::{self, StartOpts};
+use crate::devcontainer;
 use crate::layout::Layout;
+use crate::output::note;
 use crate::runtime::{Container, ContainerUser};
 use crate::session::{self, Session};
 use crate::{bundle, forward, inject, secret};
 
+/// Brings the project's container up and opens a session in it. Anything
+/// already injected is left alone (just reported when it is out of date), unless
+/// the container was just created or `reinject` asks for a fresh injection.
 pub fn up(
     ctx: &Ctx,
     path: Option<PathBuf>,
-    opts: StartOpts,
+    build: bool,
+    reinject: bool,
     no_attach: bool,
     bundle_file: Option<&Path>,
 ) -> Result<()> {
@@ -25,7 +30,7 @@ pub fn up(
     let started = devcontainer::start(
         &project,
         &ctx.target,
-        opts,
+        build,
         ctx.rt.as_ref(),
         &super::prompt::Terminal,
     )?;
@@ -33,8 +38,28 @@ pub fn up(
     // After `start`, which may have changed the user's uid.
     let user = ContainerUser::resolve(container, started.remote_user.as_deref())?;
     forward::spawn_daemon(container.id(), &ctx.target, &started.forward_ports);
-    let layout = inject::resolve_layout(container, &user)?;
-    inject::run(container, &user, &layout, &prepared)?;
+
+    let installed = if started.created || reinject {
+        None
+    } else {
+        inject::installed(container, &user)?
+    };
+    let layout = match installed {
+        Some(found) => {
+            if found.bundle != prepared.manifest.id() {
+                note!(
+                    "what is injected is out of date (your config or ldg changed); \
+                     `ldg up --reinject` updates it"
+                );
+            }
+            found.layout
+        }
+        None => {
+            let layout = inject::resolve_layout(container, &user)?;
+            inject::run(container, &user, &layout, &prepared)?;
+            layout
+        }
+    };
     if no_attach {
         return Ok(());
     }
@@ -50,38 +75,7 @@ pub fn up(
     )
 }
 
-pub fn exec(
-    ctx: &Ctx,
-    name: &str,
-    user: Option<&str>,
-    workdir: &str,
-    no_attach: bool,
-    bundle_file: Option<&Path>,
-) -> Result<()> {
-    let config = ctx.config()?;
-    let prepared = bundle::source::prepare(&config, bundle_file)?;
-    let container = ctx.rt.container(name);
-    if !container.is_running()? {
-        bail!("container {name} is not running (check the name with `docker ps`)");
-    }
-    let user = ContainerUser::resolve(container.as_ref(), user)?;
-    let layout = inject::resolve_layout(container.as_ref(), &user)?;
-    inject::run(container.as_ref(), &user, &layout, &prepared)?;
-    if no_attach {
-        return Ok(());
-    }
-    attach(
-        ctx,
-        container.as_ref(),
-        &config,
-        &user,
-        &layout,
-        &crate::shell::session_name(name, None),
-        workdir,
-    )
-}
-
-/// The part `up` and `exec` share: deliver secrets, then open the session.
+/// Delivers the secrets, then opens the session.
 fn attach(
     ctx: &Ctx,
     container: &dyn Container,

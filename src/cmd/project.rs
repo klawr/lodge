@@ -11,7 +11,7 @@ use super::{Ctx, print_json};
 use crate::config::Config;
 use crate::devcontainer::{self, ConfigState, Found};
 use crate::output::{info, line, note, warning};
-use crate::runtime::{Container, ContainerUser, Runtime};
+use crate::runtime::{ContainerUser, Runtime};
 use crate::target::Target;
 
 /// The project's container, or an error saying there is none.
@@ -95,7 +95,8 @@ impl StatusReport {
                 .and_then(|u| u.context("the container has no such user"))
         };
         let bundle = match &user {
-            Ok(user) => crate::inject::installed_bundle(c, user)
+            Ok(user) => crate::inject::installed(c, user)
+                .map(|found| found.map(|i| i.bundle))
                 .map_err(|e| warning!("could not tell which bundle is installed: {e:#}"))
                 .ok(),
             Err(e) => {
@@ -202,10 +203,7 @@ pub fn ls(ctx: &Ctx, as_json: bool) -> Result<()> {
         ));
     }
     if listed.is_empty() {
-        note!(
-            "no containers created by lodge{} (containers created before lodge labelled them are not listed)",
-            ctx.target.on_host()
-        );
+        note!("no containers created by lodge{}", ctx.target.on_host());
         return Ok(());
     }
     let width = listed.iter().map(|l| l.name.len()).max().unwrap_or(0);
@@ -267,26 +265,20 @@ pub fn logs(ctx: &Ctx, path: Option<PathBuf>, follow: bool) -> Result<()> {
     }
 }
 
-pub fn clean(
-    ctx: &Ctx,
-    path: Option<PathBuf>,
-    name: Option<&str>,
-    user: Option<&str>,
-) -> Result<()> {
-    let (container, remote_user): (Box<dyn Container>, Option<String>) = match name {
-        Some(n) => (ctx.rt.container(n), user.map(str::to_string)),
-        None => {
-            let found = require(ctx, path)?;
-            (found.container, found.remote_user)
-        }
-    };
+pub fn clean(ctx: &Ctx, path: Option<PathBuf>) -> Result<()> {
+    let Found {
+        container,
+        remote_user,
+    } = require(ctx, path)?;
     if !container.is_running()? {
-        bail!(
-            "the container is not running; start it first (`ldg up --no-attach`, or `docker start`)"
-        );
+        bail!("the container is not running; start it first (`ldg up --no-attach`)");
     }
     let user = ContainerUser::resolve(container.as_ref(), remote_user.as_deref())?;
-    let layout = crate::inject::existing_layout(container.as_ref(), &user)?;
+    let Some(installed) = crate::inject::installed(container.as_ref(), &user)? else {
+        info!("nothing is injected into {}", container.display_name());
+        return Ok(());
+    };
+    let layout = installed.layout;
     let removed = crate::inject::remove(container.as_ref(), &user, &layout)?;
     crate::secret::place::clear(container.as_ref(), &user)?;
     info!("removed lodge from {}", container.display_name());
@@ -306,15 +298,12 @@ pub fn clean(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::devcontainer::{Prompt, Recreate, StartOpts};
+    use crate::devcontainer::Prompt;
     use crate::runtime::fake::{FakeEnv, FakeRuntime};
 
     struct NoQuestions;
 
     impl Prompt for NoQuestions {
-        fn confirm_recreate(&self, _: &str) -> bool {
-            panic!("nothing to recreate")
-        }
         fn choose_workdir(&self, _: &str, _: &[String]) -> String {
             panic!("the workspace exists")
         }
@@ -341,12 +330,11 @@ mod tests {
         assert_eq!(r.to_json()["container"], serde_json::Value::Null);
     }
 
-    fn start(dir: &crate::tmpfile::TempDir, rt: &FakeRuntime) -> Box<dyn Container> {
-        let opts = StartOpts {
-            build: false,
-            recreate: Recreate::Ask,
-        };
-        devcontainer::start(dir.path(), &Target::Local, opts, rt, &NoQuestions)
+    fn start(
+        dir: &crate::tmpfile::TempDir,
+        rt: &FakeRuntime,
+    ) -> Box<dyn crate::runtime::Container> {
+        devcontainer::start(dir.path(), &Target::Local, false, rt, &NoQuestions)
             .unwrap()
             .container
     }

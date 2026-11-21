@@ -69,7 +69,7 @@ pub(super) fn inject_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle::manifest::{FORMAT, Manifest};
+    use crate::bundle::manifest::Manifest;
     use crate::bundle::source::Origin;
     use crate::runtime::fake::{FakeEnv, Who};
     use crate::tmpfile::TempDir;
@@ -107,7 +107,6 @@ mod tests {
             skip_if_exists,
         };
         let manifest = Manifest {
-            format: FORMAT,
             lodge_version: "0".into(),
             created: 0,
             arch: "x86_64".into(),
@@ -188,7 +187,10 @@ mod tests {
         let (_dir, b) = bundle("~/.config/hello", false);
         let env = FakeEnv::new()
             .with_file("/home/dev/.config/hello/rc", "mine")
-            .with_file("/p/installed/hello.config", &format!("{HASH}\n"));
+            .with_file(
+                "/p/installed/hello.config",
+                &format!("{HASH}\n/home/dev/.config/hello"),
+            );
         inject(&env, &b).unwrap();
         assert_eq!(
             env.file("/home/dev/.config/hello/rc").as_deref(),
@@ -197,7 +199,10 @@ mod tests {
 
         let env = FakeEnv::new()
             .with_file("/home/dev/.config/hello/rc", "mine")
-            .with_file("/p/installed/hello.config", "1111111111111111\n");
+            .with_file(
+                "/p/installed/hello.config",
+                "1111111111111111\n/home/dev/.config/hello",
+            );
         inject(&env, &b).unwrap();
         assert_eq!(
             env.file("/home/dev/.config/hello/rc").as_deref(),
@@ -210,7 +215,10 @@ mod tests {
         let (_dir, b) = bundle("~/.config/hello", true);
         let env = FakeEnv::new()
             .with_file("/home/dev/.config/hello/rc", "mine")
-            .with_file("/p/installed/hello.config", "1111111111111111\n");
+            .with_file(
+                "/p/installed/hello.config",
+                "1111111111111111\n/home/dev/.config/hello",
+            );
         inject(&env, &b).unwrap();
         assert_eq!(
             env.file("/home/dev/.config/hello/rc").as_deref(),

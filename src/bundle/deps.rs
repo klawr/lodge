@@ -94,7 +94,7 @@ fn parse_ldd(stdout: &str) -> Parsed {
 
     let mut push = |libs: &mut Vec<PathBuf>, path: &str| {
         // Dedup by filename — distinct paths to the same soname only need
-        // copying once into /opt/lodge/lib.
+        // copying once into the prefix's lib.
         let name = PathBuf::from(path)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned());

@@ -89,7 +89,7 @@ as   = { file = "~/.claude/.credentials.json", mode = "0600" }
 | `as`      | yes      | `"env"`, or `{ file = "/path/in/container", mode = "0600" }` (`~/` is the container user's home; `mode` defaults to `0600`). |
 | `targets` | no       | globs (`*`, `?`) matched against the container name and the host (`local`, or the `--remote` value and its host part). Omitted: any container. |
 
-How they are delivered, when you attach (`ldg up` and `ldg exec`, not with
+How they are delivered, when you attach (`ldg up`, not with
 `--no-attach`):
 
 - The value is read on your machine and sent over the container command's

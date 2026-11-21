@@ -20,7 +20,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use super::hash::hash_path;
-use super::manifest::{BIN_DIR, CONFIG_DIR, FORMAT, LIB_DIR, Manifest};
+use super::manifest::{BIN_DIR, CONFIG_DIR, LIB_DIR, Manifest};
 use super::{archive, cache, deps, elf, pack};
 use crate::bundle::arch::Arch;
 use crate::config::Config;
@@ -138,7 +138,6 @@ fn inputs_fingerprint(config: &Config, deps: &mut deps::Resolver) -> Result<Stri
     let host = Arch::host()?;
     let mut h = Fingerprint::new();
     h.field(env!("CARGO_PKG_VERSION").as_bytes())
-        .field(FORMAT.to_string().as_bytes())
         .field(host.to_string().as_bytes());
 
     let mut parts = Vec::new();
