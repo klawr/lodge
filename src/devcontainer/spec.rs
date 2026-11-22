@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use super::backend::{Backend, BackendContext, build_backend, project_basename};
 use super::lifecycle::{Hook, Lifecycle};
 use super::vars::Vars;
-use crate::host::{Host, HostRef};
+use crate::host::{Host, HostRef, Markers};
 use crate::port::PortForward;
 
 /// A parsed devcontainer.json, grouped by what the fields are for.
@@ -313,45 +313,43 @@ fn normalize_env_value(v: &str, vars: &Vars) -> String {
     vars.apply(v).replace("${containerEnv:", "${")
 }
 
-/// Whether `dir`, on this machine, holds a devcontainer config: one of the
-/// places [`find_config`] looks, without the host. For choosing a project among
-/// the folders here.
-pub fn has_config(dir: &Path) -> bool {
-    let at = dir.join(".devcontainer");
-    if at.join("devcontainer.json").is_file() || dir.join(".devcontainer.json").is_file() {
-        return true;
-    }
-    std::fs::read_dir(&at).is_ok_and(|mut entries| {
-        entries.any(|e| e.is_ok_and(|e| e.path().join("devcontainer.json").is_file()))
-    })
+/// Where a project keeps its devcontainer config, in the spec's order of
+/// precedence, as path components below the project folder (`*` is any one
+/// name): `.devcontainer/devcontainer.json`, `.devcontainer.json`, then
+/// `.devcontainer/<folder>/devcontainer.json` (one level deep). The one
+/// definition: reading the config ([`find_config`]) and finding the projects on
+/// a machine (`host::Markers`) both go by it.
+pub const CONFIG_LOCATIONS: Markers = &[
+    &[".devcontainer", "devcontainer.json"],
+    &[".devcontainer.json"],
+    &[".devcontainer", "*", "devcontainer.json"],
+];
+
+/// The config's places as one path each, `*` kept for the host to expand.
+fn config_patterns(project_path: &Path) -> Vec<PathBuf> {
+    CONFIG_LOCATIONS
+        .iter()
+        .map(|parts| project_path.join(parts.iter().collect::<PathBuf>()))
+        .collect()
 }
 
-// Devcontainer config lookup, per spec precedence: .devcontainer/devcontainer.json,
-// .devcontainer.json, then .devcontainer/<folder>/devcontainer.json (one level
-// deep). With several subfolder configs the first (alphabetically) wins, with a
+// With several subfolder configs the first (alphabetically) wins, with a
 // warning — lodge has no UI to pick one. The files are looked for on the
 // project's host, local or remote alike.
 fn find_config(project_path: &Path, host: &dyn Host) -> Result<(PathBuf, String)> {
-    let fixed = [
-        project_path.join(".devcontainer").join("devcontainer.json"),
-        project_path.join(".devcontainer.json"),
-    ];
-    let subfolders = project_path
-        .join(".devcontainer")
-        .join("*")
-        .join("devcontainer.json");
-    let patterns = [fixed[0].clone(), fixed[1].clone(), subfolders];
+    let patterns = config_patterns(project_path);
     let found = host.read_first(&patterns)?;
     let (Some(first), Some(bytes)) = (found.paths.first(), found.contents) else {
         let place = host.on_host();
+        let looked_for: Vec<String> = CONFIG_LOCATIONS.iter().map(|p| p.join("/")).collect();
         bail!(
-            "no devcontainer config found in {}{place} (looked for \
-             .devcontainer/devcontainer.json, .devcontainer.json, and \
-             .devcontainer/*/devcontainer.json)",
-            project_path.display()
+            "no devcontainer config found in {}{place} (looked for {})",
+            project_path.display(),
+            looked_for.join(", ")
         );
     };
-    if !fixed.contains(first) && found.paths.len() > 1 {
+    // A place with a `*` in it may hold several: that is the one worth a warning.
+    if !patterns.contains(first) && found.paths.len() > 1 {
         warning!(
             "multiple devcontainer configs found, using {}",
             first.display()

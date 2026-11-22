@@ -9,32 +9,50 @@
 //! other question.
 
 use anyhow::Result;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::prompt::{Ask, Choose, Item, Knob, Selection};
-use crate::config::expand_tilde;
-use crate::devcontainer::has_config;
+use crate::host::{Entry, Host, Kind, Search, Want};
 use crate::keys::Action;
 use crate::layout::tilde;
 
-/// What counts as an answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Want {
-    File,
-    /// A file or a folder.
-    Any,
-    /// A folder with a devcontainer config.
-    Project,
+fn noun(want: Want) -> &'static str {
+    match want {
+        Want::File => "files",
+        Want::Any => "files and folders",
+        Want::Project(_) => "projects",
+    }
 }
 
-impl Want {
-    fn noun(self) -> &'static str {
-        match self {
-            Want::File => "files",
-            Want::Any => "files and folders",
-            Want::Project => "projects",
-        }
+/// The files of one machine as a search sees them: the host to ask, and its home
+/// directory, which `~` means and relative paths start from. A search of another
+/// machine and of this one differ only in which host is handed in.
+pub struct Files<'a> {
+    host: &'a dyn Host,
+    home: &'a Path,
+}
+
+impl<'a> Files<'a> {
+    pub fn new(host: &'a dyn Host, home: &'a Path) -> Self {
+        Files { host, home }
+    }
+
+    pub fn home(&self) -> &Path {
+        self.home
+    }
+
+    /// What `scope` reaches that is wanted, nearest first.
+    pub fn walk(&self, scope: &Scope, want: Want) -> Result<Vec<Entry>> {
+        self.host.find(&scope.search(want))
+    }
+
+    fn inspect(&self, path: &Path, want: Want) -> Result<Kind> {
+        self.host.inspect(path, want.markers())
+    }
+
+    /// A path as it was typed, made absolute on the machine.
+    pub fn resolve(&self, typed: &str) -> PathBuf {
+        self.host.resolve(typed, self.home)
     }
 }
 
@@ -99,16 +117,22 @@ impl Scope {
         }
     }
 
+    /// What to ask a host for to look for `want`.
+    fn search(&self, want: Want) -> Search {
+        Search {
+            roots: self.roots(),
+            denied_names: self.denied_names.clone(),
+            denied_paths: self.denied_paths.clone(),
+            want,
+        }
+    }
+
     fn roots(&self) -> Vec<PathBuf> {
         if self.roots.is_empty() {
             vec![PathBuf::from("/")]
         } else {
             self.roots.clone()
         }
-    }
-
-    fn denies(&self, path: &Path, name: &str) -> bool {
-        self.denied_names.iter().any(|n| n == name) || self.denied_paths.iter().any(|d| d == path)
     }
 
     /// The settings of the search that can be edited.
@@ -168,17 +192,11 @@ impl Scope {
 
     /// This scope with knob `knob` set to `text`: the roots or the names are
     /// the words of it, and everywhere switches between `/` and where it began.
-    pub fn edited(&self, knob: usize, text: &str) -> Self {
+    pub fn edited(&self, knob: usize, text: &str, files: &Files) -> Self {
         let mut next = self.clone();
         match knob {
             ROOTS => {
-                next.roots = text
-                    .split_whitespace()
-                    .map(|r| {
-                        let path = expand_tilde(PathBuf::from(r));
-                        std::path::absolute(&path).unwrap_or(path)
-                    })
-                    .collect();
+                next.roots = text.split_whitespace().map(|r| files.resolve(r)).collect();
             }
             NAMES => {
                 next.denied_names = text.split_whitespace().map(str::to_string).collect();
@@ -196,59 +214,6 @@ impl Scope {
     }
 }
 
-/// How far down a walk goes, and how many entries it keeps: enough for a home
-/// directory, little enough to be drawn at once.
-const DEPTH: usize = 5;
-const LIMIT: usize = 20_000;
-
-/// What is wanted under the roots of `scope`, shallowest first and otherwise in
-/// name order. Not `tree::walk`, which visits everything: this one is breadth
-/// first, leaves out what the scope denies, and stops at a depth and a count.
-/// Links are listed but not followed, so a walk cannot go round in a circle.
-pub fn walk(scope: &Scope, want: Want) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut seen = HashSet::new();
-    for root in scope.roots() {
-        let mut level = vec![root];
-        for _ in 0..DEPTH {
-            let mut next = Vec::new();
-            for dir in &level {
-                let Ok(entries) = std::fs::read_dir(dir) else {
-                    continue;
-                };
-                let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
-                entries.sort_by_key(|e| e.file_name());
-                for entry in entries {
-                    let path = entry.path();
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if scope.denies(&path, &name) {
-                        continue;
-                    }
-                    let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-                    // Projects are not in hidden folders.
-                    let hidden = want == Want::Project && name.starts_with('.');
-                    if is_dir && !hidden {
-                        next.push(path.clone());
-                    }
-                    let wanted = match want {
-                        Want::File => !is_dir,
-                        Want::Any => true,
-                        Want::Project => is_dir && !hidden && has_config(&path),
-                    };
-                    if wanted && seen.insert(path.clone()) {
-                        found.push(path);
-                        if found.len() >= LIMIT {
-                            return found;
-                        }
-                    }
-                }
-            }
-            level = next;
-        }
-    }
-    found
-}
-
 /// How a search for a path ended.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Browsed {
@@ -261,14 +226,11 @@ pub enum Browsed {
 impl Browsed {
     /// The path chosen; `None` when the person left. A terminal that can't show a
     /// list is asked `question` in words.
-    pub fn or_ask(self, ask: &dyn Ask, question: &str) -> Result<Option<PathBuf>> {
+    pub fn or_ask(self, ask: &dyn Ask, question: &str, files: &Files) -> Result<Option<PathBuf>> {
         Ok(match self {
             Browsed::Chose(path) => Some(path),
             Browsed::Left => None,
-            Browsed::Unsupported => ask.ask(question)?.map(|typed| {
-                let path = expand_tilde(PathBuf::from(typed));
-                std::path::absolute(&path).unwrap_or(path)
-            }),
+            Browsed::Unsupported => ask.ask(question)?.map(|typed| files.resolve(&typed)),
         })
     }
 }
@@ -281,48 +243,53 @@ pub fn pick(
     title: &str,
     scope: &Scope,
     want: Want,
-    home: &Path,
+    files: &Files,
 ) -> Result<Browsed> {
     let mut scope = scope.clone();
     loop {
-        let found = walk(&scope, want);
-        let items = items(&found, &scope, want, home);
-        let heading = format!("{title} — {}", want.noun());
-        match choose.find_knobs(&heading, &[want.noun()], &items, &scope.knobs(home))? {
+        let found = files.walk(&scope, want)?;
+        let items = items(&found, &scope, want, files.home());
+        let heading = format!("{title} — {}", noun(want));
+        match choose.find_knobs(&heading, &[noun(want)], &items, &scope.knobs(files.home()))? {
             Selection::Left => return Ok(Browsed::Left),
             Selection::Unsupported => return Ok(Browsed::Unsupported),
-            Selection::Edited(knob, text) => scope = scope.edited(knob, &text),
+            Selection::Edited(knob, text) => scope = scope.edited(knob, &text, files),
             Selection::Items(chosen) => {
                 return Ok(match chosen.first().and_then(|&i| found.get(i)) {
-                    Some(p) => Browsed::Chose(p.clone()),
+                    Some(e) => Browsed::Chose(e.path.clone()),
                     None => Browsed::Left,
                 });
             }
-            Selection::Path(typed) => return settle(choose, title, &typed, want, &scope, home),
+            Selection::Path(typed) => return settle(choose, title, &typed, want, &scope, files),
         }
     }
 }
 
 /// The paths found, as the rows of a list. Under one root they start there;
 /// under several, where they are.
-pub fn items(found: &[PathBuf], scope: &Scope, want: Want, home: &Path) -> Vec<Item> {
+pub fn items(found: &[Entry], scope: &Scope, want: Want, home: &Path) -> Vec<Item> {
     let only = match scope.roots.as_slice() {
         [root] => Some(root.as_path()),
         _ => None,
     };
     found
         .iter()
-        .map(|p| Item {
+        .map(|e| Item {
             added: false,
             tab: 0,
             name: match only {
-                Some(root) => p.strip_prefix(root).unwrap_or(p).display().to_string(),
-                None => tilde(p, home),
+                Some(root) => e
+                    .path
+                    .strip_prefix(root)
+                    .unwrap_or(&e.path)
+                    .display()
+                    .to_string(),
+                None => tilde(&e.path, home),
             },
-            kind: match want {
-                Want::Project => "project",
-                _ if p.is_dir() => "folder",
-                _ => "file",
+            kind: match (want, e.dir) {
+                (Want::Project(_), _) => "project",
+                (_, true) => "folder",
+                (_, false) => "file",
             },
             detail: String::new(),
         })
@@ -339,18 +306,18 @@ pub fn settle(
     typed: &str,
     want: Want,
     scope: &Scope,
-    home: &Path,
+    files: &Files,
 ) -> Result<Browsed> {
-    let path = expand_tilde(PathBuf::from(typed));
-    let path = std::path::absolute(&path).unwrap_or(path);
-    let search = path.is_dir()
+    let path = files.resolve(typed);
+    let kind = files.inspect(&path, want)?;
+    let search = kind.is_folder()
         && match want {
             Want::File => true,
             Want::Any => typed.ends_with('/'),
-            Want::Project => !has_config(&path),
+            Want::Project(_) => kind != Kind::Project,
         };
     if search {
-        pick(choose, title, &scope.at(path), want, home)
+        pick(choose, title, &scope.at(path), want, files)
     } else {
         Ok(Browsed::Chose(path))
     }
@@ -359,6 +326,7 @@ pub fn settle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::LocalHost;
     use crate::tmpfile::TempDir;
     use std::cell::RefCell;
 
@@ -419,7 +387,18 @@ mod tests {
             .collect()
     }
 
+    const PROJECT: Want = Want::Project(crate::devcontainer::CONFIG_LOCATIONS);
+
     const HOME: &str = "/nowhere";
+
+    fn files() -> Files<'static> {
+        Files::new(&LocalHost, Path::new(HOME))
+    }
+
+    fn walk(scope: &Scope, want: Want) -> Vec<PathBuf> {
+        let found = files().walk(scope, want).unwrap();
+        found.into_iter().map(|e| e.path).collect()
+    }
 
     #[test]
     fn a_walk_lists_files_and_folders_nearest_first() {
@@ -473,21 +452,14 @@ mod tests {
     #[test]
     fn a_project_is_a_folder_with_a_devcontainer_config_and_not_a_hidden_one() {
         let dir = tree();
-        assert_eq!(names(dir.path(), Want::Project), ["proj"]);
+        assert_eq!(names(dir.path(), PROJECT), ["proj"]);
     }
 
     #[test]
     fn a_choice_from_the_list_is_the_path_under_the_root() {
         let dir = tree();
         let ask = Finds::answering(vec![Selection::Items(vec![0])]);
-        let got = pick(
-            &ask,
-            "File",
-            &scope(dir.path()),
-            Want::File,
-            Path::new(HOME),
-        )
-        .unwrap();
+        let got = pick(&ask, "File", &scope(dir.path()), Want::File, &files()).unwrap();
         assert_eq!(got, Browsed::Chose(dir.path().join("top.txt")));
         assert_eq!(
             ask.shown()[0][0],
@@ -499,33 +471,39 @@ mod tests {
     #[test]
     fn a_typed_folder_is_searched_when_a_file_is_wanted_and_a_typed_file_is_taken() {
         let dir = tree();
-        let home = Path::new(HOME);
         let a = dir.path().join("a");
         let ask = Finds::answering(vec![Selection::Items(vec![1])]);
         let s = scope(dir.path());
-        let got = settle(&ask, "File", a.to_str().unwrap(), Want::File, &s, home).unwrap();
+        let got = settle(&ask, "File", a.to_str().unwrap(), Want::File, &s, &files()).unwrap();
         assert_eq!(got, Browsed::Chose(a.join("b/two.txt")));
         assert_eq!(ask.shown()[0], ["one.txt", "b/two.txt"]);
 
         let none = Finds::answering(vec![]);
         let file = a.join("one.txt");
-        let got = settle(&none, "File", file.to_str().unwrap(), Want::File, &s, home).unwrap();
+        let got = settle(
+            &none,
+            "File",
+            file.to_str().unwrap(),
+            Want::File,
+            &s,
+            &files(),
+        )
+        .unwrap();
         assert_eq!(got, Browsed::Chose(file));
     }
 
     #[test]
     fn a_typed_folder_is_taken_as_it_is_unless_it_ends_in_a_slash() {
         let dir = tree();
-        let home = Path::new(HOME);
         let a = dir.path().join("a");
         let s = scope(dir.path());
         let none = Finds::answering(vec![]);
-        let got = settle(&none, "Data", a.to_str().unwrap(), Want::Any, &s, home).unwrap();
+        let got = settle(&none, "Data", a.to_str().unwrap(), Want::Any, &s, &files()).unwrap();
         assert_eq!(got, Browsed::Chose(a.clone()));
 
         let ask = Finds::answering(vec![Selection::Left]);
         let slash = format!("{}/", a.display());
-        let got = settle(&ask, "Data", &slash, Want::Any, &s, home).unwrap();
+        let got = settle(&ask, "Data", &slash, Want::Any, &s, &files()).unwrap();
         assert_eq!(got, Browsed::Left);
     }
 
@@ -541,7 +519,7 @@ mod tests {
             key.to_str().unwrap(),
             Want::File,
             &s,
-            Path::new(HOME),
+            &files(),
         );
         assert_eq!(got.unwrap(), Browsed::Chose(key));
     }
@@ -549,7 +527,6 @@ mod tests {
     #[test]
     fn a_typed_project_is_taken_and_a_typed_folder_without_one_is_searched() {
         let dir = tree();
-        let home = Path::new(HOME);
         let proj = dir.path().join("proj");
         let s = scope(dir.path());
         let none = Finds::answering(vec![]);
@@ -557,15 +534,15 @@ mod tests {
             &none,
             "Project",
             proj.to_str().unwrap(),
-            Want::Project,
+            PROJECT,
             &s,
-            home,
+            &files(),
         );
         assert_eq!(got.unwrap(), Browsed::Chose(proj.clone()));
 
         let ask = Finds::answering(vec![Selection::Items(vec![0])]);
         let top = dir.path().to_str().unwrap();
-        let got = settle(&ask, "Project", top, Want::Project, &s, home).unwrap();
+        let got = settle(&ask, "Project", top, PROJECT, &s, &files()).unwrap();
         assert_eq!(got, Browsed::Chose(proj));
     }
 
@@ -574,9 +551,9 @@ mod tests {
         let dir = tree();
         let a = dir.path().join("a");
         let both = format!("{} {}", a.display(), dir.path().join("proj").display());
-        let s = scope(dir.path()).edited(ROOTS, &both);
+        let s = scope(dir.path()).edited(ROOTS, &both, &files());
         assert_eq!(s.roots, [a, dir.path().join("proj")]);
-        let s = s.edited(ROOTS, "");
+        let s = s.edited(ROOTS, "", &files());
         assert_eq!(s.roots(), [PathBuf::from("/")]);
         assert_eq!(s.knobs(Path::new(HOME))[ROOTS].text, "/");
     }
@@ -585,15 +562,15 @@ mod tests {
     fn everywhere_switches_between_the_root_and_where_the_search_began() {
         let dir = tree();
         let s = scope(dir.path());
-        let wide = s.edited(EVERYWHERE, "");
+        let wide = s.edited(EVERYWHERE, "", &files());
         assert_eq!(wide.roots(), [PathBuf::from("/")]);
-        assert_eq!(wide.edited(EVERYWHERE, "").roots, s.roots);
+        assert_eq!(wide.edited(EVERYWHERE, "", &files()).roots, s.roots);
     }
 
     #[test]
     fn the_names_skipped_are_edited_and_what_is_let_through_is_found() {
         let dir = tree();
-        let s = scope(dir.path()).edited(NAMES, ".git node_modules");
+        let s = scope(dir.path()).edited(NAMES, ".git node_modules", &files());
         let any = walk(&s, Want::File);
         assert!(
             any.contains(&dir.path().join("build/out.o")),
@@ -614,14 +591,7 @@ mod tests {
             Selection::Edited(ROOTS, a.display().to_string()),
             Selection::Items(vec![0]),
         ]);
-        let got = pick(
-            &ask,
-            "File",
-            &scope(dir.path()),
-            Want::File,
-            Path::new(HOME),
-        )
-        .unwrap();
+        let got = pick(&ask, "File", &scope(dir.path()), Want::File, &files()).unwrap();
         assert_eq!(got, Browsed::Chose(a.join("one.txt")));
         let shown = ask.shown();
         assert!(shown[0].contains(&"top.txt".to_string()));
@@ -631,14 +601,13 @@ mod tests {
     #[test]
     fn the_knobs_say_how_the_scope_stands_and_what_is_other_than_it_began() {
         let dir = tree();
-        let home = Path::new(HOME);
         let s = scope(dir.path());
-        let k = s.knobs(home);
+        let k = s.knobs(Path::new(HOME));
         assert!(k.iter().all(|k| !k.changed));
         assert_eq!(k[EVERYWHERE].action, "look everywhere");
 
-        let wide = s.edited(EVERYWHERE, "");
-        let k = wide.knobs(home);
+        let wide = s.edited(EVERYWHERE, "", &files());
+        let k = wide.knobs(Path::new(HOME));
         assert!(k[ROOTS].changed && k[ROOTS].text == "/");
         assert!(
             k[EVERYWHERE].action.starts_with("look only in"),
@@ -647,8 +616,48 @@ mod tests {
         );
         assert!(!k[NAMES].changed);
 
-        let skipping = s.edited(NAMES, ".git");
-        let k = skipping.knobs(home);
+        let skipping = s.edited(NAMES, ".git", &files());
+        let k = skipping.knobs(Path::new(HOME));
         assert!(k[NAMES].changed && !k[ROOTS].changed);
+    }
+
+    /// A host that only runs commands (locally), so its search is the script.
+    #[cfg(unix)]
+    struct Sh;
+
+    #[cfg(unix)]
+    impl Host for Sh {
+        fn label(&self) -> Option<String> {
+            Some("sh".into())
+        }
+        fn names(&self) -> Vec<String> {
+            vec!["sh".into()]
+        }
+        fn shares_cwd(&self) -> bool {
+            false
+        }
+        fn run(&self, job: &mut crate::host::Job) -> std::io::Result<crate::host::Ran> {
+            LocalHost.run(job)
+        }
+        fn interactive(&self, argv: &[&str]) -> std::io::Result<std::process::ExitStatus> {
+            LocalHost.interactive(argv)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projects_are_found_the_same_through_a_host_that_only_runs_commands() {
+        let dir = tree();
+        for place in ["proj/.devcontainer/x", "other/.devcontainer"] {
+            let path = dir.path().join(place).join("devcontainer.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "{}").unwrap();
+        }
+        let s = scope(dir.path());
+        let there = Files::new(&Sh, Path::new(HOME)).walk(&s, PROJECT).unwrap();
+        assert_eq!(there, files().walk(&s, PROJECT).unwrap());
+        assert_eq!(there.len(), 2, "proj and other");
+        let kind = |h: &dyn Host| h.inspect(&dir.path().join("proj"), PROJECT.markers());
+        assert_eq!(kind(&Sh).unwrap(), kind(&LocalHost).unwrap());
     }
 }

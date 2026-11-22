@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 use super::{
-    Child, FirstFile, Host, Job, Line, Ran, ScratchFile, Stream, run_interactive, run_process,
-    start_process,
+    Child, Entry, FirstFile, Host, Job, Kind, Line, Markers, Ran, ScratchFile, Search, Stream,
+    find, run_interactive, run_process, start_process,
 };
+use crate::local::{Local, SystemLocal};
 use crate::platform;
 use crate::tmpfile::TempFile;
 
@@ -107,6 +108,24 @@ impl Host for LocalHost {
 
     fn fetch_dir(&self, dir: &Path, _dest: &Path) -> Result<PathBuf> {
         Ok(dir.to_path_buf())
+    }
+
+    fn home_dir(&self) -> Result<PathBuf> {
+        Ok(SystemLocal.home())
+    }
+
+    /// Relative to the folder lodge runs in, as every path on this machine is.
+    fn resolve(&self, typed: &str, home: &Path) -> PathBuf {
+        let path = PathBuf::from(find::expand_home(typed, home));
+        std::path::absolute(&path).unwrap_or(path)
+    }
+
+    fn inspect(&self, path: &Path, markers: Markers) -> Result<Kind> {
+        Ok(find::inspect(path, markers))
+    }
+
+    fn find(&self, search: &Search) -> Result<Vec<Entry>> {
+        Ok(find::walk(search))
     }
 }
 

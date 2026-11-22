@@ -13,7 +13,7 @@
 //! terminal), [`Host::tunnel`] and [`Host::spawn`] (a process that stays up). No process type crosses the seam, so a host
 //! need not be a local process at all, and `fake::FakeHost` stands in for one in
 //! tests. Everything else here (running a script, reading a file, resolving a
-//! folder, making a scratch file) is provided on top of them, so an
+//! folder, looking for projects, making a scratch file) is provided on top of them, so an
 //! implementation gets it for free and overrides only what it can do better (the
 //! local host reads files directly).
 //!
@@ -31,9 +31,11 @@ use crate::shell::{CmdLine, shell_quote};
 
 #[cfg(test)]
 pub mod fake;
+mod find;
 mod local;
 mod ssh;
 
+pub use find::{Entry, Kind, Markers, Search, Want};
 pub use local::LocalHost;
 pub use ssh::SshHost;
 
@@ -593,6 +595,54 @@ pub trait Host: Send + Sync {
             .unpack(dest)
             .with_context(|| format!("unpacking {}{}", dir.display(), self.on_host()))?;
         Ok(dest.to_path_buf())
+    }
+
+    /// The home directory of the user lodge runs as on the host: where `~` points
+    /// and where a relative path starts.
+    fn home_dir(&self) -> Result<PathBuf> {
+        let out = self.sh_output("printf %s \"$HOME\"")?;
+        let home = String::from_utf8_lossy(&out.stdout).into_owned();
+        if !out.status.success() || !home.starts_with('/') {
+            anyhow::bail!("could not find the home directory{}", self.on_host());
+        }
+        Ok(PathBuf::from(home))
+    }
+
+    /// `typed`, a path as a person writes it, as an absolute path on the host:
+    /// `~` is `home`, and a relative path starts there. Nothing is looked up, so
+    /// it need not exist, and `.` and `..` are left for whoever uses it.
+    fn resolve(&self, typed: &str, home: &Path) -> PathBuf {
+        let typed = find::expand_home(typed, home);
+        if typed.starts_with('/') {
+            PathBuf::from(typed)
+        } else {
+            // As text: a path of another machine is never joined here.
+            PathBuf::from(format!(
+                "{}/{typed}",
+                home.to_string_lossy().trim_end_matches('/')
+            ))
+        }
+    }
+
+    /// What `path` is on the host; a folder with one of the `markers` is a
+    /// [`Kind::Project`].
+    fn inspect(&self, path: &Path, markers: Markers) -> Result<Kind> {
+        let out = self.sh_output(&find::inspect_script(path, markers))?;
+        find::parse_kind(&out.stdout_text()).with_context(|| {
+            format!(
+                "could not tell what {} is{}: {}",
+                path.display(),
+                self.on_host(),
+                out.stderr_text().trim()
+            )
+        })
+    }
+
+    /// The files and folders `search` asks for, on the host, in one round trip on
+    /// another machine. A root that is not there has nothing in it.
+    fn find(&self, search: &Search) -> Result<Vec<Entry>> {
+        let out = self.sh_output(&find::script(search))?;
+        Ok(find::shape(search, &out.stdout))
     }
 
     /// The uid and gid of the user lodge runs as on the host (that is who owns a

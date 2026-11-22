@@ -14,7 +14,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use super::add::add_binary;
-use super::browse::{self, Browsed, Want};
+use super::browse::{self, Browsed, Files};
 use super::candidates::{self, Candidate, name_from};
 use super::init;
 use super::prompt::{
@@ -29,6 +29,7 @@ use crate::config::edit::{
     self, Field, Kind, NewEntry, NewSecret, RawEntry, RawSecret, SecretAs, SecretFrom, Setting,
 };
 use crate::config::unknown::Unknown;
+use crate::host::{Entry, Host, Want};
 use crate::keys::Action;
 use crate::layout::tilde;
 use crate::output::{plural, warning};
@@ -103,6 +104,15 @@ pub struct Machine<'a> {
     /// The folder `ldg` was started in: config files are looked for there.
     pub cwd: &'a Path,
     pub bundles: &'a dyn Bundles,
+    /// How this machine's files are listed.
+    pub host: &'a dyn Host,
+}
+
+impl Machine<'_> {
+    /// The files of this machine, for choosing among them.
+    fn files(&self) -> Files<'_> {
+        Files::new(self.host, self.home)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -702,7 +712,7 @@ fn on_offer(
     machine: &Machine,
     scope: &browse::Scope,
     added: &HashSet<String>,
-) -> (Vec<Candidate>, Vec<Item>) {
+) -> Result<(Vec<Candidate>, Vec<Item>)> {
     let taken = file.entries(kind);
     let names: HashSet<&str> = taken.iter().filter_map(|e| e.name.as_deref()).collect();
     let paths: HashSet<&str> = taken
@@ -736,15 +746,18 @@ fn on_offer(
     };
     // What the list above has is not offered again.
     let have: HashSet<String> = found.iter().map(|c| c.entry.path().to_string()).collect();
-    let more: Vec<PathBuf> = browse::walk(scope, want)
+    let more: Vec<Entry> = machine
+        .files()
+        .walk(scope, want)?
         .into_iter()
-        .filter(|p| kind == Kind::Data || crate::platform::is_executable(p))
-        .filter(|p| !have.contains(&tilde(p, machine.home)))
+        .filter(|e| kind == Kind::Data || crate::platform::is_executable(&e.path))
+        .filter(|e| !have.contains(&tilde(&e.path, machine.home)))
         .collect();
-    for (path, item) in more
+    for (entry, item) in more
         .iter()
         .zip(browse::items(&more, scope, want, machine.home))
     {
+        let path = &entry.path;
         let place = tilde(path, machine.home);
         items.push(Item {
             added: paths.contains(place.as_str()),
@@ -760,7 +773,7 @@ fn on_offer(
             },
         });
     }
-    (found, items)
+    Ok((found, items))
 }
 
 /// Where the files of this machine are looked for, to begin with: the
@@ -804,12 +817,12 @@ fn pick_path(
     let title = format!("{} (type to filter, or a path)", kind.key());
     let mut scope = scope(machine, Some(kind));
     let chosen = loop {
-        let (found, items) = on_offer(kind, file, machine, &scope, &HashSet::new());
+        let (found, items) = on_offer(kind, file, machine, &scope, &HashSet::new())?;
         let tabs = [list_name(kind)];
         let knobs = scope.knobs(machine.home);
         match choose.find_knobs(&title, &tabs, &items, &knobs)? {
             Selection::Left => return Ok(None),
-            Selection::Edited(knob, text) => scope = scope.edited(knob, &text),
+            Selection::Edited(knob, text) => scope = scope.edited(knob, &text, &machine.files()),
             Selection::Items(chosen) => {
                 let Some(c) = chosen.first().and_then(|&i| found.get(i)) else {
                     return Ok(None);
@@ -817,12 +830,19 @@ fn pick_path(
                 return Ok(Some(c.entry.path().to_string()));
             }
             Selection::Path(typed) => {
-                break browse::settle(choose, kind.key(), &typed, Want::Any, &scope, machine.home)?;
+                break browse::settle(
+                    choose,
+                    kind.key(),
+                    &typed,
+                    Want::Any,
+                    &scope,
+                    &machine.files(),
+                )?;
             }
             Selection::Unsupported => break Browsed::Unsupported,
         }
     };
-    let Some(typed) = chosen.or_ask(ask, "path on this machine")? else {
+    let Some(typed) = chosen.or_ask(ask, "path on this machine", &machine.files())? else {
         return Ok(None);
     };
     resolve(&typed.to_string_lossy(), machine.home).map(Some)
@@ -844,7 +864,7 @@ fn add(
     let added = std::cell::RefCell::new(HashSet::new());
     let mut scope = scope(machine, Some(kind));
     loop {
-        let (found, items) = on_offer(kind, file, machine, &scope, &added.borrow());
+        let (found, items) = on_offer(kind, file, machine, &scope, &added.borrow())?;
         let mut add_one = |pick: Pick| -> std::result::Result<String, String> {
             let typed;
             let entry = match &pick {
@@ -863,7 +883,7 @@ fn add(
         let knobs = scope.knobs(machine.home);
         match choose.find_adding_knobs(&title, &tabs, &items, &knobs, &mut add_one)? {
             Adding::Done => break,
-            Adding::Edited(knob, text) => scope = scope.edited(knob, &text),
+            Adding::Edited(knob, text) => scope = scope.edited(knob, &text, &machine.files()),
             Adding::Unsupported => {
                 // A terminal that can't show the list: the path is asked for in words.
                 let Some(typed) =
@@ -1286,9 +1306,11 @@ fn open_file(
     let mut scope = scope(machine, None);
     let chosen = loop {
         // The config files that are known, then any other file the scope reaches.
-        let more: Vec<PathBuf> = browse::walk(&scope, Want::File)
+        let more: Vec<Entry> = machine
+            .files()
+            .walk(&scope, Want::File)?
             .into_iter()
-            .filter(|f| !known.contains(f))
+            .filter(|e| !known.contains(&e.path))
             .collect();
         let mut items: Vec<Item> = known
             .iter()
@@ -1301,7 +1323,7 @@ fn open_file(
             })
             .collect();
         items.extend(browse::items(&more, &scope, Want::File, machine.home));
-        let files: Vec<&PathBuf> = known.iter().chain(&more).collect();
+        let files: Vec<&PathBuf> = known.iter().chain(more.iter().map(|e| &e.path)).collect();
         let knobs = scope.knobs(machine.home);
         match choose.find_knobs(
             "Config file (type to filter, or a path)",
@@ -1310,7 +1332,7 @@ fn open_file(
             &knobs,
         )? {
             Selection::Left => return Ok(String::new()),
-            Selection::Edited(knob, text) => scope = scope.edited(knob, &text),
+            Selection::Edited(knob, text) => scope = scope.edited(knob, &text, &machine.files()),
             Selection::Items(chosen) => match chosen.first().and_then(|&i| files.get(i)) {
                 Some(f) => break (*f).clone(),
                 None => return Ok(String::new()),
@@ -1322,7 +1344,7 @@ fn open_file(
                     &typed,
                     Want::File,
                     &scope,
-                    machine.home,
+                    &machine.files(),
                 )? {
                     Browsed::Chose(file) => break file,
                     Browsed::Left => return Ok(String::new()),
@@ -1623,6 +1645,7 @@ mod tests {
             path_var: OsStr::new(""),
             cwd: dir.path(),
             bundles: &packs,
+            host: &crate::host::LocalHost,
         };
         run(
             &config,
@@ -2361,6 +2384,7 @@ mod tests {
             path_var: OsStr::new(""),
             cwd: dir.path(),
             bundles: &Packs::default(),
+            host: &crate::host::LocalHost,
         };
         let typed = Typed(RefCell::new(vec![Some("/bin/true")]));
         run(&config, &machine, &Words(screen), &typed, &NoWait).unwrap();

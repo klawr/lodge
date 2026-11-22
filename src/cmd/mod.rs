@@ -25,6 +25,7 @@ mod configure;
 mod doctor;
 mod init;
 mod inject;
+mod new_project;
 mod project;
 mod prompt;
 mod resume;
@@ -300,9 +301,21 @@ fn configure_config(config: Option<PathBuf>, terminal: &prompt::Terminal) -> Res
         path_var: &path_var,
         cwd: &cwd,
         bundles: &packer,
+        host: &LocalHost,
     };
     configure::run(&path, &machine, terminal, terminal, terminal)?;
     Ok(())
+}
+
+/// How the machine `remote` names is reached: over ssh, or this one for `None`.
+/// The one place that picks, so a new way of reaching a machine is one more arm.
+/// The forward daemon has no terminal, so its ssh commands must never prompt.
+fn reach(remote: Option<&str>, daemon: bool) -> HostRef {
+    match remote {
+        Some(remote) if daemon => Arc::new(SshHost::unattended(remote)),
+        Some(remote) => Arc::new(SshHost::new(remote)),
+        None => Arc::new(LocalHost),
+    }
 }
 
 pub fn run(mut cli: Cli) -> Result<ExitCode> {
@@ -318,6 +331,8 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
     )?)?);
     // Without a subcommand, the person picks one of the places they were in. That
     // comes first because the pick says which host and target to build.
+    // The machine a project was looked for on, already connected.
+    let mut connected: Option<HostRef> = None;
     let subcommand = match cli.command.take() {
         Some(subcommand) => subcommand,
         None => loop {
@@ -333,34 +348,28 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                     break resumed.command;
                 }
                 Some(resume::Home::New) => {
-                    if cli.remote.is_some() {
-                        anyhow::bail!(
-                            "a project on another machine can't be browsed for: \
-                             give its path, `ldg --remote HOST up PATH`"
-                        );
-                    }
-                    let home = SystemLocal.home();
-                    let scope = browse::Scope::new(vec![home.clone()], Vec::new());
-                    match browse::pick(
+                    let reach = |remote: Option<&str>| reach(remote, false);
+                    match new_project::pick(
+                        &history,
                         &terminal,
-                        "New project",
-                        &scope,
-                        browse::Want::Project,
-                        &home,
+                        &terminal,
+                        cli.remote.as_deref(),
+                        &reach,
                     )? {
-                        browse::Browsed::Chose(dir) => {
+                        Some(found) => {
+                            cli.remote = found.remote;
+                            connected = Some(found.host);
                             break Command::Up {
-                                project: crate::cli::ProjectArg { path: Some(dir) },
+                                project: crate::cli::ProjectArg {
+                                    path: Some(found.dir),
+                                },
                                 build: false,
                                 reinject: false,
                                 no_attach: false,
                                 bundle: None,
                             };
                         }
-                        browse::Browsed::Left => continue,
-                        browse::Browsed::Unsupported => {
-                            anyhow::bail!("no projects found; give a path, `ldg up PATH`")
-                        }
+                        None => continue,
                     }
                 }
                 Some(resume::Home::Configure) => {
@@ -373,19 +382,21 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
         },
     };
     let remote = cli.remote.clone();
-    // The forward daemon has no terminal, so its ssh commands must never prompt.
     let daemon = matches!(subcommand, Command::Forward { .. });
-    let host: HostRef = match cli.remote {
-        Some(remote) if daemon => Arc::new(SshHost::unattended(remote)),
-        Some(remote) => Arc::new(SshHost::new(remote)),
-        None => Arc::new(LocalHost),
-    };
     // Open the connection while the terminal is ours, so a password or 2FA prompt
     // is answered once and everything after reuses it. The forward daemon has no
-    // terminal: it joins the connection that is already there.
-    if !daemon {
-        host.connect()?;
-    }
+    // terminal: it joins the connection that is already there. A project that was
+    // looked for on a machine has that connection open already.
+    let host: HostRef = match connected {
+        Some(host) => host,
+        None => {
+            let host = reach(cli.remote.as_deref(), daemon);
+            if !daemon {
+                host.connect()?;
+            }
+            host
+        }
+    };
     let config_path = crate::config::path_for(cli.config)?;
     let target = choose_target(cli.target, &subcommand, &config_path)?;
     let route = Route {

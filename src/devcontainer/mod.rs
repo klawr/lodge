@@ -46,7 +46,7 @@ use profile::write_env_profile;
 use spec::{Spec, load_spec};
 
 pub use backend::LABEL_PROJECT;
-pub use spec::has_config;
+pub use spec::CONFIG_LOCATIONS;
 
 /// The questions [`start`] may need a person to answer.
 pub trait Prompt {

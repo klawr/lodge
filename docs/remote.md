@@ -7,6 +7,14 @@ devcontainer config is read there, `initializeCommand` and builds run there, and
 features are installed in the remote container. Port forwarding tunnels ports
 back to `127.0.0.1` on your machine.
 
+`n` in a bare `ldg` finds a new project on this machine or on another one: it asks
+where (this machine, a machine you used before, or `another machine…`, typed as below),
+connects, and lists that machine's projects exactly as it lists local ones (one `find`
+on the remote host, so the list comes at the cost of one round trip). The projects are
+those with a devcontainer config under the remote home, `~` and relative paths mean
+the remote home, and `--remote` on the command line settles the question. A machine
+that can't be reached is asked for again.
+
 The destination is anything your SSH client understands:
 
 - `user@host`: explicit user and host.
