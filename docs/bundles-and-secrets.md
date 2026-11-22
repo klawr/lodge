@@ -24,7 +24,7 @@ ldg up --bundle lodge-x86_64.tar         # anywhere with a container runtime (or
 ```
 
 or set `bundle = "~/lodge-x86_64.tar"` at the top of `config.toml`. A configured
-bundle replaces the `[[inject]]` entries on that machine; `[session]` stays local.
+bundle replaces the `[[binary]]` and `[[config]]` entries on that machine; `[session]` stays local.
 
 A machine that only *uses* a bundle needs just the bundle (a file, or a registry
 reference as below) and a small config of its own: the `bundle =` line,

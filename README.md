@@ -70,6 +70,7 @@ for where to put them). Man page: `ldg man | man -l -`.
 | `ldg clean [PATH]` | Remove what lodge injected from the container (configs are kept and listed), and stop its port forwarding. `--container NAME` for one that `ldg attach` worked in. |
 | `ldg init` | Write a starting config (`--print` to see it first). |
 | `ldg doctor [PATH]` | Check the host, the config, and what the project's devcontainer needs. |
+| `ldg inject [ls]`, `add binary\|config …`, `rm binary\|config NAME` | List, add or remove the `[[binary]]` and `[[config]]` entries of your config without opening it (comments are kept). |
 | `ldg pack [-o FILE\|oci://REF]` | Pack your tools and configs into a portable bundle: a file (`lodge-<arch>.tar`), or published to a registry. |
 | `ldg bundle inspect\|verify FILE` | Show what a bundle holds; check it is intact. |
 | `ldg cache [clear]` | Show or clear the cache of prepared bundles. |
@@ -89,7 +90,7 @@ On the host:
 - `docker` with `docker compose` (for compose-based devcontainers). With
   `--remote`, docker runs on the *remote* host and locally you only need `ssh`.
 - `ldd` and `patchelf`, **only to pack** your tools (that is, when your config
-  lists `[[inject]]` entries). Injecting from a bundle needs neither.
+  lists `[[binary]]` entries). Injecting from a bundle needs neither.
 - `kubectl`, only for `--target kubernetes` (on the `--remote` host, with it);
   `ldg doctor` does not check it.
 
@@ -135,10 +136,10 @@ linked binaries are copied as they are.
   servers, prefer letting the container provide the toolchain.
 - Tools are on `PATH` in the sessions lodge opens (`ldg up`). Another
   way into the same container (an IDE terminal, a hand-run `docker exec`) does not
-  see them, unless an `[[inject]]` entry sets `target_binary`, which also writes a
+  see them, unless a `[[binary]]` sets `target`, which also writes a
   wrapper script at that path.
 - Libraries loaded at run time (`dlopen`, interpreters) are invisible to `ldd`;
-  list them as `[[inject]]` entries.
+  list them as `[[config]]` entries.
 - Dynamic port forwarding needs the container's bridge IP to be reachable from
   the engine's host: Linux with Docker Engine, or any engine with `--remote`.
   Docker Desktop on macOS/Windows doesn't expose container IPs.

@@ -6,8 +6,7 @@ still get a shell. `ldg init` writes a commented starting point, with the tools
 it finds on your `PATH` filled in.
 
 The config is checked as a whole before anything starts: an unknown key (with a
-suggestion for a likely typo), a duplicate tool name, an entry with nothing to
-inject, a target path that is neither absolute nor under `~/`, and a malformed
+suggestion for a likely typo), a duplicate name, a target path that is neither absolute nor under `~/`, and a malformed
 secret are all reported together. `ldg doctor` shows the
 same report.
 
@@ -23,27 +22,31 @@ an older one:
 ## Example
 
 ```toml
-# Inject Neovim plus its runtime and plugins.
-[[inject]]
-name           = "nvim"
-binary         = "/usr/local/bin/nvim"     # host binary to copy in
-config         = "~/.config/nvim"          # host config dir/file to copy in
-target_binary  = "~/.local/bin/nvim"       # also write a wrapper script here (optional)
-target_config  = "~/.config/nvim"          # where the config goes (optional, default shown)
-copy_deps      = true                      # copy shared libs via ldd when packing (default: true)
+# Programs: the binary, relinked, with the libraries it needs.
+[[binary]]
+name      = "nvim"
+path      = "/usr/local/bin/nvim"     # host binary to copy in
+target    = "~/.local/bin/nvim"       # also write a wrapper script here (optional)
+copy_deps = true                      # copy shared libs via ldd when packing (default: true)
+
+# Configs: files and directories, copied as they are.
+[[config]]
+name   = "nvim"
+path   = "~/.config/nvim"
+target = "~/.config/nvim"             # where it goes (optional, default shown)
 
 # Neovim needs its runtime at the compiled-in $VIMRUNTIME path.
-[[inject]]
-name          = "nvim-runtime"
-config        = "/usr/local/share/nvim/runtime"
-target_config = "/usr/local/share/nvim/runtime"
+[[config]]
+name   = "nvim-runtime"
+path   = "/usr/local/share/nvim/runtime"
+target = "/usr/local/share/nvim/runtime"
 
 # Ship installed plugins so the container uses your exact host versions instead
 # of re-cloning them at HEAD (which drifts into incompatible versions).
-[[inject]]
-name          = "nvim-plugins"
-config        = "~/.local/share/nvim/lazy"
-target_config = "~/.local/share/nvim/lazy"
+[[config]]
+name   = "nvim-plugins"
+path   = "~/.local/share/nvim/lazy"
+target = "~/.local/share/nvim/lazy"
 
 [session]
 shell = "/bin/bash"   # shell launched inside the container (default)
@@ -55,29 +58,85 @@ shell = "/bin/bash"   # shell launched inside the container (default)
 safe_directories = ["*"]
 ```
 
-## `[[inject]]`
+## `[[binary]]`
 
-Each entry brings a binary (with its libraries), a config file or directory,
-or both.
+A program to bring: its binary, relinked to the bundled glibc, and the shared
+libraries it needs.
 
-| field            | required | default                 | meaning |
-| ---------------- | -------- | ----------------------- | ------- |
-| `name`           | yes      | —                       | identifier, unique; used for default paths |
-| `binary`         | no       | —                       | host path to a binary to inject |
-| `config`         | no       | —                       | host path to a config file/dir to inject |
-| `target_binary`  | no       | none                    | also write a wrapper script that runs the binary at this path in the container (absolute or `~/…`, no `..`). Without it the binary is on the `PATH` of the sessions lodge opens |
-| `target_config`  | no       | `~/.config/<name>`      | config location in the container (`~` is the container user's home; absolute or `~/…`, no `..`) |
-| `copy_deps`      | no       | `true`                  | copy shared-library dependencies via `ldd` when packing |
+| field       | required | default | meaning |
+| ----------- | -------- | ------- | ------- |
+| `name`      | yes      | —       | identifier, unique among the binaries |
+| `path`      | yes      | —       | host path to the binary (may start with `~/`) |
+| `target`    | no       | none    | also write a wrapper script that runs the binary at this path in the container (absolute or `~/…`, no `..`). Without it the binary is on the `PATH` of the sessions lodge opens |
+| `copy_deps` | no       | `true`  | copy shared-library dependencies via `ldd` when packing |
 
-At least one of `binary` and `config` must be set. Host paths may start with `~/`.
+## `[[config]]`
+
+A config file or directory, copied as it is. It has nothing to do with any binary:
+a program may have several configs, or none, and a config can be shell setup.
+
+| field    | required | default            | meaning |
+| -------- | -------- | ------------------ | ------- |
+| `name`   | yes      | —                  | identifier, unique among the configs |
+| `path`   | yes      | —                  | host path to the file or directory (may start with `~/`) |
+| `target` | no       | `~/.config/<name>` | where it goes in the container (`~` is the container user's home; absolute or `~/…`, no `..`) |
+
+A binary and a config may have the same name; they are separate entries.
 
 lodge writes as the container user and never uses root, so a target must be a place
 that user can write (under `~`, say). A target elsewhere fails with the path and the
 user named.
 
 Shell aliases and other shell setup are your shell's own config: inject your
-`~/.bashrc` (or your shell and its config) with an `[[inject]]` entry whose
-`target_config` is where the container user's shell reads it.
+`~/.bashrc` (or your shell and its config) with a `[[config]]` whose `target` is
+where the container user's shell reads it.
+
+## Editing the config
+
+Run `ldg` alone and press `c` for the config screen: the whole file as the form it
+is in the TOML, with every value a line you can move to (↑/↓ or j/k): `target` and
+`bundle`, `[session]` and `[git]`, then each `[[binary]]`, `[[config]]` and
+`[[secret]]` with all of its fields under it, the ones that are not set shown as
+such (`target = (default ~/.config/nvim)`). Enter changes the selected one: `path`
+opens the list of what this machine has, the rest is typed or chosen from a short
+list (`target`, how a secret is read and placed), `copy_deps` is turned over. `x`
+puts a value back to its default or clears it, and `d` removes the entry. What each
+change did is on the first line, and a refused one says why and changes nothing.
+
+| key | |
+| --- | --- |
+| `b` | add programs |
+| `c` | add configs |
+| `s` | add a secret (a name, where its value comes from) |
+| `p` | pack the bundle into a file (Enter takes `lodge-<arch>.tar` here) |
+| `P` | publish the bundle to a registry (Enter takes the one `bundle =` names) |
+| `o` | work on another config file: the ones beside the default and in the folder `ldg` was started in, or a path typed in full |
+
+`b` and `c` open what this machine has (for programs, the tools it knows that are
+installed, then every other program on `PATH`; for configs, your `~/.config` and the
+dotfiles in `~`), narrowing as you type. Enter adds the selected one and marks it
+`[x]`, and the list stays open for the next (Esc when done). What is in your config
+already is in the list too, marked from the start; a path typed in full (`/…`, `~/…`)
+is offered as it is. A config goes where it is on this machine, when that is under
+your home directory. Credentials and state (`~/.ssh`, `~/.config/gh`, caches) are
+never listed.
+
+Not in the screen yet: the `[targets.<name>]` tables, which each target defines for
+itself.
+
+The same from the command line, without opening the file:
+
+```sh
+ldg inject                                    # list the entries
+ldg inject add binary rg                      # a program found on PATH
+ldg inject add binary nvim /usr/local/bin/nvim --target '~/.local/bin/nvim'
+ldg inject add config nvim ~/.config/nvim
+ldg inject rm binary rg
+```
+
+The file is edited in place (comments and order stay), and nothing is written
+unless the result is a valid config. With `bundle =` set, the entries are not
+used until you pack again or drop that line.
 
 ## `[session]`
 
@@ -97,24 +156,24 @@ leave, so the next `ldg up` (or `ldg attach`) lands in the same session, with
 your editor as you left it. The same holds after a dropped `--remote` connection: `ldg` reconnects
 by itself and opens a new shell, which reads the rc file again and attaches.
 
-A tmux setup, with three `[[inject]]` entries:
+A tmux setup, with a `[[binary]]` and two `[[config]]` entries:
 
 ```toml
-[[inject]]
-name   = "tmux"
-binary = "/usr/bin/tmux"
+[[binary]]
+name = "tmux"
+path = "/usr/bin/tmux"
 
 # ~/.bashrc in the container: start tmux once, attaching if it is already there.
-[[inject]]
-name          = "tmux-rc"
-config        = "~/.config/lodge/tmux-rc"
-target_config = "~/.bashrc"
+[[config]]
+name   = "tmux-rc"
+path   = "~/.config/lodge/tmux-rc"
+target = "~/.bashrc"
 
 # ~/.tmux.conf in the container.
-[[inject]]
-name          = "tmux-conf"
-config        = "~/.config/lodge/tmux.conf"
-target_config = "~/.tmux.conf"
+[[config]]
+name   = "tmux-conf"
+path   = "~/.config/lodge/tmux.conf"
+target = "~/.tmux.conf"
 ```
 
 `~/.config/lodge/tmux-rc` (use your own `~/.bashrc` and add these lines, if you
@@ -285,7 +344,7 @@ session. A pod is someone's workload, so, as for `host`:
 ## `bundle`
 
 A top-level `bundle = "path/to/lodge.tar"` injects from that bundle instead of
-packing the `[[inject]]` entries. A relative path is relative to the config
+packing the `[[binary]]` and `[[config]]` entries. A relative path is relative to the config
 file's folder. A reference with a scheme is not a path: `bundle =
 "oci://ghcr.io/me/lodge:1"` reads the bundle from a registry. `--bundle` on the
 command line (a file or such a reference) overrides it. See

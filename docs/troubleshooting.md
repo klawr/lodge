@@ -61,8 +61,8 @@ safe_directories`); if you set it to `[]`, add the directories you need.
 - `ldg doctor` checks each `binary` exists and shows its architecture; the
   container must run the same one.
 - A library loaded at run time (`dlopen`, a plugin, an interpreter) is invisible
-  to `ldd`. Add it as its own `[[inject]]` entry (`config` = the library or its
-  folder, `target_config` = where the tool looks).
+  to `ldd`. Add it as its own `[[config]]` entry (`path` = the library or its
+  folder, `target` = where the tool looks).
 - Neovim needs its runtime at the path it was built with: inject
   `<prefix>/share/nvim/runtime` to the same path (`ldg init` adds this entry).
 - Run `ldg cache clear` if you suspect a stale packed bundle.

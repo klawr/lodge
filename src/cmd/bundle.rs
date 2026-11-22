@@ -6,19 +6,65 @@ use std::path::{Path, PathBuf};
 use super::{Ctx, ago, human_size};
 use crate::arch::Arch;
 use crate::bundle;
-use crate::bundle::store::{Identity, Replace};
+use crate::bundle::store::{Identity, Replace, Sinks};
 use crate::cli::{BundleCommand, CacheCommand};
 use crate::output::{info, line, note, plural};
 use crate::tmpfile::TempDir;
+use crate::tools::Toolchain;
+
+/// Packs for the config screen with the helper programs and the places a bundle
+/// can be written, which the composition root made.
+pub struct LivePacker {
+    pub tools: Toolchain,
+    pub sinks: Sinks,
+}
+
+impl super::configure::Bundles for LivePacker {
+    fn pack(&self, config: &Path, output: Option<&str>, replace: Replace) -> Result<()> {
+        let config = crate::config::Config::load(config)?;
+        pack_config(
+            &config,
+            &self.tools,
+            &self.sinks,
+            output.map(str::to_string),
+            replace,
+        )
+    }
+
+    fn default_file(&self) -> Result<String> {
+        bundle::default_file_name()
+    }
+
+    fn is_registry(&self, reference: &str) -> bool {
+        // A registry is whatever writes somewhere other than a plain file does.
+        let file = self.sinks.find("bundle.tar").ok().map(|s| s.form());
+        self.sinks
+            .find(reference)
+            .ok()
+            .is_some_and(|s| Some(s.form()) != file)
+    }
+}
 
 pub fn pack(ctx: &Ctx, output: Option<String>, replace: Replace) -> Result<()> {
     let config = ctx.config()?;
+    pack_config(&config, &ctx.tools, &ctx.sinks, output, replace)
+}
+
+/// Packs `config` into `output` (a file, or an `oci://` reference to publish to;
+/// `lodge-<arch>.tar` here when none is given), and says what was made.
+pub fn pack_config(
+    config: &crate::config::Config,
+    tools: &Toolchain,
+    sinks: &Sinks,
+    output: Option<String>,
+    replace: Replace,
+) -> Result<()> {
     let output = match output {
         Some(o) => o,
         None => bundle::default_file_name()?,
     };
     // A destination nobody writes to fails before anything is packed.
-    let sink = ctx.sinks.find(&output)?;
+    let sink = sinks.find(&output)?;
     // The tar is built where the sink can place it cheapest: for a file, beside it,
     // so a large bundle is not held in the scratch space as well.
     let scratch = match sink.staging(&output) {
@@ -26,7 +72,7 @@ pub fn pack(ctx: &Ctx, output: Option<String>, replace: Replace) -> Result<()> {
         None => TempDir::new("pack-out"),
     }?;
     let tar = scratch.path().join("bundle.tar");
-    let manifest = bundle::pack::pack_to_file(&config, &tar, &ctx.tools)?;
+    let manifest = bundle::pack::pack_to_file(config, &tar, tools)?;
     let written = sink.put(&output, &tar, manifest.arch()?, replace)?;
     info!(
         "packed {} and {} for {} into {} (id {})",

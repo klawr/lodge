@@ -84,7 +84,7 @@ pub fn which(name: &str) -> Option<std::path::PathBuf> {
     which_in(name, &std::env::var_os("PATH")?)
 }
 
-fn which_in(name: &str, path_var: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+pub fn which_in(name: &str, path_var: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
     std::env::split_paths(path_var)
         .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())

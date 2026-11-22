@@ -17,7 +17,7 @@ fn json(template: &str) -> String {
 }
 
 fn inject_sh_config() -> String {
-    "[[inject]]\nname = \"hostsh\"\nbinary = \"/bin/sh\"\n".to_string()
+    "[[binary]]\nname = \"hostsh\"\npath = \"/bin/sh\"\n".to_string()
 }
 
 #[test]
@@ -196,7 +196,7 @@ fn packing_a_binary_for_another_architecture_than_this_machine_is_refused() {
     let fake = sb.root().join("foreign-binary");
     std::fs::write(&fake, elf).unwrap();
     sb.config(&format!(
-        "[[inject]]\nname = \"foreign\"\nbinary = \"{}\"\n",
+        "[[binary]]\nname = \"foreign\"\npath = \"{}\"\n",
         fake.display()
     ));
 
@@ -399,7 +399,7 @@ fn remote_mode_works_through_ssh_without_a_local_tar() {
     std::fs::write(cfg.join("sub/deep/file.txt"), "hello").unwrap();
     std::os::unix::fs::symlink("sub/deep/file.txt", cfg.join("link")).unwrap();
     sb.config(&format!(
-        "[[inject]]\nname = \"cfg\"\nconfig = \"{}\"\ntarget_config = \"/root/.config/cfg\"\n",
+        "[[config]]\nname = \"cfg\"\npath = \"{}\"\ntarget = \"/root/.config/cfg\"\n",
         cfg.display()
     ));
 
@@ -526,7 +526,7 @@ fn script_tool_config(sb: &Sandbox, name: &str, body: &str) -> std::path::PathBu
     let script = sb.root().join(format!("{name}-src"));
     std::fs::write(&script, body).unwrap();
     sb.config(&format!(
-        "[[inject]]\nname = \"{name}\"\nbinary = \"{}\"\ncopy_deps = false\n",
+        "[[binary]]\nname = \"{name}\"\npath = \"{}\"\ncopy_deps = false\n",
         script.display()
     ));
     script
@@ -967,7 +967,7 @@ fn secrets_are_added_on_the_machine_that_uses_a_tarred_bundle() {
     // The packing machine declares a secret too; it must stay out of the bundle.
     let script = script_tool_config(&sb, "hello", "#!/bin/sh\necho tool-ran-from-bundle\n");
     sb.config(&format!(
-        "[[inject]]\nname = \"hello\"\nbinary = \"{}\"\ncopy_deps = false\n\n[[secret]]\nname = \"API_KEY\"\nfrom = {{ env = \"LODGE_IT_API_KEY\" }}\nas = \"env\"\n",
+        "[[binary]]\nname = \"hello\"\npath = \"{}\"\ncopy_deps = false\n\n[[secret]]\nname = \"API_KEY\"\nfrom = {{ env = \"LODGE_IT_API_KEY\" }}\nas = \"env\"\n",
         script.display()
     ));
     let bundle = sb.root().join("b.tar");
@@ -1169,7 +1169,7 @@ fn ls_status_ports_and_clean_describe_and_undo_what_up_did() {
 #[ignore = "needs docker"]
 fn a_typo_in_the_config_stops_before_anything_starts() {
     let sb = Sandbox::new();
-    sb.config("[[inject]]\nname = \"x\"\nbinary = \"/bin/sh\"\ncopy_dep = true\n");
+    sb.config("[[binary]]\nname = \"x\"\npath = \"/bin/sh\"\ncopy_dep = true\n");
     let p = sb.project("typo", &json(r#"{ "image": "@IMAGE@" }"#));
     let out = p.ldg("up", &["--no-attach"]);
     assert!(!out.ok);
@@ -1220,9 +1220,9 @@ fn a_multiplexer_is_an_injected_tool_that_the_shells_rc_file_starts() {
     let conf = sb.root().join("tmux.conf");
     std::fs::write(&conf, "set -g default-command bash\n").unwrap();
     sb.config(&format!(
-        "[[inject]]\nname = \"tmux\"\nbinary = \"/usr/bin/tmux\"\n\n\
-         [[inject]]\nname = \"tmux-conf\"\nconfig = \"{}\"\ntarget_config = \"~/.tmux.conf\"\n\n\
-         [[inject]]\nname = \"tmux-rc\"\nconfig = \"{}\"\ntarget_config = \"~/.bashrc\"\n",
+        "[[binary]]\nname = \"tmux\"\npath = \"/usr/bin/tmux\"\n\n\
+         [[config]]\nname = \"tmux-conf\"\npath = \"{}\"\ntarget = \"~/.tmux.conf\"\n\n\
+         [[config]]\nname = \"tmux-rc\"\npath = \"{}\"\ntarget = \"~/.bashrc\"\n",
         conf.display(),
         rc.display()
     ));
@@ -1250,7 +1250,7 @@ fn a_user_without_root_gets_everything_in_their_own_prefix_and_nothing_elsewhere
     std::fs::create_dir_all(&settings).unwrap();
     std::fs::write(settings.join("rc"), "set x").unwrap();
     sb.config(&format!(
-        "{}\n[[inject]]\nname = \"settings\"\nconfig = \"{}\"\ntarget_config = \"/tmp/lodge-test-settings\"\n",
+        "{}\n[[config]]\nname = \"settings\"\npath = \"{}\"\ntarget = \"/tmp/lodge-test-settings\"\n",
         inject_sh_config(),
         settings.display()
     ));
@@ -1373,7 +1373,7 @@ fn remote_mode_works_against_a_real_ssh_server() {
     std::fs::create_dir_all(&cfg).unwrap();
     std::fs::write(cfg.join("rc"), "hello over ssh").unwrap();
     sb.config(&format!(
-        "[[inject]]\nname = \"cfg\"\nconfig = \"{}\"\ntarget_config = \"/root/.config/cfg\"\n",
+        "[[config]]\nname = \"cfg\"\npath = \"{}\"\ntarget = \"/root/.config/cfg\"\n",
         cfg.display()
     ));
     let port = free_port();
@@ -1562,8 +1562,8 @@ fn plain_host_round_trip(sb: &Sandbox, remote: Option<&str>) {
     std::fs::create_dir_all(&cfg).unwrap();
     std::fs::write(cfg.join("rc"), "from the bundle").unwrap();
     sb.config(&format!(
-        "[[inject]]\nname = \"hostsh\"\nbinary = \"/bin/sh\"\n\
-         [[inject]]\nname = \"cfg\"\nconfig = \"{}\"\ntarget_config = \"~/.config/cfg\"\n",
+        "[[binary]]\nname = \"hostsh\"\npath = \"/bin/sh\"\n\
+         [[config]]\nname = \"cfg\"\npath = \"{}\"\ntarget = \"~/.config/cfg\"\n",
         cfg.display()
     ));
     let work_path = work.to_string_lossy().into_owned();
@@ -1720,7 +1720,7 @@ fn a_pod_is_injected_entered_and_its_ports_forwarded_through_kubectl() {
     let home = sb.root().join("home");
     std::fs::create_dir_all(&home).unwrap();
     sb.config(&format!(
-        "[[inject]]\nname = \"hostsh\"\nbinary = \"/bin/sh\"\n\
+        "[[binary]]\nname = \"hostsh\"\npath = \"/bin/sh\"\n\
          [targets.kubernetes]\npod = \"{}\"\ncontext = \"test\"\nnamespace = \"work\"\n\
          workdir = \"/tmp\"\n",
         pod.0
@@ -1757,7 +1757,7 @@ fn a_pod_is_injected_entered_and_its_ports_forwarded_through_kubectl() {
     // The same pod, found by a label instead of its name, is the same pod: nothing
     // is injected again, and the lookup asked for running pods with that label.
     sb.config(&format!(
-        "[[inject]]\nname = \"hostsh\"\nbinary = \"/bin/sh\"\n\
+        "[[binary]]\nname = \"hostsh\"\npath = \"/bin/sh\"\n\
          [targets.kubernetes]\nselector = \"app={}\"\ncontext = \"test\"\nnamespace = \"work\"\n\
          workdir = \"/tmp\"\n",
         pod.0
@@ -1775,7 +1775,7 @@ fn a_pod_is_injected_entered_and_its_ports_forwarded_through_kubectl() {
         sb.kubectl_calls()
     );
     sb.config(&format!(
-        "[[inject]]\nname = \"hostsh\"\nbinary = \"/bin/sh\"\n\
+        "[[binary]]\nname = \"hostsh\"\npath = \"/bin/sh\"\n\
          [targets.kubernetes]\npod = \"{}\"\ncontext = \"test\"\nnamespace = \"work\"\n\
          workdir = \"/tmp\"\n",
         pod.0
@@ -1839,8 +1839,8 @@ fn a_container_lodge_did_not_make_is_attached_to_left_alone_and_cleaned() {
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(config_dir.join("rc"), "from lodge\n").unwrap();
     sb.config(&format!(
-        "[[inject]]\nname = \"hello\"\nbinary = \"{}\"\ncopy_deps = false\n\
-         config = \"{}\"\ntarget_config = \"/root/.config/hello\"\n",
+        "[[binary]]\nname = \"hello\"\npath = \"{}\"\ncopy_deps = false\n\
+         [[config]]\nname = \"hello\"\npath = \"{}\"\ntarget = \"/root/.config/hello\"\n",
         script.display(),
         config_dir.display()
     ));

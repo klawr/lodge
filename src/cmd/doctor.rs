@@ -110,7 +110,7 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
     // neither. So they are required only when this config would pack live.
     let packs_live = config
         .as_ref()
-        .is_ok_and(|c| c.bundle.is_none() && !c.inject.is_empty());
+        .is_ok_and(|c| c.bundle.is_none() && !c.binaries.is_empty());
     for tool in host_tools::ALL {
         // (shown at all, required) for what this host and config ask of it.
         let (shown, required) = match tool.need {
@@ -126,10 +126,11 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
         if let Some(bundle) = &cfg.bundle {
             checks.push(bundle_check(bundle, ctx));
         }
-        for item in &cfg.inject {
-            if let Some(binary) = &item.binary {
-                checks.push(binary_check(&item.name, binary));
-            }
+        for item in &cfg.binaries {
+            checks.push(binary_check(&item.name, &item.path));
+        }
+        for item in &cfg.configs {
+            checks.push(config_path_check(&item.name, &item.path));
         }
         for decl in &cfg.secret {
             checks.push(secret_check(decl, ctx.local.as_ref()));
@@ -202,9 +203,10 @@ fn config_check(path: &Path, config: &Result<Config>) -> Check {
             "config",
             Level::Ok,
             format!(
-                "{} ({} to inject)",
+                "{} ({}, {})",
                 path.display(),
-                plural(c.inject.len(), "tool", "tools")
+                plural(c.binaries.len(), "binary", "binaries"),
+                plural(c.configs.len(), "config", "configs")
             ),
         ),
         Ok(_) => Check::new(
@@ -251,8 +253,21 @@ fn bundle_check(reference: &str, ctx: &Ctx) -> Check {
     }
 }
 
+fn config_path_check(name: &str, path: &Path) -> Check {
+    let name = format!("config {name}");
+    if path.exists() {
+        Check::new(name, Level::Ok, path.display().to_string())
+    } else {
+        Check::new(
+            name,
+            Level::Missing,
+            format!("{} does not exist", path.display()),
+        )
+    }
+}
+
 fn binary_check(name: &str, binary: &Path) -> Check {
-    let name = format!("inject {name}");
+    let name = format!("binary {name}");
     if !binary.exists() {
         return Check::new(
             name,

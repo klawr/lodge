@@ -15,7 +15,7 @@ use super::manifest::{
     Tool,
 };
 use crate::arch::Arch;
-use crate::config::{Config, Injectable};
+use crate::config::{BinaryEntry, Config, ConfigEntry};
 use crate::layout;
 use crate::output::warning;
 use crate::shell::is_plain_name;
@@ -71,8 +71,11 @@ pub fn build(
         linker: None,
         tools: Vec::new(),
     };
-    for item in &config.inject {
-        packer.add(item)?;
+    for item in &config.binaries {
+        packer.add_binary(item)?;
+    }
+    for item in &config.configs {
+        packer.add_config(item)?;
     }
     let manifest = packer.finish(config);
     manifest
@@ -94,35 +97,38 @@ struct Packer<'a, 'r> {
 }
 
 impl Packer<'_, '_> {
-    fn add(&mut self, item: &Injectable) -> Result<()> {
+    /// The bundle's entry for `name`, made when there is none: a binary and a config
+    /// of one name are two things in the config and one tool in the bundle.
+    fn tool(&mut self, name: &str) -> Result<&mut Tool> {
         // `Config::parse` checks this too; a `Config` built in code may not
         // have been, and the name becomes a path in the bundle.
-        if !is_plain_name(&item.name) {
-            bail!(
-                "'{}' is not usable as a tool name (letters, digits and -_.+ only)",
-                item.name
-            );
+        if !is_plain_name(name) {
+            bail!("'{name}' is not usable as a name (letters, digits and -_.+ only)");
         }
-        let binary = item
-            .binary
-            .as_deref()
-            .map(|b| self.add_binary(item, b))
-            .transpose()?;
-        let config = item
-            .config
-            .as_deref()
-            .map(|c| self.add_config(item, c))
-            .transpose()?;
-        self.tools.push(Tool {
-            name: item.name.clone(),
-            binary,
-            config,
-        });
+        let at = match self.tools.iter().position(|t| t.name == name) {
+            Some(at) => at,
+            None => {
+                self.tools.push(Tool {
+                    name: name.to_string(),
+                    binary: None,
+                    config: None,
+                });
+                self.tools.len() - 1
+            }
+        };
+        Ok(&mut self.tools[at])
+    }
+
+    fn add_binary(&mut self, item: &BinaryEntry) -> Result<()> {
+        self.tool(&item.name)?;
+        let binary = self.pack_binary(item)?;
+        self.tool(&item.name)?.binary = Some(binary);
         Ok(())
     }
 
-    fn add_binary(&mut self, item: &Injectable, source: &Path) -> Result<Binary> {
+    fn pack_binary(&mut self, item: &BinaryEntry) -> Result<Binary> {
         let name = &item.name;
+        let source = item.path.as_path();
         let path = source.to_string_lossy();
         elf::check_arch(name, source, self.host)?;
 
@@ -153,7 +159,7 @@ impl Packer<'_, '_> {
         std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
 
         Ok(Binary {
-            dest: item.target_binary.clone(),
+            dest: item.target.clone(),
             dynamic,
             hash: hash_path(&dst)?,
         })
@@ -193,8 +199,16 @@ impl Packer<'_, '_> {
         Ok(())
     }
 
-    fn add_config(&mut self, item: &Injectable, source: &Path) -> Result<ConfigTree> {
+    fn add_config(&mut self, item: &ConfigEntry) -> Result<()> {
+        self.tool(&item.name)?;
+        let config = self.pack_config(item)?;
+        self.tool(&item.name)?.config = Some(config);
+        Ok(())
+    }
+
+    fn pack_config(&mut self, item: &ConfigEntry) -> Result<ConfigTree> {
         let name = &item.name;
+        let source = item.path.as_path();
         if let Some(why) = sensitive_reason(source, dirs::home_dir().as_deref()) {
             warning!(
                 "{name}: {} may contain {why}, and a bundle is meant to be shared",
@@ -207,7 +221,7 @@ impl Packer<'_, '_> {
         copy_tree(&real, &dst)?;
         Ok(ConfigTree {
             dest: item
-                .target_config
+                .target
                 .clone()
                 .unwrap_or_else(|| layout::default_config_dest(name)),
             is_dir: real.is_dir(),
@@ -320,27 +334,25 @@ pub(crate) fn patch_binary(binary: &str, editor: &dyn ElfEditor) -> Result<TempF
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Injectable;
+    use crate::config::{BinaryEntry, ConfigEntry};
     use crate::tools::{self, Ldd, Patchelf};
 
-    fn script_tool(dir: &Path, name: &str) -> Injectable {
+    fn script_tool(dir: &Path, name: &str) -> BinaryEntry {
         let bin = dir.join(format!("{name}-src"));
         std::fs::write(&bin, "#!/bin/sh\necho hi\n").unwrap();
-        Injectable {
+        BinaryEntry {
             name: name.into(),
-            binary: Some(bin),
-            config: None,
-            target_binary: None,
-            target_config: None,
+            path: bin,
+            target: None,
             // A script has no libraries, and this keeps the test free of ldd and
             // patchelf.
             copy_deps: false,
         }
     }
 
-    fn config_with(inject: Vec<Injectable>) -> Config {
+    fn config_with(binaries: Vec<BinaryEntry>) -> Config {
         Config {
-            inject,
+            binaries,
             ..Config::default()
         }
     }
@@ -348,19 +360,25 @@ mod tests {
     #[test]
     fn a_tool_and_its_config_become_a_verifiable_bundle() {
         let work = TempDir::new("pack-src").unwrap();
-        let mut tool = script_tool(work.path(), "hello");
+        let tool = script_tool(work.path(), "hello");
         let cfg = work.path().join("hello-config");
         std::fs::create_dir_all(cfg.join("sub")).unwrap();
         std::fs::write(cfg.join("sub/rc"), "set x").unwrap();
         std::os::unix::fs::symlink("sub/rc", cfg.join("link")).unwrap();
-        tool.config = Some(cfg);
-        tool.target_config = Some("~/.config/hello".into());
+        let mut config = config_with(vec![tool]);
+        config.configs.push(ConfigEntry {
+            name: "hello".into(),
+            path: cfg,
+            target: Some("~/.config/hello".into()),
+        });
 
         let out = TempDir::new("pack-out").unwrap();
         let file = out.path().join("b.tar");
-        let manifest = pack_to_file(&config_with(vec![tool]), &file, &tools::external()).unwrap();
+        let manifest = pack_to_file(&config, &file, &tools::external()).unwrap();
 
         let tool = &manifest.tools[0];
+        // The binary and the config of one name are one tool in the bundle.
+        assert_eq!(manifest.tools.len(), 1);
         assert_eq!(tool.name, "hello");
         assert_eq!(
             tool.binary.as_ref().unwrap().dest,
@@ -385,7 +403,7 @@ mod tests {
     fn a_wrapper_target_is_kept_only_when_the_config_names_one() {
         let work = TempDir::new("pack-target").unwrap();
         let mut tool = script_tool(work.path(), "hello");
-        tool.target_binary = Some("~/.local/bin/hello".into());
+        tool.target = Some("~/.local/bin/hello".into());
         let out = TempDir::new("pack-target-out").unwrap();
         let manifest = build(
             &config_with(vec![tool]),
@@ -465,7 +483,7 @@ mod tests {
         {
             return; // a static shell has nothing to relink
         }
-        tool.binary = Some(sh);
+        tool.path = sh;
         tool.copy_deps = true;
         let out = TempDir::new("pack-dyn-out").unwrap();
         let manifest = build(
@@ -520,19 +538,24 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("not usable as a tool name"), "{err}");
+        assert!(err.contains("not usable as a name"), "{err}");
     }
 
     #[test]
     fn a_missing_config_path_names_the_tool() {
         let work = TempDir::new("pack-missing").unwrap();
-        let mut tool = script_tool(work.path(), "t");
-        tool.config = Some(work.path().join("nope"));
+        let tool = script_tool(work.path(), "t");
+        let mut config = config_with(vec![tool]);
+        config.configs.push(ConfigEntry {
+            name: "t".into(),
+            path: work.path().join("nope"),
+            target: None,
+        });
         let out = TempDir::new("pack-missing-out").unwrap();
         let err = format!(
             "{:#}",
             build(
-                &config_with(vec![tool]),
+                &config,
                 out.path(),
                 &mut deps::Resolver::new(&Ldd),
                 &Patchelf
@@ -561,7 +584,7 @@ mod tests {
         elf[18..20].copy_from_slice(&machine);
         let path = work.path().join("foreign-bin");
         std::fs::write(&path, elf).unwrap();
-        tool.binary = Some(path);
+        tool.path = path;
         let out = TempDir::new("pack-arch-out").unwrap();
         let err = build(
             &config_with(vec![tool]),

@@ -440,6 +440,7 @@ dependencies = [
  "sha2",
  "tar",
  "toml",
+ "toml_edit",
  "ureq",
 ]
 

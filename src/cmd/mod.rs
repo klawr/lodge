@@ -7,6 +7,8 @@
 //! - [`project`]: `down`, `status`, `rm`, `ls`, `ports`, `logs`, `clean`
 //! - [`doctor`]: the `doctor` command
 //! - [`init`]: the `init` command
+//! - [`configure`]: the config screen of a bare `ldg`: browse, add and remove what is injected
+//! - [`inject`]: `inject add|rm|ls`, which edit the `[[inject]]` entries of the config
 //! - [`bundle`]: `pack`, `bundle`, `cache`
 //! - [`prompt`]: the questions asked on the terminal, and the interface they are asked through
 //! - [`select`]: the list to choose from with the keyboard, behind `prompt`
@@ -15,8 +17,11 @@
 
 mod attach;
 mod bundle;
+mod candidates;
+mod configure;
 mod doctor;
 mod init;
+mod inject;
 mod project;
 mod prompt;
 mod resume;
@@ -49,7 +54,7 @@ use crate::tools::{
 fn uses_target(command: &Command) -> bool {
     !matches!(
         command,
-        Command::Init { .. } | Command::Completions { .. } | Command::Man
+        Command::Init { .. } | Command::Inject { .. } | Command::Completions { .. } | Command::Man
     )
 }
 
@@ -259,10 +264,40 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
             cli.remote.as_deref(),
             cli.target.as_deref(),
         )? {
-            Some(resumed) => {
+            Some(resume::Home::Place(resumed)) => {
                 cli.remote = resumed.route.remote;
                 cli.target = Some(resumed.route.target);
                 resumed.command
+            }
+            Some(resume::Home::Configure) => {
+                // Only the config is worked on: no host, no target, no engine.
+                let path = crate::config::path_for(cli.config)?;
+                let home = SystemLocal
+                    .var("HOME")
+                    .map_or_else(|| PathBuf::from("/"), PathBuf::from);
+                let path_var = SystemLocal.var("PATH").unwrap_or_default();
+                let local: Arc<dyn Local> = Arc::new(SystemLocal);
+                let registry = Arc::new(NativeOci::new(
+                    Box::new(UreqHttp::new()),
+                    Box::new(DockerConfig::new(local)),
+                ));
+                let packer = bundle::LivePacker {
+                    tools: Toolchain {
+                        deps: Box::new(Ldd),
+                        elf: Box::new(Patchelf),
+                        oci: registry.clone(),
+                    },
+                    sinks: bundle_sinks(registry),
+                };
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let machine = configure::Machine {
+                    home: &home,
+                    path_var: &path_var,
+                    cwd: &cwd,
+                    bundles: &packer,
+                };
+                configure::run(&path, &machine, &prompt::Terminal, &prompt::Terminal)?;
+                return Ok(ExitCode::SUCCESS);
             }
             None => return Ok(ExitCode::SUCCESS),
         },
@@ -376,6 +411,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
         }
         Command::Bundle { command } => bundle::bundle(&ctx, command)?,
         Command::Cache { command } => bundle::cache(command)?,
+        Command::Inject { command } => inject::run(&ctx, command)?,
         Command::Init { force, print } => init::run(&ctx, force, print)?,
         Command::Doctor { project, json } => {
             if !doctor::run(&ctx, project.path, json)? {

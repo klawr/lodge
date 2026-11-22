@@ -13,10 +13,10 @@ pub const SCHEMA_URL: &str =
 
 /// A tool `init` looks for: its binary on `PATH`, and the config paths (under
 /// the home directory) worth bringing along when they exist.
-struct Known {
-    binary: &'static str,
-    note: &'static str,
-    configs: &'static [&'static str],
+pub(super) struct Known {
+    pub binary: &'static str,
+    pub note: &'static str,
+    pub configs: &'static [&'static str],
 }
 
 const KNOWN: &[Known] = &[
@@ -94,24 +94,7 @@ const KNOWN: &[Known] = &[
 
 pub fn run(ctx: &Ctx, force: bool, print: bool) -> Result<()> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    let found: Vec<Detected> = KNOWN
-        .iter()
-        .filter_map(|k| {
-            let binary = crate::shell::which(k.binary)?;
-            let binary = std::fs::canonicalize(&binary).unwrap_or(binary);
-            let configs = k
-                .configs
-                .iter()
-                .map(|c| home.join(c))
-                .filter(|p| p.exists())
-                .collect();
-            Some(Detected {
-                known: k,
-                binary,
-                configs,
-            })
-        })
-        .collect();
+    let found = detect(&home, &ctx.local.var("PATH").unwrap_or_default());
     let text = render(&found, &home);
 
     if print {
@@ -131,7 +114,7 @@ pub fn run(ctx: &Ctx, force: bool, print: bool) -> Result<()> {
     std::fs::write(path, &text).with_context(|| format!("writing {}", path.display()))?;
     info!("wrote {}", path.display());
     if found.is_empty() {
-        note!("no known tools found on PATH; add [[inject]] entries by hand");
+        note!("no known tools found on PATH; add [[binary]] and [[config]] entries by hand");
     } else {
         let names: Vec<&str> = found.iter().map(|f| f.known.binary).collect();
         note!(
@@ -143,14 +126,37 @@ pub fn run(ctx: &Ctx, force: bool, print: bool) -> Result<()> {
     Ok(())
 }
 
-struct Detected {
-    known: &'static Known,
-    binary: PathBuf,
-    configs: Vec<PathBuf>,
+pub(super) struct Detected {
+    pub known: &'static Known,
+    pub binary: PathBuf,
+    pub configs: Vec<PathBuf>,
+}
+
+/// The known tools that are on `PATH`, each with the configs of it that exist
+/// under `home`.
+pub(super) fn detect(home: &Path, path_var: &std::ffi::OsStr) -> Vec<Detected> {
+    KNOWN
+        .iter()
+        .filter_map(|k| {
+            let binary = crate::shell::which_in(k.binary, path_var)?;
+            let binary = std::fs::canonicalize(&binary).unwrap_or(binary);
+            let configs = k
+                .configs
+                .iter()
+                .map(|c| home.join(c))
+                .filter(|p| p.exists())
+                .collect();
+            Some(Detected {
+                known: k,
+                binary,
+                configs,
+            })
+        })
+        .collect()
 }
 
 /// `~/…` for paths under `home`, so the config reads (and travels) well.
-fn tilde(path: &Path, home: &Path) -> String {
+pub(super) fn tilde(path: &Path, home: &Path) -> String {
     match path.strip_prefix(home) {
         Ok(rest) if home != Path::new("/") => format!("~/{}", rest.display()),
         _ => path.display().to_string(),
@@ -176,42 +182,52 @@ fn render(found: &[Detected], home: &Path) -> String {
             .join(", "),
         super::targets::default_name()
     ));
-    s.push_str("# ── Tools ────────────────────────────────────────────────────────────\n");
-    s.push_str("# Each [[inject]] copies a binary (with its libraries) and/or a config.\n");
+    s.push_str("# ── Programs ─────────────────────────────────────────────────────────\n");
+    s.push_str("# Each [[binary]] copies a program, with the libraries it needs.\n");
     s.push_str("# Uncomment what you want in your containers.\n");
     if found.is_empty() {
-        s.push_str("#\n# [[inject]]\n# name   = \"nvim\"\n# binary = \"/usr/bin/nvim\"\n# config = \"~/.config/nvim\"\n");
+        s.push_str("#\n# [[binary]]\n# name = \"nvim\"\n# path = \"/usr/bin/nvim\"\n");
     }
     for f in found {
         let k = f.known;
         s.push_str(&format!(
-            "\n# {}\n# [[inject]]\n# name   = \"{}\"\n# binary = \"{}\"\n",
+            "\n# {}\n# [[binary]]\n# name = \"{}\"\n# path = \"{}\"\n",
             k.note,
             k.binary,
             tilde(&f.binary, home)
         ));
-        if let [config] = f.configs.as_slice() {
-            s.push_str(&format!("# config = \"{}\"\n", tilde(config, home)));
-        }
-        if f.configs.len() > 1 {
-            for (i, c) in f.configs.iter().enumerate() {
-                s.push_str(&format!(
-                    "#\n# [[inject]]\n# name   = \"{}-config-{}\"\n# config = \"{}\"\n",
-                    k.binary,
-                    i + 1,
-                    tilde(c, home)
-                ));
-            }
+    }
+    s.push_str("\n# ── Configs ──────────────────────────────────────────────────────────\n");
+    s.push_str("# Each [[config]] copies a config file or directory; `target` is where it\n");
+    s.push_str("# goes in the container (default: ~/.config/<name>).\n");
+    let mut any = false;
+    for f in found {
+        let k = f.known;
+        for (i, c) in f.configs.iter().enumerate() {
+            any = true;
+            let name = if f.configs.len() == 1 {
+                k.binary.to_string()
+            } else {
+                format!("{}-{}", k.binary, i + 1)
+            };
+            let at = tilde(c, home);
+            s.push_str(&format!(
+                "#\n# [[config]]\n# name   = \"{name}\"\n# path   = \"{at}\"\n# target = \"{at}\"\n"
+            ));
         }
         if k.binary == "nvim"
             && let Some(runtime) = nvim_runtime(&f.binary)
         {
+            any = true;
             let r = runtime.display();
             s.push_str(&format!(
                 "#\n# Neovim looks for its runtime at the path it was built with.\n\
-                 # [[inject]]\n# name          = \"nvim-runtime\"\n# config        = \"{r}\"\n# target_config = \"{r}\"\n"
+                 # [[config]]\n# name   = \"nvim-runtime\"\n# path   = \"{r}\"\n# target = \"{r}\"\n"
             ));
         }
+    }
+    if !any {
+        s.push_str("#\n# [[config]]\n# name   = \"nvim\"\n# path   = \"~/.config/nvim\"\n# target = \"~/.config/nvim\"\n");
     }
     s.push_str(
         "\n# ── Session ──────────────────────────────────────────────────────────\n\
@@ -254,15 +270,23 @@ mod tests {
         }];
         let text = render(&found, home);
         assert!(text.starts_with("#:schema "));
-        assert!(text.contains("# binary = \"/usr/bin/nvim\""));
-        assert!(text.contains("# config = \"~/.config/nvim\""));
+        assert!(text.contains("# path = \"/usr/bin/nvim\""));
+        assert!(text.contains("# path   = \"~/.config/nvim\""));
         let cfg = crate::config::Config::parse(&text, Path::new("/x/config.toml")).unwrap();
-        assert!(cfg.inject.is_empty());
+        assert!(cfg.binaries.is_empty() && cfg.configs.is_empty());
 
-        // Uncommenting a block gives a valid entry.
-        let uncommented = text.replace("# [[inject]]\n# name   = \"nvim\"\n# binary = \"/usr/bin/nvim\"\n# config = \"~/.config/nvim\"", "[[inject]]\nname   = \"nvim\"\nbinary = \"/usr/bin/nvim\"\nconfig = \"~/.config/nvim\"");
+        // Uncommenting a block gives a valid entry, of each kind.
+        let uncommented = text
+            .replace(
+                "# [[binary]]\n# name = \"nvim\"\n# path = \"/usr/bin/nvim\"",
+                "[[binary]]\nname = \"nvim\"\npath = \"/usr/bin/nvim\"",
+            )
+            .replace(
+                "# [[config]]\n# name   = \"nvim\"\n# path   = \"~/.config/nvim\"\n# target = \"~/.config/nvim\"",
+                "[[config]]\nname = \"nvim\"\npath = \"~/.config/nvim\"\ntarget = \"~/.config/nvim\"",
+            );
         let cfg = crate::config::Config::parse(&uncommented, Path::new("/x/config.toml")).unwrap();
-        assert_eq!(cfg.inject.len(), 1);
+        assert_eq!((cfg.binaries.len(), cfg.configs.len()), (1, 1));
     }
 
     #[test]

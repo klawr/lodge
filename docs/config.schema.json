@@ -1,5 +1,62 @@
 {
   "$defs": {
+    "BinaryEntry": {
+      "additionalProperties": false,
+      "description": "A program to inject: the binary, relinked, with its libraries.",
+      "properties": {
+        "copy_deps": {
+          "default": true,
+          "description": "Pack the shared libraries `ldd` finds for the binary (default: true).",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "Identifier, unique among the binaries; the binary's name in the bundle.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Host path to the binary.",
+          "type": "string"
+        },
+        "target": {
+          "description": "Where to put an extra wrapper script that runs the binary (default: none:\nthe binary is on the `PATH` of the sessions lodge opens).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "path"
+      ],
+      "type": "object"
+    },
+    "ConfigEntry": {
+      "additionalProperties": false,
+      "description": "A config file or directory to inject.",
+      "properties": {
+        "name": {
+          "description": "Identifier, unique among the configs; its name in the bundle, and the\ndefault place in the container.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Host path to the file or directory.",
+          "type": "string"
+        },
+        "target": {
+          "description": "Where it goes in the container (default: `~/.config/<name>`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "path"
+      ],
+      "type": "object"
+    },
     "GitConfig": {
       "additionalProperties": false,
       "properties": {
@@ -14,52 +71,6 @@
           "type": "array"
         }
       },
-      "type": "object"
-    },
-    "Injectable": {
-      "additionalProperties": false,
-      "properties": {
-        "binary": {
-          "description": "Host path to the binary to inject.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "config": {
-          "description": "Host path to a config file or directory to inject.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "copy_deps": {
-          "default": true,
-          "description": "Pack the shared libraries `ldd` finds for the binary (default: true).",
-          "type": "boolean"
-        },
-        "name": {
-          "description": "Identifier; used for default paths.",
-          "type": "string"
-        },
-        "target_binary": {
-          "description": "Where to put an extra wrapper script that runs the binary (default: none:\nthe binary is on the `PATH` of the sessions lodge opens).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "target_config": {
-          "description": "Where the config goes in the container (default: `~/.config/<name>`).",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "name"
-      ],
       "type": "object"
     },
     "RawAs": {
@@ -154,13 +165,29 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
+    "binary": {
+      "default": [],
+      "description": "Programs to inject, each with the shared libraries it needs.",
+      "items": {
+        "$ref": "#/$defs/BinaryEntry"
+      },
+      "type": "array"
+    },
     "bundle": {
       "default": null,
-      "description": "A bundle to inject from instead of packing the `[[inject]]` entries: a\nfile, or a registry as `oci://ghcr.io/me/lodge:1`. A relative file path is\nrelative to this file's folder.",
+      "description": "A bundle to inject from instead of packing the `[[binary]]` and `[[config]]`\nentries: a file, or a registry as `oci://ghcr.io/me/lodge:1`. A relative\nfile path is relative to this file's folder.",
       "type": [
         "string",
         "null"
       ]
+    },
+    "config": {
+      "default": [],
+      "description": "Config files and directories to inject.",
+      "items": {
+        "$ref": "#/$defs/ConfigEntry"
+      },
+      "type": "array"
     },
     "git": {
       "$ref": "#/$defs/GitConfig",
@@ -170,14 +197,6 @@
         ]
       },
       "description": "Git settings applied in the container."
-    },
-    "inject": {
-      "default": [],
-      "description": "Tools to inject: a binary, a config file or directory, or both.",
-      "items": {
-        "$ref": "#/$defs/Injectable"
-      },
-      "type": "array"
     },
     "secret": {
       "default": [],

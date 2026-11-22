@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
+pub mod edit;
 pub mod secret;
 
 use crate::shell::{container_path_problem, is_plain_name};
@@ -35,14 +36,17 @@ pub struct Config<S = SecretDecl> {
         schemars(with = "BTreeMap<String, serde_json::Map<String, serde_json::Value>>")
     )]
     pub targets: BTreeMap<String, toml::Table>,
-    /// A bundle to inject from instead of packing the `[[inject]]` entries: a
-    /// file, or a registry as `oci://ghcr.io/me/lodge:1`. A relative file path is
-    /// relative to this file's folder.
+    /// A bundle to inject from instead of packing the `[[binary]]` and `[[config]]`
+    /// entries: a file, or a registry as `oci://ghcr.io/me/lodge:1`. A relative
+    /// file path is relative to this file's folder.
     #[serde(default)]
     pub bundle: Option<String>,
-    /// Tools to inject: a binary, a config file or directory, or both.
-    #[serde(default)]
-    pub inject: Vec<Injectable>,
+    /// Programs to inject, each with the shared libraries it needs.
+    #[serde(default, rename = "binary")]
+    pub binaries: Vec<BinaryEntry>,
+    /// Config files and directories to inject.
+    #[serde(default, rename = "config")]
+    pub configs: Vec<ConfigEntry>,
     /// How the interactive session is opened.
     #[serde(default)]
     pub session: SessionConfig,
@@ -62,7 +66,8 @@ impl<S> Default for Config<S> {
             target: None,
             targets: BTreeMap::new(),
             bundle: None,
-            inject: Vec::new(),
+            binaries: Vec::new(),
+            configs: Vec::new(),
             session: SessionConfig::default(),
             git: GitConfig::default(),
             secret: Vec::new(),
@@ -70,24 +75,35 @@ impl<S> Default for Config<S> {
     }
 }
 
+/// A program to inject: the binary, relinked, with its libraries.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-pub struct Injectable {
-    /// Identifier; used for default paths.
+pub struct BinaryEntry {
+    /// Identifier, unique among the binaries; the binary's name in the bundle.
     pub name: String,
-    /// Host path to the binary to inject.
-    pub binary: Option<PathBuf>,
-    /// Host path to a config file or directory to inject.
-    pub config: Option<PathBuf>,
+    /// Host path to the binary.
+    pub path: PathBuf,
     /// Where to put an extra wrapper script that runs the binary (default: none:
     /// the binary is on the `PATH` of the sessions lodge opens).
-    pub target_binary: Option<String>,
-    /// Where the config goes in the container (default: `~/.config/<name>`).
-    pub target_config: Option<String>,
+    pub target: Option<String>,
     /// Pack the shared libraries `ldd` finds for the binary (default: true).
     #[serde(default = "default_true")]
     pub copy_deps: bool,
+}
+
+/// A config file or directory to inject.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct ConfigEntry {
+    /// Identifier, unique among the configs; its name in the bundle, and the
+    /// default place in the container.
+    pub name: String,
+    /// Host path to the file or directory.
+    pub path: PathBuf,
+    /// Where it goes in the container (default: `~/.config/<name>`).
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -234,7 +250,7 @@ pub const PROJECT_FILE: &str = "lodge.toml";
 
 /// The `[targets.<name>]` table of the project file in `dir`: an empty table when
 /// there is no file or no such table. The file may hold nothing but `targets`, so
-/// a stray key (an `[[inject]]` that would be ignored) is an error and not a
+/// a stray key (a `[[binary]]` that would be ignored) is an error and not a
 /// silent no-op; what is *in* the table is for the target to check.
 pub fn project_target_settings(dir: &Path, name: &str) -> Result<toml::Table> {
     let path = dir.join(PROJECT_FILE);
@@ -304,14 +320,17 @@ impl Config {
             target,
             targets,
             bundle,
-            mut inject,
+            mut binaries,
+            mut configs,
             session,
             git,
             secret,
         } = file;
-        for item in &mut inject {
-            item.binary = item.binary.take().map(expand_tilde);
-            item.config = item.config.take().map(expand_tilde);
+        for item in &mut binaries {
+            item.path = expand_tilde(std::mem::take(&mut item.path));
+        }
+        for item in &mut configs {
+            item.path = expand_tilde(std::mem::take(&mut item.path));
         }
         let secret = secret
             .into_iter()
@@ -327,7 +346,8 @@ impl Config {
             target,
             targets,
             bundle: bundle.map(|b| resolve_reference(path, b)),
-            inject,
+            binaries,
+            configs,
             session,
             git,
             secret,
@@ -337,36 +357,37 @@ impl Config {
     /// What the types can't check: every problem, so they are reported at once.
     fn problems(&self) -> Vec<String> {
         let mut problems = Vec::new();
-        let mut seen = HashSet::new();
-        for item in &self.inject {
-            if item.name.trim().is_empty() {
-                problems.push("an [[inject]] entry has an empty `name`".to_string());
-            } else if !is_plain_name(&item.name) {
-                problems.push(format!(
-                    "[[inject]] `{}` is not usable as a name (letters, digits and `-_.+` only)",
-                    item.name
-                ));
-            } else if !seen.insert(item.name.as_str()) {
-                problems.push(format!(
-                    "[[inject]] `{}` is listed more than once (names must be unique)",
-                    item.name
-                ));
-            }
-            for (key, target) in [
-                ("target_binary", &item.target_binary),
-                ("target_config", &item.target_config),
-            ] {
+        let entries = |kind: &'static str,
+                       list: Vec<(&String, &Option<String>)>,
+                       problems: &mut Vec<String>| {
+            let mut seen = HashSet::new();
+            for (name, target) in list {
+                if name.trim().is_empty() {
+                    problems.push(format!("a [[{kind}]] entry has an empty `name`"));
+                } else if !is_plain_name(name) {
+                    problems.push(format!(
+                        "[[{kind}]] `{name}` is not usable as a name (letters, digits and `-_.+` only)"
+                    ));
+                } else if !seen.insert(name.as_str()) {
+                    problems.push(format!(
+                        "[[{kind}]] `{name}` is listed more than once (names must be unique)"
+                    ));
+                }
                 if let Some(why) = target.as_deref().and_then(container_path_problem) {
-                    problems.push(format!("[[inject]] `{}`: `{key}` {why}", item.name));
+                    problems.push(format!("[[{kind}]] `{name}`: `target` {why}"));
                 }
             }
-            if item.binary.is_none() && item.config.is_none() {
-                problems.push(format!(
-                    "[[inject]] `{}` sets neither `binary` nor `config`, so there is nothing to inject",
-                    item.name
-                ));
-            }
-        }
+        };
+        entries(
+            "binary",
+            self.binaries.iter().map(|b| (&b.name, &b.target)).collect(),
+            &mut problems,
+        );
+        entries(
+            "config",
+            self.configs.iter().map(|c| (&c.name, &c.target)).collect(),
+            &mut problems,
+        );
         problems.extend(secret::problems(&self.secret));
         problems
     }
@@ -425,7 +446,7 @@ mod tests {
     #[test]
     fn empty_config_uses_defaults() {
         let c = parse("").unwrap();
-        assert!(c.inject.is_empty());
+        assert!(c.binaries.is_empty() && c.configs.is_empty());
         assert_eq!(c.session.shell, "/bin/bash");
         assert_eq!(c.git.safe_directories, vec!["*".to_string()]);
     }
@@ -434,9 +455,14 @@ mod tests {
     fn parses_full_config() {
         let c = parse(
             r#"
-            [[inject]]
+            [[binary]]
             name = "nvim"
-            binary = "/usr/bin/nvim"
+            path = "/usr/bin/nvim"
+
+            [[config]]
+            name = "nvim"
+            path = "/home/me/.config/nvim"
+            target = "~/.config/nvim"
 
             [session]
             shell = "/bin/zsh"
@@ -446,9 +472,12 @@ mod tests {
         "#,
         )
         .unwrap();
-        assert_eq!(c.inject.len(), 1);
-        assert_eq!(c.inject[0].name, "nvim");
-        assert!(c.inject[0].copy_deps); // defaults to true
+        assert_eq!(c.binaries.len(), 1);
+        assert_eq!(c.binaries[0].name, "nvim");
+        assert!(c.binaries[0].copy_deps); // defaults to true
+        // A binary and a config are separate entries, and may share a name.
+        assert_eq!(c.configs[0].name, "nvim");
+        assert_eq!(c.configs[0].target.as_deref(), Some("~/.config/nvim"));
         assert_eq!(c.session.shell, "/bin/zsh");
         assert_eq!(c.git.safe_directories, vec!["/work".to_string()]);
     }
@@ -561,15 +590,12 @@ mod tests {
     #[test]
     fn host_paths_expand_the_tilde() {
         let c = parse(
-            "[[inject]]\nname = \"x\"\nbinary = \"~/bin/x\"\n\
+            "[[binary]]\nname = \"x\"\npath = \"~/bin/x\"\n\
              [[secret]]\nname = \"T\"\nfrom = { file = \"~/tok\" }\nas = \"env\"\n",
         )
         .unwrap();
         let home = dirs::home_dir().unwrap();
-        assert_eq!(
-            c.inject[0].binary.as_deref(),
-            Some(home.join("bin/x").as_path())
-        );
+        assert_eq!(c.binaries[0].path.as_path(), home.join("bin/x").as_path());
         assert_eq!(c.secret[0].from, secret::Source::File(home.join("tok")));
     }
 
@@ -577,7 +603,7 @@ mod tests {
     fn a_typo_is_an_error_with_its_line_and_a_suggestion() {
         let err = format!(
             "{:#}",
-            parse("[[inject]]\nname = \"x\"\nbinary = \"/x\"\ncopy_dep = true\n").unwrap_err()
+            parse("[[binary]]\nname = \"x\"\npath = \"/x\"\ncopy_dep = true\n").unwrap_err()
         );
         assert!(err.contains("unknown field `copy_dep`"), "{err}");
         assert!(err.contains("line 4"), "{err}");
@@ -595,11 +621,10 @@ mod tests {
         let err = format!(
             "{:#}",
             parse(
-                "[[inject]]\nname = \"a\"\nbinary = \"/a\"\n\
-                 [[inject]]\nname = \"a\"\nbinary = \"/b\"\n\
-                 [[inject]]\nname = \"c\"\n\
-                 [[inject]]\nname = \"../up\"\nbinary = \"/u\"\n\
-                 [[inject]]\nname = \"t\"\nbinary = \"/t\"\ntarget_config = \"rel/x\"\n\
+                "[[binary]]\nname = \"a\"\npath = \"/a\"\n\
+                 [[binary]]\nname = \"a\"\npath = \"/b\"\n\
+                 [[binary]]\nname = \"../up\"\npath = \"/u\"\n\
+                 [[config]]\nname = \"t\"\npath = \"/t\"\ntarget = \"rel/x\"\n\
                  [[secret]]\nname = \"S\"\nfrom = { env = \"A\", file = \"/b\" }\nas = \"env\"\n\
                  [[secret]]\nname = \"T\"\nfrom = { env = \"A\" }\nas = \"socket\"\n"
             )
@@ -607,9 +632,8 @@ mod tests {
         );
         assert!(err.contains("`a` is listed more than once"), "{err}");
         assert!(err.contains("`../up` is not usable as a name"), "{err}");
-        assert!(err.contains("`c` sets neither"), "{err}");
         assert!(
-            err.contains("`t`: `target_config` must be absolute"),
+            err.contains("[[config]] `t`: `target` must be absolute"),
             "{err}"
         );
         assert!(
@@ -654,9 +678,9 @@ mod tests {
                 .is_empty()
         );
         // A key that would be ignored is refused, and so is a file that is not TOML.
-        std::fs::write(dir.path().join(PROJECT_FILE), "[[inject]]\nname = \"x\"\n").unwrap();
+        std::fs::write(dir.path().join(PROJECT_FILE), "[[binary]]\nname = \"x\"\n").unwrap();
         let err = project_target_settings(dir.path(), "kubernetes").unwrap_err();
-        assert!(err.to_string().contains("`inject` is not allowed"), "{err}");
+        assert!(err.to_string().contains("`binary` is not allowed"), "{err}");
         std::fs::write(dir.path().join(PROJECT_FILE), "= not toml").unwrap();
         assert!(project_target_settings(dir.path(), "kubernetes").is_err());
     }

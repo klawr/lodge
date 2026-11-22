@@ -19,6 +19,13 @@ use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlt
 use crossterm::{cursor, queue};
 use std::io::{self, Write};
 
+/// A key of its own that a list answers to, with what it does for the hints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hotkey {
+    pub key: char,
+    pub label: &'static str,
+}
+
 /// What a keypress asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Key {
@@ -225,7 +232,14 @@ fn plan(height: usize, entries: usize) -> Plan {
 /// The screen as `plan` says: the question, the titles, the entries from `top` on
 /// laid out for `width`, and a line of hints with where the selection is in the
 /// list. Nothing is wider than `width`, so a line never wraps.
-fn frame(question: &str, options: &Table, cursor: &Cursor, plan: &Plan, width: usize) -> Vec<Line> {
+fn frame(
+    question: &str,
+    options: &Table,
+    cursor: &Cursor,
+    plan: &Plan,
+    width: usize,
+    hotkeys: &[Hotkey],
+) -> Vec<Line> {
     // A space at each end of a row.
     let grid = options.grid(width.saturating_sub(2));
     let blank = || Line::of("", Tone::Normal);
@@ -251,13 +265,17 @@ fn frame(question: &str, options: &Table, cursor: &Cursor, plan: &Plan, width: u
     if plan.section_gaps {
         lines.push(blank());
     }
-    lines.push(hints(cursor, width));
+    lines.push(hints(cursor, width, hotkeys));
     lines.into_iter().map(|l| l.clipped(width)).collect()
 }
 
 /// What the keys do, and where the selection is, at the far end when there is room.
-fn hints(cursor: &Cursor, width: usize) -> Line {
-    let keys = " ↑/↓ or j/k move · Enter open · q quit";
+fn hints(cursor: &Cursor, width: usize, hotkeys: &[Hotkey]) -> Line {
+    let mut keys = String::from(" ↑/↓ or j/k move · Enter open");
+    for h in hotkeys {
+        keys.push_str(&format!(" · {} {}", h.key, h.label));
+    }
+    keys.push_str(" · q quit");
     let place = format!("{}/{} ", cursor.at + 1, cursor.len);
     let room = width.saturating_sub(keys.chars().count() + place.chars().count());
     let gap = if room > 0 {
@@ -280,6 +298,8 @@ fn usable_size((columns, rows): (u16, u16)) -> (u16, u16) {
 /// How a pick ended.
 pub enum Picked {
     Chose(usize),
+    /// A hotkey was pressed, with the row that was selected.
+    Key(char, usize),
     Left,
     /// The terminal can't be taken over for single keys; ask some other way.
     NoRawMode,
@@ -313,7 +333,7 @@ impl Drop for RawMode {
 }
 
 /// Shows `options` and lets the person move over them and choose one.
-pub fn pick(question: &str, options: &Table) -> io::Result<Picked> {
+pub fn pick(question: &str, options: &Table, hotkeys: &[Hotkey]) -> io::Result<Picked> {
     if options.is_empty() {
         return Ok(Picked::Left);
     }
@@ -327,17 +347,594 @@ pub fn pick(question: &str, options: &Table) -> io::Result<Picked> {
         let (columns, height) = (usize::from(columns), usize::from(height));
         let plan = plan(height, options.len());
         cursor.fit(plan.rows);
-        let lines = frame(question, options, &cursor, &plan, columns);
+        let lines = frame(question, options, &cursor, &plan, columns, hotkeys);
         draw(&mut err, &lines, columns)?;
         // Anything but a key (a new size, say) only means the next draw fits it.
         let Event::Key(key) = event::read()? else {
             continue;
         };
+        if let KeyCode::Char(c) = key.code
+            && key.kind != KeyEventKind::Release
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && hotkeys.iter().any(|h| h.key == c)
+        {
+            return Ok(Picked::Key(c, cursor.at));
+        }
         let Some(key) = map_key(key) else { continue };
         match cursor.apply(key) {
             Step::Stay => {}
             Step::Chose(i) => return Ok(Picked::Chose(i)),
             Step::Left => return Ok(Picked::Left),
+        }
+    }
+}
+
+/// One thing the person can filter for and mark.
+pub struct Item {
+    /// Whether it is there already: shown marked from the start, and not added again.
+    pub added: bool,
+    /// Which list it is in, as an index into the names `find` is given.
+    pub tab: usize,
+    pub name: String,
+    pub kind: &'static str,
+    pub detail: String,
+}
+
+/// How a search ended.
+pub enum Found {
+    /// The items marked, or the one under the selection when none was.
+    Chose(Vec<usize>),
+    /// Adding as it goes: the item under the selection, to be added now.
+    One(usize),
+    /// A path typed in full (starting with `/`, `~` or `.`), to be used as it is.
+    Path(String),
+    Left,
+    NoRawMode,
+}
+
+/// How well `query` matches `text`: `None` when its letters don't all appear in
+/// order, else a score where more is better. Case is ignored; a match at the
+/// start, at a word, and letters side by side score higher.
+fn score(query: &str, text: &str) -> Option<i64> {
+    let text: Vec<char> = text.to_lowercase().chars().collect();
+    let mut at = 0;
+    let mut total = 0;
+    let mut last: Option<usize> = None;
+    for q in query.to_lowercase().chars() {
+        let found = (at..text.len()).find(|&i| text[i] == q)?;
+        total += 1;
+        if last.is_some_and(|l| l + 1 == found) {
+            total += 3;
+        }
+        if found == 0 || !text[found - 1].is_alphanumeric() {
+            total += 2;
+        }
+        if found == 0 {
+            total += 2;
+        }
+        total -= (found - last.map_or(0, |l| l + 1)) as i64 / 4;
+        last = Some(found);
+        at = found + 1;
+    }
+    // Shorter names beat longer ones that match the same.
+    Some(total * 4 - (text.len() as i64).min(3))
+}
+
+/// The items that match `query`, best first and otherwise in the order given.
+fn rank(items: &[Item], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..items.len()).collect();
+    }
+    let mut hits: Vec<(i64, usize)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, it)| {
+            let by_name = score(query, &it.name);
+            let by_detail = score(query, &it.detail).map(|s| s - 8);
+            by_name.max(by_detail).map(|s| (s, i))
+        })
+        .collect();
+    hits.sort_by_key(|&(s, i)| (std::cmp::Reverse(s), i));
+    hits.into_iter().map(|(_, i)| i).collect()
+}
+
+/// A row of the result: an item, or the path typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Row {
+    Item(usize),
+    Path(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FKey {
+    Type(char),
+    Backspace,
+    ClearAll,
+    Up,
+    Down,
+    /// To the previous or next list.
+    Prev,
+    Next,
+    Mark,
+    Accept,
+    Leave,
+}
+
+fn map_find_key(event: KeyEvent) -> Option<FKey> {
+    if event.kind == KeyEventKind::Release {
+        return None;
+    }
+    let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
+    Some(match event.code {
+        KeyCode::Up => FKey::Up,
+        KeyCode::Down => FKey::Down,
+        KeyCode::Tab => FKey::Mark,
+        KeyCode::Left => FKey::Prev,
+        KeyCode::Right => FKey::Next,
+        KeyCode::Enter => FKey::Accept,
+        KeyCode::Esc => FKey::Leave,
+        KeyCode::Backspace => FKey::Backspace,
+        KeyCode::Char('c' | 'd') if ctrl => FKey::Leave,
+        KeyCode::Char('p') if ctrl => FKey::Up,
+        KeyCode::Char('n') if ctrl => FKey::Down,
+        KeyCode::Char('u') if ctrl => FKey::ClearAll,
+        KeyCode::Char(c) if !ctrl => FKey::Type(c),
+        _ => return None,
+    })
+}
+
+/// The state of a search: what was typed, what is marked, which row is selected.
+struct Finder {
+    query: String,
+    marked: std::collections::BTreeSet<usize>,
+    /// The list being looked at, of `tabs`.
+    tab: usize,
+    tabs: usize,
+    rows: Vec<Row>,
+    cursor: Cursor,
+    /// Whether Enter acts on the item at once, and marks it so it is not added
+    /// twice, instead of ending the search with what is marked.
+    adding: bool,
+}
+
+impl Finder {
+    fn new(items: &[Item], tabs: usize) -> Self {
+        let mut f = Finder {
+            query: String::new(),
+            marked: Default::default(),
+            tab: 0,
+            tabs: tabs.max(1),
+            rows: Vec::new(),
+            cursor: Cursor::new(0),
+            adding: false,
+        };
+        f.marked = (0..items.len()).filter(|&i| items[i].added).collect();
+        f.refresh(items);
+        f
+    }
+
+    fn refresh(&mut self, items: &[Item]) {
+        let mut rows = Vec::new();
+        if self.query.starts_with(['/', '~', '.']) {
+            rows.push(Row::Path(self.query.clone()));
+        }
+        rows.extend(
+            rank(items, &self.query)
+                .into_iter()
+                .filter(|&i| items[i].tab == self.tab)
+                .map(Row::Item),
+        );
+        self.cursor = Cursor::new(rows.len());
+        self.rows = rows;
+    }
+
+    /// How many items of each list match what was typed.
+    fn counts(&self, items: &[Item]) -> Vec<usize> {
+        let mut counts = vec![0; self.tabs];
+        for i in rank(items, &self.query) {
+            counts[items[i].tab] += 1;
+        }
+        counts
+    }
+
+    /// `Some` when the search is over.
+    fn apply(&mut self, key: FKey, items: &[Item]) -> Option<Found> {
+        match key {
+            FKey::Type(c) => {
+                self.query.push(c);
+                self.refresh(items);
+            }
+            FKey::Backspace => {
+                self.query.pop();
+                self.refresh(items);
+            }
+            FKey::ClearAll => {
+                self.query.clear();
+                self.refresh(items);
+            }
+            FKey::Prev | FKey::Next => {
+                self.tab = if key == FKey::Next {
+                    (self.tab + 1) % self.tabs
+                } else {
+                    (self.tab + self.tabs - 1) % self.tabs
+                };
+                self.refresh(items);
+            }
+            FKey::Accept | FKey::Mark if self.adding => match self.rows.get(self.cursor.at)? {
+                Row::Item(i) if !self.marked.contains(i) => return Some(Found::One(*i)),
+                Row::Item(_) => {}
+                Row::Path(p) => return Some(Found::Path(p.clone())),
+            },
+            FKey::Up | FKey::Down if self.rows.is_empty() => {}
+            FKey::Up => {
+                self.cursor.apply(Key::Up);
+            }
+            FKey::Down => {
+                self.cursor.apply(Key::Down);
+            }
+            FKey::Mark => {
+                if let Some(Row::Item(i)) = self.rows.get(self.cursor.at) {
+                    if !self.marked.remove(i) {
+                        self.marked.insert(*i);
+                    }
+                    self.cursor.apply(Key::Down);
+                }
+            }
+            FKey::Accept => {
+                if !self.marked.is_empty() {
+                    return Some(Found::Chose(self.marked.iter().copied().collect()));
+                }
+                match self.rows.get(self.cursor.at)? {
+                    Row::Item(i) => return Some(Found::Chose(vec![*i])),
+                    Row::Path(p) => return Some(Found::Path(p.clone())),
+                }
+            }
+            FKey::Leave => return Some(Found::Left),
+        }
+        None
+    }
+}
+
+/// The screen of a search: the question, the query, the rows from the top of
+/// the window, and the hints. Nothing is wider than `width`.
+fn find_frame(
+    question: &str,
+    tabs: &[&str],
+    items: &[Item],
+    finder: &Finder,
+    status: &str,
+    rows: usize,
+    width: usize,
+) -> Vec<Line> {
+    let counts = finder.counts(items);
+    let mut heads = vec![Span::new(" ", Tone::Normal)];
+    for (i, name) in tabs.iter().enumerate() {
+        let tone = if i == finder.tab {
+            Tone::Strong
+        } else {
+            Tone::Muted
+        };
+        let text = if i == finder.tab {
+            format!("[{name} {}]", counts[i])
+        } else {
+            format!(" {name} {} ", counts[i])
+        };
+        heads.push(Span::new(text, tone));
+        heads.push(Span::new(" ", Tone::Normal));
+    }
+    let mut lines = vec![
+        Line {
+            spans: vec![
+                Span::new(format!(" {question}"), Tone::Strong),
+                Span::new(if status.is_empty() { "" } else { "  " }, Tone::Normal),
+                Span::new(status, Tone::Accent),
+            ],
+            selected: false,
+        },
+        Line {
+            spans: heads,
+            selected: false,
+        },
+        Line {
+            spans: vec![
+                Span::new(" > ", Tone::Muted),
+                Span::new(finder.query.clone(), Tone::Normal),
+                Span::new("▏", Tone::Accent),
+            ],
+            selected: false,
+        },
+    ];
+    let shown = finder
+        .rows
+        .iter()
+        .enumerate()
+        .skip(finder.cursor.top)
+        .take(rows);
+    for (at, row) in shown {
+        let cells = match row {
+            Row::Item(i) => {
+                let item = &items[*i];
+                let mark = if finder.marked.contains(i) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                vec![
+                    Span::new(mark, Tone::Muted),
+                    Span::new(item.name.clone(), Tone::Strong),
+                    Span::new(item.kind, Tone::Accent),
+                    Span::new(item.detail.clone(), Tone::Muted),
+                ]
+            }
+            Row::Path(p) => vec![
+                Span::new("   ", Tone::Muted),
+                Span::new(format!("add {p}"), Tone::Strong),
+                Span::new("path", Tone::Accent),
+            ],
+        };
+        lines.push(Line::row(cells.into_iter(), at == finder.cursor.at));
+    }
+    let marked = if finder.marked.is_empty() {
+        String::new()
+    } else if finder.adding {
+        format!(" · {} in the config", finder.marked.len())
+    } else {
+        format!(" · {} marked", finder.marked.len())
+    };
+    let keys = if finder.adding {
+        format!(" type to filter · ←/→ list · ↑/↓ move · Enter add · Esc done{marked}")
+    } else {
+        format!(" type to filter · ←/→ list · ↑/↓ move · Tab mark · Enter add · Esc back{marked}")
+    };
+    let place = format!(
+        "{}/{} ",
+        finder.rows.len().min(finder.cursor.at + 1),
+        finder.rows.len()
+    );
+    let gap = width.saturating_sub(keys.chars().count() + place.chars().count());
+    lines.push(Line::of(
+        format!("{keys}{}{place}", " ".repeat(gap)),
+        Tone::Muted,
+    ));
+    lines.into_iter().map(|l| l.clipped(width)).collect()
+}
+
+/// A list that narrows as the person types, where several things can be marked.
+pub fn find(question: &str, tabs: &[&str], items: &[Item]) -> io::Result<Found> {
+    let Ok(_raw) = RawMode::enter() else {
+        return Ok(Found::NoRawMode);
+    };
+    let mut err = io::stderr();
+    let mut finder = Finder::new(items, tabs.len());
+    loop {
+        let (columns, height) = usable_size(terminal::size()?);
+        let (columns, height) = (usize::from(columns), usize::from(height));
+        let rows = height.saturating_sub(5).max(1);
+        finder.cursor.fit(rows);
+        draw(
+            &mut err,
+            &find_frame(question, tabs, items, &finder, "", rows, columns),
+            columns,
+        )?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        let Some(key) = map_find_key(key) else {
+            continue;
+        };
+        if let Some(done) = finder.apply(key, items) {
+            return Ok(done);
+        }
+    }
+}
+
+/// What was chosen while adding.
+pub enum Pick {
+    Item(usize),
+    /// A path typed in full.
+    Path(String),
+}
+
+/// The same search, but Enter adds what is under the selection at once (through
+/// `add`, which says what it did, or why it could not) and marks it, and the search
+/// stays open for the next; Esc ends it. Returns `false` when the terminal can't
+/// do this.
+pub fn find_adding(
+    question: &str,
+    tabs: &[&str],
+    items: &[Item],
+    add: &mut dyn FnMut(Pick) -> Result<String, String>,
+) -> io::Result<bool> {
+    let Ok(_raw) = RawMode::enter() else {
+        return Ok(false);
+    };
+    let mut err = io::stderr();
+    let mut finder = Finder::new(items, tabs.len());
+    finder.adding = true;
+    let mut status = String::new();
+    loop {
+        let (columns, height) = usable_size(terminal::size()?);
+        let (columns, height) = (usize::from(columns), usize::from(height));
+        let rows = height.saturating_sub(5).max(1);
+        finder.cursor.fit(rows);
+        let lines = find_frame(question, tabs, items, &finder, &status, rows, columns);
+        draw(&mut err, &lines, columns)?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        let Some(key) = map_find_key(key) else {
+            continue;
+        };
+        match finder.apply(key, items) {
+            None => {}
+            Some(Found::Left) => return Ok(true),
+            Some(Found::One(i)) => match add(Pick::Item(i)) {
+                Ok(done) => {
+                    finder.marked.insert(i);
+                    // On to the next, so adding several is Enter, Enter, Enter.
+                    if finder.rows.len() > 1 {
+                        finder.cursor.apply(Key::Down);
+                    }
+                    status = format!("✓ {done}");
+                }
+                Err(why) => status = format!("✗ {why}"),
+            },
+            Some(Found::Path(typed)) => match add(Pick::Path(typed)) {
+                Ok(done) => {
+                    finder.query.clear();
+                    finder.refresh(items);
+                    status = format!("✓ {done}");
+                }
+                Err(why) => status = format!("✗ {why}"),
+            },
+            Some(_) => {}
+        }
+    }
+}
+
+/// One line of a [`Doc`] and how much it matters.
+pub struct DocLine {
+    pub text: String,
+    pub tone: Tone,
+}
+
+impl DocLine {
+    pub fn new(text: impl Into<String>, tone: Tone) -> Self {
+        DocLine {
+            text: text.into(),
+            tone,
+        }
+    }
+}
+
+/// Text to look at, some of whose lines can be selected: the fields of the
+/// config's entries.
+pub struct Doc {
+    pub lines: Vec<DocLine>,
+    /// The lines that can be selected, as indexes into `lines`, in order.
+    pub stops: Vec<usize>,
+}
+
+/// The first line shown, moving `top` no more than it takes for the selected
+/// line to be in view; the first stop shows from the top of the text, the last to
+/// its end, so what comes before and after them can be read.
+fn view_top(doc: &Doc, at: usize, top: usize, rows: usize) -> usize {
+    let most = doc.lines.len().saturating_sub(rows);
+    let Some(&line) = doc.stops.get(at) else {
+        return top.min(most);
+    };
+    let mut top = top.min(most);
+    if line < top {
+        top = line;
+    } else if line >= top + rows {
+        top = line + 1 - rows;
+    }
+    if at == 0 && line < rows {
+        top = 0;
+    }
+    if at + 1 == doc.stops.len() && line >= most {
+        top = most;
+    }
+    top
+}
+
+/// The hints of a view: what the keys do, over as many lines as the width needs
+/// (each key stays whole), and where the selection is at the far end of the last.
+fn view_hints(doc: &Doc, at: usize, hotkeys: &[Hotkey], width: usize) -> Vec<String> {
+    let mut parts = vec!["↑/↓ j/k move".to_string()];
+    if !doc.stops.is_empty() {
+        parts.push("Enter edit".into());
+    }
+    parts.extend(hotkeys.iter().map(|h| format!("{} {}", h.key, h.label)));
+    parts.push("q back".into());
+    let place = if doc.stops.is_empty() {
+        String::new()
+    } else {
+        format!("{}/{} ", at + 1, doc.stops.len())
+    };
+    let room = width.saturating_sub(place.chars().count() + 1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for part in parts {
+        let joined = if line.is_empty() {
+            format!(" {part}")
+        } else {
+            format!("{line} · {part}")
+        };
+        if joined.chars().count() > room && !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+            line = format!(" {part}");
+        } else {
+            line = joined;
+        }
+    }
+    let gap = width.saturating_sub(line.chars().count() + place.chars().count());
+    lines.push(format!("{line}{}{place}", " ".repeat(gap)));
+    lines
+}
+
+/// The screen of a view: the question, the text from `top` with the line of stop
+/// `at` selected, and the hints with which stop it is.
+fn view_frame(
+    question: &str,
+    doc: &Doc,
+    at: usize,
+    top: usize,
+    rows: usize,
+    width: usize,
+    hotkeys: &[Hotkey],
+) -> Vec<Line> {
+    let mut lines = vec![Line::of(format!(" {question}"), Tone::Strong)];
+    let chosen = doc.stops.get(at).copied();
+    for (i, line) in doc.lines.iter().enumerate().skip(top).take(rows) {
+        let span = Span::new(line.text.clone(), line.tone);
+        lines.push(Line::row(std::iter::once(span), Some(i) == chosen));
+    }
+    for hint in view_hints(doc, at, hotkeys, width) {
+        lines.push(Line::of(hint, Tone::Muted));
+    }
+    lines.into_iter().map(|l| l.clipped(width)).collect()
+}
+
+/// Shows `doc` and lets the person move over its selectable lines. Ends with
+/// Enter (the stop selected), a hotkey (and the stop that was selected), or by
+/// leaving.
+pub fn view(question: &str, doc: &Doc, hotkeys: &[Hotkey]) -> io::Result<Picked> {
+    let Ok(_raw) = RawMode::enter() else {
+        return Ok(Picked::NoRawMode);
+    };
+    let mut err = io::stderr();
+    let mut cursor = Cursor::new(doc.stops.len());
+    let mut top = 0;
+    loop {
+        let (columns, height) = usable_size(terminal::size()?);
+        let (columns, height) = (usize::from(columns), usize::from(height));
+        // The question, the hints, and a line left free.
+        let rows = height
+            .saturating_sub(2 + view_hints(doc, cursor.at, hotkeys, columns).len())
+            .max(1);
+        top = view_top(doc, cursor.at, top, rows);
+        let lines = view_frame(question, doc, cursor.at, top, rows, columns, hotkeys);
+        draw(&mut err, &lines, columns)?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if let KeyCode::Char(c) = key.code
+            && key.kind != KeyEventKind::Release
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && hotkeys.iter().any(|h| h.key == c)
+        {
+            return Ok(Picked::Key(c, cursor.at));
+        }
+        match map_key(key) {
+            Some(Key::Leave) => return Ok(Picked::Left),
+            // Nothing to move over, and nothing for Enter to open.
+            _ if doc.stops.is_empty() => {}
+            Some(Key::Choose) => return Ok(Picked::Chose(cursor.at)),
+            Some(key) => {
+                cursor.apply(key);
+            }
+            None => {}
         }
     }
 }
@@ -539,7 +1136,7 @@ mod tests {
     fn the_frame_has_the_question_the_titles_the_entries_and_the_hints() {
         let mut c = Cursor::new(3);
         c.apply(Key::Down);
-        let lines = frame("Where to?", &options(3), &c, &compact(10), 80);
+        let lines = frame("Where to?", &options(3), &c, &compact(10), 80, &[]);
         let text = texts(&lines);
         assert_eq!(text[0], " Where to?");
         assert_eq!(text[1].trim_end(), " NAME");
@@ -559,10 +1156,10 @@ mod tests {
     #[test]
     fn the_hints_put_the_position_at_the_far_end_when_there_is_room_and_drop_it_when_not() {
         let c = Cursor::new(12);
-        let wide = hints(&c, 80).text();
+        let wide = hints(&c, 80, &[]).text();
         assert_eq!(wide.chars().count(), 80);
         assert!(wide.ends_with("1/12 "), "{wide:?}");
-        let tight = hints(&c, 10).text();
+        let tight = hints(&c, 10, &[]).text();
         assert!(tight.starts_with(" ↑/↓"), "{tight:?}");
     }
 
@@ -573,7 +1170,7 @@ mod tests {
             c.apply(Key::Down);
         }
         c.fit(4);
-        let lines = frame("Where to?", &options(20), &c, &compact(4), 80);
+        let lines = frame("Where to?", &options(20), &c, &compact(4), 80, &[]);
         assert_eq!(lines.len(), 7);
         let shown: Vec<String> = texts(&lines)[2..6]
             .iter()
@@ -600,12 +1197,12 @@ mod tests {
             1,
         );
         let c = Cursor::new(1);
-        let wide = texts(&frame("Where to?", &table, &c, &compact(5), 100));
+        let wide = texts(&frame("Where to?", &table, &c, &compact(5), 100, &[]));
         assert!(wide.iter().all(|l| l.chars().count() <= 100), "{wide:?}");
         assert!(wide[2].contains("/home/me/devel/projects/api"), "{wide:?}");
         // The row reaches the far end: the time is the last thing before the margin.
         assert!(wide[2].ends_with("2 h ago "), "{wide:?}");
-        let narrow = texts(&frame("Where to?", &table, &c, &compact(5), 50));
+        let narrow = texts(&frame("Where to?", &table, &c, &compact(5), 50, &[]));
         assert!(narrow.iter().all(|l| l.chars().count() <= 50), "{narrow:?}");
         // The path gave way, and the time at the end of the row is still there.
         assert!(
@@ -625,7 +1222,7 @@ mod tests {
             vec![vec![Cell::new("x".repeat(100), Tone::Normal)]],
             0,
         );
-        let lines = frame("Where to?", &one, &Cursor::new(1), &compact(5), 30);
+        let lines = frame("Where to?", &one, &Cursor::new(1), &compact(5), 30, &[]);
         assert!(
             texts(&lines).iter().all(|l| l.chars().count() <= 30),
             "{:?}",
@@ -730,7 +1327,7 @@ mod tests {
                 section_gaps,
                 rows: 3,
             };
-            let lines = frame("Where to?", &table, &c, &p, 100);
+            let lines = frame("Where to?", &table, &c, &p, 100, &[]);
             assert_eq!(lines.len(), Plan::height(section_gaps, 3), "{section_gaps}");
         }
     }
@@ -742,7 +1339,7 @@ mod tests {
             section_gaps: true,
             rows: 2,
         };
-        let lines = frame("Where to?", &options(2), &Cursor::new(2), &p, 100);
+        let lines = frame("Where to?", &options(2), &Cursor::new(2), &p, 100, &[]);
         let text = texts(&lines);
         assert_eq!(text[0], " Where to?");
         assert_eq!(text[1], "", "a gap after the question: {text:?}");
@@ -767,10 +1364,298 @@ mod tests {
 
     #[test]
     fn the_bar_covers_the_whole_width_not_only_the_text() {
-        let lines = frame("Where to?", &options(2), &Cursor::new(2), &compact(2), 40);
+        let lines = frame(
+            "Where to?",
+            &options(2),
+            &Cursor::new(2),
+            &compact(2),
+            40,
+            &[],
+        );
         let text = drawn(&lines, 40);
         // Reverse video on, the entry, its padding out to column 40, reverse off.
         let bar = format!("\x1b[7m{:<40}\x1b[0m", " entry 1 ");
         assert!(text.contains(&bar), "{text:?}");
+    }
+
+    fn items(names: &[&str]) -> Vec<Item> {
+        names
+            .iter()
+            .map(|n| Item {
+                added: false,
+                tab: 0,
+                name: n.to_string(),
+                kind: "program",
+                detail: format!("/usr/bin/{n}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn typing_narrows_the_list_best_match_first_and_ignores_case() {
+        let list = items(&["bat", "ripgrep", "rg", "fd", "Fzf"]);
+        assert_eq!(rank(&list, ""), vec![0, 1, 2, 3, 4]);
+        // `rg` is a subsequence of both, and the shorter, tighter one is first.
+        assert_eq!(rank(&list, "rg"), vec![2, 1]);
+        assert_eq!(rank(&list, "FZ"), vec![4]);
+        assert!(rank(&list, "zzz").is_empty());
+    }
+
+    fn type_into(f: &mut Finder, list: &[Item], text: &str) {
+        for c in text.chars() {
+            assert!(f.apply(FKey::Type(c), list).is_none());
+        }
+    }
+
+    #[test]
+    fn tab_marks_and_enter_takes_the_marked_or_the_one_selected() {
+        let list = items(&["a", "b", "c"]);
+        let mut f = Finder::new(&list, 1);
+        // Nothing marked: Enter takes what is selected.
+        f.apply(FKey::Down, &list);
+        assert!(matches!(f.apply(FKey::Accept, &list), Some(Found::Chose(v)) if v == [1]));
+        // Marks move the selection on, and are kept while the query changes.
+        let mut f = Finder::new(&list, 1);
+        f.apply(FKey::Mark, &list);
+        f.apply(FKey::Mark, &list);
+        type_into(&mut f, &list, "c");
+        f.apply(FKey::Mark, &list);
+        assert!(matches!(f.apply(FKey::Accept, &list), Some(Found::Chose(v)) if v == [0, 1, 2]));
+    }
+
+    #[test]
+    fn a_path_is_offered_as_it_is_and_nothing_matching_is_not_an_answer() {
+        let list = items(&["a"]);
+        let mut f = Finder::new(&list, 1);
+        type_into(&mut f, &list, "~/.vimrc");
+        assert!(matches!(f.apply(FKey::Accept, &list), Some(Found::Path(p)) if p == "~/.vimrc"));
+        let mut f = Finder::new(&list, 1);
+        type_into(&mut f, &list, "zz");
+        assert!(f.apply(FKey::Accept, &list).is_none());
+        assert!(f.apply(FKey::Down, &list).is_none(), "no rows to move over");
+        f.apply(FKey::ClearAll, &list);
+        assert_eq!(f.rows.len(), 1);
+        assert!(matches!(f.apply(FKey::Leave, &list), Some(Found::Left)));
+    }
+
+    #[test]
+    fn the_search_screen_shows_the_query_the_marks_and_fits_the_width() {
+        let list = items(&["alpha", "beta"]);
+        let mut f = Finder::new(&list, 1);
+        f.apply(FKey::Mark, &list);
+        let lines = find_frame("Add", &["Programs"], &list, &f, "", 5, 100);
+        let text: Vec<String> = lines.iter().map(Line::text).collect();
+        assert!(text[2].starts_with(" > "), "{text:?}");
+        assert!(
+            text[3].contains("[x]") && text[3].contains("alpha"),
+            "{text:?}"
+        );
+        assert!(text[4].contains("[ ]"), "{text:?}");
+        assert!(text.last().unwrap().contains("1 marked"), "{text:?}");
+        assert!(
+            find_frame("Add", &["Programs"], &list, &f, "", 5, 40)
+                .iter()
+                .all(|l| l.width() <= 40)
+        );
+    }
+
+    #[test]
+    fn hotkeys_are_named_in_the_hints() {
+        let c = Cursor::new(3);
+        let keys = [Hotkey {
+            key: 'c',
+            label: "config",
+        }];
+        assert!(hints(&c, 80, &keys).text().contains("c config"));
+    }
+
+    #[test]
+    fn the_lists_are_switched_and_each_shows_only_its_own_and_marks_are_kept() {
+        let mut list = items(&["rg", "fd"]);
+        list.push(Item {
+            added: false,
+            tab: 1,
+            name: "bashrc".into(),
+            kind: "config",
+            detail: "~/.bashrc".into(),
+        });
+        let mut f = Finder::new(&list, 2);
+        assert_eq!(f.rows, vec![Row::Item(0), Row::Item(1)]);
+        f.apply(FKey::Mark, &list);
+        f.apply(FKey::Next, &list);
+        assert_eq!(f.rows, vec![Row::Item(2)]);
+        // The count of each list follows the query, whichever is shown.
+        assert_eq!(f.counts(&list), vec![2, 1]);
+        type_into(&mut f, &list, "rc");
+        assert_eq!(f.counts(&list), vec![0, 1]);
+        f.apply(FKey::ClearAll, &list);
+        f.apply(FKey::Mark, &list);
+        // It goes round, and what was marked in the other list is still marked.
+        f.apply(FKey::Next, &list);
+        assert_eq!(f.tab, 0);
+        assert!(matches!(f.apply(FKey::Accept, &list), Some(Found::Chose(v)) if v == [0, 2]));
+        f.apply(FKey::Prev, &list);
+        assert_eq!(f.tab, 1);
+        let text: Vec<String> = find_frame("Add", &["Programs", "Configs"], &list, &f, "", 5, 100)
+            .iter()
+            .map(Line::text)
+            .collect();
+        assert!(
+            text[1].contains("Programs 2") && text[1].contains("[Configs 1]"),
+            "{text:?}"
+        );
+    }
+
+    fn form() -> Doc {
+        let lines = [
+            ("[[inject]]", Tone::Strong),
+            ("name = \"a\"", Tone::Normal),
+            ("binary = (not set)", Tone::Muted),
+            ("", Tone::Normal),
+            ("[[inject]]", Tone::Strong),
+            ("name = \"b\"", Tone::Normal),
+        ]
+        .map(|(t, tone)| DocLine::new(t, tone))
+        .into();
+        Doc {
+            lines,
+            stops: vec![1, 2, 5],
+        }
+    }
+
+    #[test]
+    fn a_view_selects_the_line_of_the_stop_and_names_which_it_is() {
+        let doc = form();
+        let keys = [Hotkey {
+            key: 'a',
+            label: "add",
+        }];
+        let lines = view_frame("Form", &doc, 1, 0, 20, 70, &keys);
+        let marked: Vec<String> = lines
+            .iter()
+            .filter(|l| l.selected)
+            .map(Line::text)
+            .collect();
+        assert_eq!(marked, vec![" binary = (not set) "]);
+        let hint = lines.last().unwrap().text();
+        assert!(
+            hint.contains("Enter edit") && hint.contains("a add"),
+            "{hint}"
+        );
+        assert!(hint.ends_with("2/3 "), "{hint}");
+        // Nothing to select: no marked line, no Enter, no place.
+        let plain = Doc {
+            lines: form().lines,
+            stops: vec![],
+        };
+        let lines = view_frame("Form", &plain, 0, 0, 20, 70, &[]);
+        assert!(lines.iter().all(|l| !l.selected));
+        assert!(!lines.last().unwrap().text().contains("Enter"));
+    }
+
+    #[test]
+    fn the_view_scrolls_to_the_line_and_shows_the_ends_of_the_text_at_the_ends() {
+        let doc = form();
+        assert_eq!(view_top(&doc, 2, 0, 20), 0);
+        // Three lines of room: the last stop shows to the end of the text.
+        assert_eq!(view_top(&doc, 2, 0, 3), 3);
+        // The first stop shows from the top of the text when it fits there.
+        assert_eq!(view_top(&doc, 0, 3, 4), 0);
+        // A stop above the window is brought into view.
+        assert_eq!(view_top(&doc, 1, 3, 2), 2);
+    }
+
+    #[test]
+    fn when_adding_enter_acts_at_once_marks_the_item_and_does_not_add_it_twice() {
+        let list = items(&["a", "b", "c"]);
+        let mut f = Finder::new(&list, 1);
+        f.adding = true;
+        assert!(matches!(f.apply(FKey::Accept, &list), Some(Found::One(0))));
+        // The caller marks it; Enter on a marked item does nothing, so does Tab on it.
+        f.marked.insert(0);
+        assert!(f.apply(FKey::Accept, &list).is_none());
+        assert!(f.apply(FKey::Mark, &list).is_none());
+        f.apply(FKey::Down, &list);
+        assert!(matches!(f.apply(FKey::Mark, &list), Some(Found::One(1))));
+        // A typed path is added as it is; nothing matching is nothing to add.
+        type_into(&mut f, &list, "~/.vimrc");
+        assert!(matches!(f.apply(FKey::Accept, &list), Some(Found::Path(p)) if p == "~/.vimrc"));
+        f.apply(FKey::ClearAll, &list);
+        type_into(&mut f, &list, "zz");
+        assert!(f.apply(FKey::Accept, &list).is_none());
+        let shown: Vec<String> = find_frame("Add", &["Programs"], &list, &f, "✓ added a", 5, 100)
+            .iter()
+            .map(Line::text)
+            .collect();
+        assert!(
+            shown[0].contains("Add") && shown[0].contains("✓ added a"),
+            "{shown:?}"
+        );
+        assert!(
+            shown.last().unwrap().contains("1 in the config")
+                && shown.last().unwrap().contains("Esc done"),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn items_that_are_there_already_start_marked_and_cannot_be_added_again() {
+        let mut list = items(&["a", "b"]);
+        list[0].added = true;
+        let mut f = Finder::new(&list, 1);
+        f.adding = true;
+        assert!(f.marked.contains(&0) && !f.marked.contains(&1));
+        assert!(f.apply(FKey::Accept, &list).is_none(), "`a` is in already");
+        f.apply(FKey::Down, &list);
+        assert!(matches!(f.apply(FKey::Accept, &list), Some(Found::One(1))));
+        let shown: Vec<String> = find_frame("Add", &["Programs"], &list, &f, "", 5, 100)
+            .iter()
+            .map(Line::text)
+            .collect();
+        assert!(
+            shown[3].contains("[x]") && shown[4].contains("[ ]"),
+            "{shown:?}"
+        );
+        assert!(
+            shown.last().unwrap().contains("1 in the config"),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn the_hints_go_over_a_second_line_when_they_do_not_fit_and_each_key_stays_whole() {
+        let doc = form();
+        let keys = [
+            Hotkey {
+                key: 'b',
+                label: "+binary",
+            },
+            Hotkey {
+                key: 'c',
+                label: "+config",
+            },
+            Hotkey {
+                key: 'P',
+                label: "publish",
+            },
+        ];
+        let wide = view_hints(&doc, 0, &keys, 120);
+        assert_eq!(wide.len(), 1);
+        assert!(
+            wide[0].contains("b +binary") && wide[0].ends_with("1/3 "),
+            "{wide:?}"
+        );
+        let narrow = view_hints(&doc, 0, &keys, 40);
+        assert!(narrow.len() > 1, "{narrow:?}");
+        for line in &narrow {
+            assert!(line.chars().count() <= 40, "{line:?}");
+        }
+        let joined = narrow.join(" ");
+        for key in ["b +binary", "c +config", "P publish", "q back"] {
+            assert!(joined.contains(key), "{key} lost in {narrow:?}");
+        }
+        // The place is at the far end of the last line only.
+        assert!(narrow.last().unwrap().ends_with("1/3 "));
+        assert!(!narrow[0].ends_with("1/3 "));
     }
 }

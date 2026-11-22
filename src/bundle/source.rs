@@ -86,8 +86,10 @@ pub(crate) fn prepare_in(
     let explicit = reference.or(config.bundle.as_deref());
     let prepared = match explicit {
         Some(reference) => {
-            if !config.inject.is_empty() {
-                warning!("a bundle is in use, so the [[inject]] entries in the config are ignored");
+            if !config.binaries.is_empty() || !config.configs.is_empty() {
+                warning!(
+                    "a bundle is in use, so the [[binary]] and [[config]] entries in the config are ignored"
+                );
             }
             from_store(root, stores, reference)?
         }
@@ -237,7 +239,7 @@ fn live(root: &Path, config: &Config, tools: &Toolchain) -> Result<Prepared> {
 /// A fingerprint of everything a live pack depends on. Packing is skipped when it
 /// is unchanged.
 ///
-/// [`pack::build`] reads the `[[inject]]` entries and `[git]`, and the files they
+/// [`pack::build`] reads the `[[binary]]` and `[[config]]` entries and `[git]`, and the files they
 /// name. The entries and settings go in whole, serialized, so a
 /// setting added to them later counts without anyone remembering to list it
 /// here; the files go in by size, mtime and mode.
@@ -248,21 +250,20 @@ fn inputs_fingerprint(config: &Config, deps: &mut deps::Resolver<'_>) -> Result<
         .field(host.to_string().as_bytes());
 
     let mut parts = Vec::new();
-    for item in &config.inject {
+    for item in &config.binaries {
         parts.push(serde_json::to_string(item)?);
-        if let Some(binary) = &item.binary {
-            // Before ldd, which cannot inspect a binary for another architecture.
-            elf::check_arch(&item.name, binary, host)?;
-            parts.push(stat_line(binary)?);
-            if item.copy_deps {
-                for lib in &deps.resolve(&binary.to_string_lossy())?.libs {
-                    parts.push(stat_line(lib)?);
-                }
+        // Before ldd, which cannot inspect a binary for another architecture.
+        elf::check_arch(&item.name, &item.path, host)?;
+        parts.push(stat_line(&item.path)?);
+        if item.copy_deps {
+            for lib in &deps.resolve(&item.path.to_string_lossy())?.libs {
+                parts.push(stat_line(lib)?);
             }
         }
-        if let Some(cfg) = &item.config {
-            stat_tree(cfg, &mut parts)?;
-        }
+    }
+    for item in &config.configs {
+        parts.push(serde_json::to_string(item)?);
+        stat_tree(&item.path, &mut parts)?;
     }
     parts.push(serde_json::to_string(&config.git)?);
 
@@ -318,7 +319,7 @@ mod tests {
     use super::*;
     use crate::bundle::store::fake::FakeStore;
     use crate::bundle::store::{FileStore, OciStore};
-    use crate::config::Injectable;
+    use crate::config::BinaryEntry;
     use crate::tmpfile::TempDir;
     use crate::tools::{self, FakeRegistry, Ldd};
     use std::sync::Arc;
@@ -335,22 +336,20 @@ mod tests {
         std::fs::read(out).unwrap()
     }
 
-    fn script_tool(dir: &Path, name: &str, body: &str) -> Injectable {
+    fn script_tool(dir: &Path, name: &str, body: &str) -> BinaryEntry {
         let bin = dir.join(format!("{name}-src"));
         std::fs::write(&bin, body).unwrap();
-        Injectable {
+        BinaryEntry {
             name: name.into(),
-            binary: Some(bin),
-            config: None,
-            target_binary: None,
-            target_config: None,
+            path: bin,
+            target: None,
             copy_deps: false,
         }
     }
 
-    fn config(inject: Vec<Injectable>) -> Config {
+    fn config(binaries: Vec<BinaryEntry>) -> Config {
         Config {
-            inject,
+            binaries,
             ..Config::default()
         }
     }
@@ -374,7 +373,7 @@ mod tests {
         let work = TempDir::new("src2").unwrap();
         let cache = TempDir::new("cache2").unwrap();
         let tool = script_tool(work.path(), "t", "#!/bin/sh\necho 1\n");
-        let source = tool.binary.clone().unwrap();
+        let source = tool.path.clone();
         let cfg = config(vec![tool]);
 
         let first = prepare_in(cache.path(), &cfg, None, &files(), &tools::external()).unwrap();
@@ -390,12 +389,16 @@ mod tests {
     fn a_change_in_the_config_tree_is_noticed() {
         let work = TempDir::new("src3").unwrap();
         let cache = TempDir::new("cache3").unwrap();
-        let mut tool = script_tool(work.path(), "t", "#!/bin/sh\n");
+        let tool = script_tool(work.path(), "t", "#!/bin/sh\n");
         let cfg_dir = work.path().join("cfgdir");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         std::fs::write(cfg_dir.join("rc"), "a").unwrap();
-        tool.config = Some(cfg_dir.clone());
-        let cfg = config(vec![tool]);
+        let mut cfg = config(vec![tool]);
+        cfg.configs.push(crate::config::ConfigEntry {
+            name: "t".into(),
+            path: cfg_dir.clone(),
+            target: None,
+        });
 
         let first = prepare_in(cache.path(), &cfg, None, &files(), &tools::external()).unwrap();
         std::fs::write(cfg_dir.join("added"), "new file").unwrap();
@@ -408,20 +411,14 @@ mod tests {
     fn every_setting_of_an_entry_is_part_of_the_fingerprint() {
         let work = TempDir::new("src7").unwrap();
         let base = || script_tool(work.path(), "t", "#!/bin/sh\n");
-        let key = |item: Injectable| {
+        let key = |item: BinaryEntry| {
             inputs_fingerprint(&config(vec![item]), &mut deps::Resolver::new(&Ldd)).unwrap()
         };
         let plain = key(base());
         // (`copy_deps` too, but turning it on asks ldd about the binary.)
-        let changes: [fn(&mut Injectable); 2] = [
-            |i| i.target_binary = Some("/opt/t".into()),
-            |i| i.target_config = Some("~/.t".into()),
-        ];
-        for change in changes {
-            let mut item = base();
-            change(&mut item);
-            assert_ne!(key(item), plain);
-        }
+        let mut item = base();
+        item.target = Some("/opt/t".into());
+        assert_ne!(key(item), plain);
     }
 
     #[test]

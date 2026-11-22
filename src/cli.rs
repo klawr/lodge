@@ -14,7 +14,10 @@ use std::path::PathBuf;
         hooks, injects your environment on top, and forwards container ports to the host.\n\n\
         Run `ldg` alone to pick up where you left off: it lists the projects and \
         containers you opened sessions in, most recent first, and takes you back \
-        into the one you choose, the same way you got there.\n\n\
+        into the one you choose, the same way you got there. On a row, `r` opens it \
+        and injects again, and `b` recreates a project's container (after asking); \
+        `c` opens the config: browse what is injected, add programs and configs from \
+        a list, remove one.\n\n\
         New here? `ldg init` writes a starting config, `ldg doctor` checks the host.",
     after_help = "Docs: https://github.com/klawr/lodge#readme"
 )]
@@ -74,6 +77,70 @@ pub enum BundleCommand {
         /// The bundle: a file, or an `oci://` reference (fetched, not cached)
         #[arg(value_name = "FILE|oci://REF")]
         reference: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AddCommand {
+    /// Add a program: its binary and the libraries it needs
+    #[command(
+        long_about = "Add a [[binary]] entry to the config file. Without a PATH, the program \
+            called NAME on the PATH of this shell is used."
+    )]
+    Binary {
+        /// Name of the entry, and of the binary in the bundle
+        name: String,
+        /// Host path of the binary (default: NAME, looked up on PATH)
+        path: Option<PathBuf>,
+        /// Also write a wrapper script that runs the binary here in the container
+        #[arg(long, value_name = "PATH")]
+        target: Option<String>,
+        /// Do not pack the shared libraries of the binary
+        #[arg(long)]
+        no_deps: bool,
+    },
+    /// Add a config file or directory
+    #[command(long_about = "Add a [[config]] entry to the config file.")]
+    Config {
+        /// Name of the entry; also the default place, `~/.config/<NAME>`
+        name: String,
+        /// Host path of the file or directory
+        path: PathBuf,
+        /// Where it goes in the container (default: `~/.config/<NAME>`)
+        #[arg(long, value_name = "PATH")]
+        target: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RemoveCommand {
+    /// Remove a program
+    Binary {
+        /// Name of the entry
+        name: String,
+    },
+    /// Remove a config file or directory
+    Config {
+        /// Name of the entry
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum InjectCommand {
+    /// List the entries in the config (the default)
+    #[command(alias = "list")]
+    Ls,
+    /// Add a program or a config to what is injected
+    Add {
+        #[command(subcommand)]
+        what: AddCommand,
+    },
+    /// Remove a program or a config from what is injected
+    #[command(alias = "remove")]
+    Rm {
+        #[command(subcommand)]
+        what: RemoveCommand,
     },
 }
 
@@ -212,7 +279,7 @@ pub enum Command {
     },
     /// Pack your tools and configs into a portable bundle
     #[command(
-        long_about = "Build a bundle from the [[inject]] entries and [git] settings \
+        long_about = "Build a bundle from the [[binary]] and [[config]] entries and [git] settings \
             in your config: your binaries relinked to a bundled glibc, their libraries, \
             and your configs, in one tar. This is the only step that needs ldd and \
             patchelf, and it must run on a Linux machine of the architecture the bundle \
@@ -232,6 +299,19 @@ pub enum Command {
         #[arg(long)]
         no_clobber: bool,
     },
+    /// Add or remove the tools and configs that are injected
+    #[command(
+        long_about = "Edit the [[binary]] and [[config]] entries of the config file (the global \
+            -c FILE, or ~/.config/lodge/config.toml) without opening it: \
+            `ldg inject add binary rg`, `ldg inject add config nvim ~/.config/nvim`, \
+            `ldg inject rm binary rg`. Comments in the file are kept. A bundle set with \
+            `bundle =` replaces the entries, so changing them does nothing until you pack \
+            again or drop that line."
+    )]
+    Inject {
+        #[command(subcommand)]
+        command: Option<InjectCommand>,
+    },
     /// Work with bundle files
     Bundle {
         #[command(subcommand)]
@@ -246,7 +326,7 @@ pub enum Command {
     #[command(
         long_about = "Write a commented config.toml (at ~/.config/lodge/config.toml, or the \
             file given with -c). Editors and tools found on PATH (nvim, hx, rg, fzf, …) \
-            are added as [[inject]] entries, commented out, so you pick what to bring. \
+            are added as [[binary]] and [[config]] entries, commented out, so you pick what to bring. \
             Refuses to overwrite an existing file unless --force."
     )]
     Init {

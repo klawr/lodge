@@ -14,30 +14,160 @@ use super::table::Table;
 use crate::devcontainer::Prompt;
 use crate::output::{line_err, note, prompt, warning};
 
+pub use super::select::{Doc, DocLine, Hotkey, Item, Pick};
+
+/// How a question with hotkeys was answered.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Choice {
+    Row(usize),
+    /// A hotkey, with the row that was selected when it was pressed.
+    Key(char, usize),
+    Left,
+}
+
+/// What came of looking through a list of things.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Selection {
+    /// The indexes of the items chosen.
+    Items(Vec<usize>),
+    /// A path typed in full.
+    Path(String),
+    Left,
+    /// The terminal can't do this; ask for what is wanted in words instead.
+    Unsupported,
+}
+
 /// Asks the person to pick one of a few things.
 pub trait Choose {
     /// The index of the option picked, or `None` when the person declines. An
     /// error when there is nobody to ask.
     fn choose(&self, question: &str, options: &Table) -> Result<Option<usize>>;
+
+    /// The same, with keys of their own: pressing one answers at once. Without a
+    /// terminal that gives single keys there are no hotkeys, and the answer is
+    /// a row or nothing.
+    fn choose_with(&self, question: &str, options: &Table, _hotkeys: &[Hotkey]) -> Result<Choice> {
+        Ok(match self.choose(question, options)? {
+            Some(i) => Choice::Row(i),
+            None => Choice::Left,
+        })
+    }
+
+    /// Shows `doc` and lets the person move over its blocks, with hotkeys as in
+    /// [`Choose::choose_with`] (the row of a key, and of Enter, is the line selected, counted over those that can be). `None`
+    /// when the terminal can't show it: the caller asks some other way.
+    fn view(&self, _title: &str, _doc: &Doc, _hotkeys: &[Hotkey]) -> Result<Option<Choice>> {
+        Ok(None)
+    }
+
+    /// Looks through `items` like [`Choose::find`], but each thing chosen is added at
+    /// once through `add` (which says what it did, or why it could not), marked in
+    /// the list, and the search stays open for the next. `false` when the terminal
+    /// can't do this: the caller asks some other way.
+    fn find_adding(
+        &self,
+        _question: &str,
+        _tabs: &[&str],
+        _items: &[Item],
+        _add: &mut dyn FnMut(Pick) -> Result<String, String>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Looks through `items`, in lists named `tabs` that the person switches
+    /// between, narrowing them as they type, and returns the ones marked.
+    fn find(&self, _question: &str, _tabs: &[&str], _items: &[Item]) -> Result<Selection> {
+        Ok(Selection::Unsupported)
+    }
+}
+
+/// Asks the person to type something.
+pub trait Ask {
+    /// The line typed, trimmed; `None` when it is empty or the input ended, which
+    /// is how a question is declined. An error when there is nobody to ask.
+    fn ask(&self, question: &str) -> Result<Option<String>>;
+}
+
+impl Ask for Terminal {
+    fn ask(&self, question: &str) -> Result<Option<String>> {
+        if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+            bail!("cannot ask \"{question}\" without a terminal");
+        }
+        prompt!("{question} > ");
+        let mut line = String::new();
+        io::stdin().lock().read_line(&mut line)?;
+        let line = line.trim();
+        Ok((!line.is_empty()).then(|| line.to_string()))
+    }
 }
 
 /// Asks on the terminal; without one, takes the safe default (or, for a question
 /// with no safe default, says there is nobody to ask).
 pub struct Terminal;
 
-impl Choose for Terminal {
-    fn choose(&self, question: &str, options: &Table) -> Result<Option<usize>> {
+impl Terminal {
+    fn check(question: &str) -> Result<()> {
         if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
             bail!("cannot ask \"{question}\" without a terminal");
         }
-        match select::pick(question, options)? {
-            select::Picked::Chose(i) => Ok(Some(i)),
-            select::Picked::Left => Ok(None),
+        Ok(())
+    }
+}
+
+impl Choose for Terminal {
+    fn choose(&self, question: &str, options: &Table) -> Result<Option<usize>> {
+        Ok(match self.choose_with(question, options, &[])? {
+            Choice::Row(i) => Some(i),
+            _ => None,
+        })
+    }
+
+    fn choose_with(&self, question: &str, options: &Table, hotkeys: &[Hotkey]) -> Result<Choice> {
+        Self::check(question)?;
+        match select::pick(question, options, hotkeys)? {
+            select::Picked::Chose(i) => Ok(Choice::Row(i)),
+            select::Picked::Key(c, at) => Ok(Choice::Key(c, at)),
+            select::Picked::Left => Ok(Choice::Left),
             // A terminal that can't give single keys (`TERM=dumb`): type a number.
-            select::Picked::NoRawMode => {
-                choose_from(question, &options.natural(), &mut io::stdin().lock())
-            }
+            select::Picked::NoRawMode => Ok(
+                match choose_from(question, &options.natural(), &mut io::stdin().lock())? {
+                    Some(i) => Choice::Row(i),
+                    None => Choice::Left,
+                },
+            ),
         }
+    }
+
+    fn view(&self, title: &str, doc: &Doc, hotkeys: &[Hotkey]) -> Result<Option<Choice>> {
+        Self::check(title)?;
+        Ok(match select::view(title, doc, hotkeys)? {
+            select::Picked::Key(c, at) => Some(Choice::Key(c, at)),
+            select::Picked::Chose(at) => Some(Choice::Row(at)),
+            select::Picked::Left => Some(Choice::Left),
+            select::Picked::NoRawMode => None,
+        })
+    }
+
+    fn find_adding(
+        &self,
+        question: &str,
+        tabs: &[&str],
+        items: &[Item],
+        add: &mut dyn FnMut(Pick) -> Result<String, String>,
+    ) -> Result<bool> {
+        Self::check(question)?;
+        Ok(select::find_adding(question, tabs, items, add)?)
+    }
+
+    fn find(&self, question: &str, tabs: &[&str], items: &[Item]) -> Result<Selection> {
+        Self::check(question)?;
+        Ok(match select::find(question, tabs, items)? {
+            select::Found::Chose(items) => Selection::Items(items),
+            select::Found::One(i) => Selection::Items(vec![i]),
+            select::Found::Path(p) => Selection::Path(p),
+            select::Found::Left => Selection::Left,
+            select::Found::NoRawMode => Selection::Unsupported,
+        })
     }
 }
 
