@@ -464,11 +464,7 @@ fn a_bundle_can_be_packed_inspected_verified_and_damage_is_caught() {
 
     let out = sb.run(&["pack", "-o", &bundle_arg]);
     assert!(out.ok, "pack failed:\n{}", out.tail(10));
-    let id = out
-        .text
-        .split("id ")
-        .nth(1)
-        .map(|s| s.trim().trim_end_matches(')').to_string());
+    let id = packed_id(&out.text);
     assert!(id.is_some(), "pack did not report an id:\n{}", out.tail(5));
 
     let inspect = sb.run(&["bundle", "inspect", &bundle_arg]);
@@ -483,8 +479,8 @@ fn a_bundle_can_be_packed_inspected_verified_and_damage_is_caught() {
     let again = sb.root().join("again.tar");
     let out2 = sb.run(&["pack", "-o", &again.to_string_lossy()]);
     assert_eq!(
-        out.text.split("id ").nth(1),
-        out2.text.split("id ").nth(1),
+        packed_id(&out.text),
+        packed_id(&out2.text),
         "the id changed although nothing did"
     );
 
@@ -570,6 +566,13 @@ fn a_bundle_for_another_architecture_is_refused() {
     );
 }
 
+/// The bundle id `pack` reports (`... id <hex>)`), ignoring any line after it.
+fn packed_id(text: &str) -> Option<String> {
+    let rest = text.split("id ").nth(1)?;
+    let id: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+    (!id.is_empty()).then_some(id)
+}
+
 #[test]
 #[ignore = "needs docker"]
 fn a_bundle_in_a_registry_is_pulled_once_and_injected() {
@@ -585,7 +588,7 @@ fn a_bundle_in_a_registry_is_pulled_once_and_injected() {
     let p = sb.project("registrybundle", &json(r#"{ "image": "@IMAGE@" }"#));
     let first = p.ldg("up", &["--no-attach", "--bundle", &reference]);
     assert!(
-        first.ok && first.has("pulling") && first.has("(extracted)"),
+        first.ok && first.has("pulling") && first.has("(fetched)"),
         "the first up should pull the bundle:\n{}",
         first.tail(8)
     );

@@ -53,7 +53,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command-arguments: --config .github/deny.toml
+          # `--config` is a global cargo-deny option, so it goes before `check`
+          # (the action's `arguments`), not after it (`command-arguments`).
+          arguments: --all-features --config .github/deny.toml
 
   # Windows is a bundle consumer only (no packing; it reaches a Linux target over
   # ssh or Docker Desktop), so this builds and tests the consumer side natively.
