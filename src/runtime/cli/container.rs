@@ -138,6 +138,10 @@ impl<F: Flavor> Inside for CliContainer<F> {
         self.cli.job(&self.cli.flavor.cp_in_args(&target))
     }
 
+    fn extract_keeps_owners(&self) -> bool {
+        self.cli.flavor.cp_in_keeps_owners()
+    }
+
     fn disposable(&self) -> bool {
         self.disposable
     }

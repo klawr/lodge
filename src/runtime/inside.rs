@@ -44,6 +44,12 @@ pub trait Inside {
     /// `workdir`, and waits until it ends.
     fn session(&self, user: User, workdir: &str, inner: &str) -> std::io::Result<ExitStatus>;
 
+    /// Whether what [`extract`](Self::extract) unpacks keeps the archive's owners.
+    /// When it does not, [`Env::put`] has root hand over what it made.
+    fn extract_keeps_owners(&self) -> bool {
+        true
+    }
+
     /// Whether the endpoint is thrown away, so replacing what is there is fine.
     fn disposable(&self) -> bool {
         true
@@ -78,6 +84,45 @@ pub fn in_dir_with_env(argv: &[&str], opts: &ExecOpts) -> Option<String> {
     );
     Some(script)
 }
+
+/// Puts right who owns what an engine unpacked as someone else.
+trait HandOver: Inside {
+    /// Gives `owner` what `src` made in `into`: the entries at its top (the file
+    /// `name`, or each name directly under a directory), and everything below
+    /// them. Nothing else in `into` is touched.
+    fn hand_over(
+        &self,
+        src: &dyn Snapshot,
+        into: &str,
+        name: &str,
+        owner: &ContainerUser,
+    ) -> Result<()>
+    where
+        Self: Env + Sized,
+    {
+        let mut tops = std::collections::BTreeSet::new();
+        if name.is_empty() {
+            src.walk(&mut |node| {
+                if let Some(first) = node.relative.split('/').next().filter(|f| !f.is_empty()) {
+                    tops.insert(format!("{}/{first}", into.trim_end_matches('/')));
+                }
+                Ok(())
+            })?;
+        } else {
+            tops.insert(format!("{}/{name}", into.trim_end_matches('/')));
+        }
+        if tops.is_empty() {
+            return Ok(());
+        }
+        let ids = format!("{}:{}", owner.uid, owner.gid);
+        let mut argv = vec!["chown", "-R", "-h", ids.as_str()];
+        argv.extend(tops.iter().map(String::as_str));
+        self.exec(&argv, &ExecOpts::root().repeatable())
+            .with_context(|| format!("giving {} what was copied into {into}", owner.name))
+    }
+}
+
+impl<T: Inside> HandOver for T {}
 
 impl<T: Inside> Env for T {
     fn is_disposable(&self) -> bool {
@@ -133,11 +178,13 @@ impl<T: Inside> Env for T {
                 .with_context(|| format!("{dest} names no file"))?;
             (parent.to_string(), file)
         };
-        self.exec(
+        let made = self.output(
             &["mkdir", "-p", &into],
             &ExecOpts::as_user(owner.exec_as()).repeatable(),
-        )
-        .with_context(|| format!("making {into} as {}", owner.name))?;
+        )?;
+        if !made.success {
+            bail!("making {into} as {}: {}", owner.name, made.stderr.trim());
+        }
 
         // Unpacking the same archive again leaves the same files, so a lost
         // connection reruns the whole send, packing the tar afresh.
@@ -159,7 +206,11 @@ impl<T: Inside> Env for T {
         if !ran.status.success() {
             bail!("unpacking into {dest} failed ({})", ran.status);
         }
-        packed.with_context(|| format!("packing for {dest}"))
+        packed.with_context(|| format!("packing for {dest}"))?;
+        if !self.extract_keeps_owners() && !owner.is_root() {
+            self.hand_over(src, &into, &name, owner)?;
+        }
+        Ok(())
     }
 
     fn write_secret(&self, dest: &str, contents: &[u8], mode: u32, user: User) -> Result<()> {
@@ -197,6 +248,7 @@ mod tests {
     /// [`Env`] does is built on them. Commands are `toy run <argv…>`.
     struct Toy {
         host: HostRef,
+        keeps_owners: bool,
     }
 
     impl Inside for Toy {
@@ -225,13 +277,20 @@ mod tests {
             self.host.interactive(&["toy", "shell", workdir])
         }
 
+        fn extract_keeps_owners(&self) -> bool {
+            self.keeps_owners
+        }
+
         fn disposable(&self) -> bool {
             false
         }
     }
 
     fn toy(host: &Arc<FakeHost>) -> Toy {
-        Toy { host: host.clone() }
+        Toy {
+            host: host.clone(),
+            keeps_owners: true,
+        }
     }
 
     fn words(line: &[&str]) -> Vec<String> {
@@ -302,6 +361,42 @@ mod tests {
         let entry = archive.entries().unwrap().next().unwrap().unwrap();
         assert_eq!(entry.path().unwrap().to_string_lossy(), "f");
         assert_eq!(entry.header().uid().unwrap(), 1000);
+    }
+
+    #[test]
+    fn what_an_unpacker_gives_to_someone_else_is_handed_to_the_owner_by_root() {
+        let host = Arc::new(FakeHost::new());
+        let toy = Toy {
+            keeps_owners: false,
+            ..toy(&host)
+        };
+        let dir = crate::tmpfile::TempDir::new("inside-handover").unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        std::fs::write(dir.path().join("bin/x"), "x").unwrap();
+        std::fs::write(dir.path().join("top"), "t").unwrap();
+        let owner = ContainerUser {
+            requested: Some("dev".into()),
+            name: "dev".into(),
+            uid: 1000,
+            gid: 1000,
+            home: "/home/dev".into(),
+        };
+        toy.put(&DiskSnapshot::at(dir.path()), "/h", &owner)
+            .unwrap();
+        // Only what the archive made, named at its top, is chowned: not `/h`.
+        assert_eq!(
+            host.argvs().last().unwrap(),
+            &words(&[
+                "toy",
+                "run",
+                "chown",
+                "-R",
+                "-h",
+                "1000:1000",
+                "/h/bin",
+                "/h/top"
+            ])
+        );
     }
 
     #[test]

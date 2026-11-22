@@ -408,15 +408,22 @@ fn files_containing(needles: &[&str], skip: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn root_is_asked_for_by_provisioning_and_the_runtime_only() {
+fn root_is_asked_for_by_provisioning_the_runtime_and_injection_cleanup_only() {
     // What lodge does *for a user* (inject, session, secrets, clean, status) is
-    // done as that user through `runtime::Acting`. Root is for creating a
-    // devcontainer (`devcontainer/`), where the spec asks for it, and for the
-    // runtime that provides it.
+    // done as that user through `runtime::Acting`, so what it makes is theirs.
+    // Root is for creating a devcontainer (`devcontainer/`), where the spec asks
+    // for it, for the runtime that provides it, and for clearing an earlier
+    // injection or a data destination the user cannot make (`inject/`).
     assert_eq!(
         files_containing(
             &["exec_root", "User::Root", "ExecOpts::root"],
-            &["devcontainer/", "runtime/", "plain_host.rs"]
+            &[
+                "devcontainer/",
+                "runtime/",
+                "plain_host.rs",
+                "inject/mod.rs",
+                "inject/data.rs"
+            ]
         ),
         Vec::<String>::new()
     );

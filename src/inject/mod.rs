@@ -2,7 +2,8 @@
 //!
 //! Everything here is done *as that user* (through [`Acting`]) into a prefix they
 //! own (see [`crate::layout`]), so it behaves the same whether the user is root, an
-//! ordinary user, or rootless: it never asks for more than the user has.
+//! ordinary user, or rootless. Root is used only to clear what an earlier
+//! injection left that the user cannot remove.
 //!
 //! An injection always replaces what is there: the libraries and binaries are
 //! read from the bundle and sent to the prefix as one tar (see [`payload`]), and
@@ -17,7 +18,7 @@ mod prefix;
 mod remove;
 mod state;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::bundle::source::Prepared;
 use crate::layout::Layout;
@@ -75,11 +76,21 @@ pub fn run(
     let safe_before = previous.map(|p| p.safe_directories).unwrap_or_default();
     // `bin/` and `lib/` are replaced as a whole, so nothing of an earlier
     // injection is left behind. (A running binary can be unlinked, but not
-    // overwritten.)
-    env.exec(
-        &["rm", "-rf", &layout.bin(), &layout.lib()],
-        &ExecOpts::default().repeatable(),
-    )?;
+    // overwritten.) What an injection made before as another user (root, when
+    // the container was first reached before `remoteUser` applied) is not the
+    // user's to remove, so root clears it; the copy below then makes it theirs.
+    let stale = ["rm", "-rf", &layout.bin(), &layout.lib()];
+    let removed = env.output(&stale, &ExecOpts::default().repeatable())?;
+    if !removed.success {
+        env.exec(&stale, &ExecOpts::root().repeatable())
+            .with_context(|| {
+                format!(
+                    "removing the earlier injection failed as {} ({})",
+                    user.name,
+                    removed.stderr.trim().lines().next().unwrap_or("no output")
+                )
+            })?;
+    }
     env.cp_in(&payload, layout.prefix())?;
 
     let mut wrappers = Vec::new();
@@ -127,6 +138,24 @@ mod tests {
             gid: 1000,
             home: "/home/dev".into(),
         }
+    }
+
+    #[test]
+    fn an_earlier_injection_the_user_cannot_remove_is_cleared_as_root() {
+        let (_dir, bundle) = prepared(&manifest("x86_64"), &[]);
+        let layout = Layout::preferred(&dev());
+        let rm = ["rm", "-rf", &layout.bin(), &layout.lib()];
+        let env = FakeEnv::new()
+            .with_output(&["uname", "-m"], "x86_64\n")
+            .with_user_failure(&rm);
+
+        run(&env, &dev(), &layout, &bundle).unwrap();
+
+        let calls = env.calls();
+        let rms: Vec<_> = calls.iter().filter(|(c, _)| c[0] == "rm").collect();
+        assert_eq!(rms.len(), 2, "first as the user, then as root");
+        assert_eq!(rms[0].1, Who::Named("dev".into()));
+        assert_eq!(rms[1].1, Who::Root);
     }
 
     #[test]

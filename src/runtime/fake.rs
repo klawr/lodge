@@ -58,6 +58,7 @@ pub struct FakeEnv {
     files: RefCell<HashMap<String, Vec<u8>>>,
     canned: HashMap<Vec<String>, String>,
     failing: RefCell<Vec<Vec<String>>>,
+    failing_for_users: Vec<Vec<String>>,
     commands: Vec<String>,
     modes: RefCell<HashMap<String, u32>>,
     /// The `uid:gid` that owns each file copied in with [`Env::put`].
@@ -98,6 +99,7 @@ impl FakeEnv {
             files: RefCell::default(),
             canned: HashMap::new(),
             failing: RefCell::default(),
+            failing_for_users: Vec::new(),
             commands: Vec::new(),
             modes: RefCell::default(),
             owners: RefCell::default(),
@@ -153,6 +155,14 @@ impl FakeEnv {
     pub fn with_failure(self, argv: &[&str]) -> Self {
         self.failing
             .borrow_mut()
+            .push(argv.iter().map(|s| s.to_string()).collect());
+        self
+    }
+
+    /// Makes the exact command `argv` exit non-zero unless it runs as root (what
+    /// a root-owned file does to everyone else).
+    pub fn with_user_failure(mut self, argv: &[&str]) -> Self {
+        self.failing_for_users
             .push(argv.iter().map(|s| s.to_string()).collect());
         self
     }
@@ -239,7 +249,9 @@ impl FakeEnv {
             stderr: String::new(),
         };
         let key: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
-        if self.failing.borrow().contains(&key) {
+        if self.failing.borrow().contains(&key)
+            || (user != User::Root && self.failing_for_users.contains(&key))
+        {
             return fail();
         }
         if let Some(stdout) = self.canned.get(&key) {

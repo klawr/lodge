@@ -55,9 +55,16 @@ impl Flavor for DockerFlavor {
 
     fn cp_in_args<'a>(&self, target: &'a str) -> Vec<&'a str> {
         // `-q`: on a terminal docker otherwise prints "Successfully copied …" for
-        // every file, which would bury lodge's own output. `-a` makes the daemon
-        // honour the archive's owners instead of making everything root's.
+        // every file, which would bury lodge's own output. `-a` does not keep the
+        // archive's owners: the daemon gives everything to the container's
+        // *configured* user (`Config.User`), and to root when that is set to root
+        // (a devcontainer's `user: root`, with another `remoteUser`). Without `-a`
+        // it is root's too. Either way the owners are put right afterwards.
         vec!["cp", "-q", "-a", "-", target]
+    }
+
+    fn cp_in_keeps_owners(&self) -> bool {
+        false
     }
 
     fn says_path_is_missing(&self, stderr: &str) -> bool {

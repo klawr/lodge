@@ -50,8 +50,14 @@ pub trait Flavor: Clone + Send + Sync + 'static {
         Self: Sized;
 
     /// The arguments of the command that streams a tar into a container,
-    /// keeping the archive's owners.
+    /// keeping the archive's owners where the engine can (see below).
     fn cp_in_args<'a>(&self, target: &'a str) -> Vec<&'a str>;
+
+    /// Whether what `cp_in_args` unpacks keeps the archive's owners. When it does
+    /// not, the copy is followed by a `chown` as root.
+    fn cp_in_keeps_owners(&self) -> bool {
+        true
+    }
 
     /// Whether `cp`'s error says the path is not in the container (as opposed to
     /// the container, the engine or the connection being the problem).

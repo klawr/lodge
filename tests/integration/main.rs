@@ -1302,6 +1302,56 @@ fn a_user_without_root_gets_everything_in_their_own_prefix_and_nothing_elsewhere
 
 #[test]
 #[ignore = "needs docker"]
+fn what_is_injected_is_the_remote_users_when_the_container_is_configured_as_root() {
+    // `docker cp -a` gives everything to the container's *configured* user, so with
+    // `containerUser: root` and another `remoteUser` (a devcontainer's usual shape)
+    // a copy is root's unless lodge hands it over. A destination only root can make
+    // (`/usr/local/share/...`) is made by root and handed over too.
+    require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
+    let sb = Sandbox::new();
+    let settings = sb.root().join("settings");
+    std::fs::create_dir_all(&settings).unwrap();
+    std::fs::write(settings.join("rc"), "set x").unwrap();
+    sb.config(&format!(
+        "{}\n[[data]]\npath = \"{}\"\ntarget = \"/usr/local/share/lodge-test-settings\"\n",
+        inject_sh_config(),
+        settings.display()
+    ));
+    let p = sb.project(
+        "configured-root",
+        &json(
+            r#"{ "image": "@IMAGE@", "containerUser": "root", "remoteUser": "nobody",
+                 "updateRemoteUserUID": false }"#,
+        ),
+    );
+    p.up();
+    let container = p.container();
+    assert_eq!(
+        docker(&["inspect", &container, "--format", "{{.Config.User}}"]),
+        "root",
+        "the container is not configured as root, so this tests nothing"
+    );
+    let prefix = "/tmp/lodge-65534";
+    let run = |script: &str| docker(&["exec", "-u", "nobody", &container, "sh", "-c", script]);
+
+    assert_eq!(run(&format!("{prefix}/bin/hostsh -c 'echo ok'")), "ok");
+    assert_eq!(
+        run(&format!(
+            "find {prefix} /usr/local/share/lodge-test-settings ! -user nobody | wc -l"
+        )),
+        "0",
+        "something injected is not the remote user's"
+    );
+    assert_eq!(run("cat /usr/local/share/lodge-test-settings/rc"), "set x");
+
+    // The next run replaces it as that user, with nothing in the way.
+    let again = p.ldg("up", &["--reinject", "--no-attach"]);
+    assert!(again.ok, "{}", again.tail(10));
+    assert!(!again.has("denied"), "{}", again.tail(10));
+}
+
+#[test]
+#[ignore = "needs docker"]
 fn the_session_finds_injected_tools_even_though_the_login_profile_resets_path() {
     require_tool("patchelf", "apt install patchelf / pacman -S patchelf");
     let sb = Sandbox::new();

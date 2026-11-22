@@ -1,11 +1,11 @@
 //! Injecting data: files and directories, copied to the place the bundle names.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::bundle::manifest::Data;
 use crate::bundle::source::Prepared;
 use crate::output::{info, warning};
-use crate::runtime::{ContainerUser, Env};
+use crate::runtime::{ContainerUser, Env, ExecOpts};
 
 /// Copies the `index`th data of the bundle to its destination and returns that
 /// path. `placed_before` is what an earlier injection placed: anything else
@@ -39,20 +39,49 @@ pub(super) fn inject_data(
     // missing directory down to the destination as the user, so the user owns the
     // whole chain and can create siblings (nvim writing `.local/state` next to
     // `.local/share`) later.
-    let written = env
-        .exec(
-            &["rm", "-rf", &dest],
-            &crate::runtime::ExecOpts::default().repeatable(),
-        )
-        .and_then(|()| env.cp_in(&prepared.bundle.data(index), &dest));
+    let as_user = |env: &dyn Env| {
+        let removed = env.output(&["rm", "-rf", &dest], &ExecOpts::default().repeatable())?;
+        if !removed.success {
+            bail!("{}", removed.stderr.trim());
+        }
+        env.cp_in(&prepared.bundle.data(index), &dest)
+    };
+    // A destination the user cannot make (`/usr/local/share/nvim`) is prepared by
+    // root in a container, which is lodge's to set up; what is copied in is the
+    // user's all the same.
+    let written = as_user(env).or_else(|first| {
+        if !env.is_disposable() {
+            return Err(first);
+        }
+        prepare_as_root(env, user, &dest, data.is_dir)
+            .and_then(|()| env.cp_in(&prepared.bundle.data(index), &dest))
+            .map_err(|second| first.context(format!("and as root: {second:#}")))
+    });
     written.with_context(|| {
         format!(
-            "writing {dest} as {} failed. lodge never uses root, so a target must be \
-             somewhere that user can write (under ~, say)",
+            "writing {dest} as {} failed; a target must be a place that user can write \
+             (under ~, say) or one a container lets root make",
             user.name
         )
     })?;
     Ok(Some(dest))
+}
+
+/// Clears `dest` and makes the place it is copied into, as root. A directory
+/// destination is handed to `user`; the parents made on the way stay root's.
+fn prepare_as_root(env: &dyn Env, user: &ContainerUser, dest: &str, is_dir: bool) -> Result<()> {
+    let root = ExecOpts::root().repeatable();
+    env.exec(&["rm", "-rf", dest], &root)?;
+    if is_dir {
+        env.exec(&["mkdir", "-p", dest], &root)?;
+        let owner = format!("{}:{}", user.uid, user.gid);
+        env.exec(&["chown", &owner, dest], &root)
+    } else {
+        match std::path::Path::new(dest).parent().and_then(|p| p.to_str()) {
+            Some(parent) if !parent.is_empty() => env.exec(&["mkdir", "-p", parent], &root),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -169,14 +198,37 @@ mod tests {
     }
 
     #[test]
-    fn a_target_the_user_cannot_write_is_an_error_that_says_so() {
+    fn a_target_the_user_cannot_make_is_prepared_by_root_and_owned_by_the_user() {
+        let (_dir, b) = bundle("/usr/local/share/hello");
+        let env = FakeEnv::new().with_user_failure(&["rm", "-rf", "/usr/local/share/hello"]);
+        inject(&env, &b).unwrap();
+        assert_eq!(
+            env.ran_as(&["chown", "1000:1000", "/usr/local/share/hello"]),
+            Some(Who::Root)
+        );
+        assert_eq!(
+            env.owner_of("/usr/local/share/hello/rc"),
+            Some((1000, 1000)),
+            "what is copied in is the user's"
+        );
+    }
+
+    #[test]
+    fn a_target_nobody_can_write_is_an_error_that_says_so() {
         let (_dir, b) = bundle("/etc/hello");
         let env = FakeEnv::new().with_failure(&["rm", "-rf", "/etc/hello"]);
         let err = format!("{:#}", inject(&env, &b).unwrap_err());
-        assert!(
-            err.contains("never uses root") && err.contains("/etc/hello") && err.contains("dev"),
-            "{err}"
-        );
+        assert!(err.contains("/etc/hello") && err.contains("dev"), "{err}");
+    }
+
+    #[test]
+    fn a_real_machine_never_gets_root_for_data() {
+        let (_dir, b) = bundle("/etc/hello");
+        let env = FakeEnv::new()
+            .shared()
+            .with_user_failure(&["rm", "-rf", "/etc/hello"]);
+        assert!(inject(&env, &b).is_err());
+        assert!(!env.ran_matching(|c| c[0] == "chown"));
     }
 
     #[test]

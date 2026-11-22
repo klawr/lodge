@@ -93,9 +93,11 @@ the layout every installed program follows. A program that keeps its files somew
 else needs its `[[data]]` written, and `ldg doctor` says when it finds files beside a
 binary that the config does not bring.
 
-lodge writes as the container user and never uses root, so a target must be a place
-that user can write (under `~`, say). A target elsewhere fails with the path and the
-user named.
+What lodge injects belongs to the container user. A target the user cannot make
+(`/usr/local/share/nvim`, say) is made by root in a container and handed to that user;
+on a real machine, which lodge does not run root commands on, a target must be a place
+the user can write (under `~`, say). A target that fails either way is reported with the
+path and the user named.
 
 Shell aliases and other shell setup are your shell's own config: inject your
 `~/.bashrc` (or your shell and its config) with a `[[data]]` whose `target` is
