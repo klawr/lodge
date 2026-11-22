@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/klawr/lodge/master/install.sh | sh
 
 Picks the binary for your CPU, checks its checksum and installs it to
 `~/.local/bin`. Set `LODGE_BIN_DIR` to install elsewhere, or `LODGE_VERSION`
-(e.g. `v0.4.2`) to pin a version.
+(e.g. `v0.4.2`) to pin a version. Running it again updates an installed `ldg`.
 
 ### Windows
 
@@ -39,14 +39,13 @@ always Linux, reached with `--remote` over ssh or through Docker Desktop's
 engine. In PowerShell:
 
 ```powershell
-$dir = "$env:LOCALAPPDATA\Programs\ldg"
-New-Item -ItemType Directory -Force $dir | Out-Null
-curl.exe -fL -o "$dir\ldg.exe" https://github.com/klawr/lodge/releases/latest/download/ldg-x86_64-pc-windows-msvc.exe
-[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ";$dir", 'User')
+$d = "$env:LOCALAPPDATA\Programs\ldg"; mkdir -Force $d >$null; Stop-Process -Name ldg -ErrorAction Ignore
+curl.exe -fL -o "$d\ldg.exe" https://github.com/klawr/lodge/releases/latest/download/ldg-x86_64-pc-windows-msvc.exe
+$p = [Environment]::GetEnvironmentVariable('Path', 'User'); if ($p -notlike "*$d*") { [Environment]::SetEnvironmentVariable('Path', "$p;$d", 'User') }
 ```
 
-The last line puts it on your user `PATH` (run it once; open a new terminal
-afterwards).
+The same lines update it (a running `ldg` is stopped first: Windows cannot overwrite
+a running program) and add it to your user `PATH` once; open a new terminal afterwards.
 
 - It uses a bundle but never makes one: `ldg pack` needs Linux (`ldd`,
   `patchelf`), so pack on a Linux or WSL2 machine and point `bundle =` at the
