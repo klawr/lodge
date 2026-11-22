@@ -108,7 +108,7 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
 
     let packs_live = config
         .as_ref()
-        .is_ok_and(|c| c.bundle.is_none() && !c.binaries.is_empty());
+        .is_ok_and(|c| c.bundle.is_none() && crate::bundle::pack::needs_tools(c));
     checks.extend(host_tool_checks(
         remote.is_some(),
         ctx.tools.packer().map(|_| ()),

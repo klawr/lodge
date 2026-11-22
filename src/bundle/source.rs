@@ -16,6 +16,9 @@
 //!
 //! So the live path and the stored-bundle path end in the same place, and there is
 //! a single injector.
+//!
+//! Packing runs `ldd` and `patchelf` only for `[[binary]]` entries, so a machine
+//! without them (not Linux) still packs a config that has none.
 
 use anyhow::{Context as _, Result};
 use std::path::Path;
@@ -198,10 +201,10 @@ fn short(e: &anyhow::Error) -> String {
 }
 
 fn live(root: &Path, config: &Config, tools: &Toolchain) -> Result<Prepared> {
-    let packer = tools.packer()?;
+    let (reader, elf) = pack::tools(config, tools)?;
     // Shared by the fingerprint and the pack, so the libraries of a binary are
     // looked up once.
-    let mut deps = deps::Resolver::new(packer.deps.as_ref());
+    let mut deps = deps::Resolver::new(reader);
     let key = format!("p-{}", inputs_fingerprint(config, &mut deps)?);
     if let Some(bundle) = cache::load(root, &key) {
         return Ok(Prepared {
@@ -211,12 +214,7 @@ fn live(root: &Path, config: &Config, tools: &Toolchain) -> Result<Prepared> {
         });
     }
     let staging = cache::staging(root, "pack")?;
-    pack::build_tar(
-        config,
-        &cache::staged(&staging),
-        &mut deps,
-        packer.elf.as_ref(),
-    )?;
+    pack::build_tar(config, &cache::staged(&staging), &mut deps, elf)?;
     Ok(Prepared {
         bundle: cache::install(root, staging, &key)?,
         origin: Origin::Packed,
@@ -788,6 +786,28 @@ mod tests {
             .unwrap();
         assert!(format!("{err:#}").contains("a file path"), "{err:#}");
     }
+    #[test]
+    fn a_machine_that_cannot_pack_still_packs_what_needs_no_tools() {
+        let work = TempDir::new("data").unwrap();
+        let cache = TempDir::new("data-cache").unwrap();
+        std::fs::write(work.path().join("rc"), "a").unwrap();
+        let cfg = Config {
+            data: vec![crate::config::DataEntry {
+                path: work.path().join("rc"),
+                target: Some("/etc/rc".into()),
+                binary: None,
+            }],
+            ..Config::default()
+        };
+        let tools = tools::consumer_only();
+        let packed = prepare_in(cache.path(), &cfg, None, &files(), &tools).unwrap();
+        assert_eq!(packed.origin, Origin::Packed);
+        assert_eq!(packed.bundle.manifest().data.len(), 1);
+        // Nothing at all is a bundle too.
+        let empty = prepare_in(cache.path(), &config(vec![]), None, &files(), &tools).unwrap();
+        assert!(empty.bundle.manifest().data.is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_machine_that_cannot_pack_still_uses_a_bundle_but_cannot_build_one() {

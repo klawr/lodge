@@ -139,6 +139,23 @@ const CANNOT_PACK: &str = "this machine cannot build a bundle (that takes ldd an
 so Linux); use one built elsewhere: `--bundle FILE`, or `bundle = \"…\"` in the config \
 (a file or an `oci://` reference)";
 
+/// Stands in for the packer's programs where none can run, and refuses whatever
+/// it is asked. Only a config with nothing for them to do gets it (see
+/// `bundle::pack::tools`), so it is never asked.
+pub struct Refusing;
+
+impl DepReader for Refusing {
+    fn read(&self, _binary: &str) -> Result<Deps> {
+        Err(anyhow::anyhow!(CANNOT_PACK))
+    }
+}
+
+impl ElfEditor for Refusing {
+    fn relink(&self, _file: &Path, _interpreter: &str, _rpath: &str) -> Result<()> {
+        Err(anyhow::anyhow!(CANNOT_PACK))
+    }
+}
+
 /// The tools lodge uses on this machine. Built once, in `cmd/`.
 pub struct Toolchain {
     /// `None` on a machine that only uses bundles other machines built.

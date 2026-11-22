@@ -18,19 +18,35 @@ use crate::output::warning;
 use crate::platform;
 use crate::shell::is_plain_name;
 use crate::tmpfile::{TempDir, TempFile, discard_file};
-use crate::tools::{ElfEditor, Toolchain};
+use crate::tools::{DepReader, ElfEditor, Refusing, Toolchain};
 use crate::tree::{self, Denied, Links};
+
+/// Whether packing `config` runs `ldd` and `patchelf`: only binaries need them,
+/// data is copied as it is.
+pub fn needs_tools(config: &Config) -> bool {
+    !config.binaries.is_empty()
+}
+
+/// The programs packing `config` runs. A machine without a packer has them only
+/// if the config needs none (see [`needs_tools`]); otherwise it is told it
+/// cannot build a bundle.
+pub fn tools<'a>(
+    config: &Config,
+    toolchain: &'a Toolchain,
+) -> Result<(&'a dyn DepReader, &'a dyn ElfEditor)> {
+    if needs_tools(config) {
+        let packer = toolchain.packer()?;
+        Ok((packer.deps.as_ref(), packer.elf.as_ref()))
+    } else {
+        Ok((&Refusing, &Refusing))
+    }
+}
 
 /// Packs `config` into a bundle file at `output`. The file appears only when it is
 /// complete: it is written beside the destination and renamed into place.
 pub fn pack_to_file(config: &Config, output: &Path, tools: &Toolchain) -> Result<Manifest> {
-    let packer = tools.packer()?;
-    build_tar(
-        config,
-        output,
-        &mut deps::Resolver::new(packer.deps.as_ref()),
-        packer.elf.as_ref(),
-    )
+    let (reader, elf) = self::tools(config, tools)?;
+    build_tar(config, output, &mut deps::Resolver::new(reader), elf)
 }
 
 /// [`build`] in a scratch directory, then written whole as a tar at `output`
