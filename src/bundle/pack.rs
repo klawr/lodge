@@ -11,12 +11,10 @@ use super::deps;
 use super::elf;
 use super::hash::hash_path;
 use super::manifest::{
-    BIN_DIR, Binary, CONFIG_DIR, ConfigTree, LIB_DIR, Lib, MANIFEST_FILE, Manifest, ORIGIN_RPATH,
-    Tool,
+    BIN_DIR, Binary, DATA_DIR, Data, LIB_DIR, Lib, MANIFEST_FILE, Manifest, ORIGIN_RPATH, data_file,
 };
 use crate::arch::Arch;
-use crate::config::{BinaryEntry, Config, ConfigEntry};
-use crate::layout;
+use crate::config::{BinaryEntry, Config, DataEntry};
 use crate::output::warning;
 use crate::shell::is_plain_name;
 use crate::tmpfile::{TempDir, TempFile, discard_file};
@@ -59,7 +57,7 @@ pub fn build(
     elf: &dyn ElfEditor,
 ) -> Result<Manifest> {
     let host = Arch::host()?;
-    for sub in [BIN_DIR, LIB_DIR, CONFIG_DIR] {
+    for sub in [BIN_DIR, LIB_DIR, DATA_DIR] {
         std::fs::create_dir_all(dir.join(sub))?;
     }
     let mut packer = Packer {
@@ -67,15 +65,17 @@ pub fn build(
         deps,
         editor: elf,
         host,
+        home: crate::config::home_dir(),
         libs: BTreeMap::new(),
         linker: None,
-        tools: Vec::new(),
+        binaries: Vec::new(),
+        data: Vec::new(),
     };
     for item in &config.binaries {
         packer.add_binary(item)?;
     }
-    for item in &config.configs {
-        packer.add_config(item)?;
+    for item in &config.data {
+        packer.add_data(item)?;
     }
     let manifest = packer.finish(config);
     manifest
@@ -90,39 +90,27 @@ struct Packer<'a, 'r> {
     deps: &'a mut deps::Resolver<'r>,
     editor: &'a dyn ElfEditor,
     host: Arch,
+    /// The home directory data under it is relative to.
+    home: PathBuf,
     /// Bundled libraries: file name to content hash.
     libs: BTreeMap<String, String>,
     linker: Option<String>,
-    tools: Vec<Tool>,
+    binaries: Vec<Binary>,
+    data: Vec<Data>,
 }
 
 impl Packer<'_, '_> {
-    /// The bundle's entry for `name`, made when there is none: a binary and a config
-    /// of one name are two things in the config and one tool in the bundle.
-    fn tool(&mut self, name: &str) -> Result<&mut Tool> {
+    fn add_binary(&mut self, item: &BinaryEntry) -> Result<()> {
         // `Config::parse` checks this too; a `Config` built in code may not
         // have been, and the name becomes a path in the bundle.
-        if !is_plain_name(name) {
-            bail!("'{name}' is not usable as a name (letters, digits and -_.+ only)");
+        if !is_plain_name(&item.name) {
+            bail!(
+                "'{}' is not usable as a name (letters, digits and -_.+ only)",
+                item.name
+            );
         }
-        let at = match self.tools.iter().position(|t| t.name == name) {
-            Some(at) => at,
-            None => {
-                self.tools.push(Tool {
-                    name: name.to_string(),
-                    binary: None,
-                    config: None,
-                });
-                self.tools.len() - 1
-            }
-        };
-        Ok(&mut self.tools[at])
-    }
-
-    fn add_binary(&mut self, item: &BinaryEntry) -> Result<()> {
-        self.tool(&item.name)?;
         let binary = self.pack_binary(item)?;
-        self.tool(&item.name)?.binary = Some(binary);
+        self.binaries.push(binary);
         Ok(())
     }
 
@@ -159,6 +147,7 @@ impl Packer<'_, '_> {
         std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
 
         Ok(Binary {
+            name: name.clone(),
             dest: item.target.clone(),
             dynamic,
             hash: hash_path(&dst)?,
@@ -199,34 +188,26 @@ impl Packer<'_, '_> {
         Ok(())
     }
 
-    fn add_config(&mut self, item: &ConfigEntry) -> Result<()> {
-        self.tool(&item.name)?;
-        let config = self.pack_config(item)?;
-        self.tool(&item.name)?.config = Some(config);
-        Ok(())
-    }
-
-    fn pack_config(&mut self, item: &ConfigEntry) -> Result<ConfigTree> {
-        let name = &item.name;
+    /// Copies a file or directory into the bundle, as the next `data/<n>`.
+    fn add_data(&mut self, item: &DataEntry) -> Result<()> {
         let source = item.path.as_path();
         if let Some(why) = sensitive_reason(source, dirs::home_dir().as_deref()) {
             warning!(
-                "{name}: {} may contain {why}, and a bundle is meant to be shared",
+                "{}: may contain {why}, and a bundle is meant to be shared",
                 source.display()
             );
         }
         let real = std::fs::canonicalize(source)
-            .with_context(|| format!("{name}: config path {} does not exist", source.display()))?;
-        let dst = self.dir.join(CONFIG_DIR).join(name);
+            .with_context(|| format!("data path {} does not exist", source.display()))?;
+        let dst = self.dir.join(data_file(self.data.len()));
         copy_tree(&real, &dst)?;
-        Ok(ConfigTree {
-            dest: item
-                .target
-                .clone()
-                .unwrap_or_else(|| layout::default_config_dest(name)),
+        self.data.push(Data {
+            dest: item.dest(&self.home),
             is_dir: real.is_dir(),
             hash: hash_path(&dst)?,
-        })
+            binary: item.binary.clone(),
+        });
+        Ok(())
     }
 
     fn finish(self, config: &Config) -> Manifest {
@@ -242,7 +223,8 @@ impl Packer<'_, '_> {
                 .into_iter()
                 .map(|(name, hash)| Lib { name, hash })
                 .collect(),
-            tools: self.tools,
+            binaries: self.binaries,
+            data: self.data,
             git_safe_directories: config.git.safe_directories.clone(),
         }
     }
@@ -334,7 +316,7 @@ pub(crate) fn patch_binary(binary: &str, editor: &dyn ElfEditor) -> Result<TempF
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BinaryEntry, ConfigEntry};
+    use crate::config::{BinaryEntry, DataEntry};
     use crate::tools::{self, Ldd, Patchelf};
 
     fn script_tool(dir: &Path, name: &str) -> BinaryEntry {
@@ -357,46 +339,98 @@ mod tests {
         }
     }
 
+    fn data_entry(path: PathBuf, target: Option<&str>, binary: Option<&str>) -> DataEntry {
+        DataEntry {
+            path,
+            target: target.map(String::from),
+            binary: binary.map(String::from),
+        }
+    }
+
     #[test]
-    fn a_tool_and_its_config_become_a_verifiable_bundle() {
+    fn a_binary_and_its_data_become_a_verifiable_bundle() {
         let work = TempDir::new("pack-src").unwrap();
         let tool = script_tool(work.path(), "hello");
         let cfg = work.path().join("hello-config");
         std::fs::create_dir_all(cfg.join("sub")).unwrap();
         std::fs::write(cfg.join("sub/rc"), "set x").unwrap();
         std::os::unix::fs::symlink("sub/rc", cfg.join("link")).unwrap();
+        let single = work.path().join("one");
+        std::fs::write(&single, "1").unwrap();
         let mut config = config_with(vec![tool]);
-        config.configs.push(ConfigEntry {
-            name: "hello".into(),
-            path: cfg,
-            target: Some("~/.config/hello".into()),
-        });
+        config
+            .data
+            .push(data_entry(cfg, Some("~/.config/hello"), Some("hello")));
+        config.data.push(data_entry(single, Some("/etc/one"), None));
 
         let out = TempDir::new("pack-out").unwrap();
         let file = out.path().join("b.tar");
         let manifest = pack_to_file(&config, &file, &tools::external()).unwrap();
 
-        let tool = &manifest.tools[0];
-        // The binary and the config of one name are one tool in the bundle.
-        assert_eq!(manifest.tools.len(), 1);
-        assert_eq!(tool.name, "hello");
-        assert_eq!(
-            tool.binary.as_ref().unwrap().dest,
-            None,
-            "no wrapper asked for"
-        );
-        assert!(!tool.binary.as_ref().unwrap().dynamic);
-        assert!(tool.config.as_ref().unwrap().is_dir);
+        assert_eq!(manifest.binaries.len(), 1);
+        assert_eq!(manifest.binaries[0].name, "hello");
+        assert_eq!(manifest.binaries[0].dest, None, "no wrapper asked for");
+        assert!(!manifest.binaries[0].dynamic);
+        assert_eq!(manifest.data.len(), 2);
+        assert_eq!(manifest.data[0].dest, "~/.config/hello");
+        assert!(manifest.data[0].is_dir);
+        assert_eq!(manifest.data[0].binary.as_deref(), Some("hello"));
+        assert!(!manifest.data[1].is_dir);
+        assert_eq!(manifest.data[1].binary, None);
         assert_eq!(manifest.arch, Arch::host().unwrap().to_string());
 
         let dest = TempDir::new("pack-dest").unwrap();
         assert_eq!(archive::extract(&file, dest.path()).unwrap(), manifest);
         assert_eq!(
-            std::fs::read_link(dest.path().join("config/hello/link")).unwrap(),
+            std::fs::read_link(dest.path().join("data/0/link")).unwrap(),
             Path::new("sub/rc"),
             "symlinks stay symlinks"
         );
+        assert_eq!(
+            std::fs::read_to_string(dest.path().join("data/1")).unwrap(),
+            "1"
+        );
         assert!(!out.path().join("b.tar.partial").exists());
+    }
+
+    #[test]
+    fn data_without_a_target_is_for_the_place_it_is_at() {
+        let work = TempDir::new("pack-mirror").unwrap();
+        let dir = work.path().join("share/hello");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = config_with(vec![]);
+        config.data.push(data_entry(dir.clone(), None, None));
+        let out = TempDir::new("pack-mirror-out").unwrap();
+        let manifest = build(
+            &config,
+            out.path(),
+            &mut deps::Resolver::new(&Ldd),
+            &Patchelf,
+        )
+        .unwrap();
+        assert_eq!(manifest.data[0].dest, dir.display().to_string());
+    }
+
+    #[test]
+    fn two_data_entries_for_one_place_are_refused() {
+        let work = TempDir::new("pack-twice").unwrap();
+        let dir = work.path().join("d");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = config_with(vec![]);
+        config.data.push(data_entry(dir.clone(), None, None));
+        config.data.push(data_entry(dir, None, None));
+        let out = TempDir::new("pack-twice-out").unwrap();
+        let err = format!(
+            "{:#}",
+            build(
+                &config,
+                out.path(),
+                &mut deps::Resolver::new(&Ldd),
+                &Patchelf
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("listed twice"), "{err}");
     }
 
     #[test]
@@ -413,7 +447,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            manifest.tools[0].binary.as_ref().unwrap().dest.as_deref(),
+            manifest.binaries[0].dest.as_deref(),
             Some("~/.local/bin/hello")
         );
     }
@@ -493,7 +527,7 @@ mod tests {
             &Patchelf,
         )
         .unwrap();
-        assert!(manifest.tools[0].binary.as_ref().unwrap().dynamic);
+        assert!(manifest.binaries[0].dynamic);
 
         let mut packed = std::fs::read(out.path().join("bin/sh")).unwrap();
         assert_eq!(
@@ -542,15 +576,12 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_config_path_names_the_tool() {
+    fn a_missing_data_path_is_named() {
         let work = TempDir::new("pack-missing").unwrap();
-        let tool = script_tool(work.path(), "t");
-        let mut config = config_with(vec![tool]);
-        config.configs.push(ConfigEntry {
-            name: "t".into(),
-            path: work.path().join("nope"),
-            target: None,
-        });
+        let mut config = config_with(vec![]);
+        config
+            .data
+            .push(data_entry(work.path().join("nope"), None, None));
         let out = TempDir::new("pack-missing-out").unwrap();
         let err = format!(
             "{:#}",
@@ -563,7 +594,7 @@ mod tests {
             .unwrap_err()
         );
         assert!(
-            err.contains("t: config path") && err.contains("does not exist"),
+            err.contains("data path") && err.contains("nope") && err.contains("does not exist"),
             "{err}"
         );
     }

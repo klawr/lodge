@@ -4,13 +4,12 @@ use std::path::Path;
 
 use crate::arch::Arch;
 use crate::bundle::elf;
-use crate::bundle::manifest::{BIN_DIR, Binary, Manifest, Tool};
+use crate::bundle::manifest::{BIN_DIR, Binary, Manifest};
 use crate::bundle::source::Prepared;
 use crate::layout::Layout;
 use crate::runtime::{ContainerUser, Env, ExecOpts};
 
-/// Puts the tool's binary into `stage/bin/`, which is sent as a whole to the
-/// prefix.
+/// Puts the binary into `stage/bin/`, which is sent as a whole to the prefix.
 ///
 /// The bundle's copy was relinked when it was packed, so it runs *directly*
 /// against the injected glibc (no ld.so wrapper). Running directly keeps
@@ -20,11 +19,10 @@ use crate::runtime::{ContainerUser, Env, ExecOpts};
 pub(super) fn stage_binary(
     bundle: &Prepared,
     layout: &Layout,
-    tool: &Tool,
     binary: &Binary,
     stage: &Path,
 ) -> Result<()> {
-    let name = &tool.name;
+    let name = &binary.name;
     let source = bundle.bin(name);
     let dir = stage.join(BIN_DIR);
     std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
@@ -56,23 +54,22 @@ pub(super) fn place_wrapper(
     env: &dyn Env,
     user: &ContainerUser,
     layout: &Layout,
-    tool: &Tool,
     binary: &Binary,
 ) -> Result<Option<String>> {
     let Some(dest) = binary.dest.as_deref().map(|d| user.expand_home(d)) else {
         return Ok(None);
     };
-    install_wrapper(env, &layout.bin_of(&tool.name), &dest)
-        .with_context(|| format!("{}: writing the wrapper {dest}", tool.name))?;
+    install_wrapper(env, &layout.bin_of(&binary.name), &dest)
+        .with_context(|| format!("{}: writing the wrapper {dest}", binary.name))?;
     Ok(Some(dest))
 }
 
 // Refuses a bundle built for a different CPU than the container runs on: its
 // binaries would otherwise fail at startup with an unhelpful "exec format error"
-// or "no such file". A bundle with no binaries (just configs) fits anywhere, and
+// or "no such file". A bundle with no binaries (just data) fits anywhere, and
 // an architecture we can't identify is let through.
 pub(super) fn check_architecture(env: &dyn Env, manifest: &Manifest) -> Result<()> {
-    if !manifest.tools.iter().any(|t| t.binary.is_some()) {
+    if manifest.binaries.is_empty() {
         return Ok(());
     }
     // A container is Linux whatever runs the engine; a real machine may not be,
@@ -139,20 +136,17 @@ mod tests {
         }
     }
 
-    fn tool(wrapper: Option<&str>) -> Tool {
-        Tool {
+    fn hello(wrapper: Option<&str>) -> Binary {
+        Binary {
             name: "hello".into(),
-            binary: Some(Binary {
-                dest: wrapper.map(String::from),
-                dynamic: false,
-                hash: "aaaaaaaaaaaaaaaa".into(),
-            }),
-            config: None,
+            dest: wrapper.map(String::from),
+            dynamic: false,
+            hash: "aaaaaaaaaaaaaaaa".into(),
         }
     }
 
     /// A bundle directory with one binary `hello`.
-    fn bundle(tool: Tool, arch: &str) -> (TempDir, Prepared) {
+    fn bundle(binary: Binary, arch: &str) -> (TempDir, Prepared) {
         let dir = TempDir::new("bin-bundle").unwrap();
         std::fs::create_dir_all(dir.path().join("bin")).unwrap();
         std::fs::write(dir.path().join("bin/hello"), "#!/bin/sh\necho hi\n").unwrap();
@@ -162,7 +156,8 @@ mod tests {
             arch: arch.into(),
             linker: None,
             libs: Vec::<Lib>::new(),
-            tools: vec![tool],
+            binaries: vec![binary],
+            data: vec![],
             git_safe_directories: vec![],
         };
         let prepared = Prepared {
@@ -174,17 +169,10 @@ mod tests {
         (dir, prepared)
     }
 
-    /// Stages the bundle's first tool for `layout` and returns what was staged.
+    /// Stages the bundle's first binary for `layout` and returns what was staged.
     fn staged(bundle: &Prepared, layout: &Layout) -> Result<(TempDir, std::path::PathBuf)> {
         let stage = TempDir::new("bin-stage").unwrap();
-        let tool = &bundle.manifest.tools[0];
-        stage_binary(
-            bundle,
-            layout,
-            tool,
-            tool.binary.as_ref().unwrap(),
-            stage.path(),
-        )?;
+        stage_binary(bundle, layout, &bundle.manifest.binaries[0], stage.path())?;
         let file = stage.path().join("bin/hello");
         Ok((stage, file))
     }
@@ -202,7 +190,7 @@ mod tests {
 
     #[test]
     fn a_static_binary_is_staged_as_it_is_in_bin() {
-        let (_dir, b) = bundle(tool(None), "x86_64");
+        let (_dir, b) = bundle(hello(None), "x86_64");
         let (_stage, file) = staged(&b, &layout()).unwrap();
         assert_eq!(
             std::fs::read_to_string(file).unwrap(),
@@ -212,24 +200,22 @@ mod tests {
 
     #[test]
     fn a_wrapper_is_written_only_where_the_config_asked_for_one() {
-        let (_dir, none) = bundle(tool(None), "x86_64");
+        let (_dir, none) = bundle(hello(None), "x86_64");
         let env = FakeEnv::new();
         let user = dev();
         let place = |b: &Prepared| {
-            let tool = &b.manifest.tools[0];
             place_wrapper(
                 &Acting::new(&env, &user),
                 &user,
                 &layout(),
-                tool,
-                tool.binary.as_ref().unwrap(),
+                &b.manifest.binaries[0],
             )
             .unwrap()
         };
         assert_eq!(place(&none), None);
         assert!(!env.ran_matching(|_| true), "nothing was written");
 
-        let (_dir, some) = bundle(tool(Some("~/.local/bin/hello")), "x86_64");
+        let (_dir, some) = bundle(hello(Some("~/.local/bin/hello")), "x86_64");
         assert_eq!(
             place(&some).as_deref(),
             Some("/home/dev/.local/bin/hello"),
@@ -262,10 +248,10 @@ mod tests {
 
     #[test]
     fn a_dynamic_binary_is_given_the_interpreter_of_the_prefix_it_goes_to() {
-        let (dir, mut b) = bundle(tool(None), "x86_64");
+        let (dir, mut b) = bundle(hello(None), "x86_64");
         std::fs::write(dir.path().join("bin/hello"), dynamic_image()).unwrap();
         b.manifest.linker = Some("ld-linux-x86-64.so.2".into());
-        b.manifest.tools[0].binary.as_mut().unwrap().dynamic = true;
+        b.manifest.binaries[0].dynamic = true;
 
         for prefix in ["/p", "/home/dev/.local/share/lodge"] {
             let (_stage, file) = staged(&b, &Layout::new(prefix)).unwrap();
@@ -287,10 +273,10 @@ mod tests {
 
     #[test]
     fn a_prefix_too_long_for_the_reserved_space_is_refused_by_name() {
-        let (dir, mut b) = bundle(tool(None), "x86_64");
+        let (dir, mut b) = bundle(hello(None), "x86_64");
         std::fs::write(dir.path().join("bin/hello"), dynamic_image()).unwrap();
         b.manifest.linker = Some("ld.so".into());
-        b.manifest.tools[0].binary.as_mut().unwrap().dynamic = true;
+        b.manifest.binaries[0].dynamic = true;
         let long = Layout::new(format!("/{}", "a".repeat(600)));
         let err = format!("{:#}", staged(&b, &long).err().unwrap());
         assert!(err.contains("hello") && err.contains("shorter"), "{err}");
@@ -298,7 +284,7 @@ mod tests {
 
     #[test]
     fn a_bundle_for_another_architecture_is_refused() {
-        let (_dir, b) = bundle(tool(None), "x86_64");
+        let (_dir, b) = bundle(hello(None), "x86_64");
         let env = FakeEnv::new().with_output(&["uname", "-m"], "aarch64\n");
         let err = check_architecture(&env, &b.manifest)
             .unwrap_err()
@@ -308,19 +294,20 @@ mod tests {
 
     #[test]
     fn matching_architecture_and_bundles_without_binaries_pass() {
-        let (_dir, b) = bundle(tool(None), "x86_64");
+        let (_dir, b) = bundle(hello(None), "x86_64");
         let env = FakeEnv::new().with_output(&["uname", "-m"], "x86_64\n");
         check_architecture(&env, &b.manifest).unwrap();
 
-        let mut configs_only = b.manifest.clone();
-        configs_only.tools[0].binary = None;
-        configs_only.tools[0].config = Some(crate::bundle::manifest::ConfigTree {
+        let mut data_only = b.manifest.clone();
+        data_only.binaries.clear();
+        data_only.data.push(crate::bundle::manifest::Data {
             dest: "~/.x".into(),
             is_dir: false,
             hash: "0000000000000000".into(),
+            binary: None,
         });
         // No `uname` is declared: a bundle with no binaries must not even ask.
-        check_architecture(&FakeEnv::new(), &configs_only).unwrap();
+        check_architecture(&FakeEnv::new(), &data_only).unwrap();
     }
 
     #[test]
@@ -331,15 +318,13 @@ mod tests {
             arch: "x86_64".into(),
             linker: None,
             libs: vec![],
-            tools: vec![crate::bundle::manifest::Tool {
+            binaries: vec![crate::bundle::manifest::Binary {
                 name: "t".into(),
-                binary: Some(crate::bundle::manifest::Binary {
-                    dest: None,
-                    dynamic: false,
-                    hash: "00000000000000aa".into(),
-                }),
-                config: None,
+                dest: None,
+                dynamic: false,
+                hash: "00000000000000aa".into(),
             }],
+            data: vec![],
             git_safe_directories: vec![],
         };
         let mac = FakeEnv::new()

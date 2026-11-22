@@ -1,4 +1,4 @@
-//! Changing the `[[binary]]` and `[[config]]` entries of the config file from the
+//! Changing the `[[binary]]` and `[[data]]` entries of the config file from the
 //! command line and the config screen.
 //!
 //! The file is edited as text (comments, order and layout stay as the person
@@ -11,20 +11,21 @@ use std::path::Path;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value, value};
 
 use super::Config;
+use super::unknown::{self, Unknown};
 
 /// The two kinds of entry, each a table of its own name in the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Binary,
-    Config,
+    Data,
 }
 
 impl Kind {
-    /// The name of the table: `[[binary]]`, `[[config]]`.
+    /// The name of the table: `[[binary]]`, `[[data]]`.
     pub fn key(self) -> &'static str {
         match self {
             Kind::Binary => "binary",
-            Kind::Config => "config",
+            Kind::Data => "data",
         }
     }
 
@@ -32,7 +33,16 @@ impl Kind {
     pub fn fields(self) -> &'static [Field] {
         match self {
             Kind::Binary => &[Field::Name, Field::Path, Field::Target, Field::CopyDeps],
-            Kind::Config => &[Field::Name, Field::Path, Field::Target],
+            Kind::Data => &[Field::Path, Field::Target, Field::For],
+        }
+    }
+
+    /// The field that tells entries of this kind apart: a program is known by
+    /// its name, data by where it comes from.
+    fn identity(self) -> Field {
+        match self {
+            Kind::Binary => Field::Name,
+            Kind::Data => Field::Path,
         }
     }
 }
@@ -43,6 +53,7 @@ pub enum Field {
     Path,
     Target,
     CopyDeps,
+    For,
 }
 
 impl Field {
@@ -52,38 +63,73 @@ impl Field {
             Field::Path => "path",
             Field::Target => "target",
             Field::CopyDeps => "copy_deps",
+            Field::For => "for",
         }
     }
 }
 
-/// What to add, paths as they are to be written.
-pub struct NewEntry {
-    pub kind: Kind,
+/// What to add, paths as they are to be written: a program or data, each with
+/// only what it has.
+#[derive(Clone)]
+pub enum NewEntry {
+    Binary(NewBinary),
+    Data(NewData),
+}
+
+#[derive(Clone)]
+pub struct NewBinary {
     pub name: String,
     pub path: String,
     pub target: Option<String>,
-    /// Only a binary has libraries.
     pub copy_deps: bool,
 }
 
+#[derive(Clone)]
+pub struct NewData {
+    pub path: String,
+    pub target: Option<String>,
+    pub binary: Option<String>,
+}
+
 impl NewEntry {
+    /// A program with the defaults: no wrapper, its libraries packed.
     pub fn binary(name: &str, path: String) -> Self {
-        NewEntry {
-            kind: Kind::Binary,
+        NewEntry::Binary(NewBinary {
             name: name.into(),
             path,
             target: None,
             copy_deps: true,
+        })
+    }
+
+    pub fn data(path: String, target: Option<String>, binary: Option<String>) -> Self {
+        NewEntry::Data(NewData {
+            path,
+            target,
+            binary,
+        })
+    }
+
+    pub fn kind(&self) -> Kind {
+        match self {
+            NewEntry::Binary(_) => Kind::Binary,
+            NewEntry::Data(_) => Kind::Data,
         }
     }
 
-    pub fn config(name: &str, path: String, target: Option<String>) -> Self {
-        NewEntry {
-            kind: Kind::Config,
-            name: name.into(),
-            path,
-            target,
-            copy_deps: true,
+    /// What tells it apart from the others of its kind: a program's name, data's path.
+    pub fn key(&self) -> &str {
+        match self {
+            NewEntry::Binary(b) => &b.name,
+            NewEntry::Data(d) => &d.path,
+        }
+    }
+
+    /// The host path, as it is to be written.
+    pub fn path(&self) -> &str {
+        match self {
+            NewEntry::Binary(b) => &b.path,
+            NewEntry::Data(d) => &d.path,
         }
     }
 }
@@ -93,31 +139,56 @@ impl NewEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawEntry {
     pub kind: Kind,
-    pub name: String,
+    pub name: Option<String>,
     pub path: Option<String>,
     pub target: Option<String>,
     pub copy_deps: Option<bool>,
+    pub binary: Option<String>,
+}
+
+impl RawEntry {
+    /// What tells it apart from the others of its kind.
+    pub fn key(&self) -> &str {
+        match self.kind {
+            Kind::Binary => self.name.as_deref().unwrap_or_default(),
+            Kind::Data => self.path.as_deref().unwrap_or_default(),
+        }
+    }
 }
 
 /// Adds an entry to the config at `path` (created when missing).
 pub fn add(path: &Path, entry: &NewEntry) -> Result<()> {
     let mut doc = read(path)?;
-    let key = entry.kind.key();
-    if entries(&doc, entry.kind).any(|t| name_of(t) == Some(entry.name.as_str())) {
+    let kind = entry.kind();
+    let key = kind.key();
+    if entries(&doc, kind).any(|t| identity_of(kind, t) == Some(entry.key())) {
         bail!(
             "a [[{key}]] `{}` is already in {}; remove it first to replace it",
-            entry.name,
+            entry.key(),
             path.display(),
         );
     }
     let mut table = Table::new();
-    table["name"] = value(&entry.name);
-    table["path"] = value(&entry.path);
-    if let Some(target) = &entry.target {
-        table["target"] = value(target.as_str());
-    }
-    if entry.kind == Kind::Binary && !entry.copy_deps {
-        table["copy_deps"] = value(false);
+    match entry {
+        NewEntry::Binary(b) => {
+            table["name"] = value(&b.name);
+            table["path"] = value(&b.path);
+            if let Some(target) = &b.target {
+                table["target"] = value(target.as_str());
+            }
+            if !b.copy_deps {
+                table["copy_deps"] = value(false);
+            }
+        }
+        NewEntry::Data(d) => {
+            table["path"] = value(&d.path);
+            if let Some(target) = &d.target {
+                table["target"] = value(target.as_str());
+            }
+            if let Some(binary) = &d.binary {
+                table["for"] = value(binary);
+            }
+        }
     }
     // A file of nothing but comments (what `ldg init` writes) keeps them above the
     // entry, where they were, and not after it.
@@ -138,22 +209,26 @@ pub fn add(path: &Path, entry: &NewEntry) -> Result<()> {
     write(path, &doc)
 }
 
-/// Removes the entry of `kind` called `name`.
-pub fn remove(path: &Path, kind: Kind, name: &str) -> Result<()> {
+/// Removes the entry of `kind` known as `key` (see [`RawEntry::key`]). Data that
+/// was for a removed binary stays, no longer for anything.
+pub fn remove(path: &Path, kind: Kind, key: &str) -> Result<()> {
     let mut doc = read(path)?;
-    let missing = || format!("no [[{}]] `{name}` in {}", kind.key(), path.display());
+    let missing = || format!("no [[{}]] `{key}` in {}", kind.key(), path.display());
     let Some(list) = doc
         .get_mut(kind.key())
         .and_then(Item::as_array_of_tables_mut)
     else {
         bail!(missing());
     };
-    let Some(at) = list.iter().position(|t| name_of(t) == Some(name)) else {
+    let Some(at) = list.iter().position(|t| identity_of(kind, t) == Some(key)) else {
         bail!(missing());
     };
     list.remove(at);
     if list.is_empty() {
         doc.remove(kind.key());
+    }
+    if kind == Kind::Binary {
+        point_data_at(&mut doc, key, None);
     }
     write(path, &doc)
 }
@@ -166,59 +241,104 @@ pub fn list(path: &Path, kind: Kind) -> Result<Vec<RawEntry>> {
     Ok(entries(&doc, kind)
         .map(|t| RawEntry {
             kind,
-            name: text(t, "name").unwrap_or_default(),
+            name: text(t, "name"),
             path: text(t, "path"),
             target: text(t, "target"),
             copy_deps: t.get("copy_deps").and_then(Item::as_bool),
+            binary: text(t, "for"),
         })
         .collect())
 }
 
-/// Sets a text field of the entry of `kind` called `name`, or takes it out with
+/// What the config at `path` holds that this version of lodge does not know (none
+/// when it is missing).
+pub fn unknown(path: &Path) -> Result<Vec<Unknown>> {
+    Ok(unknown::find(&read_text(path)?))
+}
+
+/// Takes `which` out of the config at `path`. It is the one edit that needs no
+/// valid config as its result: what it takes out is what keeps one from loading.
+pub fn remove_unknown(path: &Path, which: &Unknown) -> Result<()> {
+    let text = unknown::remove(&read_text(path)?, which)
+        .with_context(|| format!("`{}` is no longer in {}", which.label, path.display()))?;
+    store(path, &text)
+}
+
+/// Sets a text field of the entry of `kind` known as `key`, or takes it out with
 /// `None` (`copy_deps` is not text: see [`set_copy_deps`]). The result is checked as
-/// a whole, so a name in use or a target the container can't use is refused.
-pub fn set_field(
-    path: &Path,
-    kind: Kind,
-    name: &str,
-    field: Field,
-    to: Option<&str>,
-) -> Result<()> {
+/// a whole, so a name in use or a target the container can't use is refused. The
+/// data that is for a binary follows it when the binary is renamed.
+pub fn set_field(path: &Path, kind: Kind, key: &str, field: Field, to: Option<&str>) -> Result<()> {
+    if !kind.fields().contains(&field) {
+        bail!("a [[{}]] has no `{}`", kind.key(), field.key());
+    }
     if field == Field::CopyDeps {
         bail!("copy_deps is on or off, not text");
     }
-    if to.is_none() && matches!(field, Field::Name | Field::Path) {
+    if to.is_none() && (field == kind.identity() || field == Field::Path) {
         bail!("an entry needs a {}", field.key());
     }
-    change(path, kind, name, |t| match to {
+    let mut doc = read(path)?;
+    change_in(&mut doc, path, kind, key, |t| match to {
         Some(v) => t[field.key()] = value(v),
         None => {
             t.remove(field.key());
         }
-    })
+    })?;
+    if kind == Kind::Binary
+        && field == Field::Name
+        && let Some(new) = to
+    {
+        point_data_at(&mut doc, key, Some(new));
+    }
+    write(path, &doc)
 }
 
 /// Sets `copy_deps` of the binary called `name`; `true` is the default, so it is
 /// taken out of the file instead of written.
 pub fn set_copy_deps(path: &Path, name: &str, on: bool) -> Result<()> {
-    change(path, Kind::Binary, name, |t| {
+    let mut doc = read(path)?;
+    change_in(&mut doc, path, Kind::Binary, name, |t| {
         if on {
             t.remove("copy_deps");
         } else {
             t["copy_deps"] = value(false);
         }
-    })
+    })?;
+    write(path, &doc)
 }
 
-fn change(path: &Path, kind: Kind, name: &str, edit: impl FnOnce(&mut Table)) -> Result<()> {
-    let mut doc = read(path)?;
+fn change_in(
+    doc: &mut DocumentMut,
+    path: &Path,
+    kind: Kind,
+    key: &str,
+    edit: impl FnOnce(&mut Table),
+) -> Result<()> {
     let table = doc
         .get_mut(kind.key())
         .and_then(Item::as_array_of_tables_mut)
-        .and_then(|list| list.iter_mut().find(|t| name_of(t) == Some(name)))
-        .with_context(|| format!("no [[{}]] `{name}` in {}", kind.key(), path.display()))?;
+        .and_then(|list| list.iter_mut().find(|t| identity_of(kind, t) == Some(key)))
+        .with_context(|| format!("no [[{}]] `{key}` in {}", kind.key(), path.display()))?;
     edit(table);
-    write(path, &doc)
+    Ok(())
+}
+
+/// Makes the data that is for the binary `old` be for `new`, or for nothing.
+fn point_data_at(doc: &mut DocumentMut, old: &str, new: Option<&str>) {
+    let Some(list) = doc.get_mut("data").and_then(Item::as_array_of_tables_mut) else {
+        return;
+    };
+    for table in list.iter_mut() {
+        if table.get("for").and_then(Item::as_str) == Some(old) {
+            match new {
+                Some(name) => table["for"] = value(name),
+                None => {
+                    table.remove("for");
+                }
+            }
+        }
+    }
 }
 
 /// The single values of the file: `target` and `bundle` at the top, `shell` under
@@ -489,20 +609,48 @@ fn name_of(table: &Table) -> Option<&str> {
     table.get("name").and_then(Item::as_str)
 }
 
+/// What tells the entry apart from the others of its `kind`.
+fn identity_of(kind: Kind, table: &Table) -> Option<&str> {
+    table.get(kind.identity().key()).and_then(Item::as_str)
+}
+
+fn read_text(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => Ok(raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
 fn read(path: &Path) -> Result<DocumentMut> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    raw.parse()
+    read_text(path)?
+        .parse()
         .with_context(|| format!("{} is not valid TOML", path.display()))
 }
 
-/// Checks the edited text as a config, then replaces the file in one step.
+/// Checks the edited text as a config, then replaces the file in one step. A file
+/// that is invalid already may be mended a step at a time: an edit that leaves it
+/// with fewer problems than it had is let through, though it is not yet valid.
 fn write(path: &Path, doc: &DocumentMut) -> Result<()> {
     let text = doc.to_string();
-    Config::parse(&text, path)?;
+    if let Err(refused) = Config::parse(&text, path)
+        && !mends(path, &text)
+    {
+        return Err(refused);
+    }
+    store(path, &text)
+}
+
+/// Whether `text` has fewer problems than the file at `path` has now.
+fn mends(path: &Path, text: &str) -> bool {
+    let Ok(now) = read_text(path) else {
+        return false;
+    };
+    let before = Config::problem_count(&now, path);
+    before > 0 && Config::problem_count(text, path) < before
+}
+
+fn store(path: &Path, text: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -532,11 +680,7 @@ mod tests {
         add(&path, &NewEntry::binary("rg", "/usr/bin/rg".into())).unwrap();
         add(
             &path,
-            &NewEntry::config(
-                "nvim",
-                "~/.config/nvim".into(),
-                Some("~/.config/nvim".into()),
-            ),
+            &NewEntry::data("~/.config/nvim".into(), None, Some("nvim".into())),
         )
         .unwrap();
         let now = std::fs::read_to_string(&path).unwrap();
@@ -546,9 +690,12 @@ mod tests {
             now.contains("name = \"rg\"\npath = \"/usr/bin/rg\""),
             "{now}"
         );
-        assert!(now.contains("[[config]]\nname = \"nvim\""), "{now}");
+        assert!(
+            now.contains("[[data]]\npath = \"~/.config/nvim\"\nfor = \"nvim\""),
+            "{now}"
+        );
         let config = Config::load(&path).unwrap();
-        assert_eq!((config.binaries.len(), config.configs.len()), (2, 1));
+        assert_eq!((config.binaries.len(), config.data.len()), (2, 1));
         assert_eq!(config.session.shell, "/bin/zsh");
     }
 
@@ -556,8 +703,12 @@ mod tests {
     fn a_missing_file_is_created_and_a_comments_only_file_keeps_its_comments_on_top() {
         let dir = TempDir::new("config-edit-new").unwrap();
         let path = dir.path().join("lodge/config.toml");
-        let mut e = NewEntry::binary("rg", "/usr/bin/rg".into());
-        e.copy_deps = false;
+        let e = NewEntry::Binary(NewBinary {
+            name: "rg".into(),
+            path: "/usr/bin/rg".into(),
+            target: None,
+            copy_deps: false,
+        });
         add(&path, &e).unwrap();
         assert!(!Config::load(&path).unwrap().binaries[0].copy_deps);
         let (_dir, path) = file("# a starting point\n# [[binary]]\n");
@@ -570,28 +721,36 @@ mod tests {
     }
 
     #[test]
-    fn a_binary_and_a_config_may_share_a_name_but_two_binaries_may_not() {
+    fn an_entry_is_refused_when_its_name_or_its_path_is_taken() {
         let (_dir, path) = file("[[binary]]\nname = \"nvim\"\npath = \"/usr/bin/nvim\"\n");
-        add(&path, &NewEntry::config("nvim", "/etc/nvim".into(), None)).unwrap();
+        add(&path, &NewEntry::data("/etc/nvim".into(), None, None)).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let err = add(&path, &NewEntry::binary("nvim", "/x".into())).unwrap_err();
         assert!(err.to_string().contains("already in"), "{err:#}");
-        // A target the container user can't use is refused, and nothing is written.
-        let bad = NewEntry::config("bad", "/x".into(), Some("../out".into()));
-        assert!(add(&path, &bad).is_err());
+        let err = add(&path, &NewEntry::data("/etc/nvim".into(), None, None)).unwrap_err();
+        assert!(err.to_string().contains("[[data]] `/etc/nvim`"), "{err:#}");
+        // Two paths to one place, a target the container user can't use, and a
+        // binary that is not there: refused, and nothing is written.
+        for bad in [
+            NewEntry::data("/other".into(), Some("/etc/nvim".into()), None),
+            NewEntry::data("/x".into(), Some("../out".into()), None),
+            NewEntry::data("/y".into(), None, Some("emacs".into())),
+        ] {
+            assert!(add(&path, &bad).is_err());
+        }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
 
     #[test]
-    fn an_entry_is_removed_by_kind_and_name_with_its_neighbours_left_alone() {
-        let text = "[[binary]]\nname = \"a\"\npath = \"/a\"\n\n[[config]]\nname = \"a\"\npath = \"/ca\"\n\n[[binary]]\nname = \"b\"\npath = \"/b\"\n\n[session]\nshell = \"/bin/sh\"\n";
+    fn an_entry_is_removed_by_its_name_or_path_with_its_neighbours_left_alone() {
+        let text = "[[binary]]\nname = \"a\"\npath = \"/a\"\n\n[[data]]\npath = \"/da\"\n\n[[binary]]\nname = \"b\"\npath = \"/b\"\n\n[session]\nshell = \"/bin/sh\"\n";
         let (_dir, path) = file(text);
         remove(&path, Kind::Binary, "a").unwrap();
         let config = Config::load(&path).unwrap();
         assert_eq!(config.binaries.len(), 1);
-        assert_eq!(config.configs[0].name, "a", "the config of that name stays");
+        assert_eq!(config.data.len(), 1, "the data stays");
         remove(&path, Kind::Binary, "b").unwrap();
-        remove(&path, Kind::Config, "a").unwrap();
+        remove(&path, Kind::Data, "/da").unwrap();
         let now = std::fs::read_to_string(&path).unwrap();
         assert!(!now.contains("[[") && now.contains("[session]"), "{now}");
         let err = remove(&path, Kind::Binary, "b").unwrap_err();
@@ -599,22 +758,44 @@ mod tests {
     }
 
     #[test]
+    fn the_data_of_a_binary_follows_its_rename_and_outlives_its_removal() {
+        let text = "[[binary]]\nname = \"nvim\"\npath = \"/usr/bin/nvim\"\n\n\
+                    [[data]]\npath = \"/usr/share/nvim\"\nfor = \"nvim\"\n\n\
+                    [[data]]\npath = \"/etc/x\"\n";
+        let (_dir, path) = file(text);
+        set_field(&path, Kind::Binary, "nvim", Field::Name, Some("vi")).unwrap();
+        let data = list(&path, Kind::Data).unwrap();
+        assert_eq!(data[0].binary.as_deref(), Some("vi"));
+        assert_eq!(data[1].binary, None);
+        remove(&path, Kind::Binary, "vi").unwrap();
+        let data = list(&path, Kind::Data).unwrap();
+        assert_eq!(data.len(), 2, "no data is lost with the binary");
+        assert!(data.iter().all(|d| d.binary.is_none()));
+        // `for` can only name a binary that is there.
+        let err = set_field(&path, Kind::Data, "/etc/x", Field::For, Some("vi")).unwrap_err();
+        assert!(format!("{err:#}").contains("not a [[binary]]"), "{err:#}");
+    }
+
+    #[test]
     fn entries_are_read_as_written_and_a_field_is_set_cleared_or_refused() {
-        let text = "# keep\n[[binary]]\nname = \"a\"\npath = \"~/bin/a\"\ncopy_deps = false\n\n[[config]]\nname = \"b\"\npath = \"/etc/b\"\n";
+        let text = "# keep\n[[binary]]\nname = \"a\"\npath = \"~/bin/a\"\ncopy_deps = false\n\n[[data]]\npath = \"/etc/b\"\n";
         let (_dir, path) = file(text);
         let binaries = list(&path, Kind::Binary).unwrap();
         assert_eq!(binaries[0].path.as_deref(), Some("~/bin/a"));
         assert_eq!(binaries[0].copy_deps, Some(false));
-        assert_eq!(list(&path, Kind::Config).unwrap()[0].copy_deps, None);
-        set_field(&path, Kind::Config, "b", Field::Target, Some("~/.b")).unwrap();
+        assert_eq!(binaries[0].key(), "a");
+        let data = list(&path, Kind::Data).unwrap();
+        assert_eq!((data[0].copy_deps, data[0].key()), (None, "/etc/b"));
+        set_field(&path, Kind::Data, "/etc/b", Field::Target, Some("~/.b")).unwrap();
         set_copy_deps(&path, "a", true).unwrap();
         let now = std::fs::read_to_string(&path).unwrap();
         assert!(now.starts_with("# keep"), "{now}");
         assert!(!now.contains("copy_deps"), "{now}");
         assert!(now.contains("target = \"~/.b\""), "{now}");
-        set_field(&path, Kind::Config, "b", Field::Target, None).unwrap();
+        set_field(&path, Kind::Data, "/etc/b", Field::Target, None).unwrap();
         // The path or name taken out, a name in use, a target that is not usable, a
-        // missing entry, and text for copy_deps: refused, the file left as it was.
+        // missing entry, a field the kind does not have, and text for copy_deps:
+        // refused, the file left as it was.
         add(&path, &NewEntry::binary("c", "/c".into())).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
         for result in [
@@ -624,12 +805,58 @@ mod tests {
             set_field(&path, Kind::Binary, "a", Field::Target, Some("../x")),
             set_field(&path, Kind::Binary, "zz", Field::Path, Some("/x")),
             set_field(&path, Kind::Binary, "a", Field::CopyDeps, Some("no")),
+            set_field(&path, Kind::Binary, "a", Field::For, Some("c")),
+            set_field(&path, Kind::Data, "/etc/b", Field::Name, Some("b")),
+            set_field(&path, Kind::Data, "/etc/b", Field::Path, None),
         ] {
             assert!(result.is_err());
         }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         set_field(&path, Kind::Binary, "a", Field::Name, Some("d")).unwrap();
-        assert_eq!(list(&path, Kind::Binary).unwrap()[0].name, "d");
+        assert_eq!(list(&path, Kind::Binary).unwrap()[0].key(), "d");
+    }
+
+    #[test]
+    fn a_config_that_does_not_load_is_mended_by_taking_out_what_it_does_not_know() {
+        let text = "# mine\ntarget = \"docker\"\n\n[[config]]\nname = \"nvim\"\n\n[[binary]]\nname = \"a\"\npath = \"/a\"\ncopy_dep = true\n";
+        let (_dir, path) = file(text);
+        // The edits a valid config allows are refused for one that is not.
+        assert!(add(&path, &NewEntry::binary("b", "/b".into())).is_err());
+        let all = unknown(&path).unwrap();
+        assert_eq!(all.len(), 2);
+        // Taking one out is allowed though the file is not yet valid, and the rest of
+        // the text is as it was.
+        remove_unknown(&path, &all[0]).unwrap();
+        let now = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            now.starts_with("# mine\ntarget") && now.contains("copy_dep"),
+            "{now}"
+        );
+        assert!(Config::load(&path).is_err());
+        // What is no longer there cannot be taken out again.
+        assert!(remove_unknown(&path, &all[0]).is_err());
+        remove_unknown(&path, &unknown(&path).unwrap()[0]).unwrap();
+        Config::load(&path).unwrap();
+        add(&path, &NewEntry::binary("b", "/b".into())).unwrap();
+    }
+
+    #[test]
+    fn a_file_with_two_problems_is_mended_one_edit_at_a_time_and_never_made_worse() {
+        let text = "[[binary]]\nname = \"a\"\npath = \"/a\"\ntarget = \"rel/a\"\n\n\
+                    [[data]]\npath = \"/d\"\nfor = \"nope\"\n";
+        let (_dir, path) = file(text);
+        assert_eq!(Config::problem_count(text, &path), 2);
+        // Not an edit that leaves it as bad, nor one that adds a problem...
+        assert!(set_field(&path, Kind::Binary, "a", Field::Path, Some("/b")).is_err());
+        assert!(add(&path, &NewEntry::binary("c", "/c".into())).is_err());
+        // ...but each that takes one away.
+        set_field(&path, Kind::Binary, "a", Field::Target, Some("~/bin/a")).unwrap();
+        assert_eq!(
+            Config::problem_count(&std::fs::read_to_string(&path).unwrap(), &path),
+            1
+        );
+        set_field(&path, Kind::Data, "/d", Field::For, None).unwrap();
+        Config::load(&path).unwrap();
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! which bundle was injected, and what lodge placed *outside* the prefix, so
 //! `ldg status` can show the first and `ldg clean` can act on the second.
 //!
-//! One line per fact: `bundle <id>`, `source <where it came from>`, `wrapper <path>`, `config <path>`,
+//! One line per fact: `bundle <id>`, `source <where it came from>`, `wrapper <path>`, `data <path>`,
 //! `safe_directory <dir>` (a git `safe.directory` entry lodge added).
 
 use anyhow::Result;
@@ -22,8 +22,8 @@ pub struct Installed {
     pub source: Option<String>,
     /// Wrapper scripts the config asked for.
     pub wrappers: Vec<String>,
-    /// Config files and directories copied into place.
-    pub configs: Vec<String>,
+    /// Files and directories copied into place.
+    pub data: Vec<String>,
     /// Git `safe.directory` entries lodge added (not ones that were already there).
     pub safe_directories: Vec<String>,
 }
@@ -36,8 +36,8 @@ fn render(installed: &Installed) -> String {
     for path in &installed.wrappers {
         text.push_str(&format!("wrapper {path}\n"));
     }
-    for path in &installed.configs {
-        text.push_str(&format!("config {path}\n"));
+    for path in &installed.data {
+        text.push_str(&format!("data {path}\n"));
     }
     for dir in &installed.safe_directories {
         text.push_str(&format!("safe_directory {dir}\n"));
@@ -53,7 +53,7 @@ fn parse(layout: &Layout, text: &str) -> Option<Installed> {
         bundle: String::new(),
         source: None,
         wrappers: Vec::new(),
-        configs: Vec::new(),
+        data: Vec::new(),
         safe_directories: Vec::new(),
     };
     for line in text.lines() {
@@ -65,7 +65,7 @@ fn parse(layout: &Layout, text: &str) -> Option<Installed> {
             "bundle" => installed.bundle = value.to_string(),
             "source" => installed.source = Some(value.to_string()),
             "wrapper" => installed.wrappers.push(value.to_string()),
-            "config" => installed.configs.push(value.to_string()),
+            "data" => installed.data.push(value.to_string()),
             "safe_directory" => installed.safe_directories.push(value.to_string()),
             _ => {}
         }
@@ -121,7 +121,7 @@ mod tests {
             bundle: "abc".into(),
             source: Some("ghcr.io/me/lodge@sha256:aa".into()),
             wrappers: vec!["/home/dev/.local/bin/nvim".into()],
-            configs: vec!["/home/dev/.config/nvim".into(), "/home/dev/.hellorc".into()],
+            data: vec!["/home/dev/.config/nvim".into(), "/home/dev/.hellorc".into()],
             safe_directories: vec!["/w".into()],
         }
     }
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn a_record_without_a_bundle_is_no_record() {
-        assert_eq!(parse(&Layout::new("/p"), "config /x\n"), None);
+        assert_eq!(parse(&Layout::new("/p"), "data /x\n"), None);
         assert_eq!(parse(&Layout::new("/p"), ""), None);
     }
 
@@ -180,7 +180,7 @@ mod tests {
             env.file("/p/injected").unwrap(),
             "bundle abc\nsource ghcr.io/me/lodge@sha256:aa\n\
              wrapper /home/dev/.local/bin/nvim\n\
-             config /home/dev/.config/nvim\nconfig /home/dev/.hellorc\n\
+             data /home/dev/.config/nvim\ndata /home/dev/.hellorc\n\
              safe_directory /w\n"
         );
     }

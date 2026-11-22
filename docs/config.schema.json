@@ -31,20 +31,23 @@
       ],
       "type": "object"
     },
-    "ConfigEntry": {
+    "DataEntry": {
       "additionalProperties": false,
-      "description": "A config file or directory to inject.",
+      "description": "A file or directory to inject, copied as it is: a program's runtime files, a\nconfig, a plugin folder. It is identified by where it goes, so no two entries\nmay go to the same place.",
       "properties": {
-        "name": {
-          "description": "Identifier, unique among the configs; its name in the bundle, and the\ndefault place in the container.",
-          "type": "string"
+        "for": {
+          "description": "The `name` of the `[[binary]]` this belongs to. Only says what it is for:\nit is injected the same either way.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "path": {
           "description": "Host path to the file or directory.",
           "type": "string"
         },
         "target": {
-          "description": "Where it goes in the container (default: `~/.config/<name>`).",
+          "description": "Where it goes in the container (default: the same place as here, `~/…`\nwhen it is under the home directory).",
           "type": [
             "string",
             "null"
@@ -52,7 +55,6 @@
         }
       },
       "required": [
-        "name",
         "path"
       ],
       "type": "object"
@@ -175,17 +177,17 @@
     },
     "bundle": {
       "default": null,
-      "description": "A bundle to inject from instead of packing the `[[binary]]` and `[[config]]`\nentries: a file, or a registry as `oci://ghcr.io/me/lodge:1`. A relative\nfile path is relative to this file's folder.",
+      "description": "A bundle to inject from instead of packing the `[[binary]]` and `[[data]]`\nentries: a file, or a registry as `oci://ghcr.io/me/lodge:1`. A relative\nfile path is relative to this file's folder.",
       "type": [
         "string",
         "null"
       ]
     },
-    "config": {
+    "data": {
       "default": [],
-      "description": "Config files and directories to inject.",
+      "description": "Files and directories to inject, as they are.",
       "items": {
-        "$ref": "#/$defs/ConfigEntry"
+        "$ref": "#/$defs/DataEntry"
       },
       "type": "array"
     },

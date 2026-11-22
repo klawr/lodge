@@ -324,10 +324,10 @@ pub fn clean(ctx: &Ctx, path: Option<PathBuf>, existing: Option<&str>) -> Result
     for d in &removed.safe_directories {
         line!("git safe.directory  {d}");
     }
-    if !removed.configs_kept.is_empty() {
+    if !removed.data_kept.is_empty() {
         note!(
-            "injected configs were left in place (remove them by hand if unwanted):\n  {}",
-            removed.configs_kept.join("\n  ")
+            "injected data was left in place (remove it by hand if unwanted):\n  {}",
+            removed.data_kept.join("\n  ")
         );
     }
     Ok(())

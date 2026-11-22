@@ -3,7 +3,7 @@
 //! Removes what injection put there: the user's prefix (binaries, libraries, the
 //! dynamic linker and the record) and the wrappers the config asked for, if they
 //! still point at lodge. Placed secrets are [`crate::secret`]'s to remove.
-//! Injected *configs* are left in place and reported, since the user may have
+//! Injected *data* is left in place and reported, since the user may have
 //! changed them in the container. The devcontainer's own state (hook markers, the
 //! config hash, `containerEnv`) is kept, so a later `ldg up` neither re-runs create
 //! hooks nor thinks the config drifted.
@@ -20,8 +20,8 @@ use crate::shell::{script_argv, shell_quote};
 pub struct Removed {
     /// Wrapper scripts that were deleted.
     pub wrappers: Vec<String>,
-    /// Injected config files and directories, left in place.
-    pub configs_kept: Vec<String>,
+    /// Injected files and directories, left in place.
+    pub data_kept: Vec<String>,
     /// Git `safe.directory` entries that were unset.
     pub safe_directories: Vec<String>,
 }
@@ -80,7 +80,7 @@ pub fn remove(container: &dyn Env, user: &ContainerUser, installed: &Installed) 
     wrappers.dedup();
     Ok(Removed {
         wrappers,
-        configs_kept: installed.configs.clone(),
+        data_kept: installed.data.clone(),
         safe_directories: installed.safe_directories.clone(),
     })
 }
@@ -174,14 +174,14 @@ mod tests {
     }
 
     #[test]
-    fn cleaning_reports_the_kept_configs_and_never_runs_as_root() {
+    fn cleaning_reports_the_kept_data_and_never_runs_as_root() {
         let layout = Layout::preferred(&dev());
         let installed = Installed {
             layout: layout.clone(),
             bundle: "abc".into(),
             source: None,
             wrappers: vec![],
-            configs: vec!["/home/dev/.config/nvim".into()],
+            data: vec!["/home/dev/.config/nvim".into()],
             safe_directories: vec!["/w".into()],
         };
         let removal = script(layout.prefix(), &format!("exec {}/", layout.bin()));
@@ -190,7 +190,7 @@ mod tests {
             .with_output(&script_argv(UNSET_SCRIPT, &["/w"]), "");
         let removed = remove(&env, &dev(), &installed).unwrap();
         assert_eq!(removed.safe_directories, ["/w"]);
-        assert_eq!(removed.configs_kept, ["/home/dev/.config/nvim"]);
+        assert_eq!(removed.data_kept, ["/home/dev/.config/nvim"]);
         assert!(removed.wrappers.is_empty());
         for (call, who) in env.calls() {
             assert_ne!(who, Who::Root, "{call:?} ran as root");

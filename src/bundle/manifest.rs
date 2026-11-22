@@ -2,7 +2,7 @@
 //!
 //! A bundle is a file that arrives from somewhere else, so a manifest is
 //! validated before anything is trusted: paths inside the bundle are *derived
-//! from names* (`bin/<tool>`, `lib/<file>`, `config/<tool>`) rather than stored,
+//! from names* (`bin/<binary>`, `lib/<file>`, `data/<n>`) rather than stored,
 //! so it cannot point outside itself.
 //!
 //! A bundle does not know where it will be installed. Its dynamic binaries carry
@@ -21,7 +21,12 @@ use crate::shell::{container_path_problem, is_plain_name};
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const BIN_DIR: &str = "bin";
 pub const LIB_DIR: &str = "lib";
-pub const CONFIG_DIR: &str = "config";
+pub const DATA_DIR: &str = "data";
+
+/// Where the `index`th [`Data`] of a bundle is stored, relative to the bundle.
+pub fn data_file(index: usize) -> String {
+    format!("{DATA_DIR}/{index}")
+}
 
 /// The library search path of a packed binary, relative to where the binary is:
 /// `bin/` and `lib/` are siblings in a bundle and stay siblings where it is
@@ -42,7 +47,9 @@ pub struct Manifest {
     pub linker: Option<String>,
     /// Shared libraries (and the linker), stored at `lib/<name>`.
     pub libs: Vec<Lib>,
-    pub tools: Vec<Tool>,
+    pub binaries: Vec<Binary>,
+    /// Files and directories, copied as they are; the first is `data/0`.
+    pub data: Vec<Data>,
     pub git_safe_directories: Vec<String>,
 }
 
@@ -53,22 +60,15 @@ pub struct Lib {
     pub hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Tool {
-    pub name: String,
-    pub binary: Option<Binary>,
-    pub config: Option<ConfigTree>,
-}
-
-/// A binary, stored at `bin/<tool name>`.
+/// A binary, stored at `bin/<name>`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Binary {
+    pub name: String,
     /// Where an extra wrapper script goes (`~/` is the user's home), when the
-    /// config asked for one with `target_binary`. Without it the binary is
-    /// reached through the `PATH` of lodge's sessions. Called `target` in the
-    /// manifest, after the config's `target_binary`.
+    /// config asked for one with `target`. Without it the binary is reached
+    /// through the `PATH` of lodge's sessions. Called `target` in the manifest,
+    /// after the config's key.
     #[serde(rename = "target", default, skip_serializing_if = "Option::is_none")]
     pub dest: Option<String>,
     /// Whether it was relinked to the bundled glibc (false: static, or copied as is).
@@ -76,16 +76,20 @@ pub struct Binary {
     pub hash: String,
 }
 
-/// A config file or tree, stored at `config/<tool name>`.
+/// A file or directory, stored at [`data_file`]: it goes to one place in the
+/// container, which names it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ConfigTree {
-    /// Where it goes in the container (`~/` is the user's home). Called
-    /// `target` in the manifest, after the config's `target_config`.
+pub struct Data {
+    /// Where it goes in the container (`~/` is the user's home). Called `target`
+    /// in the manifest, after the config's key.
     #[serde(rename = "target")]
     pub dest: String,
     pub is_dir: bool,
     pub hash: String,
+    /// The binary it is for, by name. Says what it is for, nothing more.
+    #[serde(rename = "for", default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
 }
 
 impl Manifest {
@@ -131,30 +135,36 @@ impl Manifest {
             bail!("the dynamic linker '{linker}' is not among the bundled libraries");
         }
 
-        let mut tool_names = HashSet::new();
-        for tool in &self.tools {
-            check_name("tool", &tool.name)?;
-            if !tool_names.insert(tool.name.as_str()) {
-                bail!("tool '{}' is listed twice", tool.name);
+        let mut binary_names = HashSet::new();
+        for binary in &self.binaries {
+            let name = &binary.name;
+            check_name("binary", name)?;
+            if !binary_names.insert(name.as_str()) {
+                bail!("binary '{name}' is listed twice");
             }
-            if tool.binary.is_none() && tool.config.is_none() {
-                bail!("tool '{}' has neither a binary nor a config", tool.name);
+            if let Some(dest) = &binary.dest {
+                check_dest(name, dest)?;
             }
-            if let Some(b) = &tool.binary {
-                if let Some(dest) = &b.dest {
-                    check_dest(&tool.name, dest)?;
-                }
-                check_hash(&tool.name, &b.hash)?;
-                if b.dynamic && self.linker.is_none() {
-                    bail!(
-                        "tool '{}' is dynamic but the bundle has no linker",
-                        tool.name
-                    );
-                }
+            check_hash(name, &binary.hash)?;
+            if binary.dynamic && self.linker.is_none() {
+                bail!("binary '{name}' is dynamic but the bundle has no linker");
             }
-            if let Some(c) = &tool.config {
-                check_dest(&tool.name, &c.dest)?;
-                check_hash(&tool.name, &c.hash)?;
+        }
+
+        let mut dests = HashSet::new();
+        for data in &self.data {
+            check_dest("data", &data.dest)?;
+            check_hash(&data.dest, &data.hash)?;
+            if !dests.insert(data.dest.as_str()) {
+                bail!("data for {} is listed twice", data.dest);
+            }
+            if let Some(name) = &data.binary
+                && !binary_names.contains(name.as_str())
+            {
+                bail!(
+                    "data for {} is for '{name}', which is not a binary",
+                    data.dest
+                );
             }
         }
         Ok(())
@@ -176,9 +186,9 @@ fn check_hash(what: &str, hash: &str) -> Result<()> {
 }
 
 /// A container path: absolute or under `~/`, without `..` or control characters.
-fn check_dest(tool: &str, dest: &str) -> Result<()> {
+fn check_dest(what: &str, dest: &str) -> Result<()> {
     if let Some(why) = container_path_problem(dest) {
-        bail!("tool '{tool}' has an unusable target path {dest:?}: it {why}");
+        bail!("{what} has an unusable target path {dest:?}: it {why}");
     }
     Ok(())
 }
@@ -203,19 +213,26 @@ mod tests {
                     hash: "fedcba9876543210".into(),
                 },
             ],
-            tools: vec![Tool {
+            binaries: vec![Binary {
                 name: "nvim".into(),
-                binary: Some(Binary {
-                    dest: Some("/usr/local/bin/nvim".into()),
-                    dynamic: true,
-                    hash: "00000000000000aa".into(),
-                }),
-                config: Some(ConfigTree {
+                dest: Some("/usr/local/bin/nvim".into()),
+                dynamic: true,
+                hash: "00000000000000aa".into(),
+            }],
+            data: vec![
+                Data {
                     dest: "~/.config/nvim".into(),
                     is_dir: true,
                     hash: "00000000000000bb".into(),
-                }),
-            }],
+                    binary: Some("nvim".into()),
+                },
+                Data {
+                    dest: "~/.gitconfig".into(),
+                    is_dir: false,
+                    hash: "00000000000000cc".into(),
+                    binary: None,
+                },
+            ],
             git_safe_directories: vec!["*".into()],
         }
     }
@@ -232,7 +249,7 @@ mod tests {
     #[test]
     fn a_binary_without_a_wrapper_target_is_valid_and_leaves_it_out() {
         let mut m = sample();
-        m.tools[0].binary.as_mut().unwrap().dest = None;
+        m.binaries[0].dest = None;
         m.validate().unwrap();
         assert!(
             !String::from_utf8(m.to_json().unwrap())
@@ -268,21 +285,17 @@ mod tests {
 
     #[test]
     fn names_cannot_climb_out_of_the_bundle() {
-        assert!(invalid(|m| m.tools[0].name = "../evil".into()).contains("plain file name"));
+        assert!(invalid(|m| m.binaries[0].name = "../evil".into()).contains("plain file name"));
         assert!(invalid(|m| m.libs[1].name = "a/b".into()).contains("plain file name"));
-        assert!(invalid(|m| m.tools[0].name = "..".into()).contains("plain file name"));
+        assert!(invalid(|m| m.binaries[0].name = "..".into()).contains("plain file name"));
     }
 
     #[test]
     fn targets_must_be_absolute_or_home_relative_without_dotdot() {
         assert!(
-            invalid(|m| m.tools[0].binary.as_mut().unwrap().dest = Some("bin/nvim".into()))
-                .contains("unusable target")
+            invalid(|m| m.binaries[0].dest = Some("bin/nvim".into())).contains("unusable target")
         );
-        assert!(
-            invalid(|m| m.tools[0].config.as_mut().unwrap().dest = "/etc/../x".into())
-                .contains("unusable target")
-        );
+        assert!(invalid(|m| m.data[0].dest = "/etc/../x".into()).contains("unusable target"));
     }
 
     #[test]
@@ -295,13 +308,24 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_must_bring_something() {
-        assert!(
-            invalid(|m| {
-                m.tools[0].binary = None;
-                m.tools[0].config = None;
-            })
-            .contains("neither")
-        );
+    fn data_goes_to_one_place_and_is_for_a_binary_the_bundle_has() {
+        assert!(invalid(|m| m.data[1].dest = m.data[0].dest.clone()).contains("listed twice"));
+        assert!(invalid(|m| m.data[0].binary = Some("emacs".into())).contains("not a binary"),);
+        assert!(invalid(|m| m.binaries.push(m.binaries[0].clone())).contains("listed twice"));
+        assert!(invalid(|m| m.data[0].hash = "zz".into()).contains("malformed hash"));
+    }
+
+    #[test]
+    fn data_is_stored_by_position() {
+        assert_eq!(data_file(0), "data/0");
+        assert_eq!(data_file(12), "data/12");
+    }
+
+    #[test]
+    fn a_bundle_may_hold_nothing_but_data() {
+        let mut m = sample();
+        m.binaries.clear();
+        m.data[0].binary = None;
+        m.validate().unwrap();
     }
 }

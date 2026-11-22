@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 pub mod edit;
 pub mod secret;
+pub mod unknown;
 
 use crate::shell::{container_path_problem, is_plain_name};
 use secret::{RawSecret, SecretDecl};
@@ -36,7 +37,7 @@ pub struct Config<S = SecretDecl> {
         schemars(with = "BTreeMap<String, serde_json::Map<String, serde_json::Value>>")
     )]
     pub targets: BTreeMap<String, toml::Table>,
-    /// A bundle to inject from instead of packing the `[[binary]]` and `[[config]]`
+    /// A bundle to inject from instead of packing the `[[binary]]` and `[[data]]`
     /// entries: a file, or a registry as `oci://ghcr.io/me/lodge:1`. A relative
     /// file path is relative to this file's folder.
     #[serde(default)]
@@ -44,9 +45,9 @@ pub struct Config<S = SecretDecl> {
     /// Programs to inject, each with the shared libraries it needs.
     #[serde(default, rename = "binary")]
     pub binaries: Vec<BinaryEntry>,
-    /// Config files and directories to inject.
-    #[serde(default, rename = "config")]
-    pub configs: Vec<ConfigEntry>,
+    /// Files and directories to inject, as they are.
+    #[serde(default)]
+    pub data: Vec<DataEntry>,
     /// How the interactive session is opened.
     #[serde(default)]
     pub session: SessionConfig,
@@ -67,7 +68,7 @@ impl<S> Default for Config<S> {
             targets: BTreeMap::new(),
             bundle: None,
             binaries: Vec::new(),
-            configs: Vec::new(),
+            data: Vec::new(),
             session: SessionConfig::default(),
             git: GitConfig::default(),
             secret: Vec::new(),
@@ -92,18 +93,37 @@ pub struct BinaryEntry {
     pub copy_deps: bool,
 }
 
-/// A config file or directory to inject.
+/// A file or directory to inject, copied as it is: a program's runtime files, a
+/// config, a plugin folder. It is identified by where it goes, so no two entries
+/// may go to the same place.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-pub struct ConfigEntry {
-    /// Identifier, unique among the configs; its name in the bundle, and the
-    /// default place in the container.
-    pub name: String,
+pub struct DataEntry {
     /// Host path to the file or directory.
     pub path: PathBuf,
-    /// Where it goes in the container (default: `~/.config/<name>`).
+    /// Where it goes in the container (default: the same place as here, `~/…`
+    /// when it is under the home directory).
     pub target: Option<String>,
+    /// The `name` of the `[[binary]]` this belongs to. Only says what it is for:
+    /// it is injected the same either way.
+    #[serde(rename = "for")]
+    pub binary: Option<String>,
+}
+
+impl DataEntry {
+    /// Where it goes in the container, given the home directory it is under here.
+    pub fn dest(&self, home: &Path) -> String {
+        match &self.target {
+            Some(target) => target.clone(),
+            None => crate::layout::tilde(&self.path, home),
+        }
+    }
+}
+
+/// The home directory, or `/` where there is none (and so no place is relative to it).
+pub(crate) fn home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -298,19 +318,35 @@ impl Config {
     /// against), and checks it. What the file's syntax and types get wrong is
     /// reported on its own; everything else is reported together.
     pub fn parse(raw: &str, path: &Path) -> Result<Self> {
-        let invalid = || format!("invalid config {}", path.display());
-        let file: Config<RawSecret> = toml::from_str(raw).map_err(|e| {
-            anyhow::anyhow!("{}{}", e.message(), location(raw, &e)).context(invalid())
-        })?;
+        Self::read(raw, path).map_err(|mut problems| {
+            let report = match problems.len() {
+                1 => problems.swap_remove(0),
+                _ => format!("\n  - {}", problems.join("\n  - ")),
+            };
+            anyhow::anyhow!(report).context(format!("invalid config {}", path.display()))
+        })
+    }
+
+    /// How many things are wrong with `raw`: none for a config that is valid.
+    /// A file the types reject is one problem, the first they find.
+    pub fn problem_count(raw: &str, path: &Path) -> usize {
+        Self::read(raw, path)
+            .err()
+            .map_or(0, |problems| problems.len())
+    }
+
+    /// The config in `raw`, or every problem with it.
+    fn read(raw: &str, path: &Path) -> std::result::Result<Self, Vec<String>> {
+        let file: Config<RawSecret> = toml::from_str(raw)
+            .map_err(|e| vec![format!("{}{}", e.message(), location(raw, &e))])?;
         let mut problems = Vec::new();
         let cfg = Self::from_file(file, path, &mut problems);
         problems.extend(cfg.problems());
-        let report = match problems.len() {
-            0 => return Ok(cfg),
-            1 => problems.swap_remove(0),
-            _ => format!("\n  - {}", problems.join("\n  - ")),
-        };
-        Err(anyhow::anyhow!(report).context(invalid()))
+        if problems.is_empty() {
+            Ok(cfg)
+        } else {
+            Err(problems)
+        }
     }
 
     /// The config as read from `path`, with its host paths resolved and each
@@ -321,7 +357,7 @@ impl Config {
             targets,
             bundle,
             mut binaries,
-            mut configs,
+            mut data,
             session,
             git,
             secret,
@@ -329,7 +365,7 @@ impl Config {
         for item in &mut binaries {
             item.path = expand_tilde(std::mem::take(&mut item.path));
         }
-        for item in &mut configs {
+        for item in &mut data {
             item.path = expand_tilde(std::mem::take(&mut item.path));
         }
         let secret = secret
@@ -347,7 +383,7 @@ impl Config {
             targets,
             bundle: bundle.map(|b| resolve_reference(path, b)),
             binaries,
-            configs,
+            data,
             session,
             git,
             secret,
@@ -356,39 +392,58 @@ impl Config {
 
     /// What the types can't check: every problem, so they are reported at once.
     fn problems(&self) -> Vec<String> {
-        let mut problems = Vec::new();
-        let entries = |kind: &'static str,
-                       list: Vec<(&String, &Option<String>)>,
-                       problems: &mut Vec<String>| {
-            let mut seen = HashSet::new();
-            for (name, target) in list {
-                if name.trim().is_empty() {
-                    problems.push(format!("a [[{kind}]] entry has an empty `name`"));
-                } else if !is_plain_name(name) {
-                    problems.push(format!(
-                        "[[{kind}]] `{name}` is not usable as a name (letters, digits and `-_.+` only)"
-                    ));
-                } else if !seen.insert(name.as_str()) {
-                    problems.push(format!(
-                        "[[{kind}]] `{name}` is listed more than once (names must be unique)"
-                    ));
-                }
-                if let Some(why) = target.as_deref().and_then(container_path_problem) {
-                    problems.push(format!("[[{kind}]] `{name}`: `target` {why}"));
-                }
-            }
-        };
-        entries(
-            "binary",
-            self.binaries.iter().map(|b| (&b.name, &b.target)).collect(),
-            &mut problems,
-        );
-        entries(
-            "config",
-            self.configs.iter().map(|c| (&c.name, &c.target)).collect(),
-            &mut problems,
-        );
+        let mut problems = self.binary_problems();
+        problems.extend(self.data_problems(&home_dir()));
         problems.extend(secret::problems(&self.secret));
+        problems
+    }
+
+    fn binary_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        let mut seen = HashSet::new();
+        for item in &self.binaries {
+            let name = &item.name;
+            if name.trim().is_empty() {
+                problems.push("a [[binary]] entry has an empty `name`".to_string());
+            } else if !is_plain_name(name) {
+                problems.push(format!(
+                    "[[binary]] `{name}` is not usable as a name (letters, digits and `-_.+` only)"
+                ));
+            } else if !seen.insert(name.as_str()) {
+                problems.push(format!(
+                    "[[binary]] `{name}` is listed more than once (names must be unique)"
+                ));
+            }
+            if let Some(why) = item.target.as_deref().and_then(container_path_problem) {
+                problems.push(format!("[[binary]] `{name}`: `target` {why}"));
+            }
+        }
+        problems
+    }
+
+    fn data_problems(&self, home: &Path) -> Vec<String> {
+        let mut problems = Vec::new();
+        let mut seen = HashSet::new();
+        for item in &self.data {
+            let dest = item.dest(home);
+            let at = item.path.display();
+            if let Some(why) = container_path_problem(&dest) {
+                problems.push(format!(
+                    "[[data]] `{at}`: the place it goes to, {dest}, {why}"
+                ));
+            } else if !seen.insert(dest.clone()) {
+                problems.push(format!(
+                    "[[data]] `{at}` goes to {dest}, where another [[data]] goes too"
+                ));
+            }
+            if let Some(name) = &item.binary
+                && !self.binaries.iter().any(|b| &b.name == name)
+            {
+                problems.push(format!(
+                    "[[data]] `{at}`: `for` names `{name}`, which is not a [[binary]]"
+                ));
+            }
+        }
         problems
     }
 }
@@ -446,7 +501,7 @@ mod tests {
     #[test]
     fn empty_config_uses_defaults() {
         let c = parse("").unwrap();
-        assert!(c.binaries.is_empty() && c.configs.is_empty());
+        assert!(c.binaries.is_empty() && c.data.is_empty());
         assert_eq!(c.session.shell, "/bin/bash");
         assert_eq!(c.git.safe_directories, vec!["*".to_string()]);
     }
@@ -459,8 +514,11 @@ mod tests {
             name = "nvim"
             path = "/usr/bin/nvim"
 
-            [[config]]
-            name = "nvim"
+            [[data]]
+            path = "/usr/local/share/nvim"
+            for = "nvim"
+
+            [[data]]
             path = "/home/me/.config/nvim"
             target = "~/.config/nvim"
 
@@ -475,9 +533,11 @@ mod tests {
         assert_eq!(c.binaries.len(), 1);
         assert_eq!(c.binaries[0].name, "nvim");
         assert!(c.binaries[0].copy_deps); // defaults to true
-        // A binary and a config are separate entries, and may share a name.
-        assert_eq!(c.configs[0].name, "nvim");
-        assert_eq!(c.configs[0].target.as_deref(), Some("~/.config/nvim"));
+        assert_eq!(c.data.len(), 2);
+        assert_eq!(c.data[0].binary.as_deref(), Some("nvim"));
+        assert_eq!(c.data[0].target, None);
+        assert_eq!(c.data[1].binary, None);
+        assert_eq!(c.data[1].target.as_deref(), Some("~/.config/nvim"));
         assert_eq!(c.session.shell, "/bin/zsh");
         assert_eq!(c.git.safe_directories, vec!["/work".to_string()]);
     }
@@ -600,6 +660,26 @@ mod tests {
     }
 
     #[test]
+    fn data_goes_where_it_is_here_unless_it_says_otherwise() {
+        let home = dirs::home_dir().unwrap();
+        let c = parse(
+            "[[data]]\npath = \"~/.config/nvim\"\n\
+             [[data]]\npath = \"/usr/local/share/nvim\"\n\
+             [[data]]\npath = \"/usr/local/lib/nvim\"\ntarget = \"~/lib/nvim\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.data[0].path, home.join(".config/nvim"));
+        assert_eq!(c.data[0].dest(&home), "~/.config/nvim");
+        assert_eq!(c.data[1].dest(&home), "/usr/local/share/nvim");
+        assert_eq!(c.data[2].dest(&home), "~/lib/nvim");
+        // Where it is under is the caller's to say: another home, another place.
+        assert_eq!(
+            c.data[0].dest(Path::new("/elsewhere")),
+            home.join(".config/nvim").display().to_string()
+        );
+    }
+
+    #[test]
     fn a_typo_is_an_error_with_its_line_and_a_suggestion() {
         let err = format!(
             "{:#}",
@@ -624,7 +704,10 @@ mod tests {
                 "[[binary]]\nname = \"a\"\npath = \"/a\"\n\
                  [[binary]]\nname = \"a\"\npath = \"/b\"\n\
                  [[binary]]\nname = \"../up\"\npath = \"/u\"\n\
-                 [[config]]\nname = \"t\"\npath = \"/t\"\ntarget = \"rel/x\"\n\
+                 [[data]]\npath = \"/t\"\ntarget = \"rel/x\"\n\
+                 [[data]]\npath = \"/m\"\ntarget = \"/same\"\n\
+                 [[data]]\npath = \"/n\"\ntarget = \"/same\"\n\
+                 [[data]]\npath = \"/o\"\nfor = \"nope\"\n\
                  [[secret]]\nname = \"S\"\nfrom = { env = \"A\", file = \"/b\" }\nas = \"env\"\n\
                  [[secret]]\nname = \"T\"\nfrom = { env = \"A\" }\nas = \"socket\"\n"
             )
@@ -633,7 +716,15 @@ mod tests {
         assert!(err.contains("`a` is listed more than once"), "{err}");
         assert!(err.contains("`../up` is not usable as a name"), "{err}");
         assert!(
-            err.contains("[[config]] `t`: `target` must be absolute"),
+            err.contains("[[data]] `/t`: the place it goes to, rel/x, must be absolute"),
+            "{err}"
+        );
+        assert!(
+            err.contains("[[data]] `/n` goes to /same, where another [[data]] goes too"),
+            "{err}"
+        );
+        assert!(
+            err.contains("[[data]] `/o`: `for` names `nope`, which is not a [[binary]]"),
             "{err}"
         );
         assert!(

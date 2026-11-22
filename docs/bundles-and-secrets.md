@@ -3,7 +3,7 @@
 ## Bundles
 
 Injection always works from a **bundle**: a plain tar holding your tools already
-relinked to a bundled glibc, their libraries, your configs and git settings, and a
+relinked to a bundled glibc, their libraries, your data and git settings, and a
 manifest. A bundle is tied to a CPU architecture, but not to a user, a home
 directory or an install location: it is injected into whichever user's prefix it
 is used for. Without any options, `ldg up` packs your config into a
@@ -24,7 +24,7 @@ ldg up --bundle lodge-x86_64.tar         # anywhere with a container runtime (or
 ```
 
 or set `bundle = "~/lodge-x86_64.tar"` at the top of `config.toml`. A configured
-bundle replaces the `[[binary]]` and `[[config]]` entries on that machine; `[session]` stays local.
+bundle replaces the `[[binary]]` and `[[data]]` entries on that machine; `[session]` stays local.
 
 A machine that only *uses* a bundle needs just the bundle (a file, or a registry
 reference as below) and a small config of its own: the `bundle =` line,
@@ -111,8 +111,8 @@ Two things to keep in mind:
 
 - **A bundle is code that runs in your containers.** Pin by digest when the
   registry is not yours, and only use a registry you trust for what you publish.
-- **A bundle holds your configs and git settings**, so publish it to a private
-  repository (see the warning below about what a config directory can hold).
+- **A bundle holds your data and git settings**, so publish it to a private
+  repository (see the warning below about what a data directory can hold).
   Secrets are never in a bundle.
 
 `ldg bundle inspect` and `ldg bundle verify` take a file or a reference

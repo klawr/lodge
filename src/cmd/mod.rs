@@ -15,6 +15,7 @@
 //! - [`table`]: rows of cells laid out for whatever width the terminal has
 //! - [`targets`]: the list of targets, the one place that says which there are
 
+mod add;
 mod attach;
 mod bundle;
 mod candidates;

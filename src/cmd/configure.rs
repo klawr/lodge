@@ -1,5 +1,5 @@
 //! The config screen, reached with `c` from a bare `ldg`: the whole config file as a
-//! form, every value a line that can be changed, programs and configs chosen from
+//! form, every value a line that can be changed, programs and data chosen from
 //! what this machine has, and the bundle packed or published from it. Each step is
 //! a question put through [`Choose`] and [`Ask`], and each change is made by
 //! [`crate::config::edit`], so what is written is checked the way `ldg inject`
@@ -13,9 +13,9 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use super::candidates::{self, Candidate};
+use super::add::add_binary;
+use super::candidates::{self, Candidate, name_from};
 use super::init;
-use super::inject::name_from;
 use super::prompt::{Ask, Choice, Choose, Doc, DocLine, Hotkey, Item, Pick, Selection};
 use super::table::{Cell, Table, Tone};
 use crate::bundle::store::Replace;
@@ -23,7 +23,9 @@ use crate::config::Config;
 use crate::config::edit::{
     self, Field, Kind, NewEntry, NewSecret, RawEntry, RawSecret, SecretAs, SecretFrom, Setting,
 };
-use crate::output::warning;
+use crate::config::unknown::Unknown;
+use crate::layout::tilde;
+use crate::output::{plural, warning};
 
 const KEYS: &[Hotkey] = &[
     Hotkey {
@@ -31,15 +33,15 @@ const KEYS: &[Hotkey] = &[
         label: "+binary",
     },
     Hotkey {
-        key: 'c',
-        label: "+config",
+        key: 'd',
+        label: "+data",
     },
     Hotkey {
         key: 's',
         label: "+secret",
     },
     Hotkey {
-        key: 'd',
+        key: 'r',
         label: "remove",
     },
     Hotkey {
@@ -120,14 +122,20 @@ enum Stop {
         entry: usize,
         field: SecretField,
     },
+    /// Something in the file that this version of lodge does not know.
+    Unknown(usize),
 }
 
 /// What the file holds, as written.
 struct File {
     settings: Vec<(Setting, Option<String>)>,
     binaries: Vec<RawEntry>,
-    configs: Vec<RawEntry>,
+    data: Vec<RawEntry>,
     secrets: Vec<RawSecret>,
+    /// What lodge does not know in it, to be shown and taken out.
+    unknown: Vec<Unknown>,
+    /// Why it does not load, when it does not: the form is shown all the same.
+    problem: Option<String>,
 }
 
 impl File {
@@ -139,16 +147,29 @@ impl File {
         Ok(File {
             settings,
             binaries: edit::list(path, Kind::Binary)?,
-            configs: edit::list(path, Kind::Config)?,
+            data: edit::list(path, Kind::Data)?,
             secrets: edit::list_secrets(path)?,
+            unknown: edit::unknown(path)?,
+            problem: Config::load(path).err().map(|e| why(&e)),
         })
     }
 
     fn entries(&self, kind: Kind) -> &[RawEntry] {
         match kind {
             Kind::Binary => &self.binaries,
-            Kind::Config => &self.configs,
+            Kind::Data => &self.data,
         }
+    }
+
+    /// The programs, as `(name, host path)`: what their data is looked for beside.
+    fn programs(&self) -> Vec<(String, PathBuf)> {
+        self.binaries
+            .iter()
+            .filter_map(|b| {
+                let path = crate::config::expand_tilde(PathBuf::from(b.path.as_deref()?));
+                Some((b.name.clone()?, path))
+            })
+            .collect()
     }
 
     fn setting(&self, which: Setting) -> Option<&str> {
@@ -163,13 +184,15 @@ pub fn run(path: &Path, machine: &Machine, choose: &dyn Choose, ask: &dyn Ask) -
     let mut path = path.to_path_buf();
     let mut status = String::new();
     loop {
-        // A config that does not load would show as an empty form with nothing to
-        // select, and every change to it would be refused: say so instead.
-        if let Err(e) = Config::load(&path) {
-            warning!("{e:#}");
-            return Ok(());
-        }
-        let file = File::read(&path)?;
+        // A file that is not TOML at all has no form to show; one that does not load
+        // as a config does, with what is wrong with it, so it can be mended here.
+        let file = match File::read(&path) {
+            Ok(file) => file,
+            Err(e) => {
+                warning!("{e:#}");
+                return Ok(());
+            }
+        };
         let title = match status.as_str() {
             "" => format!("Config {}", path.display()),
             // First, so a long path cannot push it off the line.
@@ -192,6 +215,19 @@ pub fn run(path: &Path, machine: &Machine, choose: &dyn Choose, ask: &dyn Ask) -
     }
 }
 
+/// What is wrong with a config that does not load, on one line.
+fn why(e: &anyhow::Error) -> String {
+    e.root_cause()
+        .to_string()
+        .trim()
+        .replace("\n  - ", " · ")
+        .trim_start_matches(" · ")
+        .to_string()
+}
+
+/// What is said of a line that lodge does not know, when it is changed.
+const NOT_USED: &str = "this version of lodge does not use it: press r to remove it";
+
 /// What a key or Enter on a line of the form does.
 fn act(
     path: &mut PathBuf,
@@ -210,16 +246,16 @@ fn act(
     let stop = stops.get(row).copied();
     match key {
         Some('b') => add(path, Kind::Binary, file, machine, choose, ask),
-        Some('c') => add(path, Kind::Config, file, machine, choose, ask),
+        Some('d') => add(path, Kind::Data, file, machine, choose, ask),
         Some('s') => add_secret(path, choose, ask),
         Some('p') => pack(path, machine, ask, None),
         Some('P') => publish(path, file, machine, ask),
         Some('o') => open_file(path, machine, choose, ask),
-        Some('d') => match stop {
+        Some('r') => match stop {
             Some(Stop::Entry { kind, entry, .. }) => {
-                let name = &file.entries(kind)[entry].name;
-                edit::remove(path, kind, name)?;
-                Ok(format!("removed {} `{name}`", kind.key()))
+                let key = file.entries(kind)[entry].key();
+                edit::remove(path, kind, key)?;
+                Ok(format!("removed {} `{key}`", kind.key()))
             }
             Some(Stop::Secret { entry, .. }) => {
                 let name = &file.secrets[entry].name;
@@ -227,6 +263,11 @@ fn act(
                 Ok(format!("removed secret `{name}`"))
             }
             Some(Stop::Setting(which)) => clear_setting(path, which),
+            Some(Stop::Unknown(i)) => {
+                let which = &file.unknown[i];
+                edit::remove_unknown(path, which)?;
+                Ok(format!("removed {}", which.label))
+            }
             None => Ok(String::new()),
         },
         Some(_) => match stop {
@@ -235,6 +276,7 @@ fn act(
                 clear(path, &file.entries(kind)[entry], field)
             }
             Some(Stop::Secret { entry, field }) => clear_secret(path, &file.secrets[entry], field),
+            Some(Stop::Unknown(_)) => anyhow::bail!(NOT_USED),
             None => Ok(String::new()),
         },
         None => match stop {
@@ -243,6 +285,7 @@ fn act(
                 path,
                 &file.entries(kind)[entry],
                 field,
+                file,
                 machine,
                 choose,
                 ask,
@@ -250,6 +293,7 @@ fn act(
             Some(Stop::Secret { entry, field }) => {
                 edit_secret(path, &file.secrets[entry], field, choose, ask)
             }
+            Some(Stop::Unknown(_)) => anyhow::bail!(NOT_USED),
             None => Ok(String::new()),
         },
     }
@@ -273,6 +317,13 @@ impl Builder {
         self.text("", Tone::Normal);
     }
 
+    /// A line that can be selected, as it is.
+    fn pick(&mut self, stop: Stop, text: impl Into<String>, tone: Tone) {
+        self.stops.push(stop);
+        self.at.push(self.lines.len());
+        self.text(text, tone);
+    }
+
     /// A `key = value` line that can be selected; `unset` says what a missing
     /// value stands for.
     fn value(&mut self, stop: Stop, key: &str, width: usize, value: Option<String>, unset: String) {
@@ -287,7 +338,7 @@ impl Builder {
 }
 
 /// The file as a form shaped like the TOML: the single values first (`target`,
-/// `bundle`, then `[session]` and `[git]`), then each `[[binary]]`, `[[config]]`
+/// `bundle`, then `[session]` and `[git]`), then each `[[binary]]`, `[[data]]`
 /// and `[[secret]]` with all of its fields under it, the ones that are not set
 /// shown as such. Every value is a line that can be selected. A kind with no
 /// entries shows the key that adds one.
@@ -309,6 +360,14 @@ fn form(file: &File) -> (Doc, Vec<Stop>) {
             unset(which),
         );
     };
+    if let Some(problem) = &file.problem {
+        f.text(format!("# does not load: {problem}"), Tone::Accent);
+        f.text(
+            "# change what is wrong, or take out what is not known (below): each step that leaves fewer problems is kept",
+            Tone::Muted,
+        );
+        f.blank();
+    }
     setting(&mut f, Setting::Target, 6);
     setting(&mut f, Setting::Bundle, 6);
     if file.setting(Setting::Bundle).is_some() {
@@ -326,13 +385,13 @@ fn form(file: &File) -> (Doc, Vec<Stop>) {
         setting(&mut f, which, width);
     }
 
-    for kind in [Kind::Binary, Kind::Config] {
+    for kind in [Kind::Binary, Kind::Data] {
         f.blank();
         let list = file.entries(kind);
         if list.is_empty() {
             let hint = match kind {
                 Kind::Binary => "press b to add a program",
-                Kind::Config => "press c to add a config",
+                Kind::Data => "press d to add data",
             };
             f.text(format!("# [[{}]]  {hint}", kind.key()), Tone::Muted);
         }
@@ -349,17 +408,18 @@ fn form(file: &File) -> (Doc, Vec<Stop>) {
             f.text(format!("[[{}]]", kind.key()), Tone::Strong);
             for &field in kind.fields() {
                 let value = match field {
-                    Field::Name => Some(quote(&e.name)),
+                    Field::Name => e.name.as_deref().map(quote),
                     Field::Path => e.path.as_deref().map(quote),
                     Field::Target => e.target.as_deref().map(quote),
                     Field::CopyDeps => e.copy_deps.map(|b| b.to_string()),
+                    Field::For => e.binary.as_deref().map(quote),
                 };
                 let stop = Stop::Entry {
                     kind,
                     entry: n,
                     field,
                 };
-                f.value(stop, field.key(), width, value, unset_field(kind, e, field));
+                f.value(stop, field.key(), width, value, unset_field(kind, field));
             }
         }
     }
@@ -389,6 +449,16 @@ fn form(file: &File) -> (Doc, Vec<Stop>) {
             );
         }
     }
+    if !file.unknown.is_empty() {
+        f.blank();
+        f.text(
+            "# not known to this version of lodge: r removes",
+            Tone::Accent,
+        );
+        for (n, u) in file.unknown.iter().enumerate() {
+            f.pick(Stop::Unknown(n), u.label.clone(), Tone::Normal);
+        }
+    }
     (
         Doc {
             lines: f.lines,
@@ -403,9 +473,9 @@ fn quote(text: &str) -> String {
 }
 
 /// What a field that is not set stands for.
-fn unset_field(kind: Kind, e: &RawEntry, field: Field) -> String {
+fn unset_field(kind: Kind, field: Field) -> String {
     match (kind, field) {
-        (Kind::Config, Field::Target) => format!("(default ~/.config/{})", e.name),
+        (Kind::Data, Field::Target) => "(the same place as here)".into(),
         (Kind::Binary, Field::Target) => "(not set: on PATH)".into(),
         (_, Field::CopyDeps) => "(default true)".into(),
         _ => "(not set)".into(),
@@ -481,47 +551,62 @@ fn clear_setting(path: &Path, which: Setting) -> Result<String> {
 
 /// Takes a field out of an entry (`copy_deps` goes back to its default).
 fn clear(path: &Path, entry: &RawEntry, field: Field) -> Result<String> {
+    let key = entry.key();
     match field {
-        Field::CopyDeps => edit::set_copy_deps(path, &entry.name, true)?,
-        _ => edit::set_field(path, entry.kind, &entry.name, field, None)?,
+        Field::CopyDeps => edit::set_copy_deps(path, key, true)?,
+        _ => edit::set_field(path, entry.kind, key, field, None)?,
     }
-    Ok(format!("cleared {} of `{}`", field.key(), entry.name))
+    Ok(format!("cleared {} of `{key}`", field.key()))
 }
 
 /// Changes one field of an entry: the path is chosen from the machine's own, a
-/// name or a target is typed, `copy_deps` is turned over.
+/// name or a target is typed, `for` is chosen among the programs, `copy_deps` is
+/// turned over.
 fn edit_field(
     path: &Path,
     entry: &RawEntry,
     field: Field,
+    file: &File,
     machine: &Machine,
     choose: &dyn Choose,
     ask: &dyn Ask,
 ) -> Result<String> {
-    let (kind, name) = (entry.kind, &entry.name);
+    let (kind, key) = (entry.kind, entry.key());
     match field {
         Field::CopyDeps => {
             let on = !entry.copy_deps.unwrap_or(true);
-            edit::set_copy_deps(path, name, on)?;
-            Ok(format!("copy_deps of `{name}` is now {on}"))
+            edit::set_copy_deps(path, key, on)?;
+            Ok(format!("copy_deps of `{key}` is now {on}"))
         }
         Field::Path => {
-            let Some((chosen, place)) = pick_path(kind, machine, choose, ask)? else {
+            let Some(chosen) = pick_path(kind, file, machine, choose, ask)? else {
                 return Ok(String::new());
             };
-            edit::set_field(path, kind, name, Field::Path, Some(&chosen))?;
-            // A config goes where it is here, unless the entry already says.
-            if let Some(place) = place.filter(|_| kind == Kind::Config && entry.target.is_none()) {
-                edit::set_field(path, kind, name, Field::Target, Some(&place))?;
+            edit::set_field(path, kind, key, Field::Path, Some(&chosen))?;
+            Ok(format!("path of `{key}` is now {chosen}"))
+        }
+        Field::For => {
+            let names: Vec<&str> = file
+                .binaries
+                .iter()
+                .filter_map(|b| b.name.as_deref())
+                .collect();
+            if names.is_empty() {
+                anyhow::bail!("there is no [[binary]] for it to be for: press b to add one");
             }
-            Ok(format!("path of `{name}` is now {chosen}"))
+            let options: Vec<(&str, &str)> = names.iter().map(|n| (*n, "")).collect();
+            let Some(i) = pick_one(choose, &format!("`{key}` is for"), &options)? else {
+                return Ok(String::new());
+            };
+            edit::set_field(path, kind, key, Field::For, Some(names[i]))?;
+            Ok(format!("`{key}` is for `{}`", names[i]))
         }
         Field::Name | Field::Target => {
-            let Some(typed) = ask.ask(&format!("{} of `{name}`", field.key()))? else {
+            let Some(typed) = ask.ask(&format!("{} of `{key}`", field.key()))? else {
                 return Ok(String::new());
             };
-            edit::set_field(path, kind, name, field, Some(&typed))?;
-            Ok(format!("{} of `{name}` is now {typed}", field.key()))
+            edit::set_field(path, kind, key, field, Some(&typed))?;
+            Ok(format!("{} of `{key}` is now {typed}", field.key()))
         }
     }
 }
@@ -529,20 +614,22 @@ fn edit_field(
 /// What this machine has of `kind`, as items to look through, and the
 /// candidates they stand for. What is in the config already is on offer too,
 /// shown marked.
-fn on_offer(kind: Kind, taken: &[RawEntry], machine: &Machine) -> (Vec<Candidate>, Vec<Item>) {
-    let names: HashSet<&str> = taken.iter().map(|e| e.name.as_str()).collect();
+fn on_offer(kind: Kind, file: &File, machine: &Machine) -> (Vec<Candidate>, Vec<Item>) {
+    let taken = file.entries(kind);
+    let names: HashSet<&str> = taken.iter().filter_map(|e| e.name.as_deref()).collect();
     let paths: HashSet<&str> = taken.iter().filter_map(|e| e.path.as_deref()).collect();
     let found = match kind {
         Kind::Binary => {
             let known = init::detect(machine.home, machine.path_var);
             candidates::programs(machine.home, machine.path_var, &known)
         }
-        Kind::Config => candidates::configs(machine.home),
+        Kind::Data => candidates::data(machine.home, &file.programs()),
     };
     let items = found
         .iter()
         .map(|c| Item {
-            added: names.contains(c.name.as_str()) || paths.contains(c.entry.path.as_str()),
+            added: (kind == Kind::Binary && names.contains(c.name.as_str()))
+                || paths.contains(c.entry.path()),
             tab: 0,
             name: c.name.clone(),
             kind: c.kind,
@@ -555,31 +642,31 @@ fn on_offer(kind: Kind, taken: &[RawEntry], machine: &Machine) -> (Vec<Candidate
 fn list_name(kind: Kind) -> &'static str {
     match kind {
         Kind::Binary => "Programs",
-        Kind::Config => "Configs",
+        Kind::Data => "Data",
     }
 }
 
-/// A path typed in full, as the config writes it, and where a config would go in
-/// the container; a path that is not there is refused.
-fn resolve(typed: &str, home: &Path) -> Result<(String, Option<String>)> {
+/// A path typed in full, as the config writes it; a path that is not there is
+/// refused.
+fn resolve(typed: &str, home: &Path) -> Result<String> {
     let file = crate::config::expand_tilde(PathBuf::from(typed));
     let file = std::path::absolute(&file).unwrap_or(file);
     if !file.exists() {
         anyhow::bail!("{} does not exist", file.display());
     }
-    let place = init::tilde(&file, home);
-    let target = place.starts_with("~/").then(|| place.clone());
-    Ok((place, target))
+    Ok(tilde(&file, home))
 }
 
-/// A program or a config from what this machine has, or a path typed in full.
+/// A program or data from what this machine has, or a path typed in full, as the
+/// config writes it.
 fn pick_path(
     kind: Kind,
+    file: &File,
     machine: &Machine,
     choose: &dyn Choose,
     ask: &dyn Ask,
-) -> Result<Option<(String, Option<String>)>> {
-    let (found, items) = on_offer(kind, &[], machine);
+) -> Result<Option<String>> {
+    let (found, items) = on_offer(kind, file, machine);
     let title = format!("{} (type to filter, or a path)", kind.key());
     let typed = match choose.find(&title, &[list_name(kind)], &items)? {
         Selection::Left => return Ok(None),
@@ -587,7 +674,7 @@ fn pick_path(
             let Some(c) = chosen.first().and_then(|&i| found.get(i)) else {
                 return Ok(None);
             };
-            return Ok(Some((c.entry.path.clone(), c.entry.target.clone())));
+            return Ok(Some(c.entry.path().to_string()));
         }
         Selection::Path(typed) => typed,
         Selection::Unsupported => match ask.ask("path on this machine")? {
@@ -608,7 +695,7 @@ fn add(
     choose: &dyn Choose,
     ask: &dyn Ask,
 ) -> Result<String> {
-    let (found, items) = on_offer(kind, file.entries(kind), machine);
+    let (found, items) = on_offer(kind, file, machine);
     let title = format!("Add {} (type to filter, or a path)", kind.key());
     let added = std::cell::Cell::new(0);
     let mut add_one = |pick: Pick| -> std::result::Result<String, String> {
@@ -620,33 +707,51 @@ fn add(
                 &typed
             }
         };
-        edit::add(path, entry).map_err(|e| one_line(&e))?;
+        let said = place(path, entry, machine.home).map_err(|e| one_line(&e))?;
         added.set(added.get() + 1);
-        Ok(format!("added `{}`", entry.name))
+        Ok(said)
     };
     if !choose.find_adding(&title, &[list_name(kind)], &items, &mut add_one)? {
         // A terminal that can't show the list: the path is asked for in words.
         let Some(typed) = ask.ask(&format!("path of the {} on this machine", kind.key()))? else {
             return Ok(String::new());
         };
-        let entry = entry_for(kind, machine.home, &typed)?;
-        edit::add(path, &entry)?;
-        return Ok(format!("added `{}`", entry.name));
+        return place(path, &entry_for(kind, machine.home, &typed)?, machine.home);
     }
+    let (one, many) = match kind {
+        Kind::Binary => ("binary", "binaries"),
+        Kind::Data => ("data entry", "data entries"),
+    };
     Ok(match added.get() {
         0 => String::new(),
-        1 => format!("added a {}", kind.key()),
-        n => format!("added {n} {}s", kind.key()),
+        n => format!("added {}", plural(n, one, many)),
     })
+}
+
+/// Writes `entry` into the config, and says what was added. A program brings what
+/// sits beside it as data, as `ldg inject add binary` does.
+fn place(path: &Path, entry: &NewEntry, home: &Path) -> Result<String> {
+    match entry.kind() {
+        Kind::Binary => {
+            let data = add_binary(path, entry.clone(), home, true)?;
+            Ok(match data.len() {
+                0 => format!("added `{}`", entry.key()),
+                n => format!("added `{}` and {n} data beside it", entry.key()),
+            })
+        }
+        Kind::Data => {
+            edit::add(path, entry)?;
+            Ok(format!("added `{}`", entry.key()))
+        }
+    }
 }
 
 /// The entry that adding the path `typed` makes.
 fn entry_for(kind: Kind, home: &Path, typed: &str) -> Result<NewEntry> {
-    let (place, target) = resolve(typed, home)?;
-    let name = name_from(Path::new(typed));
+    let place = resolve(typed, home)?;
     Ok(match kind {
-        Kind::Binary => NewEntry::binary(&name, place),
-        Kind::Config => NewEntry::config(&name, place, target),
+        Kind::Binary => NewEntry::binary(&name_from(Path::new(typed)), place),
+        Kind::Data => NewEntry::data(place, None, None),
     })
 }
 
@@ -878,7 +983,7 @@ fn open_file(
         .map(|f| Item {
             added: false,
             tab: 0,
-            name: init::tilde(f, machine.home),
+            name: tilde(f, machine.home),
             kind: if f == path { "current" } else { "" },
             detail: String::new(),
         })
@@ -910,11 +1015,12 @@ fn open_file(
 /// A row of the table that stands in for the form.
 enum Row {
     Entry(Kind, String),
+    Unknown(usize),
     Add(Kind),
 }
 
 /// The entries and two ways to add one, for a terminal that can't show the form:
-/// programs and configs only.
+/// programs and data only.
 fn table(
     path: &Path,
     file: &File,
@@ -924,17 +1030,25 @@ fn table(
 ) -> Result<Option<Result<String>>> {
     let mut rows = Vec::new();
     let mut cells = Vec::new();
-    for e in file.binaries.iter().chain(&file.configs) {
+    for e in file.binaries.iter().chain(&file.data) {
         cells.push(vec![
             Cell::new(e.kind.key(), Tone::Muted),
-            Cell::new(e.name.clone(), Tone::Strong),
+            Cell::new(e.name.clone().unwrap_or_default(), Tone::Strong),
             Cell::new(e.path.clone().unwrap_or_default(), Tone::Normal),
         ]);
-        rows.push(Row::Entry(e.kind, e.name.clone()));
+        rows.push(Row::Entry(e.kind, e.key().to_string()));
+    }
+    for (n, u) in file.unknown.iter().enumerate() {
+        cells.push(vec![
+            Cell::new("unknown", Tone::Accent),
+            Cell::new("", Tone::Strong),
+            Cell::new(u.label.clone(), Tone::Normal),
+        ]);
+        rows.push(Row::Unknown(n));
     }
     for (kind, text) in [
         (Kind::Binary, "+ add a program"),
-        (Kind::Config, "+ add a config"),
+        (Kind::Data, "+ add data"),
     ] {
         cells.push(vec![
             Cell::new("", Tone::Muted),
@@ -952,6 +1066,18 @@ fn table(
                 if pick_one(choose, name, &options)? == Some(0) {
                     edit::remove(path, *kind, name)
                         .map(|()| format!("removed {} `{name}`", kind.key()))
+                } else {
+                    Ok(String::new())
+                }
+            }
+            Some(Row::Unknown(i)) => {
+                let which = &file.unknown[*i];
+                let options = [
+                    ("remove it", "this version of lodge does not use it"),
+                    ("back", ""),
+                ];
+                if pick_one(choose, &which.label, &options)? == Some(0) {
+                    edit::remove_unknown(path, which).map(|()| format!("removed {}", which.label))
                 } else {
                     Ok(String::new())
                 }
@@ -1118,11 +1244,11 @@ mod tests {
         }
     }
 
-    const FILE: &str = "# keep\ntarget = \"podman\"\n\n[session]\nshell = \"/bin/zsh\"\n\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\n\n[[binary]]\nname = \"b\"\npath = \"/bin/ls\"\n\n[[config]]\nname = \"c\"\npath = \"/etc/hostname\"\n\n[[secret]]\nname = \"TOKEN\"\nfrom = { env = \"HOST_TOKEN\" }\nas = \"env\"\n";
+    const FILE: &str = "# keep\ntarget = \"podman\"\n\n[session]\nshell = \"/bin/zsh\"\n\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\n\n[[binary]]\nname = \"b\"\npath = \"/bin/ls\"\n\n[[data]]\npath = \"/etc/hostname\"\n\n[[secret]]\nname = \"TOKEN\"\nfrom = { env = \"HOST_TOKEN\" }\nas = \"env\"\n";
 
     // Stops of FILE: 0 target, 1 bundle, 2 shell, 3 safe_directories; binary a
-    // 4-7, binary b 8-11 (name, path, target, copy_deps); config c 12-14 (name,
-    // path, target); secret 15-18 (name, from, as, targets).
+    // 4-7, binary b 8-11 (name, path, target, copy_deps); data 12-14 (path,
+    // target, for); secret 15-18 (name, from, as, targets).
 
     #[test]
     fn the_form_is_the_toml_with_every_value_and_says_what_is_not_set() {
@@ -1151,7 +1277,10 @@ mod tests {
                 "target    = (not set: on PATH)",
             ]
         );
-        assert!(text.contains(&"target = (default ~/.config/c)"), "{text:?}");
+        assert!(
+            text.contains(&"target = (the same place as here)"),
+            "{text:?}"
+        );
         assert!(
             text.contains(&"from    = { env = \"HOST_TOKEN\" }"),
             "{text:?}"
@@ -1162,7 +1291,7 @@ mod tests {
         let text = r.screen.shown.borrow()[0].1.join("\n");
         for hint in [
             "press b to add a program",
-            "press c to add a config",
+            "press d to add data",
             "press s to add a secret",
         ] {
             assert!(text.contains(hint), "{text}");
@@ -1184,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_changes_the_value_x_clears_it_d_removes_the_entry() {
+    fn enter_changes_the_value_x_clears_it_r_removes_the_entry() {
         let screen = Screen {
             views: RefCell::new(vec![
                 Choice::Row(2),      // shell: typed
@@ -1195,7 +1324,7 @@ mod tests {
                 Choice::Row(6),      // target of binary a: typed
                 Choice::Row(7),      // copy_deps of a: turned off
                 Choice::Key('x', 6), // target of a: cleared
-                Choice::Key('d', 9), // an entry of b: removed
+                Choice::Key('r', 9), // an entry of b: removed
                 Choice::Left,
             ]),
             picks: RefCell::new(vec![Some(2)]),
@@ -1237,7 +1366,7 @@ mod tests {
         );
         assert!(!r.config.contains("name = \"b\""), "{}", r.config);
         assert!(
-            r.config.contains("[[config]]\nname = \"c\""),
+            r.config.contains("[[data]]\npath = \"/etc/hostname\""),
             "{}",
             r.config
         );
@@ -1261,9 +1390,9 @@ mod tests {
     }
 
     #[test]
-    fn b_and_c_add_one_enter_at_a_time_and_what_is_there_already_is_marked() {
+    fn b_and_d_add_one_enter_at_a_time_and_what_is_there_already_is_marked() {
         let screen = Screen {
-            views: RefCell::new(vec![Choice::Key('c', 0), Choice::Key('b', 0), Choice::Left]),
+            views: RefCell::new(vec![Choice::Key('d', 0), Choice::Key('b', 0), Choice::Left]),
             adds: RefCell::new(vec![
                 vec![
                     Pick::Item(0),
@@ -1274,19 +1403,15 @@ mod tests {
             ]),
             ..Screen::default()
         };
-        let r = drive(
-            "[[config]]\nname = \"x\"\npath = \"/etc/hostname\"\n",
-            screen,
-            vec![],
-        );
+        let r = drive("[[data]]\npath = \"/etc/hostname\"\n", screen, vec![]);
         let offered = r.screen.offered.borrow();
         assert!(
-            offered[0].starts_with("Add config") && offered[0].ends_with(": bashrc"),
+            offered[0].starts_with("Add data") && offered[0].ends_with(": bashrc"),
             "{offered:?}"
         );
         assert!(offered[1].starts_with("Add binary"), "{offered:?}");
         let results = r.screen.results.borrow();
-        assert_eq!(results[0], Ok("added `bashrc`".to_string()));
+        assert_eq!(results[0], Ok("added `~/.bashrc`".to_string()));
         assert!(
             results[1].as_ref().unwrap_err().contains("already in"),
             "{results:?}"
@@ -1296,8 +1421,7 @@ mod tests {
             "{results:?}"
         );
         assert!(
-            r.config
-                .contains("name = \"bashrc\"\npath = \"~/.bashrc\"\ntarget = \"~/.bashrc\""),
+            r.config.contains("[[data]]\npath = \"~/.bashrc\"\n"),
             "{}",
             r.config
         );
@@ -1315,21 +1439,17 @@ mod tests {
             .iter()
             .map(|s| s.0.clone())
             .collect();
-        assert!(titles[1].contains("✓ added a config"), "{titles:?}");
+        assert!(titles[1].contains("✓ added 1 data entry"), "{titles:?}");
     }
 
     #[test]
     fn what_the_config_has_already_is_marked_in_the_list() {
         let screen = Screen {
-            views: RefCell::new(vec![Choice::Key('c', 0), Choice::Left]),
+            views: RefCell::new(vec![Choice::Key('d', 0), Choice::Left]),
             adds: RefCell::new(vec![vec![]]),
             ..Screen::default()
         };
-        let r = drive(
-            "[[config]]\nname = \"bashrc\"\npath = \"~/.bashrc\"\n",
-            screen,
-            vec![],
-        );
+        let r = drive("[[data]]\npath = \"~/.bashrc\"\n", screen, vec![]);
         assert!(
             r.screen.offered.borrow()[0].ends_with(": bashrc*"),
             "{:?}",
@@ -1349,7 +1469,7 @@ mod tests {
                 Choice::Row(16),      // from of TOKEN: an environment variable
                 Choice::Key('x', 22), // targets cleared
                 Choice::Key('x', 20), // from can't be cleared
-                Choice::Key('d', 15), // TOKEN removed
+                Choice::Key('r', 15), // TOKEN removed
                 Choice::Left,
             ]),
             picks: RefCell::new(vec![Some(2), Some(1), Some(0)]),
@@ -1510,14 +1630,96 @@ mod tests {
     }
 
     #[test]
-    fn a_config_that_does_not_load_is_said_and_not_shown_as_an_empty_form() {
-        let r = drive("[[inject]]\nname = \"x\"\n", views(vec![]), vec![]);
+    fn a_config_that_does_not_load_is_shown_with_why_and_what_it_does_not_know() {
+        // The stops are the four settings, the four of binary a, then what lodge does not know.
+        let r = drive(
+            "# mine\ntarget = \"podman\"\n\n[[inject]]\nname = \"x\"\n\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\ncopy_dep = true\n",
+            views(vec![Choice::Row(8), Choice::Key('x', 9), Choice::Left]),
+            vec![],
+        );
+        let shown = r.screen.shown.borrow();
+        let text = shown[0].1.join("\n");
+        assert!(
+            text.contains("# does not load: unknown field `inject`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# not known to this version of lodge"),
+            "{text}"
+        );
+        assert!(text.contains("[[inject]]\n"), "{text}");
+        assert!(text.contains("copy_dep = true  in [[binary]]"), "{text}");
+        // Changing one says what to do, and changes nothing.
+        assert!(
+            shown[1]
+                .0
+                .contains("✗ this version of lodge does not use it"),
+            "{:?}",
+            shown[1].0
+        );
+        assert!(
+            shown[2]
+                .0
+                .contains("✗ this version of lodge does not use it"),
+            "{:?}",
+            shown[2].0
+        );
+        assert!(r.config.contains("[[inject]]") && r.config.contains("copy_dep"));
+    }
+
+    #[test]
+    fn what_a_config_does_not_know_is_removed_with_r_until_it_loads_again() {
+        let r = drive(
+            "# mine\ntarget = \"podman\"\n\n[[inject]]\nname = \"x\"\n\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\ncopy_dep = true\n",
+            views(vec![Choice::Key('r', 8), Choice::Key('r', 8), Choice::Left]),
+            vec![],
+        );
+        assert!(
+            r.config.starts_with("# mine\ntarget = \"podman\""),
+            "{}",
+            r.config
+        );
+        assert!(
+            !r.config.contains("inject") && !r.config.contains("copy_dep"),
+            "{}",
+            r.config
+        );
+        assert!(
+            r.config.contains("[[binary]]\nname = \"a\""),
+            "{}",
+            r.config
+        );
+        let shown = r.screen.shown.borrow();
+        assert!(
+            shown[1].0.contains("✓ removed [[inject]]"),
+            "{:?}",
+            shown[1].0
+        );
+        assert!(
+            shown[2]
+                .0
+                .contains("✓ removed copy_dep = true  in [[binary]]"),
+            "{:?}",
+            shown[2].0
+        );
+        // Once it loads, the banner and the group are gone.
+        let last = shown[2].1.join("\n");
+        assert!(
+            !last.contains("does not load") && !last.contains("not known"),
+            "{last}"
+        );
+        Config::load(&r.dir.path().join("config.toml")).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_is_not_toml_has_no_form_and_is_said() {
+        let r = drive("= not toml", views(vec![]), vec![]);
         assert!(r.screen.shown.borrow().is_empty());
     }
 
     #[test]
-    fn without_the_form_a_table_lists_programs_and_configs_and_two_rows_add() {
-        // Rows: a, b, c, add a program, add a config. Remove `b`, add by typing.
+    fn without_the_form_a_table_lists_programs_and_data_and_two_rows_add() {
+        // Rows: a, b, the data, add a program, add data. Remove `b`, add data by typing.
         let screen = Screen {
             no_form: true,
             picks: RefCell::new(vec![Some(1), Some(0), Some(3), None]),
@@ -1551,9 +1753,6 @@ mod tests {
         run(&config, &machine, &Words(screen), &typed).unwrap();
         let now = std::fs::read_to_string(&config).unwrap();
         assert!(!now.contains("name = \"b\""), "{now}");
-        assert!(
-            now.contains("name = \"true\"\npath = \"/bin/true\""),
-            "{now}"
-        );
+        assert!(now.contains("[[data]]\npath = \"/bin/true\""), "{now}");
     }
 }

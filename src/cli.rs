@@ -16,7 +16,7 @@ use std::path::PathBuf;
         containers you opened sessions in, most recent first, and takes you back \
         into the one you choose, the same way you got there. On a row, `r` opens it \
         and injects again, and `b` recreates a project's container (after asking); \
-        `c` opens the config: browse what is injected, add programs and configs from \
+        `c` opens the config: browse what is injected, add programs and data from \
         a list, remove one.\n\n\
         New here? `ldg init` writes a starting config, `ldg doctor` checks the host.",
     after_help = "Docs: https://github.com/klawr/lodge#readme"
@@ -98,17 +98,25 @@ pub enum AddCommand {
         /// Do not pack the shared libraries of the binary
         #[arg(long)]
         no_deps: bool,
+        /// Do not also add what sits beside the program (`../share/NAME`, `../lib/NAME`)
+        #[arg(long)]
+        no_data: bool,
     },
-    /// Add a config file or directory
-    #[command(long_about = "Add a [[config]] entry to the config file.")]
-    Config {
-        /// Name of the entry; also the default place, `~/.config/<NAME>`
-        name: String,
+    /// Add a file or directory, copied as it is
+    #[command(
+        long_about = "Add a [[data]] entry to the config file: a file or directory, such as a \
+            config, a plugin folder or the runtime files of a program. It goes to the same \
+            place in the container as it is here (`~/…` stays under the user's home)."
+    )]
+    Data {
         /// Host path of the file or directory
         path: PathBuf,
-        /// Where it goes in the container (default: `~/.config/<NAME>`)
+        /// Where it goes in the container (default: the same place as here)
         #[arg(long, value_name = "PATH")]
         target: Option<String>,
+        /// The program it is for, by its name (only says what it belongs to)
+        #[arg(long = "for", value_name = "NAME")]
+        binary: Option<String>,
     },
 }
 
@@ -119,10 +127,10 @@ pub enum RemoveCommand {
         /// Name of the entry
         name: String,
     },
-    /// Remove a config file or directory
-    Config {
-        /// Name of the entry
-        name: String,
+    /// Remove a file or directory
+    Data {
+        /// Host path of the file or directory
+        path: PathBuf,
     },
 }
 
@@ -131,12 +139,12 @@ pub enum InjectCommand {
     /// List the entries in the config (the default)
     #[command(alias = "list")]
     Ls,
-    /// Add a program or a config to what is injected
+    /// Add a program or data to what is injected
     Add {
         #[command(subcommand)]
         what: AddCommand,
     },
-    /// Remove a program or a config from what is injected
+    /// Remove a program or data from what is injected
     #[command(alias = "remove")]
     Rm {
         #[command(subcommand)]
@@ -189,7 +197,7 @@ pub enum Command {
         long_about = "Inject your tools into a running container that was made some other \
             way (a `docker run`, a compose service, someone else's), and open a shell in \
             it. Nothing is created, started or stopped: the container must be running, \
-            and it is treated as somebody's workload, so a config that is already there \
+            and it is treated as somebody's workload, so a file that is already there \
             is left as it is (with a warning) and git's ownership check is not loosened. \
             It acts as the user the container runs as. Works on the engine of the target \
             (`--target docker|podman`, and `--remote`). `ldg clean --container NAME` takes \
@@ -266,8 +274,8 @@ pub enum Command {
     /// Remove what lodge injected from a container
     #[command(
         long_about = "Remove what lodge injected: binaries, libraries, the wrappers it \
-            installed, its shell setup and any placed secrets. Injected configs are left \
-            in place (you may have changed them) and listed. The devcontainer's own state \
+            installed, its shell setup and any placed secrets. Injected data is left \
+            in place (you may have changed it) and listed. The devcontainer's own state \
             (hook markers, recorded config) is kept."
     )]
     Clean {
@@ -277,11 +285,11 @@ pub enum Command {
         #[arg(long, value_name = "NAME|ID", conflicts_with = "path")]
         container: Option<String>,
     },
-    /// Pack your tools and configs into a portable bundle
+    /// Pack your tools and their data into a portable bundle
     #[command(
-        long_about = "Build a bundle from the [[binary]] and [[config]] entries and [git] settings \
+        long_about = "Build a bundle from the [[binary]] and [[data]] entries and [git] settings \
             in your config: your binaries relinked to a bundled glibc, their libraries, \
-            and your configs, in one tar. This is the only step that needs ldd and \
+            and your data, in one tar. This is the only step that needs ldd and \
             patchelf, and it must run on a Linux machine of the architecture the bundle \
             is for. Credentials directories (~/.ssh, ~/.config/gh, …) trigger a warning: \
             a bundle is meant to be shared. The output is a file, or a registry as \
@@ -299,11 +307,11 @@ pub enum Command {
         #[arg(long)]
         no_clobber: bool,
     },
-    /// Add or remove the tools and configs that are injected
+    /// Add or remove the programs and data that are injected
     #[command(
-        long_about = "Edit the [[binary]] and [[config]] entries of the config file (the global \
+        long_about = "Edit the [[binary]] and [[data]] entries of the config file (the global \
             -c FILE, or ~/.config/lodge/config.toml) without opening it: \
-            `ldg inject add binary rg`, `ldg inject add config nvim ~/.config/nvim`, \
+            `ldg inject add binary rg`, `ldg inject add data ~/.config/nvim --for nvim`, \
             `ldg inject rm binary rg`. Comments in the file are kept. A bundle set with \
             `bundle =` replaces the entries, so changing them does nothing until you pack \
             again or drop that line."
@@ -326,7 +334,7 @@ pub enum Command {
     #[command(
         long_about = "Write a commented config.toml (at ~/.config/lodge/config.toml, or the \
             file given with -c). Editors and tools found on PATH (nvim, hx, rg, fzf, …) \
-            are added as [[binary]] and [[config]] entries, commented out, so you pick what to bring. \
+            are added as [[binary]] and [[data]] entries, commented out, so you pick what to bring. \
             Refuses to overwrite an existing file unless --force."
     )]
     Init {

@@ -399,7 +399,7 @@ fn remote_mode_works_through_ssh_without_a_local_tar() {
     std::fs::write(cfg.join("sub/deep/file.txt"), "hello").unwrap();
     std::os::unix::fs::symlink("sub/deep/file.txt", cfg.join("link")).unwrap();
     sb.config(&format!(
-        "[[config]]\nname = \"cfg\"\npath = \"{}\"\ntarget = \"/root/.config/cfg\"\n",
+        "[[data]]\npath = \"{}\"\ntarget = \"/root/.config/cfg\"\n",
         cfg.display()
     ));
 
@@ -1221,8 +1221,8 @@ fn a_multiplexer_is_an_injected_tool_that_the_shells_rc_file_starts() {
     std::fs::write(&conf, "set -g default-command bash\n").unwrap();
     sb.config(&format!(
         "[[binary]]\nname = \"tmux\"\npath = \"/usr/bin/tmux\"\n\n\
-         [[config]]\nname = \"tmux-conf\"\npath = \"{}\"\ntarget = \"~/.tmux.conf\"\n\n\
-         [[config]]\nname = \"tmux-rc\"\npath = \"{}\"\ntarget = \"~/.bashrc\"\n",
+         [[data]]\npath = \"{}\"\ntarget = \"~/.tmux.conf\"\nfor = \"tmux\"\n\n\
+         [[data]]\npath = \"{}\"\ntarget = \"~/.bashrc\"\n",
         conf.display(),
         rc.display()
     ));
@@ -1250,7 +1250,7 @@ fn a_user_without_root_gets_everything_in_their_own_prefix_and_nothing_elsewhere
     std::fs::create_dir_all(&settings).unwrap();
     std::fs::write(settings.join("rc"), "set x").unwrap();
     sb.config(&format!(
-        "{}\n[[config]]\nname = \"settings\"\npath = \"{}\"\ntarget = \"/tmp/lodge-test-settings\"\n",
+        "{}\n[[data]]\npath = \"{}\"\ntarget = \"/tmp/lodge-test-settings\"\n",
         inject_sh_config(),
         settings.display()
     ));
@@ -1373,7 +1373,7 @@ fn remote_mode_works_against_a_real_ssh_server() {
     std::fs::create_dir_all(&cfg).unwrap();
     std::fs::write(cfg.join("rc"), "hello over ssh").unwrap();
     sb.config(&format!(
-        "[[config]]\nname = \"cfg\"\npath = \"{}\"\ntarget = \"/root/.config/cfg\"\n",
+        "[[data]]\npath = \"{}\"\ntarget = \"/root/.config/cfg\"\n",
         cfg.display()
     ));
     let port = free_port();
@@ -1563,7 +1563,7 @@ fn plain_host_round_trip(sb: &Sandbox, remote: Option<&str>) {
     std::fs::write(cfg.join("rc"), "from the bundle").unwrap();
     sb.config(&format!(
         "[[binary]]\nname = \"hostsh\"\npath = \"/bin/sh\"\n\
-         [[config]]\nname = \"cfg\"\npath = \"{}\"\ntarget = \"~/.config/cfg\"\n",
+         [[data]]\npath = \"{}\"\ntarget = \"~/.config/cfg\"\n",
         cfg.display()
     ));
     let work_path = work.to_string_lossy().into_owned();
@@ -1840,7 +1840,7 @@ fn a_container_lodge_did_not_make_is_attached_to_left_alone_and_cleaned() {
     std::fs::write(config_dir.join("rc"), "from lodge\n").unwrap();
     sb.config(&format!(
         "[[binary]]\nname = \"hello\"\npath = \"{}\"\ncopy_deps = false\n\
-         [[config]]\nname = \"hello\"\npath = \"{}\"\ntarget = \"/root/.config/hello\"\n",
+         [[data]]\npath = \"{}\"\ntarget = \"/root/.config/hello\"\nfor = \"hello\"\n",
         script.display(),
         config_dir.display()
     ));

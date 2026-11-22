@@ -75,8 +75,9 @@ pub fn pack_config(
     let manifest = bundle::pack::pack_to_file(config, &tar, tools)?;
     let written = sink.put(&output, &tar, manifest.arch()?, replace)?;
     info!(
-        "packed {} and {} for {} into {} (id {})",
-        plural(manifest.tools.len(), "tool", "tools"),
+        "packed {}, {} and {} for {} into {} (id {})",
+        plural(manifest.binaries.len(), "binary", "binaries"),
+        plural(manifest.data.len(), "data entry", "data entries"),
         plural(manifest.libs.len(), "library", "libraries"),
         manifest.arch,
         written,
@@ -106,8 +107,9 @@ pub fn bundle(ctx: &Ctx, command: BundleCommand) -> Result<()> {
             let (_scratch, tar, _) = fetch(ctx, &reference)?;
             let manifest = bundle::verify_file(&tar)?;
             line!(
-                "ok  {}, {}, id {}",
-                plural(manifest.tools.len(), "tool", "tools"),
+                "ok  {}, {}, {}, id {}",
+                plural(manifest.binaries.len(), "binary", "binaries"),
+                plural(manifest.data.len(), "data entry", "data entries"),
                 plural(manifest.libs.len(), "library", "libraries"),
                 manifest.id()
             );
@@ -134,20 +136,21 @@ fn inspect(reference: &str, pinned: &str, file: &Path) -> Result<()> {
         manifest.arch,
         manifest.lodge_version
     );
-    for tool in &manifest.tools {
-        let mut parts = Vec::new();
-        if let Some(b) = &tool.binary {
-            let kind = if b.dynamic { "relinked" } else { "as is" };
-            match &b.dest {
-                Some(dest) => parts.push(format!("bin ({kind}) + wrapper → {dest}")),
-                None => parts.push(format!("bin ({kind})")),
-            }
-        }
-        if let Some(c) = &tool.config {
-            let kind = if c.is_dir { "dir" } else { "file" };
-            parts.push(format!("config → {} ({kind})", c.dest));
-        }
-        line!("tool      {:<12} {}", tool.name, parts.join(" · "));
+    for b in &manifest.binaries {
+        let kind = if b.dynamic { "relinked" } else { "as is" };
+        let wrapper = match &b.dest {
+            Some(dest) => format!(" + wrapper → {dest}"),
+            None => String::new(),
+        };
+        line!("binary    {:<12} {kind}{wrapper}", b.name);
+    }
+    for d in &manifest.data {
+        let kind = if d.is_dir { "dir" } else { "file" };
+        let of = match &d.binary {
+            Some(binary) => format!(" · for {binary}"),
+            None => String::new(),
+        };
+        line!("data      {} ({kind}){of}", d.dest);
     }
     let linker = manifest.linker.as_deref().unwrap_or("none");
     line!("libs      {} (linker {linker})", manifest.libs.len());
@@ -171,12 +174,12 @@ pub fn cache(command: Option<CacheCommand>) -> Result<()> {
                 "{:<18} {:<8} {:>5} {:>9}  USED",
                 "ID",
                 "ARCH",
-                "TOOLS",
+                "BINS",
                 "SIZE"
             );
             for e in &entries {
                 let (id, arch, tools) = match &e.manifest {
-                    Some(m) => (m.id(), m.arch.to_string(), m.tools.len().to_string()),
+                    Some(m) => (m.id(), m.arch.to_string(), m.binaries.len().to_string()),
                     None => ("(incomplete)".into(), "-".into(), "-".into()),
                 };
                 line!(

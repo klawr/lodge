@@ -21,7 +21,7 @@ use anyhow::{Context as _, Result};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use super::manifest::{BIN_DIR, CONFIG_DIR, LIB_DIR, Manifest};
+use super::manifest::{BIN_DIR, LIB_DIR, Manifest, data_file};
 use super::store::{Stores, Unreachable};
 use super::{archive, cache, deps, elf, pack};
 use crate::arch::Arch;
@@ -60,8 +60,9 @@ impl Prepared {
         self.dir.join(LIB_DIR).join(name)
     }
 
-    pub fn config(&self, tool: &str) -> PathBuf {
-        self.dir.join(CONFIG_DIR).join(tool)
+    /// The `index`th of the manifest's `data`.
+    pub fn data(&self, index: usize) -> PathBuf {
+        self.dir.join(data_file(index))
     }
 }
 
@@ -86,9 +87,9 @@ pub(crate) fn prepare_in(
     let explicit = reference.or(config.bundle.as_deref());
     let prepared = match explicit {
         Some(reference) => {
-            if !config.binaries.is_empty() || !config.configs.is_empty() {
+            if !config.binaries.is_empty() || !config.data.is_empty() {
                 warning!(
-                    "a bundle is in use, so the [[binary]] and [[config]] entries in the config are ignored"
+                    "a bundle is in use, so the [[binary]] and [[data]] entries in the config are ignored"
                 );
             }
             from_store(root, stores, reference)?
@@ -239,7 +240,7 @@ fn live(root: &Path, config: &Config, tools: &Toolchain) -> Result<Prepared> {
 /// A fingerprint of everything a live pack depends on. Packing is skipped when it
 /// is unchanged.
 ///
-/// [`pack::build`] reads the `[[binary]]` and `[[config]]` entries and `[git]`, and the files they
+/// [`pack::build`] reads the `[[binary]]` and `[[data]]` entries and `[git]`, and the files they
 /// name. The entries and settings go in whole, serialized, so a
 /// setting added to them later counts without anyone remembering to list it
 /// here; the files go in by size, mtime and mode.
@@ -261,7 +262,7 @@ fn inputs_fingerprint(config: &Config, deps: &mut deps::Resolver<'_>) -> Result<
             }
         }
     }
-    for item in &config.configs {
+    for item in &config.data {
         parts.push(serde_json::to_string(item)?);
         stat_tree(&item.path, &mut parts)?;
     }
@@ -386,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn a_change_in_the_config_tree_is_noticed() {
+    fn a_change_in_a_data_tree_is_noticed() {
         let work = TempDir::new("src3").unwrap();
         let cache = TempDir::new("cache3").unwrap();
         let tool = script_tool(work.path(), "t", "#!/bin/sh\n");
@@ -394,10 +395,10 @@ mod tests {
         std::fs::create_dir_all(&cfg_dir).unwrap();
         std::fs::write(cfg_dir.join("rc"), "a").unwrap();
         let mut cfg = config(vec![tool]);
-        cfg.configs.push(crate::config::ConfigEntry {
-            name: "t".into(),
+        cfg.data.push(crate::config::DataEntry {
             path: cfg_dir.clone(),
             target: None,
+            binary: Some("t".into()),
         });
 
         let first = prepare_in(cache.path(), &cfg, None, &files(), &tools::external()).unwrap();
@@ -456,7 +457,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first.origin, Origin::Extracted);
-        assert_eq!(first.manifest.tools.len(), 1);
+        assert_eq!(first.manifest.binaries.len(), 1);
         assert!(first.bin("t").exists());
         let second = prepare_in(
             cache.path(),
@@ -477,12 +478,13 @@ mod tests {
         let cfg = config(vec![script_tool(
             work.path(),
             "t",
-            "#!/bin/sh\necho data\n",
+            "#!/bin/sh\necho payload\n",
         )]);
         let file = out.path().join("b.tar");
         pack::pack_to_file(&cfg, &file, &tools::external()).unwrap();
         let mut bytes = std::fs::read(&file).unwrap();
-        let pos = bytes.windows(4).position(|w| w == b"data").unwrap();
+        // Damage the binary's content: the manifest is read first, and must be whole.
+        let pos = bytes.windows(7).position(|w| w == b"payload").unwrap();
         bytes[pos] ^= 0xFF;
         std::fs::write(&file, bytes).unwrap();
 
@@ -719,7 +721,8 @@ mod tests {
             arch: "x86_64".into(),
             linker: None,
             libs: vec![],
-            tools: vec![],
+            binaries: vec![],
+            data: vec![],
             git_safe_directories: vec![],
         };
         for key in ["o-a", "o-b"] {

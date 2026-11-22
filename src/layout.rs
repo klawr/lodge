@@ -13,6 +13,8 @@
 //!   written through the engine as root, at creation, under `/opt/lodge`, and is
 //!   the devcontainer's, not the user's.
 
+use std::path::Path;
+
 use crate::runtime::ContainerUser;
 
 /// Where the prefix goes under a user's home.
@@ -95,9 +97,15 @@ impl Layout {
     }
 }
 
-/// Where a tool's config goes when the config names no `target_config`.
-pub fn default_config_dest(tool: &str) -> String {
-    format!("~/.config/{tool}")
+/// `path` as the config writes it, and as it is meant in a container: `~/…` when
+/// it is under `home` (the container's user has a home of their own), else the
+/// path as it is. This is the place a `[[data]]` entry without a `target` goes
+/// to: the same place as here.
+pub fn tilde(path: &Path, home: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) if home != Path::new("/") => format!("~/{}", rest.display()),
+        _ => path.display().to_string(),
+    }
 }
 
 // ── provisioning state: the devcontainer's own, root-owned ───────────────────
@@ -153,6 +161,21 @@ mod tests {
             assert!(path.starts_with("/home/dev/.local/share/lodge/"), "{path}");
         }
         assert_eq!(l.bin_of("nvim"), "/home/dev/.local/share/lodge/bin/nvim");
+    }
+
+    #[test]
+    fn a_path_keeps_its_place_and_only_the_home_is_relative() {
+        let home = Path::new("/home/me");
+        assert_eq!(tilde(Path::new("/home/me/.vimrc"), home), "~/.vimrc");
+        assert_eq!(
+            tilde(Path::new("/usr/local/share/nvim"), home),
+            "/usr/local/share/nvim"
+        );
+        // A root home is every path's prefix, and no place of its own.
+        assert_eq!(
+            tilde(Path::new("/usr/bin/rg"), Path::new("/")),
+            "/usr/bin/rg"
+        );
     }
 
     #[test]

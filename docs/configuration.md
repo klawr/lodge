@@ -29,24 +29,21 @@ path      = "/usr/local/bin/nvim"     # host binary to copy in
 target    = "~/.local/bin/nvim"       # also write a wrapper script here (optional)
 copy_deps = true                      # copy shared libs via ldd when packing (default: true)
 
-# Configs: files and directories, copied as they are.
-[[config]]
-name   = "nvim"
-path   = "~/.config/nvim"
-target = "~/.config/nvim"             # where it goes (optional, default shown)
+# Data: files and directories, copied as they are, to the same place in the
+# container. `for` only says which program one belongs to.
+[[data]]
+path = "/usr/local/share/nvim"        # what a program keeps beside its binary
+for  = "nvim"
 
-# Neovim needs its runtime at the compiled-in $VIMRUNTIME path.
-[[config]]
-name   = "nvim-runtime"
-path   = "/usr/local/share/nvim/runtime"
-target = "/usr/local/share/nvim/runtime"
+[[data]]
+path = "~/.config/nvim"               # `~/…` stays under the container user's home
+for  = "nvim"
 
 # Ship installed plugins so the container uses your exact host versions instead
 # of re-cloning them at HEAD (which drifts into incompatible versions).
-[[config]]
-name   = "nvim-plugins"
-path   = "~/.local/share/nvim/lazy"
-target = "~/.local/share/nvim/lazy"
+[[data]]
+path = "~/.local/share/nvim/lazy"
+for  = "nvim"
 
 [session]
 shell = "/bin/bash"   # shell launched inside the container (default)
@@ -70,56 +67,79 @@ libraries it needs.
 | `target`    | no       | none    | also write a wrapper script that runs the binary at this path in the container (absolute or `~/…`, no `..`). Without it the binary is on the `PATH` of the sessions lodge opens |
 | `copy_deps` | no       | `true`  | copy shared-library dependencies via `ldd` when packing |
 
-## `[[config]]`
+## `[[data]]`
 
-A config file or directory, copied as it is. It has nothing to do with any binary:
-a program may have several configs, or none, and a config can be shell setup.
+A file or directory, copied as it is: what a program needs beside its binary (an
+editor's runtime files), a config, a plugin folder, shell setup. A program may have
+several, or none.
 
-| field    | required | default            | meaning |
-| -------- | -------- | ------------------ | ------- |
-| `name`   | yes      | —                  | identifier, unique among the configs |
-| `path`   | yes      | —                  | host path to the file or directory (may start with `~/`) |
-| `target` | no       | `~/.config/<name>` | where it goes in the container (`~` is the container user's home; absolute or `~/…`, no `..`) |
+| field    | required | default                  | meaning |
+| -------- | -------- | ------------------------ | ------- |
+| `path`   | yes      | —                        | host path to the file or directory (may start with `~/`) |
+| `target` | no       | the same place as `path` | where it goes in the container (`~` is the container user's home; absolute or `~/…`, no `..`) |
+| `for`    | no       | none                     | the `name` of the `[[binary]]` it belongs to. It only says what the data is for (the screen and `ldg doctor` use it): it is injected the same either way |
 
-A binary and a config may have the same name; they are separate entries.
+A path under your home directory goes under the container user's home (`~/.config/nvim`
+stays `~/.config/nvim`); any other path goes to the same absolute path. Data is told
+apart by where it goes, so no two entries may go to the same place, and `for` must
+name a `[[binary]]` of the config.
+
+A program built to run from where it was installed looks for its files there. For a
+binary at `<prefix>/bin/<name>`, lodge looks for `<prefix>/share/<name>` and
+`<prefix>/lib/<name>`, and offers them as data for it when you add the program (`ldg
+inject add binary`, and `b` in the config screen add them with it; `--no-data` leaves
+them out) and when you ask `ldg init`. It does not need to know the program: it is
+the layout every installed program follows. A program that keeps its files somewhere
+else needs its `[[data]]` written, and `ldg doctor` says when it finds files beside a
+binary that the config does not bring.
 
 lodge writes as the container user and never uses root, so a target must be a place
 that user can write (under `~`, say). A target elsewhere fails with the path and the
 user named.
 
 Shell aliases and other shell setup are your shell's own config: inject your
-`~/.bashrc` (or your shell and its config) with a `[[config]]` whose `target` is
+`~/.bashrc` (or your shell and its config) with a `[[data]]` whose `target` is
 where the container user's shell reads it.
 
 ## Editing the config
 
 Run `ldg` alone and press `c` for the config screen: the whole file as the form it
 is in the TOML, with every value a line you can move to (↑/↓ or j/k): `target` and
-`bundle`, `[session]` and `[git]`, then each `[[binary]]`, `[[config]]` and
+`bundle`, `[session]` and `[git]`, then each `[[binary]]`, `[[data]]` and
 `[[secret]]` with all of its fields under it, the ones that are not set shown as
-such (`target = (default ~/.config/nvim)`). Enter changes the selected one: `path`
+such (`target = (the same place as here)`). Enter changes the selected one: `path`
 opens the list of what this machine has, the rest is typed or chosen from a short
-list (`target`, how a secret is read and placed), `copy_deps` is turned over. `x`
-puts a value back to its default or clears it, and `d` removes the entry. What each
-change did is on the first line, and a refused one says why and changes nothing.
+list (`for`, `target`, how a secret is read and placed), `copy_deps` is turned over.
+`x` puts a value back to its default or clears it, and `r` removes the entry. What
+each change did is on the first line, and a refused one says why and changes nothing.
+A binary that is renamed takes its data with it, and one that is removed leaves its
+data in place, no longer for anything.
 
 | key | |
 | --- | --- |
 | `b` | add programs |
-| `c` | add configs |
+| `d` | add data |
 | `s` | add a secret (a name, where its value comes from) |
 | `p` | pack the bundle into a file (Enter takes `lodge-<arch>.tar` here) |
 | `P` | publish the bundle to a registry (Enter takes the one `bundle =` names) |
 | `o` | work on another config file: the ones beside the default and in the folder `ldg` was started in, or a path typed in full |
 
-`b` and `c` open what this machine has (for programs, the tools it knows that are
-installed, then every other program on `PATH`; for configs, your `~/.config` and the
-dotfiles in `~`), narrowing as you type. Enter adds the selected one and marks it
-`[x]`, and the list stays open for the next (Esc when done). What is in your config
-already is in the list too, marked from the start; a path typed in full (`/…`, `~/…`)
-is offered as it is. A config goes where it is on this machine, when that is under
-your home directory. Credentials and state (`~/.ssh`, `~/.config/gh`, caches) are
-never listed.
+`b` and `d` open what this machine has (for programs, the tools it knows that are
+installed, then every other program on `PATH`; for data, what sits beside the
+programs in your config, then your `~/.config` and the dotfiles in `~`), narrowing as
+you type. Enter adds the selected one and marks it `[x]`, and the list stays open for
+the next (Esc when done). A program is added with what sits beside it. What is in your
+config already is in the list too, marked from the start; a path typed in full (`/…`,
+`~/…`) is offered as it is, and goes where it is on this machine. Credentials and
+state (`~/.ssh`, `~/.config/gh`, caches) are never listed.
+
+A config that does not load (after an upgrade that renamed a table, say) is still
+shown, with why on top, and what this version of lodge does not know (a table it
+dropped, a misspelled key) grouped at the end as lines of their own. `r` removes
+one, and the rest of the file, its comments included, stays as it was. Any other
+change is kept while it leaves the file with fewer problems than it had, so a config
+with several can be mended one at a time; one that would add a problem is refused, as
+for a config that loads. Only a file that is not TOML at all has no form.
 
 Not in the screen yet: the `[targets.<name>]` tables, which each target defines for
 itself.
@@ -130,8 +150,9 @@ The same from the command line, without opening the file:
 ldg inject                                    # list the entries
 ldg inject add binary rg                      # a program found on PATH
 ldg inject add binary nvim /usr/local/bin/nvim --target '~/.local/bin/nvim'
-ldg inject add config nvim ~/.config/nvim
+ldg inject add data ~/.config/nvim --for nvim
 ldg inject rm binary rg
+ldg inject rm data ~/.config/nvim
 ```
 
 The file is edited in place (comments and order stay), and nothing is written
@@ -156,7 +177,7 @@ leave, so the next `ldg up` (or `ldg attach`) lands in the same session, with
 your editor as you left it. The same holds after a dropped `--remote` connection: `ldg` reconnects
 by itself and opens a new shell, which reads the rc file again and attaches.
 
-A tmux setup, with a `[[binary]]` and two `[[config]]` entries:
+A tmux setup, with a `[[binary]]` and two `[[data]]` entries:
 
 ```toml
 [[binary]]
@@ -164,16 +185,15 @@ name = "tmux"
 path = "/usr/bin/tmux"
 
 # ~/.bashrc in the container: start tmux once, attaching if it is already there.
-[[config]]
-name   = "tmux-rc"
+[[data]]
 path   = "~/.config/lodge/tmux-rc"
 target = "~/.bashrc"
 
 # ~/.tmux.conf in the container.
-[[config]]
-name   = "tmux-conf"
+[[data]]
 path   = "~/.config/lodge/tmux.conf"
 target = "~/.tmux.conf"
+for    = "tmux"
 ```
 
 `~/.config/lodge/tmux-rc` (use your own `~/.bashrc` and add these lines, if you
@@ -251,7 +271,7 @@ It injects, delivers secrets and opens a shell as `up` does, in the user's home 
 
 - Nothing is created, started or stopped: a container that is not running is refused.
 - It acts as the user the container runs as.
-- A config lodge did not place is left as it is, with a warning, and git's
+- Data lodge did not place is left as it is, with a warning, and git's
   `safe.directory = *` is not set.
 - Ports it listens on are forwarded as for any container.
 
@@ -270,7 +290,7 @@ Because it is a real machine, lodge is careful with it:
 
 - It acts as the user the machine connects as, and cannot act as another (`root` or a
   named user is refused).
-- A config lodge did not place is **left as it is**, with a warning, instead of
+- Data lodge did not place is **left as it is**, with a warning, instead of
   replaced: `ldg up` never overwrites your own dotfiles. One it placed earlier is
   updated.
 - git's `safe.directory = *` is not set. List folders in `[git] safe_directories`
@@ -328,7 +348,7 @@ session. A pod is someone's workload, so, as for `host`:
 
 - It acts as the user the pod runs as, and cannot act as another: `kubectl exec` has
   no way to switch user, so `root` or a named user is refused.
-- A config lodge did not place is left as it is, with a warning, and git's
+- Data lodge did not place is left as it is, with a warning, and git's
   `safe.directory = *` is not set.
 - The image needs `sh` and `tar`, and `cat` for the forwarder to see which ports
   listen. The bundle holds Linux binaries, so the pod's architecture must be one it
@@ -344,7 +364,7 @@ session. A pod is someone's workload, so, as for `host`:
 ## `bundle`
 
 A top-level `bundle = "path/to/lodge.tar"` injects from that bundle instead of
-packing the `[[binary]]` and `[[config]]` entries. A relative path is relative to the config
+packing the `[[binary]]` and `[[data]]` entries. A relative path is relative to the config
 file's folder. A reference with a scheme is not a path: `bundle =
 "oci://ghcr.io/me/lodge:1"` reads the bundle from a registry. `--bundle` on the
 command line (a file or such a reference) overrides it. See

@@ -61,10 +61,14 @@ safe_directories`); if you set it to `[]`, add the directories you need.
 - `ldg doctor` checks each `binary` exists and shows its architecture; the
   container must run the same one.
 - A library loaded at run time (`dlopen`, a plugin, an interpreter) is invisible
-  to `ldd`. Add it as its own `[[config]]` entry (`path` = the library or its
-  folder, `target` = where the tool looks).
-- Neovim needs its runtime at the path it was built with: inject
-  `<prefix>/share/nvim/runtime` to the same path (`ldg init` adds this entry).
+  to `ldd`. Add it as its own `[[data]]` entry (`path` = the library or its
+  folder; it goes to the same place, or to `target`).
+- A program built to run from where it was installed (Neovim is one) needs the
+  files it keeps beside its binary, at the path it was built with. lodge brings
+  `<prefix>/share/<name>` and `<prefix>/lib/<name>` when you add the program, and
+  `ldg doctor` says when they are beside a binary and not in the config. An
+  error like "module 'vim.uri' not found" means they are missing in the container:
+  add them with `ldg inject add data PATH --for NAME`.
 - Run `ldg cache clear` if you suspect a stale packed bundle.
 
 ## The devcontainer is reported as changed
@@ -139,7 +143,7 @@ reached through a proxy needs `HTTPS_PROXY` (and `NO_PROXY` for what is not).
 ## A plain host
 
 `ldg --target host up` works on the machine itself, as the user you connect as. If
-it says a config "already exists and was not injected by lodge; leaving it as it
+it says a file "already exists and was not injected by lodge; leaving it as it
 is", that is on purpose: lodge does not overwrite your files on a real machine.
 Remove or move the file if you want the bundle's version, then `ldg up --reinject`.
 "The bundle's binaries are for Linux" means the machine is not Linux; "cannot act as
@@ -150,6 +154,6 @@ has the login user.
 
 `ldg clean` removes lodge's directory (`~/.local/share/lodge` of the container
 user, or `/tmp/lodge-<uid>`), the wrapper scripts it wrote, the git `safe.directory` entries it added and the
-placed secrets, and lists the configs it left in place. `ldg rm` removes the whole container. lodge keeps nothing about a container on the host except the
+placed secrets, and lists the data it left in place. `ldg rm` removes the whole container. lodge keeps nothing about a container on the host except the
 bundle cache (`ldg cache clear`) and the forwarding logs in
 `~/.local/share/lodge/`.

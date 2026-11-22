@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use super::hash::hash_path;
-use super::manifest::{BIN_DIR, CONFIG_DIR, LIB_DIR, MANIFEST_FILE, Manifest};
+use super::manifest::{BIN_DIR, DATA_DIR, LIB_DIR, MANIFEST_FILE, Manifest, data_file};
 
 /// Writes the bundle directory `dir` (a manifest plus `bin/`, `lib/`, `config/`)
 /// as a tar.
@@ -19,7 +19,7 @@ pub fn write_tar(dir: &Path, out: impl Write) -> Result<()> {
     builder
         .append_path_with_name(dir.join(MANIFEST_FILE), MANIFEST_FILE)
         .context("adding the manifest")?;
-    for sub in [BIN_DIR, LIB_DIR, CONFIG_DIR] {
+    for sub in [BIN_DIR, LIB_DIR, DATA_DIR] {
         let path = dir.join(sub);
         if path.exists() {
             builder
@@ -84,20 +84,18 @@ pub fn verify(dir: &Path, manifest: &Manifest) -> Result<()> {
     for lib in &manifest.libs {
         check(format!("{LIB_DIR}/{}", lib.name), &lib.hash)?;
     }
-    for tool in &manifest.tools {
-        if let Some(b) = &tool.binary {
-            check(format!("{BIN_DIR}/{}", tool.name), &b.hash)?;
-        }
-        if let Some(c) = &tool.config {
-            check(format!("{CONFIG_DIR}/{}", tool.name), &c.hash)?;
-        }
+    for binary in &manifest.binaries {
+        check(format!("{BIN_DIR}/{}", binary.name), &binary.hash)?;
+    }
+    for (i, data) in manifest.data.iter().enumerate() {
+        check(data_file(i), &data.hash)?;
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::manifest::{Binary, ConfigTree, Lib, Tool};
+    use super::super::manifest::{Binary, Data, Lib};
     use super::*;
     use crate::tmpfile::TempDir;
 
@@ -105,13 +103,13 @@ mod tests {
     fn bundle_dir() -> (TempDir, Manifest) {
         let dir = TempDir::new("bundle").unwrap();
         let p = dir.path();
-        for sub in [BIN_DIR, LIB_DIR, CONFIG_DIR] {
+        for sub in [BIN_DIR, LIB_DIR, DATA_DIR] {
             std::fs::create_dir_all(p.join(sub)).unwrap();
         }
         std::fs::write(p.join("bin/hello"), "#!/bin/sh\necho hi\n").unwrap();
         std::fs::write(p.join("lib/libx.so.1"), "library").unwrap();
-        std::fs::create_dir_all(p.join("config/hello/sub")).unwrap();
-        std::fs::write(p.join("config/hello/sub/rc"), "set x").unwrap();
+        std::fs::create_dir_all(p.join("data/0/sub")).unwrap();
+        std::fs::write(p.join("data/0/sub/rc"), "set x").unwrap();
 
         let manifest = Manifest {
             lodge_version: "0".into(),
@@ -122,18 +120,17 @@ mod tests {
                 name: "libx.so.1".into(),
                 hash: hash_path(&p.join("lib/libx.so.1")).unwrap(),
             }],
-            tools: vec![Tool {
+            binaries: vec![Binary {
                 name: "hello".into(),
-                binary: Some(Binary {
-                    dest: None,
-                    dynamic: true,
-                    hash: hash_path(&p.join("bin/hello")).unwrap(),
-                }),
-                config: Some(ConfigTree {
-                    dest: "~/.config/hello".into(),
-                    is_dir: true,
-                    hash: hash_path(&p.join("config/hello")).unwrap(),
-                }),
+                dest: None,
+                dynamic: true,
+                hash: hash_path(&p.join("bin/hello")).unwrap(),
+            }],
+            data: vec![Data {
+                dest: "~/.config/hello".into(),
+                is_dir: true,
+                hash: hash_path(&p.join("data/0")).unwrap(),
+                binary: Some("hello".into()),
             }],
             git_safe_directories: vec![],
         };
@@ -158,7 +155,7 @@ mod tests {
         let dest = TempDir::new("extracted").unwrap();
         assert_eq!(extract(&file, dest.path()).unwrap(), manifest);
         assert_eq!(
-            std::fs::read_to_string(dest.path().join("config/hello/sub/rc")).unwrap(),
+            std::fs::read_to_string(dest.path().join("data/0/sub/rc")).unwrap(),
             "set x"
         );
     }

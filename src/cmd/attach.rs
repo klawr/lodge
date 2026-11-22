@@ -202,7 +202,8 @@ mod tests {
             arch: "x86_64".into(),
             linker: None,
             libs: vec![],
-            tools: vec![],
+            binaries: vec![],
+            data: vec![],
             git_safe_directories: vec![],
         }
     }

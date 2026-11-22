@@ -6,26 +6,32 @@ use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
 use super::Ctx;
-use super::init::tilde;
+use super::add::add_binary;
 use crate::cli::{AddCommand, InjectCommand, RemoveCommand};
-use crate::config::edit::{self, Kind, NewEntry};
+use crate::config::edit::{self, Kind, NewBinary, NewEntry};
 use crate::config::expand_tilde;
+use crate::layout::tilde;
 use crate::output::{info, line, note, warning};
+
+/// The home directory of the user running lodge, which paths under it are relative to.
+fn home_of(ctx: &Ctx) -> PathBuf {
+    ctx.local
+        .var("HOME")
+        .map_or_else(|| PathBuf::from("/"), PathBuf::from)
+}
 
 pub fn run(ctx: &Ctx, command: Option<InjectCommand>) -> Result<()> {
     let path = &ctx.config_path;
-    let home = ctx
-        .local
-        .var("HOME")
-        .map_or_else(|| PathBuf::from("/"), PathBuf::from);
+    let home = home_of(ctx);
     match command.unwrap_or(InjectCommand::Ls) {
-        InjectCommand::Ls => return list(ctx),
+        InjectCommand::Ls => return list(ctx, &home),
         InjectCommand::Add { what } => match what {
             AddCommand::Binary {
                 name,
                 path: given,
                 target,
                 no_deps,
+                no_data,
             } => {
                 // A bare name is a program on PATH, the way `ldg init` finds tools.
                 let given = match given {
@@ -34,27 +40,32 @@ pub fn run(ctx: &Ctx, command: Option<InjectCommand>) -> Result<()> {
                         anyhow::anyhow!("`{name}` is not on PATH; give its location after the name")
                     })?,
                 };
-                let mut entry = NewEntry::binary(&name, host_path(given, &home)?);
-                entry.target = target;
-                entry.copy_deps = !no_deps;
-                add(path, entry)?
+                let entry = NewEntry::Binary(NewBinary {
+                    name: name.clone(),
+                    path: host_path(given, &home)?,
+                    target,
+                    copy_deps: !no_deps,
+                });
+                for placed in add_binary(path, entry, &home, !no_data)? {
+                    info!("added data `{placed}` for `{name}` (it sits beside the program)");
+                }
             }
-            AddCommand::Config {
-                name,
+            AddCommand::Data {
                 path: given,
                 target,
+                binary,
             } => {
-                let entry = NewEntry::config(&name, host_path(given, &home)?, target);
+                let entry = NewEntry::data(host_path(given, &home)?, target, binary);
                 add(path, entry)?
             }
         },
         InjectCommand::Rm { what } => {
-            let (kind, name) = match what {
+            let (kind, key) = match what {
                 RemoveCommand::Binary { name } => (Kind::Binary, name),
-                RemoveCommand::Config { name } => (Kind::Config, name),
+                RemoveCommand::Data { path: given } => (Kind::Data, data_key(path, given)?),
             };
-            edit::remove(path, kind, &name)?;
-            info!("removed {} `{name}` from {}", kind.key(), path.display());
+            edit::remove(path, kind, &key)?;
+            info!("removed {} `{key}` from {}", kind.key(), path.display());
         }
     }
     bundle_note(ctx);
@@ -65,11 +76,23 @@ fn add(path: &Path, entry: NewEntry) -> Result<()> {
     edit::add(path, &entry)?;
     info!(
         "added {} `{}` to {}",
-        entry.kind.key(),
-        entry.name,
+        entry.kind().key(),
+        entry.key(),
         path.display()
     );
     Ok(())
+}
+
+/// The key of the data in the config at `path` that comes from `given`: the entry
+/// is found by the place it means, however the config writes it (`~/x` or the
+/// whole path).
+fn data_key(path: &Path, given: PathBuf) -> Result<String> {
+    let want = std::path::absolute(expand_tilde(given.clone())).unwrap_or(given);
+    edit::list(path, Kind::Data)?
+        .into_iter()
+        .filter_map(|d| d.path)
+        .find(|written| expand_tilde(PathBuf::from(written)) == want)
+        .ok_or_else(|| anyhow::anyhow!("no [[data]] `{}` in {}", want.display(), path.display()))
 }
 
 /// A host path as it is written in the config: absolute (so it means the same
@@ -81,24 +104,6 @@ pub(super) fn host_path(path: PathBuf, home: &Path) -> Result<String> {
         bail!("{} does not exist", path.display());
     }
     Ok(tilde(&path, home))
-}
-
-/// A name for an entry made from a path: its last part without leading dots
-/// (`~/.bashrc` is `bashrc`), cut to what a name may hold.
-pub(super) fn name_from(path: &Path) -> String {
-    let base = path
-        .file_name()
-        .map(|n| n.to_string_lossy().trim_start_matches('.').to_string())
-        .unwrap_or_default();
-    base.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || "-_.+".contains(c) {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
 }
 
 /// A configured bundle is injected instead of the entries, which would leave an
@@ -114,9 +119,9 @@ fn bundle_note(ctx: &Ctx) {
     }
 }
 
-fn list(ctx: &Ctx) -> Result<()> {
+fn list(ctx: &Ctx, home: &Path) -> Result<()> {
     let config = ctx.config()?;
-    if config.binaries.is_empty() && config.configs.is_empty() {
+    if config.binaries.is_empty() && config.data.is_empty() {
         note!(
             "nothing is injected by {} (`ldg inject add binary NAME` adds a program)",
             ctx.config_path.display()
@@ -127,22 +132,17 @@ fn list(ctx: &Ctx) -> Result<()> {
         .binaries
         .iter()
         .map(|b| b.name.len())
-        .chain(config.configs.iter().map(|c| c.name.len()))
         .max()
         .unwrap_or(0);
     for item in &config.binaries {
         line!("binary  {:<width$}  {}", item.name, item.path.display());
     }
-    for item in &config.configs {
-        let to = item
-            .target
-            .clone()
-            .unwrap_or_else(|| format!("~/.config/{}", item.name));
-        line!(
-            "config  {:<width$}  {} → {to}",
-            item.name,
-            item.path.display()
-        );
+    for item in &config.data {
+        let of = match &item.binary {
+            Some(binary) => format!(" · for {binary}"),
+            None => String::new(),
+        };
+        line!("data    {} → {}{of}", item.path.display(), item.dest(home));
     }
     Ok(())
 }

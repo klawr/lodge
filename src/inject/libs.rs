@@ -54,7 +54,8 @@ mod tests {
                     hash: format!("{:016x}", c.len()),
                 })
                 .collect(),
-            tools: vec![],
+            binaries: vec![],
+            data: vec![],
             git_safe_directories: vec![],
         };
         let prepared = Prepared {

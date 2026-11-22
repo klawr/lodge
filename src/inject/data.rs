@@ -1,27 +1,26 @@
-//! Injecting config files and directories.
+//! Injecting data: files and directories, copied to the place the bundle names.
 
 use anyhow::{Context, Result};
 
-use crate::bundle::manifest::{ConfigTree, Tool};
+use crate::bundle::manifest::Data;
 use crate::bundle::source::Prepared;
 use crate::output::{info, warning};
 use crate::runtime::{ContainerUser, Env};
 
-/// Copies the tool's config to its destination and returns that path.
-/// `placed_before` is what an earlier injection placed: anything else already
-/// at the destination is not lodge's, so replacing it is warned about, and on a
-/// machine that is not thrown away (a plain host) it is left alone and `None` is
-/// returned: lodge never overwrites someone's real dotfiles.
-pub(super) fn inject_config(
+/// Copies the `index`th data of the bundle to its destination and returns that
+/// path. `placed_before` is what an earlier injection placed: anything else
+/// already at the destination is not lodge's, so replacing it is warned about,
+/// and on a machine that is not thrown away (a plain host) it is left alone and
+/// `None` is returned: lodge never overwrites someone's real dotfiles.
+pub(super) fn inject_data(
     env: &dyn Env,
     user: &ContainerUser,
     bundle: &Prepared,
-    tool: &Tool,
-    config: &ConfigTree,
+    index: usize,
+    data: &Data,
     placed_before: &[String],
 ) -> Result<Option<String>> {
-    let name = &tool.name;
-    let dest = user.expand_home(&config.dest);
+    let dest = user.expand_home(&data.dest);
     if !placed_before.contains(&dest) && env.exists(&dest)? {
         if !env.is_disposable() {
             warning!("{dest} already exists and was not injected by lodge; leaving it as it is");
@@ -29,7 +28,10 @@ pub(super) fn inject_config(
         }
         warning!("{dest} already exists and was not injected by lodge; replacing it");
     }
-    info!("injecting {name} config → {dest}");
+    match &data.binary {
+        Some(binary) => info!("injecting data of {binary} → {dest}"),
+        None => info!("injecting data → {dest}"),
+    }
 
     // Replace anything at the destination before copying: a directory is merged
     // into an existing one, so removing first makes the copy mirror the bundle
@@ -42,10 +44,10 @@ pub(super) fn inject_config(
             &["rm", "-rf", &dest],
             &crate::runtime::ExecOpts::default().repeatable(),
         )
-        .and_then(|()| env.cp_in(&bundle.config(name).to_string_lossy(), &dest));
+        .and_then(|()| env.cp_in(&bundle.data(index).to_string_lossy(), &dest));
     written.with_context(|| {
         format!(
-            "{name}: writing {dest} as {} failed. lodge never uses root, so a target must be \
+            "writing {dest} as {} failed. lodge never uses root, so a target must be \
              somewhere that user can write (under ~, say)",
             user.name
         )
@@ -71,28 +73,24 @@ mod tests {
         }
     }
 
-    /// A bundle whose tool `hello` has the config tree `config/hello/rc`,
-    /// going to `dest`.
+    /// A bundle whose one data is the tree `data/0/rc`, going to `dest`.
     fn bundle(dest: &str) -> (TempDir, Prepared) {
         let dir = TempDir::new("cfg-bundle").unwrap();
-        std::fs::create_dir_all(dir.path().join("config/hello")).unwrap();
-        std::fs::write(dir.path().join("config/hello/rc"), "set x").unwrap();
-        let tool = Tool {
-            name: "hello".into(),
-            binary: None,
-            config: Some(ConfigTree {
-                dest: dest.into(),
-                is_dir: true,
-                hash: "00000000000000aa".into(),
-            }),
-        };
+        std::fs::create_dir_all(dir.path().join("data/0")).unwrap();
+        std::fs::write(dir.path().join("data/0/rc"), "set x").unwrap();
         let manifest = Manifest {
             lodge_version: "0".into(),
             created: 0,
             arch: "x86_64".into(),
             linker: None,
             libs: vec![],
-            tools: vec![tool],
+            binaries: vec![],
+            data: vec![Data {
+                dest: dest.into(),
+                is_dir: true,
+                hash: "00000000000000aa".into(),
+                binary: None,
+            }],
             git_safe_directories: vec![],
         };
         let prepared = Prepared {
@@ -109,7 +107,7 @@ mod tests {
     }
 
     fn inject_known(env: &FakeEnv, b: &Prepared, placed_before: &[String]) -> Result<String> {
-        Ok(inject_maybe(env, b, placed_before)?.expect("the config was placed"))
+        Ok(inject_maybe(env, b, placed_before)?.expect("the data was placed"))
     }
 
     fn inject_maybe(
@@ -117,20 +115,19 @@ mod tests {
         b: &Prepared,
         placed_before: &[String],
     ) -> Result<Option<String>> {
-        let tool = &b.manifest.tools[0];
         let user = dev();
-        inject_config(
+        inject_data(
             &crate::runtime::Acting::new(env, &user),
             &user,
             b,
-            tool,
-            tool.config.as_ref().unwrap(),
+            0,
+            &b.manifest.data[0],
             placed_before,
         )
     }
 
     #[test]
-    fn a_config_lands_in_the_users_home_owned_by_them_without_any_chown() {
+    fn data_lands_in_the_users_home_owned_by_them_without_any_chown() {
         let (_dir, b) = bundle("~/.config/hello");
         let env = FakeEnv::new();
         let placed = inject(&env, &b).unwrap();
@@ -198,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn a_real_machine_keeps_a_config_it_did_not_place_and_lodges_own_is_updated() {
+    fn a_real_machine_keeps_data_it_did_not_place_and_lodges_own_is_updated() {
         let (_dir, b) = bundle("~/.config/hello");
         let env = FakeEnv::new()
             .shared()

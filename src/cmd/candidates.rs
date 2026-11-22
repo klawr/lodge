@@ -1,15 +1,17 @@
 //! What could be injected, found on this machine: the known tools that are
-//! installed (with their configs), the other programs on `PATH`, and the config
-//! files and folders in the home directory. Each is ready to be added as it
-//! is, so the person chooses from a list and is not asked for paths.
+//! installed, the other programs on `PATH`, the files a program keeps beside it
+//! (see [`companions`]), and the config files and folders in the home directory.
+//! Each is ready to be added as it is, so the person chooses from a list and is
+//! not asked for paths.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use super::init::{Detected, tilde};
+use super::init::Detected;
 use crate::config::edit::NewEntry;
+use crate::layout::tilde;
 use crate::shell::is_plain_name;
 
 /// Something that can be added: what it is called and shown as, and the entry
@@ -102,10 +104,25 @@ pub fn programs(home: &Path, path_var: &OsStr, known: &[Detected]) -> Vec<Candid
     out
 }
 
-/// The configs on offer: what is in `~/.config` and the dotfiles in the home
-/// directory, leaving out credentials and state.
-pub fn configs(home: &Path) -> Vec<Candidate> {
+/// The data on offer: what the programs in the config keep beside them, then what
+/// is in `~/.config` and the dotfiles in the home directory, leaving out
+/// credentials and state. `binaries` are the programs of the config as `(name,
+/// host path)`.
+pub fn data(home: &Path, binaries: &[(String, PathBuf)]) -> Vec<Candidate> {
     let mut used = HashSet::new();
+    let mut out = Vec::new();
+    for (binary, path) in binaries {
+        for place in companions(path) {
+            if used.insert(place.clone()) {
+                out.push(Candidate {
+                    name: name_from(&place),
+                    kind: "data",
+                    detail: format!("{} · for {binary}", tilde(&place, home)),
+                    entry: NewEntry::data(tilde(&place, home), None, Some(binary.clone())),
+                });
+            }
+        }
+    }
     let mut paths = children(&home.join(".config"), NOT_OFFERED_IN_CONFIG);
     paths.extend(children(home, NOT_OFFERED).into_iter().filter(|p| {
         p.file_name().is_some_and(|n| {
@@ -113,32 +130,59 @@ pub fn configs(home: &Path) -> Vec<Candidate> {
             n.starts_with('.') && !n.ends_with("history")
         })
     }));
-    let mut out = Vec::new();
     for path in paths {
-        let name = super::inject::name_from(&path);
-        if name.is_empty() || !used.insert(name.clone()) {
+        let name = name_from(&path);
+        if name.is_empty() || !used.insert(path.clone()) {
             continue;
         }
         out.push(Candidate {
             kind: "config",
             detail: tilde(&path, home),
-            entry: config_entry(&name, &path, home),
+            entry: NewEntry::data(tilde(&path, home), None, None),
             name,
         });
     }
     out
 }
 
-/// A config file or folder, which goes where it is here when that is under `home`.
-fn config_entry(name: &str, path: &Path, home: &Path) -> NewEntry {
-    NewEntry::config(name, tilde(path, home), target_in_home(path, home))
+/// A name for an entry made from a path: its last part without leading dots
+/// (`~/.bashrc` is `bashrc`), cut to what a name may hold.
+pub(super) fn name_from(path: &Path) -> String {
+    let base = path
+        .file_name()
+        .map(|n| n.to_string_lossy().trim_start_matches('.').to_string())
+        .unwrap_or_default();
+    base.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-_.+".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
-/// A config's place in the container: the same as here, when it is under the home
-/// directory (the container's user has one too); else it is left to the default.
-fn target_in_home(path: &Path, home: &Path) -> Option<String> {
-    let at = tilde(path, home);
-    at.starts_with("~/").then_some(at)
+/// What a program keeps beside it, by the filesystem layout's convention and
+/// without knowing anything about the program: for `<prefix>/bin/<name>`, the
+/// directories `<prefix>/share/<name>` and `<prefix>/lib/<name>` that exist. A
+/// program built to run from where it was installed (an editor with its runtime
+/// files, a tool with its plugins) looks there, so it is not much use without them.
+pub fn companions(binary: &Path) -> Vec<PathBuf> {
+    let (Some(name), Some(bin)) = (binary.file_name(), binary.parent()) else {
+        return Vec::new();
+    };
+    let Some(prefix) = bin
+        .parent()
+        .filter(|_| bin.file_name().is_some_and(|n| n == "bin"))
+    else {
+        return Vec::new();
+    };
+    ["share", "lib"]
+        .iter()
+        .map(|dir| prefix.join(dir).join(name))
+        .filter(|place| place.is_dir())
+        .collect()
 }
 
 /// The entries of `dir`, sorted, except `skip`; nothing when it can't be read.
@@ -214,7 +258,7 @@ mod tests {
         touch(&home.join(".ssh/id_ed25519"), 0o600);
         touch(&home.join(".config/gh/hosts.yml"), 0o600);
         touch(&home.join(".config/starship.toml"), 0o644);
-        let found = configs(&home);
+        let found = data(&home, &[]);
         let all = names(&found);
         for want in ["nvim", "starship.toml", "bashrc", "tmux.conf"] {
             assert!(all.contains(&want), "{want} missing from {all:?}");
@@ -222,11 +266,52 @@ mod tests {
         for never in ["gh", "ssh", "id_ed25519", "bash_history"] {
             assert!(!all.contains(&never), "{never} in {all:?}");
         }
-        // A config goes where it is here, when that is under the home directory.
+        // Data goes where it is here, so it is added with no target of its own.
         let rc = found.iter().find(|c| c.name == "bashrc").unwrap();
-        assert_eq!(rc.entry.path, "~/.bashrc");
-        assert_eq!(rc.entry.target.as_deref(), Some("~/.bashrc"));
-        assert_eq!(rc.entry.kind, crate::config::edit::Kind::Config);
+        let NewEntry::Data(rc) = &rc.entry else {
+            panic!("a dotfile is data");
+        };
+        assert_eq!(rc.path, "~/.bashrc");
+        assert_eq!(rc.target, None);
+    }
+
+    #[test]
+    fn a_program_keeps_its_files_in_share_and_lib_beside_its_bin() {
+        let dir = TempDir::new("candidates-companions").unwrap();
+        let prefix = dir.path().join("local");
+        touch(&prefix.join("bin/nvim"), 0o755);
+        touch(&prefix.join("share/nvim/runtime/init.vim"), 0o644);
+        touch(&prefix.join("lib/nvim/parser/c.so"), 0o644);
+        touch(&prefix.join("share/other/x"), 0o644);
+        touch(&prefix.join("lib/nvim-not-a-dir"), 0o644);
+        assert_eq!(
+            companions(&prefix.join("bin/nvim")),
+            [prefix.join("share/nvim"), prefix.join("lib/nvim")]
+        );
+        // A program with nothing beside it, and one that is not in a `bin/`.
+        touch(&prefix.join("bin/rg"), 0o755);
+        touch(&dir.path().join("tools/nvim"), 0o755);
+        touch(&dir.path().join("share/nvim/x"), 0o644);
+        assert!(companions(&prefix.join("bin/rg")).is_empty());
+        assert!(companions(&dir.path().join("tools/nvim")).is_empty());
+    }
+
+    #[test]
+    fn the_data_of_the_programs_in_the_config_comes_first_and_says_what_it_is_for() {
+        let dir = TempDir::new("candidates-data").unwrap();
+        let home = dir.path().join("home");
+        touch(&home.join(".bashrc"), 0o644);
+        touch(&home.join("opt/bin/tool"), 0o755);
+        touch(&home.join("opt/share/tool/x"), 0o644);
+        let programs = [("tool".to_string(), home.join("opt/bin/tool"))];
+        let found = data(&home, &programs);
+        let NewEntry::Data(first) = &found[0].entry else {
+            panic!("what sits beside a program is data");
+        };
+        assert_eq!(first.path, "~/opt/share/tool");
+        assert_eq!(first.binary.as_deref(), Some("tool"));
+        assert!(found[0].detail.ends_with("for tool"), "{}", found[0].detail);
+        assert!(names(&found).contains(&"bashrc"));
     }
 
     #[test]
@@ -244,7 +329,7 @@ mod tests {
         assert!(
             found
                 .iter()
-                .all(|c| c.entry.kind == crate::config::edit::Kind::Binary)
+                .all(|c| c.entry.kind() == crate::config::edit::Kind::Binary)
         );
     }
 }

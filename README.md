@@ -67,11 +67,11 @@ for where to put them). Man page: `ldg man | man -l -`.
 | `ldg ls` | Every container lodge created, across projects. |
 | `ldg ports [PATH]` | The ports forwarded to this machine for the project's container. |
 | `ldg logs [PATH]` | The port-forwarding log (`-f` to follow). |
-| `ldg clean [PATH]` | Remove what lodge injected from the container (configs are kept and listed), and stop its port forwarding. `--container NAME` for one that `ldg attach` worked in. |
+| `ldg clean [PATH]` | Remove what lodge injected from the container (data is kept and listed), and stop its port forwarding. `--container NAME` for one that `ldg attach` worked in. |
 | `ldg init` | Write a starting config (`--print` to see it first). |
 | `ldg doctor [PATH]` | Check the host, the config, and what the project's devcontainer needs. |
-| `ldg inject [ls]`, `add binary\|config …`, `rm binary\|config NAME` | List, add or remove the `[[binary]]` and `[[config]]` entries of your config without opening it (comments are kept). |
-| `ldg pack [-o FILE\|oci://REF]` | Pack your tools and configs into a portable bundle: a file (`lodge-<arch>.tar`), or published to a registry. |
+| `ldg inject [ls]`, `add binary\|data …`, `rm binary\|data …` | List, add or remove the `[[binary]]` and `[[data]]` entries of your config without opening it (comments are kept). A program is added with what sits beside it. |
+| `ldg pack [-o FILE\|oci://REF]` | Pack your tools and their data into a portable bundle: a file (`lodge-<arch>.tar`), or published to a registry. |
 | `ldg bundle inspect\|verify FILE` | Show what a bundle holds; check it is intact. |
 | `ldg cache [clear]` | Show or clear the cache of prepared bundles. |
 | `ldg completions SHELL`, `ldg man` | Shell completions and the man page. |
@@ -139,7 +139,7 @@ linked binaries are copied as they are.
   see them, unless a `[[binary]]` sets `target`, which also writes a
   wrapper script at that path.
 - Libraries loaded at run time (`dlopen`, interpreters) are invisible to `ldd`;
-  list them as `[[config]]` entries.
+  list them as `[[data]]` entries.
 - Dynamic port forwarding needs the container's bridge IP to be reachable from
   the engine's host: Linux with Docker Engine, or any engine with `--remote`.
   Docker Desktop on macOS/Windows doesn't expose container IPs.
@@ -152,8 +152,8 @@ linked binaries are copied as they are.
   [Configuration](docs/configuration.md#kubernetes-a-running-pod).
 - `--target host` injects into a machine itself (this one, or another over
   `--remote`) as the user you connect as: your tools in `~/.local/share/lodge`,
-  your configs where you said, and a session. It is a real machine, not a
-  throwaway, so lodge never overwrites a config file it did not place, never sets
+  your data where you said, and a session. It is a real machine, not a
+  throwaway, so lodge never overwrites a file it did not place, never sets
   git's `safe.directory = *`, and cannot act as another user. The machine must be
   Linux with `tar`; there is no devcontainer, so nothing is created, stopped or
   removed (`down`, `rm` and `ls` say so, and `ldg clean` takes lodge out).

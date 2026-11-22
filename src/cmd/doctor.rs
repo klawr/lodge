@@ -128,9 +128,12 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
         }
         for item in &cfg.binaries {
             checks.push(binary_check(&item.name, &item.path));
+            if let Some(missing) = unlisted_data_check(&item.name, &item.path, &cfg.data) {
+                checks.push(missing);
+            }
         }
-        for item in &cfg.configs {
-            checks.push(config_path_check(&item.name, &item.path));
+        for item in &cfg.data {
+            checks.push(data_path_check(&item.path));
         }
         for decl in &cfg.secret {
             checks.push(secret_check(decl, ctx.local.as_ref()));
@@ -206,7 +209,7 @@ fn config_check(path: &Path, config: &Result<Config>) -> Check {
                 "{} ({}, {})",
                 path.display(),
                 plural(c.binaries.len(), "binary", "binaries"),
-                plural(c.configs.len(), "config", "configs")
+                plural(c.data.len(), "data entry", "data entries")
             ),
         ),
         Ok(_) => Check::new(
@@ -239,7 +242,7 @@ fn bundle_check(reference: &str, ctx: &Ctx) -> Check {
                         ""
                     },
                     m.arch,
-                    plural(m.tools.len(), "tool", "tools"),
+                    plural(m.binaries.len(), "binary", "binaries"),
                     m.id()
                 ),
                 None => format!(
@@ -253,10 +256,10 @@ fn bundle_check(reference: &str, ctx: &Ctx) -> Check {
     }
 }
 
-fn config_path_check(name: &str, path: &Path) -> Check {
-    let name = format!("config {name}");
+fn data_path_check(path: &Path) -> Check {
+    let name = format!("data {}", path.display());
     if path.exists() {
-        Check::new(name, Level::Ok, path.display().to_string())
+        Check::new(name, Level::Ok, "found")
     } else {
         Check::new(
             name,
@@ -264,6 +267,33 @@ fn config_path_check(name: &str, path: &Path) -> Check {
             format!("{} does not exist", path.display()),
         )
     }
+}
+
+/// A program with files beside it that the config does not bring: it may start in
+/// the container and then not find them. Said only for the files the filesystem
+/// layout's convention puts there (see [`super::candidates::companions`]), and
+/// only as a hint, since a program may not need them.
+fn unlisted_data_check(
+    name: &str,
+    binary: &Path,
+    data: &[crate::config::DataEntry],
+) -> Option<Check> {
+    let missing: Vec<String> = super::candidates::companions(binary)
+        .into_iter()
+        .filter(|place| !data.iter().any(|d| &d.path == place))
+        .map(|place| place.display().to_string())
+        .collect();
+    (!missing.is_empty()).then(|| {
+        Check::new(
+            format!("binary {name}"),
+            Level::Optional,
+            format!(
+                "{} sits beside it and is not injected; if it needs it: `ldg inject add data {} --for {name}`",
+                missing.join(", "),
+                missing[0]
+            ),
+        )
+    })
 }
 
 fn binary_check(name: &str, binary: &Path) -> Check {
@@ -296,6 +326,28 @@ mod tests {
         needed_for: "x",
         hint: "install it",
     };
+
+    #[test]
+    fn files_beside_a_program_that_the_config_leaves_out_are_hinted_at() {
+        let dir = crate::tmpfile::TempDir::new("doctor-data").unwrap();
+        let share = dir.path().join("share/tool");
+        std::fs::create_dir_all(&share).unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        let binary = dir.path().join("bin/tool");
+        let hint = unlisted_data_check("tool", &binary, &[]).unwrap();
+        assert!(hint.level == Level::Optional);
+        assert!(
+            hint.detail.contains(&share.display().to_string()),
+            "{}",
+            hint.detail
+        );
+        let listed = [crate::config::DataEntry {
+            path: share,
+            target: None,
+            binary: None,
+        }];
+        assert!(unlisted_data_check("tool", &binary, &listed).is_none());
+    }
 
     #[test]
     fn a_missing_required_tool_is_reported_missing_and_an_optional_one_is_not() {
