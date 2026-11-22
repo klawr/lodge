@@ -12,6 +12,11 @@ allow = [
   "MPL-2.0",
   "Unicode-3.0",
   "Unlicense",
+  # rustls and its crypto/trust-store dependencies (ring, webpki, subtle,
+  # untrusted, webpki-roots), all permissive.
+  "ISC",
+  "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
 ]
 
 [bans]

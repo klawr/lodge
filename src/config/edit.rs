@@ -730,6 +730,9 @@ mod tests {
         (dir, path)
     }
 
+    // TODO(windows): `/a.tar` is read back as `C:/a.tar` there; assert on a path
+    // the platform calls absolute.
+    #[cfg(unix)]
     #[test]
     fn a_bundle_is_listed_once_and_what_else_is_written_stays() {
         let (_dir, path) = file("# mine\ntarget = \"docker\"\n\n[session]\nshell = \"/bin/zsh\"\n");

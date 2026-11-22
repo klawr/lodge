@@ -321,6 +321,7 @@ mod tests {
         assert!(!sh(PREPARE_SCRIPT, &[link.to_str().unwrap()]));
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_link_script_replaces_files_but_not_directories() {
         let tmp = crate::tmpfile::TempDir::new("link").unwrap();

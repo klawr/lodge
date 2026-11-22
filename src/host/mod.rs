@@ -939,6 +939,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_provided_helpers_work_through_the_run_primitive_alone() {
         // A host that only implements `run` (locally, with `sh`) still reads,

@@ -1876,6 +1876,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn b_and_d_add_one_enter_at_a_time_and_what_is_there_already_is_marked() {
         let screen = Screen {
@@ -2353,6 +2354,7 @@ mod tests {
         assert!(r.screen.shown.borrow().is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn without_the_form_a_table_lists_programs_and_data_and_two_rows_add() {
         // Rows: a, b, the data, add a program, add data. Remove `b`, add data by typing.

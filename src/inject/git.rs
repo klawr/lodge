@@ -135,6 +135,7 @@ mod tests {
         assert!(!env.ran_matching(|c| c[0] == "sh" && c.iter().any(|a| a.contains("git config"))));
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_unset_script_treats_a_missing_entry_as_done() {
         use std::process::Command;

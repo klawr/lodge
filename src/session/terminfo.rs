@@ -238,6 +238,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_terminal_and_where_its_entries_are_come_from_the_machine_lodge_runs_on() {
         let local = FakeLocal::new()

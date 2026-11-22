@@ -273,6 +273,7 @@ mod tests {
         assert!(DiskSnapshot::resolved(&dir.path().join("missing")).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_special_file_is_refused() {
         let dir = TempDir::new("snap-fifo").unwrap();

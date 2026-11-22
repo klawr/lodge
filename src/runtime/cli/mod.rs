@@ -638,6 +638,7 @@ mod tests {
             tag: "t".into(),
         };
         docker(&host).build_image(&spec).unwrap();
+        let dockerfile = Path::new("/p/.devcontainer").join("Dockerfile");
         let calls = host.calls();
         assert_eq!(
             calls.len(),
@@ -652,7 +653,7 @@ mod tests {
                 "-t",
                 "t",
                 "-f",
-                "/p/.devcontainer/Dockerfile",
+                dockerfile.to_str().unwrap(),
                 "/p/.devcontainer"
             ])
         );

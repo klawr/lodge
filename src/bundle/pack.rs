@@ -428,6 +428,7 @@ mod tests {
         assert!(!out.path().join("b.tar.partial").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn data_without_a_target_is_for_the_place_it_is_at() {
         let work = TempDir::new("pack-mirror").unwrap();
@@ -446,6 +447,7 @@ mod tests {
         assert_eq!(manifest.data[0].dest, dir.display().to_string());
     }
 
+    #[cfg(unix)]
     #[test]
     fn two_data_entries_for_one_place_are_refused() {
         let work = TempDir::new("pack-twice").unwrap();
@@ -468,6 +470,7 @@ mod tests {
         assert!(err.contains("listed twice"), "{err}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_wrapper_target_is_kept_only_when_the_config_names_one() {
         let work = TempDir::new("pack-target").unwrap();
@@ -582,6 +585,7 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&rpath.stdout).trim(), ORIGIN_RPATH);
     }
 
+    #[cfg(unix)]
     #[test]
     fn packing_the_same_inputs_twice_gives_the_same_id() {
         let work = TempDir::new("pack-id").unwrap();

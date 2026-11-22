@@ -48,7 +48,12 @@ fn spawners(program: &str) -> Vec<String> {
             let code = text.split("#[cfg(test)]\nmod ").next().unwrap();
             code.contains(&needle)
         })
-        .map(|f| f.strip_prefix(&src).unwrap().to_string_lossy().into_owned())
+        .map(|f| {
+            f.strip_prefix(&src)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
         .collect();
     found.sort();
     found
@@ -290,7 +295,11 @@ fn dependencies() -> Vec<(String, String, String)> {
     rust_files(&src, &mut files);
     let mut out = Vec::new();
     for f in files {
-        let rel = f.strip_prefix(&src).unwrap().to_string_lossy().into_owned();
+        let rel = f
+            .strip_prefix(&src)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
         let module = rel
             .split('/')
             .next()
@@ -381,7 +390,12 @@ fn files_containing(needles: &[&str], skip: &[&str]) -> Vec<String> {
     rust_files(&src, &mut files);
     let mut found: Vec<String> = files
         .iter()
-        .map(|f| f.strip_prefix(&src).unwrap().to_string_lossy().into_owned())
+        .map(|f| {
+            f.strip_prefix(&src)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
         .filter(|name| name != "conventions.rs" && !skip.iter().any(|s| name.starts_with(s)))
         .filter(|name| {
             let text = std::fs::read_to_string(src.join(name)).unwrap();

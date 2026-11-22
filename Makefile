@@ -41,7 +41,7 @@ schema: ## Regenerate docs/config.schema.json from the config types
 	UPDATE_SCHEMA=1 cargo test --quiet the_config_schema_is_current
 
 deny: ## Licenses, advisories and sources of dependencies (needs cargo-deny)
-	cargo deny check --config .github/deny.toml
+	cargo deny --config .github/deny.toml check
 
 hooks: ## Install a git pre-push hook that runs `make check`
 	@printf '#!/bin/sh\nexec make check\n' > .git/hooks/pre-push

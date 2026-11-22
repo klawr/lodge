@@ -143,6 +143,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn finds_a_tool_that_is_on_the_path() {
         let found = which_in("sh", std::ffi::OsStr::new("/nonexistent:/bin:/usr/bin"));

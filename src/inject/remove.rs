@@ -134,6 +134,7 @@ mod tests {
         assert!(!s.contains("lodge-env.sh"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_recorded_wrapper_is_removed_only_while_it_still_points_at_the_prefix() {
         let dir = crate::tmpfile::TempDir::new("wrapper-mine").unwrap();

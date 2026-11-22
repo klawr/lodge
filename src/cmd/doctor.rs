@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn files_beside_a_program_that_the_config_leaves_out_are_hinted_at() {
         let dir = crate::tmpfile::TempDir::new("doctor-data").unwrap();
-        let share = dir.path().join("share/tool");
+        let share = dir.path().join("share").join("tool");
         std::fs::create_dir_all(&share).unwrap();
         std::fs::create_dir_all(dir.path().join("bin")).unwrap();
         let binary = dir.path().join("bin/tool");

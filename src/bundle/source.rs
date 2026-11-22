@@ -342,6 +342,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_second_prepare_of_unchanged_inputs_reuses_the_cache() {
         let work = TempDir::new("src").unwrap();
@@ -356,6 +357,7 @@ mod tests {
         assert_eq!(first.bundle.manifest().id(), second.bundle.manifest().id());
     }
 
+    #[cfg(unix)]
     #[test]
     fn changing_a_source_file_packs_a_new_bundle() {
         let work = TempDir::new("src2").unwrap();
@@ -373,6 +375,7 @@ mod tests {
         assert_ne!(first.bundle.manifest().id(), second.bundle.manifest().id());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_change_in_a_data_tree_is_noticed() {
         let work = TempDir::new("src3").unwrap();
@@ -424,6 +427,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_bundle_file_is_fetched_once_and_then_reused() {
         let work = TempDir::new("src4").unwrap();
@@ -457,6 +461,7 @@ mod tests {
         assert_eq!(second.origin, Origin::Cached);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_damaged_bundle_file_is_refused_and_leaves_nothing_cached() {
         let work = TempDir::new("src5").unwrap();
@@ -493,6 +498,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_cache_can_be_listed_and_cleared() {
         let tmp = TempDir::new("cache-list").unwrap();
@@ -515,6 +521,7 @@ mod tests {
         assert!(cache::entries(&root).is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn only_the_most_recently_used_bundles_are_kept() {
         let work = TempDir::new("src6").unwrap();
@@ -538,6 +545,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn looking_a_bundle_up_fetches_nothing_and_says_whether_it_is_cached() {
         let work = TempDir::new("lookup").unwrap();
@@ -558,6 +566,7 @@ mod tests {
         assert_eq!(fetched.lock().unwrap().len(), 1, "only `prepare` fetched");
     }
 
+    #[cfg(unix)]
     #[test]
     fn looking_up_a_place_that_cannot_be_reached_uses_what_was_remembered() {
         let work = TempDir::new("lookup2").unwrap();
@@ -574,6 +583,7 @@ mod tests {
         assert!(found.offline && found.cached.is_some());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_bundle_from_a_store_is_fetched_once_then_found_in_the_cache() {
         let work = TempDir::new("store1").unwrap();
@@ -630,6 +640,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_place_that_cannot_be_reached_is_answered_from_the_cache_with_what_it_named_last() {
         let work = TempDir::new("offline1").unwrap();
@@ -658,6 +669,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn offline_with_nothing_remembered_or_nothing_cached_is_an_error_that_says_so() {
         let work = TempDir::new("offline2").unwrap();
@@ -683,6 +695,7 @@ mod tests {
         assert!(prepare_a(&cache, &offline).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_place_that_answers_no_is_not_overruled_by_the_cache() {
         let work = TempDir::new("offline3").unwrap();
@@ -720,6 +733,7 @@ mod tests {
         assert_eq!(cache::recall(root.path(), "oci://x/y:2", None), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_bundle_in_a_registry_is_pulled_once_per_digest() {
         let work = TempDir::new("store2").unwrap();
@@ -774,6 +788,7 @@ mod tests {
             .unwrap();
         assert!(format!("{err:#}").contains("a file path"), "{err:#}");
     }
+    #[cfg(unix)]
     #[test]
     fn a_machine_that_cannot_pack_still_uses_a_bundle_but_cannot_build_one() {
         let work = TempDir::new("consumer").unwrap();

@@ -511,7 +511,9 @@ mod tests {
                     ("devcontainer.local_folder".into(), "/home/me/proj".into()),
                     (
                         "devcontainer.config_file".into(),
-                        "/home/me/proj/.devcontainer/devcontainer.json".into()
+                        p.join(".devcontainer/devcontainer.json")
+                            .to_string_lossy()
+                            .into_owned()
                     ),
                 ],
                 workdir: Some("/workspaces/proj".into()),

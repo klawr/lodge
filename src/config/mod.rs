@@ -714,7 +714,7 @@ mod tests {
         );
         assert_eq!(
             parse("bundle = \"b.tar\"").unwrap().bundle.unwrap(),
-            "/srv/lodge/b.tar"
+            Path::new("/srv/lodge").join("b.tar").to_string_lossy()
         );
     }
 
@@ -732,7 +732,11 @@ mod tests {
     #[test]
     fn the_listed_bundles_are_read_like_the_default_one() {
         let c = parse("bundles = [\"b.tar\", \"oci://ghcr.io/me/lodge:2\"]").unwrap();
-        assert_eq!(c.bundles, ["/srv/lodge/b.tar", "oci://ghcr.io/me/lodge:2"]);
+        let b = Path::new("/srv/lodge").join("b.tar");
+        assert_eq!(
+            c.bundles,
+            [&*b.to_string_lossy(), "oci://ghcr.io/me/lodge:2"]
+        );
         assert!(parse("").unwrap().bundles.is_empty());
     }
 

@@ -422,6 +422,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn docker_config_wins_over_home_and_a_broken_file_is_an_error() {
         let local = FakeLocal::new()

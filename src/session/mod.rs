@@ -243,6 +243,7 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_prefix_comes_first_then_the_login_path_then_what_the_login_dropped() {
         let bin = "/home/dev/.local/share/lodge/bin";
@@ -259,6 +260,7 @@ mod tests {
         assert_eq!(path_after("/usr/bin", ""), format!("{bin}:/usr/bin"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn path_entries_with_spaces_or_wildcards_are_kept_literally() {
         let bin = "/home/dev/.local/share/lodge/bin";

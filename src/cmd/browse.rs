@@ -383,8 +383,13 @@ mod tests {
     fn names(root: &Path, want: Want) -> Vec<String> {
         walk(&scope(root), want)
             .iter()
-            .map(|p| p.strip_prefix(root).unwrap().display().to_string())
+            .map(|p| slashed(&p.strip_prefix(root).unwrap().display().to_string()))
             .collect()
+    }
+
+    /// A path as a list shows it, with `/` whatever the platform joins with.
+    fn slashed(path: &str) -> String {
+        path.replace('\\', "/")
     }
 
     const PROJECT: Want = Want::Project(crate::devcontainer::CONFIG_LOCATIONS);
@@ -476,7 +481,13 @@ mod tests {
         let s = scope(dir.path());
         let got = settle(&ask, "File", a.to_str().unwrap(), Want::File, &s, &files()).unwrap();
         assert_eq!(got, Browsed::Chose(a.join("b/two.txt")));
-        assert_eq!(ask.shown()[0], ["one.txt", "b/two.txt"]);
+        assert_eq!(
+            ask.shown()[0]
+                .iter()
+                .map(|s| slashed(s))
+                .collect::<Vec<_>>(),
+            ["one.txt", "b/two.txt"]
+        );
 
         let none = Finds::answering(vec![]);
         let file = a.join("one.txt");
@@ -595,7 +606,11 @@ mod tests {
         assert_eq!(got, Browsed::Chose(a.join("one.txt")));
         let shown = ask.shown();
         assert!(shown[0].contains(&"top.txt".to_string()));
-        assert_eq!(shown[1], ["one.txt", "b/two.txt"], "now under the new root");
+        assert_eq!(
+            shown[1].iter().map(|s| slashed(s)).collect::<Vec<_>>(),
+            ["one.txt", "b/two.txt"],
+            "now under the new root"
+        );
     }
 
     #[test]
