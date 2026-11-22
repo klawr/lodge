@@ -251,6 +251,37 @@ fn bundle_sinks(oci: Arc<dyn OciPusher>) -> Sinks {
     Sinks::new(vec![Box::new(FileSink), Box::new(OciSink::new(oci))])
 }
 
+/// Works on the config alone: no host, no target, no engine.
+fn configure_config(config: Option<PathBuf>) -> Result<()> {
+    let path = crate::config::path_for(config)?;
+    let home = SystemLocal
+        .var("HOME")
+        .map_or_else(|| PathBuf::from("/"), PathBuf::from);
+    let path_var = SystemLocal.var("PATH").unwrap_or_default();
+    let local: Arc<dyn Local> = Arc::new(SystemLocal);
+    let registry = Arc::new(NativeOci::new(
+        Box::new(UreqHttp::new()),
+        Box::new(DockerConfig::new(local)),
+    ));
+    let packer = bundle::LivePacker {
+        tools: Toolchain {
+            deps: Box::new(Ldd),
+            elf: Box::new(Patchelf),
+            oci: registry.clone(),
+        },
+        sinks: bundle_sinks(registry),
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let machine = configure::Machine {
+        home: &home,
+        path_var: &path_var,
+        cwd: &cwd,
+        bundles: &packer,
+    };
+    configure::run(&path, &machine, &prompt::Terminal, &prompt::Terminal)?;
+    Ok(())
+}
+
 pub fn run(mut cli: Cli) -> Result<ExitCode> {
     // The composition root: the one place that picks how the project's machine
     // is reached and which target is worked in on it. Each is an interface everything
@@ -261,79 +292,58 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
     // comes first because the pick says which host and target to build.
     let subcommand = match cli.command.take() {
         Some(subcommand) => subcommand,
-        None => match resume::pick(
-            &history,
-            &prompt::Terminal,
-            cli.remote.as_deref(),
-            cli.target.as_deref(),
-        )? {
-            Some(resume::Home::Place(resumed)) => {
-                cli.remote = resumed.route.remote;
-                cli.target = Some(resumed.route.target);
-                resumed.command
-            }
-            Some(resume::Home::New) => {
-                if cli.remote.is_some() {
-                    anyhow::bail!(
-                        "a project on another machine can't be browsed for: \
-                         give its path, `ldg --remote HOST up PATH`"
-                    );
+        None => loop {
+            match resume::pick(
+                &history,
+                &prompt::Terminal,
+                cli.remote.as_deref(),
+                cli.target.as_deref(),
+            )? {
+                Some(resume::Home::Place(resumed)) => {
+                    cli.remote = resumed.route.remote;
+                    cli.target = Some(resumed.route.target);
+                    break resumed.command;
                 }
-                let home = SystemLocal
-                    .var("HOME")
-                    .map_or_else(|| PathBuf::from("/"), PathBuf::from);
-                let scope = browse::Scope::new(vec![home.clone()], Vec::new());
-                match browse::pick(
-                    &prompt::Terminal,
-                    "New project",
-                    &scope,
-                    browse::Want::Project,
-                    &home,
-                )? {
-                    browse::Browsed::Chose(dir) => Command::Up {
-                        project: crate::cli::ProjectArg { path: Some(dir) },
-                        build: false,
-                        reinject: false,
-                        no_attach: false,
-                        bundle: None,
-                    },
-                    browse::Browsed::Left => return Ok(ExitCode::SUCCESS),
-                    browse::Browsed::Unsupported => {
-                        anyhow::bail!("no projects found; give a path, `ldg up PATH`")
+                Some(resume::Home::New) => {
+                    if cli.remote.is_some() {
+                        anyhow::bail!(
+                            "a project on another machine can't be browsed for: \
+                             give its path, `ldg --remote HOST up PATH`"
+                        );
+                    }
+                    let home = SystemLocal
+                        .var("HOME")
+                        .map_or_else(|| PathBuf::from("/"), PathBuf::from);
+                    let scope = browse::Scope::new(vec![home.clone()], Vec::new());
+                    match browse::pick(
+                        &prompt::Terminal,
+                        "New project",
+                        &scope,
+                        browse::Want::Project,
+                        &home,
+                    )? {
+                        browse::Browsed::Chose(dir) => {
+                            break Command::Up {
+                                project: crate::cli::ProjectArg { path: Some(dir) },
+                                build: false,
+                                reinject: false,
+                                no_attach: false,
+                                bundle: None,
+                            };
+                        }
+                        browse::Browsed::Left => continue,
+                        browse::Browsed::Unsupported => {
+                            anyhow::bail!("no projects found; give a path, `ldg up PATH`")
+                        }
                     }
                 }
+                Some(resume::Home::Configure) => {
+                    // Leaving the config goes back to the places, not out of ldg.
+                    configure_config(cli.config.clone())?;
+                    continue;
+                }
+                None => return Ok(ExitCode::SUCCESS),
             }
-            Some(resume::Home::Configure) => {
-                // Only the config is worked on: no host, no target, no engine.
-                let path = crate::config::path_for(cli.config)?;
-                let home = SystemLocal
-                    .var("HOME")
-                    .map_or_else(|| PathBuf::from("/"), PathBuf::from);
-                let path_var = SystemLocal.var("PATH").unwrap_or_default();
-                let local: Arc<dyn Local> = Arc::new(SystemLocal);
-                let registry = Arc::new(NativeOci::new(
-                    Box::new(UreqHttp::new()),
-                    Box::new(DockerConfig::new(local)),
-                ));
-                let packer = bundle::LivePacker {
-                    tools: Toolchain {
-                        deps: Box::new(Ldd),
-                        elf: Box::new(Patchelf),
-                        oci: registry.clone(),
-                    },
-                    sinks: bundle_sinks(registry),
-                };
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                let machine = configure::Machine {
-                    home: &home,
-                    path_var: &path_var,
-                    cwd: &cwd,
-                    bundles: &packer,
-                };
-                configure::run(&path, &machine, &prompt::Terminal, &prompt::Terminal)?;
-                return Ok(ExitCode::SUCCESS);
-            }
-            None => return Ok(ExitCode::SUCCESS),
         },
     };
     let remote = cli.remote.clone();
