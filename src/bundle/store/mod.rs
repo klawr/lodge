@@ -5,7 +5,7 @@
 //! store that [`handles`](BundleStore::handles) it, so nothing else knows what
 //! kinds exist: a new place bundles can be kept (an `https://` URL, a bucket) is
 //! one more store, handed to [`Stores`] where `cmd::run` builds it. What comes out
-//! is always a tar that `bundle::source` extracts into the cache, so injection
+//! is always a tar that `bundle::source` verifies and keeps in the cache, so injection
 //! never sees where a bundle came from.
 //!
 //! Fetching is two steps so the cache can skip the expensive one:

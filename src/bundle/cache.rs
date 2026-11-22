@@ -1,22 +1,29 @@
-//! The cache of readied bundle directories, under `~/.cache/lodge/bundles/`.
+//! The cache of readied bundles, under `~/.cache/lodge/bundles/`.
 //!
-//! An entry is a directory named by its key: the one a bundle store gave it
-//! (`f-<file hash>`, `o-<image digest>`), or `p-<inputs fingerprint>` for a live
-//! pack. Entries appear
-//! atomically (staged, then renamed into place), are marked as used by their
-//! modification time, and all but the [`KEEP`] most recently used are pruned.
+//! An entry is a bundle's tar, verified, named by its key: the one a bundle
+//! store gave it (`f-<file hash>`, `o-<image digest>`), or `p-<inputs
+//! fingerprint>` for a live pack, and `.tar`. It is kept as the tar and read in
+//! place (see [`super::reader`]), never unpacked. Entries appear atomically
+//! (staged, then renamed into place), are marked as used by their modification
+//! time, and all but the [`KEEP`] most recently used are pruned.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use super::manifest::{MANIFEST_FILE, Manifest};
+use super::manifest::Manifest;
+use super::reader::Bundle;
 use crate::arch::Arch;
-use crate::tmpfile::{TempDir, discard_dir};
-use crate::tree::{self, Denied, Links};
+use crate::tmpfile::{TempDir, discard_dir, discard_file};
 
 /// How many cached bundles to keep (the most recently used).
 pub const KEEP: usize = 4;
+
+/// The extension of an entry.
+const EXTENSION: &str = "tar";
+
+/// The name a bundle's tar has in a [`staging`] directory.
+const STAGED: &str = "bundle.tar";
 
 /// The file, beside the entries, that remembers which bundle a reference named
 /// the last time its place could be asked.
@@ -45,7 +52,7 @@ pub(super) fn remember(root: &Path, reference: &str, arch: Option<Arch>, key: &s
     let write = || -> Result<()> {
         let mut tags = read_tags(root);
         // What was pruned from the cache cannot be answered from it.
-        tags.retain(|_, k| root.join(k).is_dir());
+        tags.retain(|_, key| entry_path(root, key).is_file());
         tags.insert(tag_key(reference, arch), key.to_string());
         let partial = root.join(format!("{TAGS_FILE}.partial"));
         std::fs::write(&partial, serde_json::to_vec_pretty(&tags)?)?;
@@ -61,7 +68,7 @@ pub(super) fn remember(root: &Path, reference: &str, arch: Option<Arch>, key: &s
 /// bundle is still in the cache.
 pub(super) fn recall(root: &Path, reference: &str, arch: Option<Arch>) -> Option<String> {
     let key = read_tags(root).remove(&tag_key(reference, arch))?;
-    load(&root.join(&key)).map(|_| key)
+    load(root, &key).map(|_| key)
 }
 
 /// Where prepared bundles are cached: `~/.cache/lodge/bundles`.
@@ -72,9 +79,14 @@ pub fn root() -> Result<PathBuf> {
         .join("bundles"))
 }
 
-/// One cached bundle directory.
+/// Where the entry `key` is.
+fn entry_path(root: &Path, key: &str) -> PathBuf {
+    root.join(format!("{key}.{EXTENSION}"))
+}
+
+/// One cached bundle.
 pub struct Entry {
-    pub dir: PathBuf,
+    pub file: PathBuf,
     /// The bundle's manifest, if the entry is complete.
     pub manifest: Option<Manifest>,
     /// Bytes on disk.
@@ -89,17 +101,15 @@ pub fn entries(root: &Path) -> Vec<Entry> {
     };
     let mut out: Vec<Entry> = read
         .filter_map(std::result::Result::ok)
-        .filter(|e| e.path().is_dir())
+        .filter(|e| e.path().extension().is_some_and(|x| x == EXTENSION))
         .map(|e| {
-            let dir = e.path();
-            let manifest = std::fs::read(dir.join(MANIFEST_FILE))
-                .ok()
-                .and_then(|b| Manifest::from_json(&b).ok());
+            let file = e.path();
+            let meta = e.metadata().ok();
             Entry {
-                size: dir_size(&dir),
-                modified: e.metadata().and_then(|m| m.modified()).ok(),
-                manifest,
-                dir,
+                manifest: Bundle::open(&file).ok().map(|b| b.manifest().clone()),
+                size: meta.as_ref().map_or(0, std::fs::Metadata::len),
+                modified: meta.and_then(|m| m.modified().ok()),
+                file,
             }
         })
         .collect();
@@ -112,60 +122,68 @@ pub fn clear(root: &Path) -> (usize, u64) {
     let all = entries(root);
     let size = all.iter().map(|e| e.size).sum();
     for e in &all {
-        discard_dir(&e.dir);
+        discard_file(&e.file);
     }
     // What the references named points at nothing now.
     std::fs::remove_file(root.join(TAGS_FILE)).ok();
     (all.len(), size)
 }
 
-/// Bytes on disk under `path`. Best effort: it is only shown, so whatever
-/// could be measured before a failure is the answer.
-fn dir_size(path: &Path) -> u64 {
-    let mut size = 0;
-    tree::walk(path, Links::Keep, Denied::Skip, &mut |e| {
-        if !e.meta.is_dir() {
-            size += e.meta.len();
-        }
-        Ok(())
-    })
-    .ok();
-    size
-}
-
-/// The manifest of the entry in `dir`, marking it as recently used; `None` if
-/// there is no valid bundle there.
-pub(super) fn load(dir: &Path) -> Option<Manifest> {
-    let bytes = std::fs::read(dir.join(MANIFEST_FILE)).ok()?;
-    let manifest = Manifest::from_json(&bytes).ok()?;
-    touch(dir);
-    Some(manifest)
+/// The cached bundle `key`, marking it as recently used; `None` if there is no
+/// usable one. The content is not checked again: it was when it was cached.
+pub(super) fn load(root: &Path, key: &str) -> Option<Bundle> {
+    let file = entry_path(root, key);
+    let bundle = Bundle::open(&file).ok()?;
+    touch(&file);
+    Some(bundle)
 }
 
 /// A staging directory under `root`, on the same filesystem as the entries so
-/// it can be moved into place with [`install`].
+/// what is built in it can be moved into place with [`install`].
 pub(super) fn staging(root: &Path, name: &str) -> Result<TempDir> {
     std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
     Ok(TempDir::new_in(root, name)?)
 }
 
-/// Moves a finished staging directory into place. Atomic, so an entry is either
-/// complete or absent. If a concurrent run got there first its copy is just as
-/// good.
-pub(super) fn install(staging: TempDir, dir: &Path) -> Result<PathBuf> {
-    match std::fs::rename(staging.path(), dir) {
-        Ok(()) => Ok(dir.to_path_buf()),
-        Err(_) if dir.join(MANIFEST_FILE).exists() => Ok(dir.to_path_buf()),
-        Err(e) => Err(e).with_context(|| format!("saving the bundle to {}", dir.display())),
+/// Where the bundle's tar goes in `staging`, for [`install`] to find.
+pub(super) fn staged(staging: &TempDir) -> PathBuf {
+    staging.path().join(STAGED)
+}
+
+/// Puts the tar at `tar` where [`install`] finds it: moved when it is already in
+/// `staging` (a store that fetched it there), copied otherwise (a file the user
+/// keeps). Returns where it is.
+pub(super) fn stage_tar(staging: &TempDir, tar: &Path) -> Result<PathBuf> {
+    let to = staged(staging);
+    if tar.starts_with(staging.path()) {
+        std::fs::rename(tar, &to)
+    } else {
+        std::fs::copy(tar, &to).map(|_| ())
     }
+    .with_context(|| format!("keeping {}", tar.display()))?;
+    Ok(to)
+}
+
+/// Moves the tar staged in `staging` into place as the entry `key`, and opens
+/// it. Atomic, so an entry is either complete or absent. If a concurrent run got
+/// there first its copy is just as good.
+pub(super) fn install(root: &Path, staging: TempDir, key: &str) -> Result<Bundle> {
+    let file = entry_path(root, key);
+    if let Err(e) = std::fs::rename(staged(&staging), &file)
+        && load(root, key).is_none()
+    {
+        return Err(e).with_context(|| format!("saving the bundle to {}", file.display()));
+    }
+    load(root, key)
+        .with_context(|| format!("the bundle just saved to {} is unreadable", file.display()))
 }
 
 #[allow(
     clippy::let_underscore_must_use,
     reason = "recency is only a pruning hint"
 )]
-fn touch(dir: &Path) {
-    if let Ok(handle) = std::fs::File::open(dir) {
+fn touch(file: &Path) {
+    if let Ok(handle) = std::fs::File::open(file) {
         let _ = handle.set_modified(SystemTime::now());
     }
 }
@@ -193,7 +211,12 @@ pub(super) fn prune(root: &Path, keep: &Path) {
     cached.sort_by_key(|entry| std::cmp::Reverse(entry.0)); // newest first
     for (_, path) in cached.into_iter().skip(KEEP) {
         if path != keep {
-            discard_dir(&path);
+            // (Entries of an older layout were directories.)
+            if path.is_dir() {
+                discard_dir(&path);
+            } else {
+                discard_file(&path);
+            }
         }
     }
 }
@@ -201,17 +224,24 @@ pub(super) fn prune(root: &Path, keep: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bundle::testing::{bundle_dir, tar_of};
+
+    /// An entry `key` holding the bundle of a small directory.
+    fn put(root: &Path, key: &str) {
+        let (dir, _) = bundle_dir();
+        let (_keep, tar) = tar_of(dir.path(), "cache-entry");
+        std::fs::copy(tar, entry_path(root, key)).unwrap();
+    }
 
     #[test]
     fn bundles_from_a_registry_are_pruned_like_the_others() {
         let root = TempDir::new("prune-o").unwrap();
         for n in 0..KEEP + 2 {
-            let dir = root.path().join(format!("o-{n}"));
-            std::fs::create_dir(&dir).unwrap();
+            put(root.path(), &format!("o-{n}"));
             std::thread::sleep(std::time::Duration::from_millis(15));
-            touch(&dir);
+            touch(&entry_path(root.path(), &format!("o-{n}")));
         }
-        let keep = root.path().join("o-0");
+        let keep = entry_path(root.path(), "o-0");
         prune(root.path(), &keep);
         let left = std::fs::read_dir(root.path()).unwrap().count();
         // The most recent ones stay, and so does the one in use, whatever its age.
@@ -222,10 +252,42 @@ mod tests {
     #[test]
     fn clearing_the_cache_forgets_what_the_references_named() {
         let root = TempDir::new("clear-tags").unwrap();
-        std::fs::create_dir(root.path().join("o-a")).unwrap();
+        put(root.path(), "o-a");
         remember(root.path(), "oci://x/y:1", None, "o-a");
         assert!(root.path().join(TAGS_FILE).exists());
-        clear(root.path());
+        assert_eq!(clear(root.path()).0, 1);
         assert!(!root.path().join(TAGS_FILE).exists());
+        assert!(entries(root.path()).is_empty());
+    }
+
+    #[test]
+    fn an_entry_is_installed_whole_and_listed_with_its_manifest() {
+        let root = TempDir::new("install").unwrap();
+        let staging = staging(root.path(), "t").unwrap();
+        let (dir, manifest) = bundle_dir();
+        let (_keep, tar) = tar_of(dir.path(), "to-stage");
+        let staged_at = stage_tar(&staging, &tar).unwrap();
+        assert!(tar.exists(), "a file the user keeps is copied, not moved");
+        assert_eq!(staged_at, staged(&staging));
+
+        let bundle = install(root.path(), staging, "f-1").unwrap();
+        assert_eq!(bundle.manifest(), &manifest);
+        let listed = entries(root.path());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].manifest.as_ref(), Some(&manifest));
+        assert_eq!(load(root.path(), "f-1").unwrap().manifest(), &manifest);
+        assert!(load(root.path(), "f-2").is_none());
+    }
+
+    #[test]
+    fn a_tar_a_store_fetched_into_staging_is_moved_not_copied() {
+        let root = TempDir::new("stage-move").unwrap();
+        let staging = staging(root.path(), "t").unwrap();
+        let (dir, _) = bundle_dir();
+        let (_keep, tar) = tar_of(dir.path(), "fetched");
+        let fetched = staging.path().join("sha256-abc");
+        std::fs::copy(&tar, &fetched).unwrap();
+        stage_tar(&staging, &fetched).unwrap();
+        assert!(!fetched.exists());
     }
 }

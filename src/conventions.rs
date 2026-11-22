@@ -331,6 +331,7 @@ const FOUNDATION: &[&str] = &[
     "provision",
     "runtime",
     "shell",
+    "snapshot",
     "tools",
     "tmpfile",
     "tree",

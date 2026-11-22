@@ -3,35 +3,45 @@
 //! Deterministic: entries are visited in name order, and the hash covers each
 //! entry's relative path, kind, the executable bit and the content (a symlink
 //! contributes its target). Two trees hash the same exactly when they would
-//! install the same.
+//! install the same, wherever they are held: it is defined over a [`Snapshot`],
+//! so a bundle in a tar hashes as the directory it was packed from did.
 
 use anyhow::{Context, Result};
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use crate::fingerprint::Fingerprint;
-use crate::tree::{self, Denied, Links};
+use crate::snapshot::{DiskSnapshot, Kind, Snapshot};
 
+/// The hash of the tree at `path` on this machine.
 pub fn hash_path(path: &Path) -> Result<String> {
+    hash(&DiskSnapshot::at(path))
+}
+
+/// The hash of `snapshot`.
+pub fn hash(snapshot: &dyn Snapshot) -> Result<String> {
     let mut h = Fingerprint::new();
-    tree::walk(path, Links::Keep, Denied::Fail, &mut |e| {
+    snapshot.walk(&mut |node| {
         // The root is "", its children "/name", theirs "/name/child".
-        let label = if e.relative.is_empty() {
+        let label = if node.relative.is_empty() {
             String::new()
         } else {
-            format!("/{}", e.relative)
+            format!("/{}", node.relative)
         };
-        if e.meta.is_symlink() {
-            let target = std::fs::read_link(e.path)?;
-            h.field(b"L").field(label.as_bytes());
-            h.field(target.to_string_lossy().as_bytes());
-        } else if e.meta.is_dir() {
-            h.field(b"D").field(label.as_bytes());
-        } else {
-            h.field(b"F").field(label.as_bytes());
-            h.put(&[u8::from(e.meta.permissions().mode() & 0o111 != 0)]);
-            feed_file(e.path, &mut h)?;
+        match &node.kind {
+            Kind::Link(target) => {
+                h.field(b"L").field(label.as_bytes());
+                h.field(target.as_bytes());
+            }
+            Kind::Dir => {
+                h.field(b"D").field(label.as_bytes());
+            }
+            Kind::File => {
+                h.field(b"F").field(label.as_bytes());
+                h.put(&[u8::from(node.mode & 0o111 != 0)]);
+                feed(snapshot.open(&node.relative)?, &mut h)
+                    .with_context(|| format!("reading {}", node.relative))?;
+            }
         }
         Ok(())
     })?;
@@ -39,9 +49,7 @@ pub fn hash_path(path: &Path) -> Result<String> {
 }
 
 /// Streams a file through the hash, so a large binary is never held in memory.
-fn feed_file(path: &Path, h: &mut Fingerprint) -> Result<()> {
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+fn feed(mut file: impl Read, h: &mut Fingerprint) -> std::io::Result<()> {
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = file.read(&mut buf)?;
@@ -56,6 +64,7 @@ fn feed_file(path: &Path, h: &mut Fingerprint) -> Result<()> {
 mod tests {
     use super::*;
     use crate::tmpfile::TempDir;
+    use std::os::unix::fs::PermissionsExt;
 
     fn tree(files: &[(&str, &str)]) -> TempDir {
         let dir = TempDir::new("tree").unwrap();

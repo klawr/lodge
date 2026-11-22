@@ -1,12 +1,12 @@
 //! Getting a bundle ready to inject from.
 //!
-//! Injection reads only from a bundle *directory*: a manifest plus `bin/`, `lib/`
-//! and `config/`. This module produces one, from either source, and keeps it in
-//! the [`cache`] so work is not repeated:
+//! Injection reads only from a [`Bundle`]: a verified tar, read in place. This
+//! module produces one, from either source, and keeps it in the [`cache`] so
+//! work is not repeated:
 //!
 //! - a bundle **reference** (`--bundle`, or `bundle = …` in the config: a file, a
 //!   registry, whatever a [`store`](super::store) handles) is identified, and
-//!   fetched and extracted once, keyed by what it identified as (the hash of a
+//!   fetched and verified once, keyed by what it identified as (the hash of a
 //!   file, the digest of an image);
 //! - otherwise the config is **packed live**, keyed by a fingerprint of everything
 //!   it depends on (the config entries, each source file's size and mtime, the
@@ -19,11 +19,12 @@
 
 use anyhow::{Context as _, Result};
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use super::manifest::{BIN_DIR, LIB_DIR, Manifest, data_file};
+use super::manifest::Manifest;
+use super::reader::Bundle;
 use super::store::{Stores, Unreachable};
-use super::{archive, cache, deps, elf, pack};
+use super::{cache, deps, elf, pack};
 use crate::arch::Arch;
 use crate::config::Config;
 use crate::fingerprint::Fingerprint;
@@ -31,10 +32,9 @@ use crate::output::{info, warning};
 use crate::tools::Toolchain;
 use crate::tree::{self, Denied, Links};
 
-/// A bundle directory ready to inject from.
+/// A bundle ready to inject from.
 pub struct Prepared {
-    pub dir: PathBuf,
-    pub manifest: Manifest,
+    pub bundle: Bundle,
     pub origin: Origin,
     /// Where it came from, as exactly as the place can say (a registry's digest),
     /// for `ldg status`; `None` for one packed from the config.
@@ -43,27 +43,12 @@ pub struct Prepared {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
-    /// Reused from the cache; nothing was packed or extracted.
+    /// Reused from the cache; nothing was packed or fetched.
     Cached,
     /// Packed from the config just now.
     Packed,
-    /// Fetched from a store (a file, a registry) and extracted just now.
-    Extracted,
-}
-
-impl Prepared {
-    pub fn bin(&self, tool: &str) -> PathBuf {
-        self.dir.join(BIN_DIR).join(tool)
-    }
-
-    pub fn lib(&self, name: &str) -> PathBuf {
-        self.dir.join(LIB_DIR).join(name)
-    }
-
-    /// The `index`th of the manifest's `data`.
-    pub fn data(&self, index: usize) -> PathBuf {
-        self.dir.join(data_file(index))
-    }
+    /// Fetched from a store (a file, a registry) and verified just now.
+    Fetched,
 }
 
 /// Readies the bundle to inject from: `reference` if given, else the config's
@@ -96,14 +81,14 @@ pub(crate) fn prepare_in(
         }
         None => live(root, config, tools)?,
     };
-    cache::prune(root, &prepared.dir);
+    cache::prune(root, prepared.bundle.file());
 
     let how = match prepared.origin {
         Origin::Cached => "cached",
         Origin::Packed => "packed",
-        Origin::Extracted => "extracted",
+        Origin::Fetched => "fetched",
     };
-    info!("bundle {} ({how})", prepared.manifest.id());
+    info!("bundle {} ({how})", prepared.bundle.manifest().id());
     Ok(prepared)
 }
 
@@ -134,26 +119,24 @@ pub(crate) fn from_store(root: &Path, stores: &Stores, reference: &str) -> Resul
         }
         Err(e) => return Err(e),
     };
-    let dir = root.join(&identity.key);
-    if let Some(manifest) = cache::load(&dir) {
+    if let Some(bundle) = cache::load(root, &identity.key) {
         cache::remember(root, reference, arch, &identity.key);
         return Ok(Prepared {
-            dir,
-            manifest,
+            bundle,
             origin: Origin::Cached,
             source: Some(identity.pinned),
         });
     }
-    let fetched = cache::staging(root, "fetch")?;
-    let tar = store.fetch(&identity, fetched.path())?;
-    let staging = cache::staging(root, "extract")?;
-    let manifest = archive::extract(&tar, staging.path())?;
-    let dir = cache::install(staging, &dir)?;
+    let staging = cache::staging(root, "fetch")?;
+    let fetched = store.fetch(&identity, staging.path())?;
+    // What is verified is the copy that is kept, so nothing can change between.
+    let staged = cache::stage_tar(&staging, &fetched)?;
+    Bundle::verified(&staged)?;
+    let bundle = cache::install(root, staging, &identity.key)?;
     cache::remember(root, reference, arch, &identity.key);
     Ok(Prepared {
-        dir,
-        manifest,
-        origin: Origin::Extracted,
+        bundle,
+        origin: Origin::Fetched,
         source: Some(identity.pinned),
     })
 }
@@ -175,17 +158,17 @@ pub(crate) fn look_up(root: &Path, stores: &Stores, reference: &str) -> Result<L
     let arch = Arch::host().ok();
     match store.identify(reference, arch) {
         Ok(identity) => Ok(Lookup {
-            cached: cache::load(&root.join(&identity.key)),
+            cached: cache::load(root, &identity.key).map(|b| b.manifest().clone()),
             pinned: identity.pinned,
             offline: false,
         }),
         Err(e) if e.downcast_ref::<Unreachable>().is_some() => {
             let remembered =
-                cache::recall(root, reference, arch).and_then(|key| cache::load(&root.join(key)));
+                cache::recall(root, reference, arch).and_then(|key| cache::load(root, &key));
             match remembered {
-                Some(manifest) => Ok(Lookup {
+                Some(bundle) => Ok(Lookup {
                     pinned: reference.into(),
-                    cached: Some(manifest),
+                    cached: Some(bundle.manifest().clone()),
                     offline: true,
                 }),
                 None => Err(e.context(format!(
@@ -199,11 +182,10 @@ pub(crate) fn look_up(root: &Path, stores: &Stores, reference: &str) -> Result<L
 
 /// The bundle in the cache under `key`.
 fn cached(root: &Path, key: &str) -> Result<Prepared> {
-    let dir = root.join(key);
-    let manifest = cache::load(&dir).with_context(|| format!("the cached bundle {key} is gone"))?;
+    let bundle =
+        cache::load(root, key).with_context(|| format!("the cached bundle {key} is gone"))?;
     Ok(Prepared {
-        dir,
-        manifest,
+        bundle,
         origin: Origin::Cached,
         source: None,
     })
@@ -215,23 +197,27 @@ fn short(e: &anyhow::Error) -> String {
 }
 
 fn live(root: &Path, config: &Config, tools: &Toolchain) -> Result<Prepared> {
+    let packer = tools.packer()?;
     // Shared by the fingerprint and the pack, so the libraries of a binary are
     // looked up once.
-    let mut deps = deps::Resolver::new(tools.deps.as_ref());
-    let dir = root.join(format!("p-{}", inputs_fingerprint(config, &mut deps)?));
-    if let Some(manifest) = cache::load(&dir) {
+    let mut deps = deps::Resolver::new(packer.deps.as_ref());
+    let key = format!("p-{}", inputs_fingerprint(config, &mut deps)?);
+    if let Some(bundle) = cache::load(root, &key) {
         return Ok(Prepared {
-            dir,
-            manifest,
+            bundle,
             origin: Origin::Cached,
             source: None,
         });
     }
     let staging = cache::staging(root, "pack")?;
-    let manifest = pack::build(config, staging.path(), &mut deps, tools.elf.as_ref())?;
+    pack::build_tar(
+        config,
+        &cache::staged(&staging),
+        &mut deps,
+        packer.elf.as_ref(),
+    )?;
     Ok(Prepared {
-        dir: cache::install(staging, &dir)?,
-        manifest,
+        bundle: cache::install(root, staging, &key)?,
         origin: Origin::Packed,
         source: None,
     })
@@ -320,7 +306,9 @@ mod tests {
     use super::*;
     use crate::bundle::store::fake::FakeStore;
     use crate::bundle::store::{FileStore, OciStore};
+    use crate::bundle::testing::{manifest, prepared};
     use crate::config::BinaryEntry;
+    use crate::snapshot::Snapshot;
     use crate::tmpfile::TempDir;
     use crate::tools::{self, FakeRegistry, Ldd};
     use std::sync::Arc;
@@ -365,8 +353,8 @@ mod tests {
         assert_eq!(first.origin, Origin::Packed);
         let second = prepare_in(cache.path(), &cfg, None, &files(), &tools::external()).unwrap();
         assert_eq!(second.origin, Origin::Cached);
-        assert_eq!(first.dir, second.dir);
-        assert_eq!(first.manifest.id(), second.manifest.id());
+        assert_eq!(first.bundle.file(), second.bundle.file());
+        assert_eq!(first.bundle.manifest().id(), second.bundle.manifest().id());
     }
 
     #[test]
@@ -382,8 +370,8 @@ mod tests {
         std::fs::write(&source, "#!/bin/sh\necho changed, and longer\n").unwrap();
         let second = prepare_in(cache.path(), &cfg, None, &files(), &tools::external()).unwrap();
         assert_eq!(second.origin, Origin::Packed);
-        assert_ne!(first.dir, second.dir);
-        assert_ne!(first.manifest.id(), second.manifest.id());
+        assert_ne!(first.bundle.file(), second.bundle.file());
+        assert_ne!(first.bundle.manifest().id(), second.bundle.manifest().id());
     }
 
     #[test]
@@ -405,7 +393,7 @@ mod tests {
         std::fs::write(cfg_dir.join("added"), "new file").unwrap();
         let second = prepare_in(cache.path(), &cfg, None, &files(), &tools::external()).unwrap();
         assert_eq!(second.origin, Origin::Packed);
-        assert_ne!(first.dir, second.dir);
+        assert_ne!(first.bundle.file(), second.bundle.file());
     }
 
     #[test]
@@ -438,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bundle_file_is_extracted_once_and_then_reused() {
+    fn a_bundle_file_is_fetched_once_and_then_reused() {
         let work = TempDir::new("src4").unwrap();
         let out = TempDir::new("out4").unwrap();
         let cache = TempDir::new("cache4").unwrap();
@@ -456,9 +444,9 @@ mod tests {
             &tools::external(),
         )
         .unwrap();
-        assert_eq!(first.origin, Origin::Extracted);
-        assert_eq!(first.manifest.binaries.len(), 1);
-        assert!(first.bin("t").exists());
+        assert_eq!(first.origin, Origin::Fetched);
+        assert_eq!(first.bundle.manifest().binaries.len(), 1);
+        assert!(first.bundle.bin("t").root().is_ok());
         let second = prepare_in(
             cache.path(),
             &empty,
@@ -501,7 +489,7 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(cache.path()).unwrap().collect();
         assert!(
             leftovers.is_empty(),
-            "a failed extraction left {} entries",
+            "a failed fetch left {} entries",
             leftovers.len()
         );
     }
@@ -546,7 +534,7 @@ mod tests {
         let kept = std::fs::read_dir(cache.path()).unwrap().count();
         assert_eq!(kept, cache::KEEP);
         assert!(
-            last.unwrap().dir.exists(),
+            last.unwrap().bundle.file().exists(),
             "the bundle in use must survive pruning"
         );
     }
@@ -605,9 +593,13 @@ mod tests {
             &tools::external(),
         )
         .unwrap();
-        assert_eq!(first.origin, Origin::Extracted);
-        assert!(first.bin("t").exists());
-        assert!(first.dir.ends_with("x-1"), "{}", first.dir.display());
+        assert_eq!(first.origin, Origin::Fetched);
+        assert!(first.bundle.bin("t").root().is_ok());
+        assert!(
+            first.bundle.file().ends_with("x-1.tar"),
+            "{}",
+            first.bundle.file().display()
+        );
         let second = prepare_in(
             cache.path(),
             &empty,
@@ -625,7 +617,7 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        assert_eq!(names, ["tags.json", "x-1"]);
+        assert_eq!(names, ["tags.json", "x-1.tar"]);
     }
 
     /// Prepares `fake://a` from `stores` into `cache`.
@@ -648,18 +640,19 @@ mod tests {
             "x-1",
             bundle_tar(work.path(), "#!/bin/sh\n"),
         ))]);
-        assert_eq!(
-            prepare_a(&cache, &online).unwrap().origin,
-            Origin::Extracted
-        );
+        assert_eq!(prepare_a(&cache, &online).unwrap().origin, Origin::Fetched);
 
         let offline = FakeStore::new().unreachable();
         let fetched = offline.fetched();
         let offline = Stores::new(vec![Box::new(offline)]);
         let again = prepare_a(&cache, &offline).unwrap();
         assert_eq!(again.origin, Origin::Cached);
-        assert!(again.dir.ends_with("x-1"), "{}", again.dir.display());
-        assert!(again.bin("t").exists());
+        assert!(
+            again.bundle.file().ends_with("x-1.tar"),
+            "{}",
+            again.bundle.file().display()
+        );
+        assert!(again.bundle.bin("t").root().is_ok());
         assert!(
             fetched.lock().unwrap().is_empty(),
             "nothing is fetched offline"
@@ -687,7 +680,7 @@ mod tests {
             bundle_tar(work.path(), "#!/bin/sh\n"),
         ))]);
         prepare_a(&cache, &online).unwrap();
-        std::fs::remove_dir_all(cache.path().join("x-1")).unwrap();
+        std::fs::remove_file(cache.path().join("x-1.tar")).unwrap();
         assert!(prepare_a(&cache, &offline).is_err());
     }
 
@@ -710,30 +703,13 @@ mod tests {
     #[test]
     fn the_same_reference_for_another_architecture_is_remembered_apart() {
         let root = TempDir::new("tags").unwrap();
-        std::fs::create_dir(root.path().join("o-a")).unwrap();
-        std::fs::create_dir(root.path().join("o-b")).unwrap();
+        // `recall` needs a real bundle in the entry.
+        let (_dir, bundle) = prepared(&manifest("x86_64"), &[]);
+        for key in ["o-a", "o-b"] {
+            std::fs::copy(bundle.bundle.file(), root.path().join(format!("{key}.tar"))).unwrap();
+        }
         cache::remember(root.path(), "oci://x/y:1", Some(Arch::X86_64), "o-a");
         cache::remember(root.path(), "oci://x/y:1", Some(Arch::Aarch64), "o-b");
-        // `recall` needs a real bundle in the entry.
-        let manifest = Manifest {
-            lodge_version: "0".into(),
-            created: 0,
-            arch: "x86_64".into(),
-            linker: None,
-            libs: vec![],
-            binaries: vec![],
-            data: vec![],
-            git_safe_directories: vec![],
-        };
-        for key in ["o-a", "o-b"] {
-            std::fs::write(
-                root.path()
-                    .join(key)
-                    .join(crate::bundle::manifest::MANIFEST_FILE),
-                manifest.to_json().unwrap(),
-            )
-            .unwrap();
-        }
         assert_eq!(
             cache::recall(root.path(), "oci://x/y:1", Some(Arch::Aarch64)).as_deref(),
             Some("o-b")
@@ -770,8 +746,8 @@ mod tests {
             &tools::external(),
         )
         .unwrap();
-        assert_eq!(first.origin, Origin::Extracted);
-        assert!(first.bin("t").exists());
+        assert_eq!(first.origin, Origin::Fetched);
+        assert!(first.bundle.bin("t").root().is_ok());
         let second = prepare_in(
             cache.path(),
             &empty,
@@ -798,5 +774,35 @@ mod tests {
             .err()
             .unwrap();
         assert!(format!("{err:#}").contains("a file path"), "{err:#}");
+    }
+    #[test]
+    fn a_machine_that_cannot_pack_still_uses_a_bundle_but_cannot_build_one() {
+        let work = TempDir::new("consumer").unwrap();
+        let out = TempDir::new("consumer-out").unwrap();
+        let cache = TempDir::new("consumer-cache").unwrap();
+        let file = out.path().join("b.tar");
+        let cfg = config(vec![script_tool(work.path(), "t", "#!/bin/sh\n")]);
+        pack::pack_to_file(&cfg, &file, &tools::external()).unwrap();
+        let tools = tools::consumer_only();
+
+        // A bundle is used...
+        let used = prepare_in(
+            cache.path(),
+            &config(vec![]),
+            Some(file.to_str().unwrap()),
+            &files(),
+            &tools,
+        )
+        .unwrap();
+        assert_eq!(used.origin, Origin::Fetched);
+        // ...but there is nothing to build one from the config with, and it says so.
+        let err = prepare_in(cache.path(), &cfg, None, &files(), &tools)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("cannot build a bundle"), "{err}");
+        let out = out.path().join("again.tar");
+        assert!(pack::pack_to_file(&cfg, &out, &tools).is_err());
+        assert!(!out.exists());
     }
 }

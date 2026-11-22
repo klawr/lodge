@@ -106,21 +106,14 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
     let config = Config::load(&ctx.config_path);
     checks.push(config_check(&ctx.config_path, &config));
 
-    // ldd and patchelf are needed only to *pack*: with a bundle, injection needs
-    // neither. So they are required only when this config would pack live.
     let packs_live = config
         .as_ref()
         .is_ok_and(|c| c.bundle.is_none() && !c.binaries.is_empty());
-    for tool in host_tools::ALL {
-        // (shown at all, required) for what this host and config ask of it.
-        let (shown, required) = match tool.need {
-            Need::Remote => (remote.is_some(), remote.is_some()),
-            Need::Pack => (true, packs_live),
-        };
-        if shown {
-            checks.push(tool_check(tool, required));
-        }
-    }
+    checks.extend(host_tool_checks(
+        remote.is_some(),
+        ctx.tools.packer().map(|_| ()),
+        packs_live,
+    ));
 
     if let Ok(cfg) = &config {
         if let Some(bundle) = &cfg.bundle {
@@ -183,6 +176,29 @@ fn secret_check(
         Ok(_) => Check::new(name, Level::Ok, format!("resolves ({source})")),
         Err(e) => Check::new(name, Level::Missing, format!("{e:#}")),
     }
+}
+
+/// The helper programs lodge runs on this machine, and which of them the work
+/// asked for. `ldd` and `patchelf` are needed only to *pack*: with a bundle,
+/// injection needs neither, so they are required only when the config would pack
+/// live, and not shown on a machine that cannot pack at all (`can_pack` says why
+/// not), which needs the bundle instead.
+fn host_tool_checks(remote: bool, can_pack: Result<()>, packs_live: bool) -> Vec<Check> {
+    let mut checks = Vec::new();
+    if packs_live && let Err(e) = &can_pack {
+        checks.push(Check::new("bundle", Level::Missing, e.to_string()));
+    }
+    for tool in host_tools::ALL {
+        // (shown at all, required) for what this host and config ask of it.
+        let (shown, required) = match tool.need {
+            Need::Remote => (remote, remote),
+            Need::Pack => (can_pack.is_ok(), packs_live),
+        };
+        if shown {
+            checks.push(tool_check(tool, required));
+        }
+    }
+    checks
 }
 
 fn tool_check(tool: &Tool, required: bool) -> Check {
@@ -326,6 +342,37 @@ mod tests {
         needed_for: "x",
         hint: "install it",
     };
+
+    fn names(checks: &[Check]) -> Vec<&str> {
+        checks.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_machine_that_cannot_pack_is_not_asked_for_the_packing_tools_but_for_a_bundle() {
+        let cannot = || Err(anyhow::anyhow!("no packing here"));
+        // Nothing to pack: nothing to say about it.
+        let quiet = host_tool_checks(false, cannot(), false);
+        assert!(names(&quiet).is_empty(), "{:?}", names(&quiet));
+        // A config that would pack: the missing bundle is the problem, not the tools.
+        let loud = host_tool_checks(false, cannot(), true);
+        assert_eq!(names(&loud), ["bundle"]);
+        assert!(loud[0].level == Level::Missing);
+        assert!(loud[0].detail.contains("no packing here"));
+        // A machine that can pack lists the tools, and requires them only to pack.
+        let can = host_tool_checks(false, Ok(()), false);
+        assert_eq!(names(&can), ["ldd", "patchelf"]);
+        assert!(can.iter().all(|c| c.level != Level::Missing));
+    }
+
+    #[test]
+    fn the_remote_tool_is_listed_only_for_a_remote() {
+        assert!(
+            names(&host_tool_checks(false, Ok(()), false))
+                .iter()
+                .all(|n| *n != "ssh")
+        );
+        assert!(names(&host_tool_checks(true, Ok(()), false)).contains(&"ssh"));
+    }
 
     #[test]
     fn files_beside_a_program_that_the_config_leaves_out_are_hinted_at() {

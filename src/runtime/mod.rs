@@ -32,12 +32,11 @@ pub use user::{ContainerUser, LoginOnly, User};
 
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
 use crate::shell::{script_argv, shell_quote};
-use crate::tmpfile::TempFile;
+use crate::snapshot::{InMemoryFile, Snapshot};
 
 /// The script behind [`Env::write_secret`]: `$1` is the destination, the value
 /// arrives on stdin and `%MODE%` is replaced by an octal mode. Written to a
@@ -131,14 +130,13 @@ pub trait Env {
     /// non-zero exit is reported in [`Output::success`].
     fn output(&self, argv: &[&str], opts: &ExecOpts) -> Result<Output>;
 
-    /// Copies the local file or directory `src` to `dest` inside the
-    /// environment, keeping file modes, with `owner` owning everything that is
-    /// created, parent directories included. A file becomes `dest`; a
-    /// directory's *contents* are merged into `dest`. Missing parent directories
-    /// (of `dest`, for a file; `dest` itself, for a directory) are made. Files
-    /// already in `dest` that `src` lacks are kept, so remove `dest` first for an
-    /// exact copy.
-    fn put(&self, src: &str, dest: &str, owner: &ContainerUser) -> Result<()>;
+    /// Copies `src` to `dest` inside the environment, keeping file modes, with
+    /// `owner` owning everything that is created, parent directories included. A
+    /// file becomes `dest`; a directory's *contents* are merged into `dest`.
+    /// Missing parent directories (of `dest`, for a file; `dest` itself, for a
+    /// directory) are made. Files already in `dest` that `src` lacks are kept, so
+    /// remove `dest` first for an exact copy.
+    fn put(&self, src: &dyn Snapshot, dest: &str, owner: &ContainerUser) -> Result<()>;
 
     /// Writes `contents` to `dest` inside the environment with permission bits
     /// `mode`, as `user`. The bytes travel on the command's **stdin**, never in
@@ -235,7 +233,7 @@ pub trait Env {
 
     /// Copies `src` into the environment, owned by the actor; see
     /// [`put`](Self::put).
-    fn cp_in(&self, src: &str, dest: &str) -> Result<()> {
+    fn cp_in(&self, src: &dyn Snapshot, dest: &str) -> Result<()> {
         self.put(src, dest, &self.actor())
     }
 
@@ -246,15 +244,9 @@ pub trait Env {
     }
 
     /// Like [`write_file`](Self::write_file) with the permission bits `mode` (a
-    /// script that must run, say). Stages the bytes in a local temp file and
-    /// sends them with [`put`](Self::put).
+    /// script that must run, say).
     fn write_file_mode(&self, dest: &str, contents: &[u8], mode: u32) -> Result<()> {
-        let name = Path::new(dest)
-            .file_name()
-            .map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
-        let tmp = TempFile::write(&name, contents)?;
-        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode))?;
-        self.cp_in(&tmp.path().to_string_lossy(), dest)
+        self.cp_in(&InMemoryFile::new(contents, mode), dest)
     }
 
     /// The text of the file `path` (read as the actor), `None` if there is no
@@ -309,7 +301,7 @@ impl Env for Acting<'_> {
         self.env.output(argv, &self.resolve(opts))
     }
 
-    fn put(&self, src: &str, dest: &str, owner: &ContainerUser) -> Result<()> {
+    fn put(&self, src: &dyn Snapshot, dest: &str, owner: &ContainerUser) -> Result<()> {
         self.env.put(src, dest, owner)
     }
 
@@ -682,7 +674,12 @@ mod tests {
         fn output(&self, _: &[&str], _: &ExecOpts) -> anyhow::Result<super::Output> {
             unreachable!("nothing runs here")
         }
-        fn put(&self, _: &str, _: &str, _: &ContainerUser) -> anyhow::Result<()> {
+        fn put(
+            &self,
+            _: &dyn crate::snapshot::Snapshot,
+            _: &str,
+            _: &ContainerUser,
+        ) -> anyhow::Result<()> {
             unreachable!()
         }
         fn write_secret(&self, _: &str, _: &[u8], _: u32, _: User) -> anyhow::Result<()> {

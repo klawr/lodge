@@ -21,6 +21,7 @@ use std::process::ExitStatus;
 use super::{ContainerUser, Env, ExecOpts, Output, User, tarball};
 use crate::host::{HostRef, Input, Job, Repeat};
 use crate::shell::shell_quote;
+use crate::snapshot::Snapshot;
 
 /// What is particular to reaching inside one endpoint.
 pub trait Inside {
@@ -114,12 +115,10 @@ impl<T: Inside> Env for T {
     /// The directory it unpacks into is made first, *as the owner*, so what is
     /// made there is theirs and root is never needed; then a tar built here is
     /// streamed to the endpoint's own unpacker.
-    fn put(&self, src: &str, dest: &str, owner: &ContainerUser) -> Result<()> {
-        let source = Path::new(src);
-        let meta = std::fs::metadata(source).with_context(|| format!("stat {src}"))?;
+    fn put(&self, src: &dyn Snapshot, dest: &str, owner: &ContainerUser) -> Result<()> {
         // A directory is unpacked *into* `dest`; a file into its parent, under
         // its own name.
-        let (into, name) = if meta.is_dir() {
+        let (into, name) = if src.root()?.is_dir() {
             (dest.to_string(), String::new())
         } else {
             let dest_path = Path::new(dest);
@@ -146,7 +145,7 @@ impl<T: Inside> Env for T {
         let mut feed = |stdin: &mut dyn std::io::Write| {
             // Dropping the writer closes the pipe, so the unpacker sees the end of
             // its input.
-            packed = tarball::pack(source, &name, owner, stdin);
+            packed = tarball::pack(src, &name, owner, stdin);
             Ok(())
         };
         let ran = self
@@ -158,9 +157,9 @@ impl<T: Inside> Env for T {
             )
             .with_context(|| format!("unpacking into {into}"))?;
         if !ran.status.success() {
-            bail!("unpacking {src} into {dest} failed ({})", ran.status);
+            bail!("unpacking into {dest} failed ({})", ran.status);
         }
-        packed.with_context(|| format!("packing {src}"))
+        packed.with_context(|| format!("packing for {dest}"))
     }
 
     fn write_secret(&self, dest: &str, contents: &[u8], mode: u32, user: User) -> Result<()> {
@@ -191,6 +190,7 @@ impl<T: Inside> Env for T {
 mod tests {
     use super::*;
     use crate::host::fake::{FakeHost, Reply};
+    use crate::snapshot::DiskSnapshot;
     use std::sync::Arc;
 
     /// An endpoint that is only the five things [`Inside`] asks for: everything an
@@ -293,7 +293,7 @@ mod tests {
             gid: 1000,
             home: "/home/dev".into(),
         };
-        toy.put(&dir.path().join("f").to_string_lossy(), "/h/f", &owner)
+        toy.put(&DiskSnapshot::at(&dir.path().join("f")), "/h/f", &owner)
             .unwrap();
         let calls = host.calls();
         assert_eq!(calls[0].argv, words(&["toy", "run", "mkdir", "-p", "/h"]));

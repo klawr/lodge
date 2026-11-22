@@ -110,7 +110,7 @@ fn attach(
     };
     let layout = match installed {
         Some(found) => {
-            if found.bundle != prepared.manifest.id() {
+            if found.bundle != prepared.bundle.manifest().id() {
                 note!(
                     "what is injected is out of date (your config or ldg changed); \
                      `ldg up --reinject` updates it"
@@ -153,8 +153,7 @@ fn attach(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle::manifest::Manifest;
-    use crate::bundle::source::{Origin, Prepared};
+    use crate::bundle::testing::{manifest, prepared};
     use crate::devcontainer::{Devcontainer, Prompt};
     use crate::forward::ForwardDaemon;
     use crate::host::fake;
@@ -192,19 +191,6 @@ mod tests {
             uid: 1000,
             gid: 1000,
             home: "/home/dev".into(),
-        }
-    }
-
-    fn manifest() -> Manifest {
-        Manifest {
-            lodge_version: "0".into(),
-            created: 0,
-            arch: "x86_64".into(),
-            linker: None,
-            libs: vec![],
-            binaries: vec![],
-            data: vec![],
-            git_safe_directories: vec![],
         }
     }
 
@@ -263,12 +249,7 @@ mod tests {
             remote_user: None,
             post_attach: None,
         };
-        let prepared = Prepared {
-            dir: dir.path().to_path_buf(),
-            manifest: manifest(),
-            origin: Origin::Packed,
-            source: None,
-        };
+        let (_bundle, prepared) = prepared(&manifest("x86_64"), &[]);
 
         let place = Place::Project { path: "/p".into() };
         attach(

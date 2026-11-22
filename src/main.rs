@@ -33,6 +33,7 @@ mod runtime;
 mod secret;
 mod session;
 mod shell;
+mod snapshot;
 mod tmpfile;
 mod tools;
 mod tree;

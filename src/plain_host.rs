@@ -277,7 +277,7 @@ mod tests {
         let user = ContainerUser::resolve(&plain, None).unwrap();
         plain
             .put(
-                &dir.path().join("rc").to_string_lossy(),
+                &crate::snapshot::DiskSnapshot::at(&dir.path().join("rc")),
                 "/home/dev/.config/hello/rc",
                 &user,
             )

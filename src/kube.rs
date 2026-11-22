@@ -675,7 +675,7 @@ mod tests {
         std::fs::write(dir.path().join("rc"), "set x").unwrap();
         let user = ContainerUser::resolve(&pod, None).unwrap();
         pod.put(
-            &dir.path().join("rc").to_string_lossy(),
+            &crate::snapshot::DiskSnapshot::at(&dir.path().join("rc")),
             "/home/dev/.config/hello/rc",
             &user,
         )

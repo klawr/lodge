@@ -15,7 +15,7 @@ use crate::runtime::{ContainerUser, Env};
 pub(super) fn inject_data(
     env: &dyn Env,
     user: &ContainerUser,
-    bundle: &Prepared,
+    prepared: &Prepared,
     index: usize,
     data: &Data,
     placed_before: &[String],
@@ -44,7 +44,7 @@ pub(super) fn inject_data(
             &["rm", "-rf", &dest],
             &crate::runtime::ExecOpts::default().repeatable(),
         )
-        .and_then(|()| env.cp_in(&bundle.data(index).to_string_lossy(), &dest));
+        .and_then(|()| env.cp_in(&prepared.bundle.data(index), &dest));
     written.with_context(|| {
         format!(
             "writing {dest} as {} failed. lodge never uses root, so a target must be \
@@ -59,7 +59,7 @@ pub(super) fn inject_data(
 mod tests {
     use super::*;
     use crate::bundle::manifest::Manifest;
-    use crate::bundle::source::Origin;
+    use crate::bundle::testing::{manifest, prepared};
     use crate::runtime::fake::{FakeEnv, Who};
     use crate::tmpfile::TempDir;
 
@@ -75,31 +75,16 @@ mod tests {
 
     /// A bundle whose one data is the tree `data/0/rc`, going to `dest`.
     fn bundle(dest: &str) -> (TempDir, Prepared) {
-        let dir = TempDir::new("cfg-bundle").unwrap();
-        std::fs::create_dir_all(dir.path().join("data/0")).unwrap();
-        std::fs::write(dir.path().join("data/0/rc"), "set x").unwrap();
         let manifest = Manifest {
-            lodge_version: "0".into(),
-            created: 0,
-            arch: "x86_64".into(),
-            linker: None,
-            libs: vec![],
-            binaries: vec![],
             data: vec![Data {
                 dest: dest.into(),
                 is_dir: true,
                 hash: "00000000000000aa".into(),
                 binary: None,
             }],
-            git_safe_directories: vec![],
+            ..manifest("x86_64")
         };
-        let prepared = Prepared {
-            dir: dir.path().to_path_buf(),
-            manifest,
-            origin: Origin::Packed,
-            source: None,
-        };
-        (dir, prepared)
+        prepared(&manifest, &[("data/0/rc", b"set x")])
     }
 
     fn inject(env: &FakeEnv, b: &Prepared) -> Result<String> {
@@ -121,7 +106,7 @@ mod tests {
             &user,
             b,
             0,
-            &b.manifest.data[0],
+            &b.bundle.manifest().data[0],
             placed_before,
         )
     }

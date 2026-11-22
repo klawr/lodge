@@ -15,6 +15,7 @@ use super::markers;
 use crate::host::Host;
 use crate::output::{info, warning};
 use crate::runtime::{ContainerUser, Env, ExecOpts, User};
+use crate::snapshot::DiskSnapshot;
 use crate::tmpfile::TempDir;
 use crate::tools::OciFetcher;
 use anyhow::Result;
@@ -316,7 +317,7 @@ fn validate_options(r: &Resolved) {
 fn install_one(env: &dyn Env, r: &Resolved, users: &[ContainerUser; 2]) -> Result<()> {
     let dest = format!("{FEATURES_DIR}/{}", r.meta.id);
     env.exec(&["rm", "-rf", &dest], &ExecOpts::root().repeatable())?;
-    env.cp_in(&r.dir.to_string_lossy(), &dest)?;
+    env.cp_in(&DiskSnapshot::resolved(&r.dir)?, &dest)?;
 
     info!("installing feature {}", r.reference);
     let vars = build_env(r, users);

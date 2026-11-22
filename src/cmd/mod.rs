@@ -48,7 +48,7 @@ use crate::local::{Local, SystemLocal};
 use crate::output::warning;
 use crate::provision::{Endpoints, Wiring};
 use crate::tools::{
-    DockerConfig, Ldd, NativeOci, OciFetcher, OciPusher, Patchelf, Toolchain, UreqHttp,
+    DockerConfig, Ldd, NativeOci, OciFetcher, OciPusher, Packer, Patchelf, Toolchain, UreqHttp,
 };
 
 /// Whether a command works in a target at all. `init` and the generated
@@ -251,6 +251,19 @@ fn bundle_sinks(oci: Arc<dyn OciPusher>) -> Sinks {
     Sinks::new(vec![Box::new(FileSink), Box::new(OciSink::new(oci))])
 }
 
+/// The helper programs this machine can run. Building a bundle takes `ldd` and
+/// `patchelf` and binaries that are Linux's, so only a Linux machine can; any
+/// other one only uses the bundles that are built for it.
+fn toolchain(oci: Arc<dyn OciFetcher>) -> Toolchain {
+    Toolchain {
+        packer: cfg!(target_os = "linux").then(|| Packer {
+            deps: Box::new(Ldd),
+            elf: Box::new(Patchelf),
+        }),
+        oci,
+    }
+}
+
 /// Works on the config alone: no host, no target, no engine.
 fn configure_config(config: Option<PathBuf>) -> Result<()> {
     let path = crate::config::path_for(config)?;
@@ -264,11 +277,7 @@ fn configure_config(config: Option<PathBuf>) -> Result<()> {
         Box::new(DockerConfig::new(local)),
     ));
     let packer = bundle::LivePacker {
-        tools: Toolchain {
-            deps: Box::new(Ldd),
-            elf: Box::new(Patchelf),
-            oci: registry.clone(),
-        },
+        tools: toolchain(registry.clone()),
         sinks: bundle_sinks(registry),
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -373,11 +382,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
         Box::new(UreqHttp::new()),
         Box::new(DockerConfig::new(local.clone())),
     ));
-    let tools = Toolchain {
-        deps: Box::new(Ldd),
-        elf: Box::new(Patchelf),
-        oci: registry.clone(),
-    };
+    let tools = toolchain(registry.clone());
     // Read on this machine, even with `--remote`: the folder you stand in is here.
     let project = project_dir(&subcommand, cli.project_dir);
     let endpoints = build_endpoints(

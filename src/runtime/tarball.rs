@@ -1,73 +1,61 @@
-//! Packing a local file or directory as a tar stream whose entries belong to a
-//! given user.
+//! Packing a snapshot as a tar stream whose entries belong to a given user.
 //!
 //! Copying into an environment as a user, without root, means the archive itself
 //! says who owns what it creates (an engine that unpacks it as `docker cp -a`
 //! does honours that). So the ownership fields are set here, in-process, instead
 //! of fixed afterwards with `chown`, and nothing needs a `tar` in the target.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::io::Write;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
 
 use super::ContainerUser;
-use crate::tree::{self, Denied, Links};
+use crate::snapshot::{Kind, Snapshot};
 
 /// Writes `src` to `out` as a tar archive owned by `owner`.
 ///
 /// A directory becomes its *contents*, each entry named relative to it, so that
 /// unpacking into `dest` fills `dest`. A file becomes the single entry `name`.
-/// Modes and modification times are kept, symlinks *inside* a directory stay
-/// symlinks, and anything but files, directories and symlinks (a socket, say) is
-/// refused rather than silently dropped. A `src` that is itself a symlink is
-/// followed: what is copied is what it points at, never a link to a path on this
-/// machine.
-pub fn pack(src: &Path, name: &str, owner: &ContainerUser, out: impl Write) -> Result<()> {
-    let src = &std::fs::canonicalize(src).with_context(|| format!("reading {}", src.display()))?;
+/// Modes and modification times are kept, and symlinks *inside* a directory stay
+/// symlinks.
+pub fn pack(src: &dyn Snapshot, name: &str, owner: &ContainerUser, out: impl Write) -> Result<()> {
     let mut builder = tar::Builder::new(out);
-    tree::walk(src, Links::Keep, Denied::Fail, &mut |e| {
-        let meta = e.meta;
+    src.walk(&mut |node| {
         let mut header = tar::Header::new_gnu();
         header.set_uid(u64::from(owner.uid));
         header.set_gid(u64::from(owner.gid));
-        header.set_mode(meta.permissions().mode() & 0o7777);
-        header.set_mtime(u64::try_from(meta.mtime()).unwrap_or(0));
-        let entry_name = if e.relative.is_empty() {
-            name.to_string()
+        header.set_mode(node.mode);
+        header.set_mtime(node.mtime);
+        let entry_name = if node.relative.is_empty() {
+            name
         } else {
-            e.relative.to_string()
+            &node.relative
         };
-        let kind = meta.file_type();
-        if kind.is_dir() {
-            if e.relative.is_empty() {
-                return Ok(()); // the directory itself already exists at `dest`
+        let packing = || format!("packing {entry_name}");
+        match &node.kind {
+            Kind::Dir => {
+                if node.relative.is_empty() {
+                    return Ok(()); // the directory itself already exists at `dest`
+                }
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_size(0);
+                builder
+                    .append_data(&mut header, format!("{entry_name}/"), std::io::empty())
+                    .with_context(packing)
             }
-            header.set_entry_type(tar::EntryType::Directory);
-            header.set_size(0);
-            builder
-                .append_data(&mut header, format!("{entry_name}/"), std::io::empty())
-                .with_context(|| format!("packing {}", e.path.display()))
-        } else if kind.is_symlink() {
-            header.set_entry_type(tar::EntryType::Symlink);
-            header.set_size(0);
-            let target = std::fs::read_link(e.path)?;
-            builder
-                .append_link(&mut header, &entry_name, target)
-                .with_context(|| format!("packing {}", e.path.display()))
-        } else if kind.is_file() {
-            header.set_entry_type(tar::EntryType::Regular);
-            header.set_size(meta.len());
-            let file = std::fs::File::open(e.path)
-                .with_context(|| format!("reading {}", e.path.display()))?;
-            builder
-                .append_data(&mut header, &entry_name, file)
-                .with_context(|| format!("packing {}", e.path.display()))
-        } else {
-            bail!(
-                "{} is neither a file, a directory nor a link, so it can't be copied",
-                e.path.display()
-            )
+            Kind::Link(target) => {
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                builder
+                    .append_link(&mut header, entry_name, target)
+                    .with_context(packing)
+            }
+            Kind::File => {
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_size(node.size);
+                builder
+                    .append_data(&mut header, entry_name, src.open(&node.relative)?)
+                    .with_context(packing)
+            }
         }
     })?;
     builder.into_inner().context("finishing the archive")?;
@@ -77,8 +65,10 @@ pub fn pack(src: &Path, name: &str, owner: &ContainerUser, out: impl Write) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot::DiskSnapshot;
     use crate::tmpfile::TempDir;
     use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
 
     fn owner() -> ContainerUser {
         ContainerUser {
@@ -130,7 +120,7 @@ mod tests {
         std::os::unix::fs::symlink("a", dir.path().join("link")).unwrap();
 
         let mut buf = Vec::new();
-        pack(dir.path(), "ignored", &owner(), &mut buf).unwrap();
+        pack(&DiskSnapshot::at(dir.path()), "ignored", &owner(), &mut buf).unwrap();
         let rows = rows(&buf);
 
         let names: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
@@ -152,7 +142,7 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let mut buf = Vec::new();
-        pack(&file, "dest-name", &owner(), &mut buf).unwrap();
+        pack(&DiskSnapshot::at(&file), "dest-name", &owner(), &mut buf).unwrap();
         let rows = rows(&buf);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "dest-name");
@@ -169,7 +159,13 @@ mod tests {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let mut buf = Vec::new();
-        pack(&link, "dest", &owner(), &mut buf).unwrap();
+        pack(
+            &DiskSnapshot::resolved(&link).unwrap(),
+            "dest",
+            &owner(),
+            &mut buf,
+        )
+        .unwrap();
         let file = rows(&buf);
         assert_eq!(file.len(), 1);
         assert_eq!(
@@ -184,23 +180,16 @@ mod tests {
         let dir_link = dir.path().join("dl");
         std::os::unix::fs::symlink(&sub, &dir_link).unwrap();
         let mut buf = Vec::new();
-        pack(&dir_link, "ignored", &owner(), &mut buf).unwrap();
+        pack(
+            &DiskSnapshot::resolved(&dir_link).unwrap(),
+            "ignored",
+            &owner(),
+            &mut buf,
+        )
+        .unwrap();
         assert_eq!(
             rows(&buf).iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
             ["f"]
         );
-    }
-
-    #[test]
-    fn a_special_file_is_refused() {
-        let dir = TempDir::new("tarball-fifo").unwrap();
-        let fifo = dir.path().join("pipe");
-        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
-        if made.is_ok_and(|s| s.success()) {
-            let err = pack(dir.path(), "x", &owner(), Vec::new())
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("neither a file"), "{err}");
-        }
     }
 }

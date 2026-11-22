@@ -23,7 +23,7 @@
 use anyhow::{Context, Result};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
-use std::os::unix::fs::PermissionsExt;
+use std::io::Read as _;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -34,7 +34,7 @@ use super::{
     RunSpec, Runtime, User,
 };
 use crate::host::{Child, Stream};
-use crate::tree::{self, Denied, Links};
+use crate::snapshot::{Kind, Snapshot};
 
 /// Who a recorded command ran as ([`User`] without the borrow).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,9 +354,9 @@ impl Env for FakeEnv {
 
     /// A file becomes `dest`; a directory's files are merged into `dest`, as
     /// [`Env::put`] promises, and the owner owns them.
-    fn put(&self, src: &str, dest: &str, owner: &ContainerUser) -> Result<()> {
+    fn put(&self, src: &dyn Snapshot, dest: &str, owner: &ContainerUser) -> Result<()> {
         // The directory the real one unpacks into is made as the owner first.
-        let into = if Path::new(src).is_dir() {
+        let into = if src.root()?.is_dir() {
             dest
         } else {
             Path::new(dest)
@@ -367,19 +367,20 @@ impl Env for FakeEnv {
         };
         self.record(&["mkdir", "-p", into], owner.exec_as());
         let mut copied = Vec::new();
-        tree::walk(Path::new(src), Links::Keep, Denied::Fail, &mut |e| {
-            if !e.meta.is_dir() {
-                let to = if e.relative.is_empty() {
+        // (Links are not modelled: a fake keeps files.)
+        src.walk(&mut |node| {
+            if node.kind == Kind::File {
+                let to = if node.relative.is_empty() {
                     dest.to_string()
                 } else {
-                    format!("{}/{}", dest.trim_end_matches('/'), e.relative)
+                    format!("{}/{}", dest.trim_end_matches('/'), node.relative)
                 };
-                let mode = e.meta.permissions().mode() & 0o777;
-                copied.push((to, std::fs::read(e.path)?, mode));
+                let mut bytes = Vec::new();
+                src.open(&node.relative)?.read_to_end(&mut bytes)?;
+                copied.push((to, bytes, node.mode & 0o777));
             }
             Ok(())
-        })
-        .with_context(|| format!("reading {src}"))?;
+        })?;
         let mut owners = self.owners.borrow_mut();
         for (path, _, mode) in &copied {
             owners.insert(path.clone(), (owner.uid, owner.gid));
@@ -775,7 +776,7 @@ impl Env for FakeContainer {
         }
     }
 
-    fn put(&self, src: &str, dest: &str, owner: &ContainerUser) -> Result<()> {
+    fn put(&self, src: &dyn Snapshot, dest: &str, owner: &ContainerUser) -> Result<()> {
         self.env()?.put(src, dest, owner)
     }
 
@@ -848,6 +849,7 @@ impl Container for FakeContainer {
 mod tests {
     use super::*;
     use crate::runtime::Env;
+    use crate::snapshot::DiskSnapshot;
 
     #[test]
     #[should_panic(expected = "FakeEnv: unexpected command")]
@@ -894,7 +896,7 @@ mod tests {
         std::fs::write(src.path().join("a"), "A").unwrap();
         std::fs::write(src.path().join("sub/b"), "B").unwrap();
         let env = FakeEnv::new().with_file("/d/old", "kept");
-        env.cp_in(&src.path().to_string_lossy(), "/d").unwrap();
+        env.cp_in(&DiskSnapshot::at(src.path()), "/d").unwrap();
         assert_eq!(env.file("/d/a").as_deref(), Some("A"));
         assert_eq!(env.file("/d/sub/b").as_deref(), Some("B"));
         assert_eq!(env.file("/d/old").as_deref(), Some("kept"));
@@ -916,7 +918,7 @@ mod tests {
         std::fs::write(src.path().join("f"), "x").unwrap();
         let env = FakeEnv::new();
         env.put(
-            &src.path().join("f").to_string_lossy(),
+            &DiskSnapshot::at(&src.path().join("f")),
             "/home/dev/.local/f",
             &owner,
         )

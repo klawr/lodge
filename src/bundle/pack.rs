@@ -24,13 +24,25 @@ use crate::tree::{self, Denied, Links};
 /// Packs `config` into a bundle file at `output`. The file appears only when it is
 /// complete: it is written beside the destination and renamed into place.
 pub fn pack_to_file(config: &Config, output: &Path, tools: &Toolchain) -> Result<Manifest> {
-    let scratch = TempDir::new("pack")?;
-    let manifest = build(
+    let packer = tools.packer()?;
+    build_tar(
         config,
-        scratch.path(),
-        &mut deps::Resolver::new(tools.deps.as_ref()),
-        tools.elf.as_ref(),
-    )?;
+        output,
+        &mut deps::Resolver::new(packer.deps.as_ref()),
+        packer.elf.as_ref(),
+    )
+}
+
+/// [`build`] in a scratch directory, then written whole as a tar at `output`
+/// (see [`pack_to_file`]).
+pub fn build_tar(
+    config: &Config,
+    output: &Path,
+    deps: &mut deps::Resolver<'_>,
+    elf: &dyn ElfEditor,
+) -> Result<Manifest> {
+    let scratch = TempDir::new("pack")?;
+    let manifest = build(config, scratch.path(), deps, elf)?;
 
     let partial = PathBuf::from(format!("{}.partial", output.display()));
     let written = std::fs::File::create(&partial)
@@ -316,8 +328,11 @@ pub(crate) fn patch_binary(binary: &str, editor: &dyn ElfEditor) -> Result<TempF
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bundle::reader::Bundle;
     use crate::config::{BinaryEntry, DataEntry};
+    use crate::snapshot::{Kind, Snapshot};
     use crate::tools::{self, Ldd, Patchelf};
+    use std::io::Read as _;
 
     fn script_tool(dir: &Path, name: &str) -> BinaryEntry {
         let bin = dir.join(format!("{name}-src"));
@@ -379,17 +394,31 @@ mod tests {
         assert_eq!(manifest.data[1].binary, None);
         assert_eq!(manifest.arch, Arch::host().unwrap().to_string());
 
-        let dest = TempDir::new("pack-dest").unwrap();
-        assert_eq!(archive::extract(&file, dest.path()).unwrap(), manifest);
+        let bundle = Bundle::verified(&file).unwrap();
+        assert_eq!(bundle.manifest(), &manifest);
+        let mut links = Vec::new();
+        bundle
+            .data(0)
+            .walk(&mut |n| {
+                if let Kind::Link(to) = &n.kind {
+                    links.push((n.relative.clone(), to.clone()));
+                }
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(
-            std::fs::read_link(dest.path().join("data/0/link")).unwrap(),
-            Path::new("sub/rc"),
+            links,
+            [("link".to_string(), "sub/rc".to_string())],
             "symlinks stay symlinks"
         );
-        assert_eq!(
-            std::fs::read_to_string(dest.path().join("data/1")).unwrap(),
-            "1"
-        );
+        let mut single = String::new();
+        bundle
+            .data(1)
+            .open("")
+            .unwrap()
+            .read_to_string(&mut single)
+            .unwrap();
+        assert_eq!(single, "1");
         assert!(!out.path().join("b.tar.partial").exists());
     }
 

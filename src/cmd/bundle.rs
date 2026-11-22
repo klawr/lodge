@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use super::{Ctx, ago, human_size};
 use crate::arch::Arch;
 use crate::bundle;
+use crate::bundle::reader::Bundle;
 use crate::bundle::store::{Identity, Replace, Sinks};
 use crate::cli::{BundleCommand, CacheCommand};
 use crate::output::{info, line, note, plural};
@@ -105,7 +106,7 @@ pub fn bundle(ctx: &Ctx, command: BundleCommand) -> Result<()> {
         }
         BundleCommand::Verify { reference } => {
             let (_scratch, tar, _) = fetch(ctx, &reference)?;
-            let manifest = bundle::verify_file(&tar)?;
+            let manifest = Bundle::verified(&tar)?.manifest().clone();
             line!(
                 "ok  {}, {}, {}, id {}",
                 plural(manifest.binaries.len(), "binary", "binaries"),
@@ -121,7 +122,7 @@ pub fn bundle(ctx: &Ctx, command: BundleCommand) -> Result<()> {
 /// Prints what is in the bundle `reference` names, whose tar is at `file`;
 /// `pinned` is the reference made exact, shown when it says more.
 fn inspect(reference: &str, pinned: &str, file: &Path) -> Result<()> {
-    let manifest = bundle::archive::read_manifest(file)?;
+    let manifest = Bundle::open(file)?.manifest().clone();
     let size = std::fs::metadata(file)
         .with_context(|| format!("reading {}", file.display()))?
         .len();

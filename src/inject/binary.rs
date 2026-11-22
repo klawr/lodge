@@ -1,52 +1,9 @@
 use anyhow::{Context, Result, bail};
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 
 use crate::arch::Arch;
-use crate::bundle::elf;
-use crate::bundle::manifest::{BIN_DIR, Binary, Manifest};
-use crate::bundle::source::Prepared;
+use crate::bundle::manifest::{Binary, Manifest};
 use crate::layout::Layout;
 use crate::runtime::{ContainerUser, Env, ExecOpts};
-
-/// Puts the binary into `stage/bin/`, which is sent as a whole to the prefix.
-///
-/// The bundle's copy was relinked when it was packed, so it runs *directly*
-/// against the injected glibc (no ld.so wrapper). Running directly keeps
-/// /proc/self/exe pointing at the binary, which tools like Neovim need when
-/// they re-exec themselves (`--embed`). A dynamic one is staged as a copy whose
-/// interpreter names the dynamic linker in `layout`; a static one as it is.
-pub(super) fn stage_binary(
-    bundle: &Prepared,
-    layout: &Layout,
-    binary: &Binary,
-    stage: &Path,
-) -> Result<()> {
-    let name = &binary.name;
-    let source = bundle.bin(name);
-    let dir = stage.join(BIN_DIR);
-    std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
-    let to = dir.join(name);
-    if !binary.dynamic {
-        // A link costs nothing; a copy is for a bundle cache on another filesystem.
-        if std::fs::hard_link(&source, &to).is_err() {
-            std::fs::copy(&source, &to).with_context(|| format!("staging {}", source.display()))?;
-        }
-        return Ok(());
-    }
-    let linker = bundle
-        .manifest
-        .linker
-        .as_deref()
-        .with_context(|| format!("{name} is dynamic but the bundle names no linker"))?;
-    let mut bytes =
-        std::fs::read(&source).with_context(|| format!("reading {}", source.display()))?;
-    elf::set_interpreter(&mut bytes, &layout.lib_file(linker))
-        .with_context(|| format!("preparing {name} to run from {}", layout.prefix()))?;
-    std::fs::write(&to, &bytes).with_context(|| format!("staging {}", to.display()))?;
-    std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o755))?;
-    Ok(())
-}
 
 /// Where the config asked for an extra wrapper (a script, so any program that
 /// looks for the tool at that path finds it), writes it and returns its path.
@@ -116,11 +73,9 @@ fn install_wrapper(env: &dyn Env, lodge_binary: &str, dest: &str) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle::manifest::Lib;
-    use crate::bundle::source::Origin;
+    use crate::bundle::testing::manifest;
     use crate::runtime::Acting;
     use crate::runtime::fake::FakeEnv;
-    use crate::tmpfile::TempDir;
 
     fn layout() -> Layout {
         Layout::new("/p")
@@ -145,36 +100,12 @@ mod tests {
         }
     }
 
-    /// A bundle directory with one binary `hello`.
-    fn bundle(binary: Binary, arch: &str) -> (TempDir, Prepared) {
-        let dir = TempDir::new("bin-bundle").unwrap();
-        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
-        std::fs::write(dir.path().join("bin/hello"), "#!/bin/sh\necho hi\n").unwrap();
-        let manifest = Manifest {
-            lodge_version: "0".into(),
-            created: 0,
-            arch: arch.into(),
-            linker: None,
-            libs: Vec::<Lib>::new(),
+    /// A manifest for `arch` listing the one binary `hello`.
+    fn manifest_of(binary: Binary, arch: &str) -> Manifest {
+        Manifest {
             binaries: vec![binary],
-            data: vec![],
-            git_safe_directories: vec![],
-        };
-        let prepared = Prepared {
-            dir: dir.path().to_path_buf(),
-            manifest,
-            origin: Origin::Packed,
-            source: None,
-        };
-        (dir, prepared)
-    }
-
-    /// Stages the bundle's first binary for `layout` and returns what was staged.
-    fn staged(bundle: &Prepared, layout: &Layout) -> Result<(TempDir, std::path::PathBuf)> {
-        let stage = TempDir::new("bin-stage").unwrap();
-        stage_binary(bundle, layout, &bundle.manifest.binaries[0], stage.path())?;
-        let file = stage.path().join("bin/hello");
-        Ok((stage, file))
+            ..manifest(arch)
+        }
     }
 
     #[test]
@@ -189,33 +120,17 @@ mod tests {
     }
 
     #[test]
-    fn a_static_binary_is_staged_as_it_is_in_bin() {
-        let (_dir, b) = bundle(hello(None), "x86_64");
-        let (_stage, file) = staged(&b, &layout()).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(file).unwrap(),
-            "#!/bin/sh\necho hi\n"
-        );
-    }
-
-    #[test]
     fn a_wrapper_is_written_only_where_the_config_asked_for_one() {
-        let (_dir, none) = bundle(hello(None), "x86_64");
+        let none = manifest_of(hello(None), "x86_64");
         let env = FakeEnv::new();
         let user = dev();
-        let place = |b: &Prepared| {
-            place_wrapper(
-                &Acting::new(&env, &user),
-                &user,
-                &layout(),
-                &b.manifest.binaries[0],
-            )
-            .unwrap()
+        let place = |m: &Manifest| {
+            place_wrapper(&Acting::new(&env, &user), &user, &layout(), &m.binaries[0]).unwrap()
         };
         assert_eq!(place(&none), None);
         assert!(!env.ran_matching(|_| true), "nothing was written");
 
-        let (_dir, some) = bundle(hello(Some("~/.local/bin/hello")), "x86_64");
+        let some = manifest_of(hello(Some("~/.local/bin/hello")), "x86_64");
         assert_eq!(
             place(&some).as_deref(),
             Some("/home/dev/.local/bin/hello"),
@@ -228,77 +143,21 @@ mod tests {
         );
     }
 
-    /// An ELF64 image with a placeholder interpreter, as `ldg pack` leaves it.
-    fn dynamic_image() -> Vec<u8> {
-        let cap = elf::INTERP_CAPACITY;
-        let mut v = vec![0u8; 128 + cap];
-        v[..4].copy_from_slice(b"\x7fELF");
-        v[4] = 2;
-        v[5] = 1;
-        v[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
-        v[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
-        v[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
-        v[64..68].copy_from_slice(&3u32.to_le_bytes());
-        v[72..80].copy_from_slice(&128u64.to_le_bytes());
-        v[96..104].copy_from_slice(&(cap as u64).to_le_bytes());
-        let placeholder = elf::placeholder_interpreter();
-        v[128..128 + placeholder.len()].copy_from_slice(placeholder.as_bytes());
-        v
-    }
-
-    #[test]
-    fn a_dynamic_binary_is_given_the_interpreter_of_the_prefix_it_goes_to() {
-        let (dir, mut b) = bundle(hello(None), "x86_64");
-        std::fs::write(dir.path().join("bin/hello"), dynamic_image()).unwrap();
-        b.manifest.linker = Some("ld-linux-x86-64.so.2".into());
-        b.manifest.binaries[0].dynamic = true;
-
-        for prefix in ["/p", "/home/dev/.local/share/lodge"] {
-            let (_stage, file) = staged(&b, &Layout::new(prefix)).unwrap();
-            let image = std::fs::read(&file).unwrap();
-            let interp = elf::interpreter(&image).unwrap().unwrap();
-            assert_eq!(interp, format!("{prefix}/lib/ld-linux-x86-64.so.2"));
-            assert_eq!(
-                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
-                0o755
-            );
-        }
-        // The bundle's own copy still holds the placeholder.
-        let kept = std::fs::read(dir.path().join("bin/hello")).unwrap();
-        assert_eq!(
-            elf::interpreter(&kept).unwrap(),
-            Some(elf::placeholder_interpreter())
-        );
-    }
-
-    #[test]
-    fn a_prefix_too_long_for_the_reserved_space_is_refused_by_name() {
-        let (dir, mut b) = bundle(hello(None), "x86_64");
-        std::fs::write(dir.path().join("bin/hello"), dynamic_image()).unwrap();
-        b.manifest.linker = Some("ld.so".into());
-        b.manifest.binaries[0].dynamic = true;
-        let long = Layout::new(format!("/{}", "a".repeat(600)));
-        let err = format!("{:#}", staged(&b, &long).err().unwrap());
-        assert!(err.contains("hello") && err.contains("shorter"), "{err}");
-    }
-
     #[test]
     fn a_bundle_for_another_architecture_is_refused() {
-        let (_dir, b) = bundle(hello(None), "x86_64");
+        let m = manifest_of(hello(None), "x86_64");
         let env = FakeEnv::new().with_output(&["uname", "-m"], "aarch64\n");
-        let err = check_architecture(&env, &b.manifest)
-            .unwrap_err()
-            .to_string();
+        let err = check_architecture(&env, &m).unwrap_err().to_string();
         assert!(err.contains("x86_64") && err.contains("aarch64"), "{err}");
     }
 
     #[test]
     fn matching_architecture_and_bundles_without_binaries_pass() {
-        let (_dir, b) = bundle(hello(None), "x86_64");
+        let m = manifest_of(hello(None), "x86_64");
         let env = FakeEnv::new().with_output(&["uname", "-m"], "x86_64\n");
-        check_architecture(&env, &b.manifest).unwrap();
+        check_architecture(&env, &m).unwrap();
 
-        let mut data_only = b.manifest.clone();
+        let mut data_only = m.clone();
         data_only.binaries.clear();
         data_only.data.push(crate::bundle::manifest::Data {
             dest: "~/.x".into(),
@@ -312,21 +171,15 @@ mod tests {
 
     #[test]
     fn a_real_machine_that_is_not_linux_is_refused_but_a_container_is_never_asked() {
-        let manifest = Manifest {
-            lodge_version: "0".into(),
-            created: 0,
-            arch: "x86_64".into(),
-            linker: None,
-            libs: vec![],
-            binaries: vec![crate::bundle::manifest::Binary {
+        let manifest = manifest_of(
+            Binary {
                 name: "t".into(),
                 dest: None,
                 dynamic: false,
                 hash: "00000000000000aa".into(),
-            }],
-            data: vec![],
-            git_safe_directories: vec![],
-        };
+            },
+            "x86_64",
+        );
         let mac = FakeEnv::new()
             .shared()
             .with_output(&["uname", "-s"], "Darwin\n");

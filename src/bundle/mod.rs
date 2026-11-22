@@ -7,7 +7,8 @@
 //! machine can be used from any machine that can reach a container.
 //!
 //! - [`manifest`]: what a bundle contains, and the rules it must obey
-//! - [`archive`]: writing, reading and verifying the tar
+//! - [`archive`]: writing the tar
+//! - [`reader`]: reading and verifying one in place, as a [`Snapshot`](crate::snapshot::Snapshot)
 //! - [`pack`]: building a bundle from the user's config (`deps` remembers what a `DepReader` said,
 //!   `elf` reads a binary's architecture)
 //! - [`source`]: readying a bundle directory to inject from
@@ -21,23 +22,16 @@ pub mod elf;
 mod hash;
 pub mod manifest;
 pub mod pack;
+pub mod reader;
 pub mod source;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod testing;
 
 use anyhow::Result;
-use std::path::Path;
-
-use manifest::Manifest;
 
 /// The file name `ldg pack` uses when none is given: `lodge-<arch>.tar`, with
 /// the architecture named as the manifest names it.
 pub fn default_file_name() -> Result<String> {
     Ok(format!("lodge-{}.tar", crate::arch::Arch::host()?))
-}
-
-/// Checks that the bundle at `file` is intact: every file the manifest lists is
-/// present and matches its recorded hash. Run after carrying a bundle somewhere.
-pub fn verify_file(file: &Path) -> Result<Manifest> {
-    let scratch = crate::tmpfile::TempDir::new("verify")?;
-    archive::extract(file, scratch.path())
 }

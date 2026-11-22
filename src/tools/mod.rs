@@ -126,11 +126,33 @@ pub struct Pinned {
     pub digest: String,
 }
 
-/// The tools lodge uses on this machine. Built once, in `cmd/`.
-pub struct Toolchain {
+/// What building a bundle takes. Only a machine that can run the programs has
+/// it: see [`Toolchain::packer`].
+pub struct Packer {
     pub deps: Box<dyn DepReader>,
     pub elf: Box<dyn ElfEditor>,
+}
+
+/// Why a machine that has no [`Packer`] cannot build a bundle, and what to do
+/// instead.
+const CANNOT_PACK: &str = "this machine cannot build a bundle (that takes ldd and patchelf, \
+so Linux); use one built elsewhere: `--bundle FILE`, or `bundle = \"…\"` in the config \
+(a file or an `oci://` reference)";
+
+/// The tools lodge uses on this machine. Built once, in `cmd/`.
+pub struct Toolchain {
+    /// `None` on a machine that only uses bundles other machines built.
+    pub packer: Option<Packer>,
     pub oci: Arc<dyn OciFetcher>,
+}
+
+impl Toolchain {
+    /// What building a bundle uses, or an error that says this machine cannot.
+    pub fn packer(&self) -> Result<&Packer> {
+        self.packer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!(CANNOT_PACK))
+    }
 }
 
 /// A registry that is never reached: for tests that must not pull.
@@ -298,8 +320,32 @@ impl OciFetcher for FakeRegistry {
 #[cfg(test)]
 pub(crate) fn external() -> Toolchain {
     Toolchain {
-        deps: Box::new(Ldd),
-        elf: Box::new(Patchelf),
+        packer: Some(Packer {
+            deps: Box::new(Ldd),
+            elf: Box::new(Patchelf),
+        }),
         oci: Arc::new(NoRegistry),
+    }
+}
+
+/// A machine that cannot build a bundle: the tools of [`external`] without the packer.
+#[cfg(test)]
+pub(crate) fn consumer_only() -> Toolchain {
+    Toolchain {
+        packer: None,
+        ..external()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_machine_without_a_packer_says_what_to_do_instead() {
+        let err = consumer_only().packer().err().unwrap().to_string();
+        assert!(err.contains("cannot build a bundle"), "{err}");
+        assert!(err.contains("--bundle") && err.contains("oci://"), "{err}");
+        assert!(external().packer().is_ok());
     }
 }
