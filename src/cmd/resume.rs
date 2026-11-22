@@ -164,6 +164,7 @@ fn describe(entries: &[Entry]) -> Table {
                 Cell::new(e.name.clone(), Tone::Strong),
                 Cell::new(place, Tone::Normal),
                 how,
+                Cell::new(shown(e.bundle.as_deref()), Tone::Muted),
                 Cell::new(format!("{} ago", super::ago(when)), Tone::Muted),
             ]
         })
@@ -175,9 +176,22 @@ fn describe(entries: &[Entry]) -> Table {
             none("`ldg up` in a project or `ldg attach NAME` remembers one; n for a new one, c for the config"),
             none(""),
             none(""),
+            none(""),
         ]);
     }
-    Table::new(vec!["NAME", "WHERE", "VIA", "LAST"], rows, 1)
+    Table::new(vec!["NAME", "WHERE", "VIA", "BUNDLE", "LAST"], rows, 1)
+}
+
+/// The bundle a session was injected from, short enough for a column: a file by
+/// its name, anything with a scheme as it was written, the packed config as `-`.
+fn shown(bundle: Option<&str>) -> String {
+    match bundle {
+        None => "-".into(),
+        Some(reference) if reference.contains("://") => reference.to_string(),
+        Some(path) => std::path::Path::new(path)
+            .file_name()
+            .map_or_else(|| path.to_string(), |n| n.to_string_lossy().into()),
+    }
 }
 
 #[cfg(test)]
@@ -247,7 +261,29 @@ mod tests {
             },
             name: name.into(),
             last_used: now() - age,
+            bundle: None,
         }
+    }
+
+    #[test]
+    fn the_bundle_column_names_a_file_by_its_name_and_a_registry_as_written() {
+        assert_eq!(shown(None), "-");
+        assert_eq!(
+            shown(Some("/home/me/work/lodge-x86_64.tar")),
+            "lodge-x86_64.tar"
+        );
+        assert_eq!(
+            shown(Some("oci://ghcr.io/me/lodge:1")),
+            "oci://ghcr.io/me/lodge:1"
+        );
+    }
+
+    #[test]
+    fn the_table_shows_which_bundle_a_place_was_last_opened_with() {
+        let mut e = entry(project("/home/me/api"), "docker", None, "Demo API", 60);
+        e.bundle = Some("/x/work.tar".into());
+        let rows = describe(&[e]).natural();
+        assert!(rows[0].contains("work.tar"), "{rows:?}");
     }
 
     fn project(path: &str) -> Place {

@@ -122,6 +122,9 @@ data in place, no longer for anything.
 | `s` | add a secret (a name, where its value comes from) |
 | `p` | pack the bundle into a file (Enter takes `lodge-<arch>.tar` here) |
 | `P` | publish the bundle to a registry (Enter takes the one `bundle =` names) |
+
+Enter on the `bundle` line chooses the bundle in use from those on offer (the default, `bundles`, and the config as it is where it can be packed), or lets you type one; the one that was in use stays on offer. A pack or a publish from here lists what it wrote, as `ldg pack` does.
+
 | `o` | work on another config file: the ones beside the default and in the folder `ldg` was started in, or a path typed in full |
 
 `b` and `d` open what this machine has (for programs, the tools it knows that are
@@ -369,6 +372,13 @@ file's folder. A reference with a scheme is not a path: `bundle =
 "oci://ghcr.io/me/lodge:1"` reads the bundle from a registry. `--bundle` on the
 command line (a file or such a reference) overrides it. See
 [Bundles and secrets](bundles-and-secrets.md).
+
+`bundles = ["oci://ghcr.io/me/lodge:2", "~/work.tar"]` lists others to choose
+from, written like `bundle`. With `bundle` (or the packed config, when it is not
+set) they are what `ldg up` offers when it injects into a project it has not opened
+before. `ldg bundle use|add|rm|ls` change both keys without opening the file, and
+`ldg pack -o` adds what it writes. See
+[Several bundles](bundles-and-secrets.md#several-bundles).
 
 ## `[[secret]]`
 

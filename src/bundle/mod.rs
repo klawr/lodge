@@ -17,6 +17,7 @@
 
 pub mod archive;
 pub mod cache;
+pub mod choice;
 pub mod deps;
 pub mod elf;
 mod hash;

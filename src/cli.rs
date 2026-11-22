@@ -78,6 +78,42 @@ pub enum BundleCommand {
         #[arg(value_name = "FILE|oci://REF")]
         reference: String,
     },
+    /// Make a bundle the default, or choose one from those on offer
+    #[command(
+        long_about = "Set `bundle =` in the config, so that `ldg up` and `ldg attach` inject \
+            from it. The bundle is fetched and checked first, so a reference that is wrong \
+            or for another architecture is refused before the config is touched. The \
+            bundle that was the default stays on offer (see `ldg bundle ls`). With \
+            --live the default is the config's own [[binary]] and [[data]] entries, packed \
+            on the spot (Linux only). With neither, you choose from the bundles on offer."
+    )]
+    Use {
+        /// The bundle: a file, or an `oci://` reference
+        #[arg(value_name = "FILE|oci://REF", conflicts_with = "live")]
+        reference: Option<String>,
+        /// Pack the config's entries instead of using a bundle
+        #[arg(long)]
+        live: bool,
+    },
+    /// Put a bundle on offer, without making it the default
+    #[command(
+        long_about = "Add a bundle to `bundles` in the config. When `ldg up` injects into a \
+            project it has not opened before (or with --reinject) and more than one bundle is \
+            on offer, it asks which. `ldg pack -o` adds what it writes."
+    )]
+    Add {
+        /// The bundle: a file, or an `oci://` reference
+        #[arg(value_name = "FILE|oci://REF")]
+        reference: String,
+    },
+    /// Take a bundle off the ones on offer
+    Rm {
+        /// The bundle, as listed by `ldg bundle ls`
+        #[arg(value_name = "FILE|oci://REF")]
+        reference: String,
+    },
+    /// List the bundles on offer; the default is marked
+    Ls,
 }
 
 #[derive(Subcommand)]

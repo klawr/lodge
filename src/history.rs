@@ -74,10 +74,14 @@ pub struct Entry {
     pub name: String,
     /// When it was last opened, in seconds since the Unix epoch.
     pub last_used: u64,
+    /// The bundle the session was injected from, as it was written: a reference,
+    /// none for the config packed on the spot. Shown, not replayed: opening the
+    /// place again uses the bundle the config names then.
+    pub bundle: Option<String>,
 }
 
 impl Entry {
-    fn is(&self, place: &Place, route: &Route) -> bool {
+    pub fn is(&self, place: &Place, route: &Route) -> bool {
         self.place.is(place) && self.route == *route
     }
 }
@@ -89,7 +93,13 @@ pub trait History {
 
     /// Notes that a session was opened in `place`: it becomes the most recent
     /// entry, replacing an earlier one for the same place and route.
-    fn remember(&self, place: Place, route: Route, name: String) -> Result<()>;
+    fn remember(
+        &self,
+        place: Place,
+        route: Route,
+        name: String,
+        bundle: Option<String>,
+    ) -> Result<()>;
 }
 
 /// Puts a session at the front of `entries`, in place of an earlier one for the
@@ -146,7 +156,13 @@ impl History for FileHistory {
         })
     }
 
-    fn remember(&self, place: Place, route: Route, name: String) -> Result<()> {
+    fn remember(
+        &self,
+        place: Place,
+        route: Route,
+        name: String,
+        bundle: Option<String>,
+    ) -> Result<()> {
         let path = self.file()?;
         // A history that can't be read is replaced rather than kept from being
         // written: it is only a convenience, and `entries` says what is wrong.
@@ -161,6 +177,7 @@ impl History for FileHistory {
                 route,
                 name,
                 last_used,
+                bundle,
             },
         );
         if let Some(dir) = path.parent() {
@@ -198,7 +215,13 @@ impl History for Memory {
         Ok(self.0.borrow().clone())
     }
 
-    fn remember(&self, place: Place, route: Route, name: String) -> Result<()> {
+    fn remember(
+        &self,
+        place: Place,
+        route: Route,
+        name: String,
+        bundle: Option<String>,
+    ) -> Result<()> {
         put_first(
             &mut self.0.borrow_mut(),
             Entry {
@@ -206,6 +229,7 @@ impl History for Memory {
                 route,
                 name,
                 last_used: 0,
+                bundle,
             },
         );
         Ok(())
@@ -241,13 +265,13 @@ mod tests {
     fn the_most_recent_place_comes_first_and_a_repeat_moves_up_instead_of_adding() {
         let history = Memory::default();
         history
-            .remember(project("/a"), route(None), "a".into())
+            .remember(project("/a"), route(None), "a".into(), None)
             .unwrap();
         history
-            .remember(project("/b"), route(None), "b".into())
+            .remember(project("/b"), route(None), "b".into(), None)
             .unwrap();
         history
-            .remember(project("/a"), route(None), "a again".into())
+            .remember(project("/a"), route(None), "a again".into(), None)
             .unwrap();
         assert_eq!(names(&history), ["a again", "b"]);
     }
@@ -256,17 +280,17 @@ mod tests {
     fn the_same_folder_through_another_remote_or_target_is_another_place() {
         let history = Memory::default();
         history
-            .remember(project("/a"), route(None), "here".into())
+            .remember(project("/a"), route(None), "here".into(), None)
             .unwrap();
         history
-            .remember(project("/a"), route(Some("me@box")), "there".into())
+            .remember(project("/a"), route(Some("me@box")), "there".into(), None)
             .unwrap();
         let other = Route {
             target: "podman".into(),
             remote: None,
         };
         history
-            .remember(project("/a"), other, "podman".into())
+            .remember(project("/a"), other, "podman".into(), None)
             .unwrap();
         assert_eq!(names(&history), ["podman", "there", "here"]);
     }
@@ -279,10 +303,10 @@ mod tests {
             workdir: workdir.map(Into::into),
         };
         history
-            .remember(attach(None), route(None), "db".into())
+            .remember(attach(None), route(None), "db".into(), None)
             .unwrap();
         history
-            .remember(attach(Some("/srv")), route(None), "db".into())
+            .remember(attach(Some("/srv")), route(None), "db".into(), None)
             .unwrap();
         let entries = history.entries().unwrap();
         assert_eq!(entries.len(), 1);
@@ -290,11 +314,47 @@ mod tests {
     }
 
     #[test]
+    fn a_session_keeps_the_bundle_it_was_injected_from() {
+        let history = Memory::default();
+        history
+            .remember(project("/a"), route(None), "a".into(), Some("x.tar".into()))
+            .unwrap();
+        history
+            .remember(project("/b"), route(None), "b".into(), None)
+            .unwrap();
+        let bundles: Vec<_> = history
+            .entries()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.bundle)
+            .collect();
+        assert_eq!(bundles, [None, Some("x.tar".to_string())]);
+    }
+
+    #[test]
+    fn a_history_written_before_bundles_were_kept_is_still_read() {
+        let dir = TempDir::new("history-old").unwrap();
+        let path = dir.path().join("history.json");
+        std::fs::write(
+            &path,
+            r#"[{"place":{"kind":"project","path":"/a"},"route":{"target":"docker","remote":null},"name":"a","last_used":1}]"#,
+        )
+        .unwrap();
+        let entries = FileHistory::at(path).entries().unwrap();
+        assert_eq!(entries[0].bundle, None);
+    }
+
+    #[test]
     fn only_the_most_recent_places_are_kept() {
         let history = Memory::default();
         for i in 0..MAX_ENTRIES + 5 {
             history
-                .remember(project(&format!("/p{i}")), route(None), format!("p{i}"))
+                .remember(
+                    project(&format!("/p{i}")),
+                    route(None),
+                    format!("p{i}"),
+                    None,
+                )
                 .unwrap();
         }
         let kept = names(&history);
@@ -320,10 +380,10 @@ mod tests {
         let path = dir.path().join("lodge").join("history.json");
         assert!(FileHistory::at(path.clone()).entries().unwrap().is_empty());
         FileHistory::at(path.clone())
-            .remember(project("/a"), route(Some("me@box")), "a".into())
+            .remember(project("/a"), route(Some("me@box")), "a".into(), None)
             .unwrap();
         FileHistory::at(path.clone())
-            .remember(project("/b"), route(None), "b".into())
+            .remember(project("/b"), route(None), "b".into(), None)
             .unwrap();
         let entries = FileHistory::at(path.clone()).entries().unwrap();
         assert_eq!(
@@ -343,7 +403,7 @@ mod tests {
         std::fs::write(&path, "[]").unwrap();
         crate::platform::set_mode(&path, 0o644).unwrap();
         FileHistory::at(path.clone())
-            .remember(project("/a"), route(None), "a".into())
+            .remember(project("/a"), route(None), "a".into(), None)
             .unwrap();
         let mode = crate::platform::mode(&std::fs::metadata(&path).unwrap());
         assert_eq!(mode & 0o777, 0o600, "{mode:o}");
@@ -361,7 +421,7 @@ mod tests {
             "{err}"
         );
         history
-            .remember(project("/a"), route(None), "a".into())
+            .remember(project("/a"), route(None), "a".into(), None)
             .unwrap();
         assert_eq!(names(&history), ["a"]);
     }

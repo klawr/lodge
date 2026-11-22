@@ -618,17 +618,11 @@ impl Finder {
     /// `Some` when the search is over.
     fn apply(&mut self, key: FKey, items: &[Item]) -> Option<Found> {
         if let Some((at, mut text)) = self.editing.take() {
-            match key {
-                FKey::Accept => return Some(Found::Edited(at, text)),
-                FKey::Leave => {}
-                FKey::Type(c) => text.push(c),
-                FKey::Backspace => {
-                    text.pop();
-                }
-                FKey::ClearAll => text.clear(),
-                _ => {}
+            if key == FKey::Accept {
+                return Some(Found::Edited(at, text));
             }
-            if !matches!(key, FKey::Leave) {
+            edit_text(&mut text, key);
+            if key != FKey::Leave {
                 self.editing = Some((at, text));
             }
             return None;
@@ -645,16 +639,8 @@ impl Finder {
                     }
                 }
             }
-            FKey::Type(c) => {
-                self.query.push(c);
-                self.refresh(items);
-            }
-            FKey::Backspace => {
-                self.query.pop();
-                self.refresh(items);
-            }
-            FKey::ClearAll => {
-                self.query.clear();
+            FKey::Type(_) | FKey::Backspace | FKey::ClearAll => {
+                edit_text(&mut self.query, key);
                 self.refresh(items);
             }
             FKey::Prev | FKey::Next => {
@@ -1071,6 +1057,78 @@ pub fn view(question: &str, doc: &Doc, hotkeys: &[Hotkey]) -> io::Result<Picked>
     }
 }
 
+/// How a line typed in [`input`] ended.
+pub enum Typed {
+    /// What was typed, as Enter left it (maybe nothing).
+    Line(String),
+    Left,
+    /// The terminal can't be taken over for single keys; ask some other way.
+    NoRawMode,
+}
+
+/// What a key does to a line of text being typed, when it is one that edits:
+/// whether it did.
+fn edit_text(text: &mut String, key: FKey) -> bool {
+    match key {
+        FKey::Type(c) => text.push(c),
+        FKey::Backspace => {
+            text.pop();
+        }
+        FKey::ClearAll => text.clear(),
+        _ => return false,
+    }
+    true
+}
+
+fn input_frame(question: &str, text: &str, width: usize) -> Vec<Line> {
+    vec![
+        Line::of(format!(" {question}"), Tone::Strong),
+        Line::of("", Tone::Normal),
+        Line {
+            spans: vec![
+                Span::new(" > ", Tone::Muted),
+                Span::new(text, Tone::Normal),
+                Span::new("▏", Tone::Accent),
+            ],
+            selected: false,
+        },
+        Line::of("", Tone::Normal),
+        Line::of(" Enter accept · Esc cancel · ctrl-u clear", Tone::Muted),
+    ]
+    .into_iter()
+    .map(|l| l.clipped(width))
+    .collect()
+}
+
+/// Asks for a line of text on the alternate screen, like the lists, so the
+/// person is not thrown out to the shell to answer.
+pub fn input(question: &str) -> io::Result<Typed> {
+    let Ok(_raw) = RawMode::enter() else {
+        return Ok(Typed::NoRawMode);
+    };
+    let mut err = io::stderr();
+    let mut text = String::new();
+    loop {
+        let (columns, _) = usable_size(terminal::size()?);
+        draw(
+            &mut err,
+            &input_frame(question, &text, usize::from(columns)),
+            usize::from(columns),
+        )?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        match map_find_key(key) {
+            Some(FKey::Accept) => return Ok(Typed::Line(text)),
+            Some(FKey::Leave) => return Ok(Typed::Left),
+            Some(key) => {
+                edit_text(&mut text, key);
+            }
+            None => {}
+        }
+    }
+}
+
 /// Prints one span in the look its tone has. Colour is only the terminal's own
 /// cyan, so a theme decides what it is, and crossterm leaves it out when
 /// `NO_COLOR` is set; bold and dim stay. A selected line is reversed as a whole,
@@ -1125,6 +1183,20 @@ mod tests {
 
     fn plain(c: char) -> Option<Key> {
         press(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn typing_edits_a_line_and_other_keys_leave_it_alone() {
+        let mut t = String::new();
+        for c in "abc".chars() {
+            assert!(edit_text(&mut t, FKey::Type(c)));
+        }
+        assert!(edit_text(&mut t, FKey::Backspace));
+        assert_eq!(t, "ab");
+        assert!(!edit_text(&mut t, FKey::Accept));
+        assert_eq!(t, "ab");
+        assert!(edit_text(&mut t, FKey::ClearAll));
+        assert_eq!(t, "");
     }
 
     #[test]

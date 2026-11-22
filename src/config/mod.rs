@@ -42,6 +42,11 @@ pub struct Config<S = SecretDecl> {
     /// file path is relative to this file's folder.
     #[serde(default)]
     pub bundle: Option<String>,
+    /// Other bundles to choose from, as `bundle` is written. `ldg up` offers them
+    /// (with `bundle`, or the packed config when that is not set) when it injects
+    /// into a project it has not opened before. `ldg pack -o` adds what it writes.
+    #[serde(default)]
+    pub bundles: Vec<String>,
     /// Programs to inject, each with the shared libraries it needs.
     #[serde(default, rename = "binary")]
     pub binaries: Vec<BinaryEntry>,
@@ -67,6 +72,7 @@ impl<S> Default for Config<S> {
             target: None,
             targets: BTreeMap::new(),
             bundle: None,
+            bundles: Vec::new(),
             binaries: Vec::new(),
             data: Vec::new(),
             session: SessionConfig::default(),
@@ -221,6 +227,20 @@ fn resolve_reference(config_file: &Path, reference: String) -> String {
         .into_owned()
 }
 
+/// A bundle reference for writing into the config from somewhere else than the
+/// file's folder: a path made absolute (against the folder lodge runs in), so it
+/// means the same wherever the config is read from; a `~/…` path or a reference
+/// with a scheme is kept as it is.
+pub fn absolute_reference(reference: &str) -> String {
+    if reference.contains("://") || reference.starts_with('~') {
+        return reference.to_string();
+    }
+    std::path::absolute(reference).map_or_else(
+        |_| reference.to_string(),
+        |p| p.to_string_lossy().into_owned(),
+    )
+}
+
 fn resolve_against(config_file: &Path, path: PathBuf) -> PathBuf {
     let path = expand_tilde(path);
     if path.is_absolute() {
@@ -356,6 +376,7 @@ impl Config {
             target,
             targets,
             bundle,
+            bundles,
             mut binaries,
             mut data,
             session,
@@ -382,6 +403,10 @@ impl Config {
             target,
             targets,
             bundle: bundle.map(|b| resolve_reference(path, b)),
+            bundles: bundles
+                .into_iter()
+                .map(|b| resolve_reference(path, b))
+                .collect(),
             binaries,
             data,
             session,
@@ -636,6 +661,24 @@ mod tests {
                 .unwrap(),
             "oci://ghcr.io/me/lodge:1"
         );
+    }
+
+    #[test]
+    fn the_listed_bundles_are_read_like_the_default_one() {
+        let c = parse("bundles = [\"b.tar\", \"oci://ghcr.io/me/lodge:2\"]").unwrap();
+        assert_eq!(c.bundles, ["/srv/lodge/b.tar", "oci://ghcr.io/me/lodge:2"]);
+        assert!(parse("").unwrap().bundles.is_empty());
+    }
+
+    #[test]
+    fn a_reference_written_into_the_config_keeps_its_scheme_and_its_tilde() {
+        assert_eq!(
+            absolute_reference("oci://ghcr.io/me/lodge:1"),
+            "oci://ghcr.io/me/lodge:1"
+        );
+        assert_eq!(absolute_reference("~/x.tar"), "~/x.tar");
+        assert!(Path::new(&absolute_reference("x.tar")).is_absolute());
+        assert!(absolute_reference("x.tar").ends_with("x.tar"));
     }
 
     #[test]

@@ -4,6 +4,8 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 use super::Ctx;
+use super::bundle as bundle_cmd;
+use crate::bundle::choice;
 use crate::config::Config;
 use crate::history::Place;
 use crate::output::note;
@@ -26,15 +28,66 @@ pub fn up(
 ) -> Result<()> {
     let project = ctx.project(path)?;
     let config = ctx.config()?;
-    // Ready the bundle first, so a problem with it fails before anything starts.
-    let prepared = bundle::source::prepare(&config, bundle, &ctx.bundles, &ctx.tools)?;
+    let place = Place::Project {
+        path: project.clone(),
+    };
+    // Which bundle comes first, and is readied before anything starts, so a
+    // problem with it fails before a container is made.
+    let bundle = choose_bundle(ctx, &config, bundle, &place, reinject)?;
+    let prepared = bundle::source::prepare(&config, bundle.as_deref(), &ctx.bundles, &ctx.tools)?;
     // How an endpoint is made, or found, is the endpoints' business; which
     // endpoints is chosen once, in `cmd::run`.
     let attached = ctx.endpoints.provision(&project, build)?;
-    let place = Place::Project { path: project };
+    let used = bundle.or_else(|| config.bundle.clone());
     attach(
-        ctx, &attached, &config, &prepared, reinject, no_attach, place,
+        ctx,
+        &attached,
+        &config,
+        &Injection {
+            prepared: &prepared,
+            used: used.as_deref(),
+            reinject,
+            no_attach,
+        },
+        place,
     )
+}
+
+/// A bundle for a message: its id, and where it came from when that is known.
+fn describe(id: &str, source: Option<&str>) -> String {
+    match source {
+        Some(source) => format!("bundle {id} ({source})"),
+        None => format!("bundle {id}"),
+    }
+}
+
+/// Which bundle this run injects from, as a reference that overrides the config's
+/// `bundle` (`None`: the config's default). What was asked for with `--bundle` is
+/// not questioned. Otherwise, when an injection is about to happen into a place
+/// not opened before (or `--reinject` says to inject again) and the config puts
+/// more than one bundle on offer, the person is asked which. Nobody to ask, or
+/// declining, is the default.
+fn choose_bundle(
+    ctx: &Ctx,
+    config: &Config,
+    explicit: Option<&str>,
+    place: &Place,
+    reinject: bool,
+) -> Result<Option<String>> {
+    if explicit.is_some() {
+        return Ok(explicit.map(str::to_string));
+    }
+    let default = choice::default(config);
+    let offered = choice::options(&default, &config.bundles);
+    if offered.len() < 2 || !(reinject || !ctx.knows(place)) || !ctx.choose.can_ask() {
+        return Ok(None);
+    }
+    let question = format!("Which bundle for {}?", place.fallback_name());
+    let chosen = bundle_cmd::pick(ctx.choose.as_ref(), &question, &offered, &default)?;
+    Ok(match chosen {
+        Some(c) if c != default => c.reference().map(str::to_string),
+        _ => None,
+    })
 }
 
 /// Works in a container that is running and that lodge did not make: the same
@@ -57,8 +110,12 @@ pub fn attach_to(
              containers it did not make"
         );
     }
-    let prepared = bundle::source::prepare(&config, bundle, &ctx.bundles, &ctx.tools)?;
-    let workdir_flag = workdir.clone();
+    let place = Place::Container {
+        name: name.to_string(),
+        workdir: workdir.clone(),
+    };
+    let bundle = choose_bundle(ctx, &config, bundle, &place, reinject)?;
+    let prepared = bundle::source::prepare(&config, bundle.as_deref(), &ctx.bundles, &ctx.tools)?;
     let workdir = match workdir {
         Some(dir) => dir,
         None => ContainerUser::resolve(container.as_ref(), None)?.home,
@@ -74,13 +131,29 @@ pub fn attach_to(
         remote_user: None,
         post_attach: None,
     };
-    let place = Place::Container {
-        name: name.to_string(),
-        workdir: workdir_flag,
-    };
+    let used = bundle.or_else(|| config.bundle.clone());
     attach(
-        ctx, &attached, &config, &prepared, reinject, no_attach, place,
+        ctx,
+        &attached,
+        &config,
+        &Injection {
+            prepared: &prepared,
+            used: used.as_deref(),
+            reinject,
+            no_attach,
+        },
+        place,
     )
+}
+
+/// What this run injects, and whether it may be skipped or must be done again.
+struct Injection<'a> {
+    prepared: &'a bundle::source::Prepared,
+    /// The reference the bundle was asked for by, for the history; `None` for the
+    /// config packed on the spot.
+    used: Option<&'a str>,
+    reinject: bool,
+    no_attach: bool,
 }
 
 /// Works in an endpoint that is up: forwards its ports, injects (unless that was
@@ -91,11 +164,15 @@ fn attach(
     ctx: &Ctx,
     attached: &Attached,
     config: &Config,
-    prepared: &bundle::source::Prepared,
-    reinject: bool,
-    no_attach: bool,
+    injection: &Injection,
     place: Place,
 ) -> Result<()> {
+    let Injection {
+        prepared,
+        used,
+        reinject,
+        no_attach,
+    } = *injection;
     let container = attached.container.as_ref();
     // After provisioning, which may have changed the user's uid.
     let user = ContainerUser::resolve(container, attached.remote_user.as_deref())?;
@@ -112,8 +189,13 @@ fn attach(
         Some(found) => {
             if found.bundle != prepared.bundle.manifest().id() {
                 note!(
-                    "what is injected is out of date (your config or ldg changed); \
-                     `ldg up --reinject` updates it"
+                    "what is injected is out of date: the container has {}, this run uses {}; \
+                     `ldg up --reinject` updates it",
+                    describe(&found.bundle, found.source.as_deref()),
+                    describe(
+                        prepared.bundle.manifest().id().as_str(),
+                        prepared.source.as_deref()
+                    ),
                 );
             }
             found.layout
@@ -127,7 +209,7 @@ fn attach(
     if no_attach {
         return Ok(());
     }
-    ctx.remember(place, attached.name.as_deref());
+    ctx.remember(place, attached.name.as_deref(), used);
     attached.run_post_attach();
     let setup = secret::deliver::deliver(
         container,
@@ -234,6 +316,7 @@ mod tests {
             bundles: crate::bundle::store::Stores::new(vec![]),
             sinks: crate::bundle::store::Sinks::new(vec![]),
             history: Box::new(crate::history::Memory::default()),
+            choose: Box::new(Picks::nobody()),
             route: crate::history::Route {
                 target: "docker".into(),
                 remote: None,
@@ -256,9 +339,12 @@ mod tests {
             &ctx,
             &attached,
             &Config::default(),
-            &prepared,
-            false,
-            true,
+            &Injection {
+                prepared: &prepared,
+                used: None,
+                reinject: false,
+                no_attach: true,
+            },
             place,
         )
         .unwrap();
@@ -299,6 +385,7 @@ mod tests {
             bundles: crate::bundle::store::Stores::new(vec![]),
             sinks: crate::bundle::store::Sinks::new(vec![]),
             history: Box::new(crate::history::Memory::default()),
+            choose: Box::new(Picks::nobody()),
             route: crate::history::Route {
                 target: "docker".into(),
                 remote: None,
@@ -322,14 +409,195 @@ mod tests {
             &dir,
         );
         let project = |path: &str| Place::Project { path: path.into() };
-        ctx.remember(project("/work/api"), Some("Demo API"));
-        ctx.remember(project("/work/web"), None);
+        ctx.remember(project("/work/api"), Some("Demo API"), Some("a.tar"));
+        ctx.remember(project("/work/web"), None, None);
         let entries = ctx.history.entries().unwrap();
         let seen: Vec<_> = entries
             .iter()
             .map(|e| (e.name.as_str(), e.route.target.as_str()))
             .collect();
         assert_eq!(seen, [("web", "docker"), ("Demo API", "docker")]);
+        // What each session was injected from is kept with it.
+        let bundles: Vec<_> = entries.iter().map(|e| e.bundle.as_deref()).collect();
+        assert_eq!(bundles, [None, Some("a.tar")]);
+    }
+
+    /// Answers a question with a row, or says there is nobody to ask, and keeps
+    /// what it was asked.
+    struct Picks {
+        row: Option<usize>,
+        can_ask: bool,
+        offered: Rc<RefCell<Vec<Vec<String>>>>,
+    }
+
+    impl Picks {
+        fn nobody() -> Self {
+            Picks {
+                row: None,
+                can_ask: false,
+                offered: Rc::default(),
+            }
+        }
+
+        fn answering(row: Option<usize>) -> (Self, Rc<RefCell<Vec<Vec<String>>>>) {
+            let offered = Rc::new(RefCell::new(Vec::new()));
+            let picks = Picks {
+                row,
+                can_ask: true,
+                offered: offered.clone(),
+            };
+            (picks, offered)
+        }
+    }
+
+    impl crate::cmd::prompt::Choose for Picks {
+        fn can_ask(&self) -> bool {
+            self.can_ask
+        }
+
+        fn choose(&self, _: &str, options: &crate::cmd::table::Table) -> Result<Option<usize>> {
+            self.offered.borrow_mut().push(options.natural());
+            Ok(self.row)
+        }
+    }
+
+    /// A context that asks through `choose`, with `history` already holding the
+    /// places in it.
+    fn ctx_choosing(choose: Picks, known: &[&str], dir: &TempDir) -> Ctx {
+        let mut ctx = ctx_with(
+            Box::new(Devcontainer::new(
+                fake(),
+                Arc::new(FakeLocal::new()),
+                Box::new(Rc::new(FakeRuntime::new(FakeEnv::new))),
+                Arc::new(tools::NoRegistry),
+                Arc::new(NoQuestions),
+            )),
+            dir,
+        );
+        ctx.choose = Box::new(choose);
+        for path in known {
+            ctx.remember(
+                Place::Project {
+                    path: (*path).into(),
+                },
+                None,
+                None,
+            );
+        }
+        ctx
+    }
+
+    fn offering(default: Option<&str>, others: &[&str]) -> Config {
+        Config {
+            bundle: default.map(Into::into),
+            bundles: others.iter().map(|o| o.to_string()).collect(),
+            ..Config::default()
+        }
+    }
+
+    fn project(path: &str) -> Place {
+        Place::Project { path: path.into() }
+    }
+
+    #[test]
+    fn a_new_place_with_bundles_on_offer_asks_and_a_pick_other_than_the_default_is_used() {
+        let dir = TempDir::new("choose-new").unwrap();
+        let (picks, offered) = Picks::answering(Some(1));
+        let ctx = ctx_choosing(picks, &[], &dir);
+        let config = offering(Some("a.tar"), &["b.tar"]);
+        let chosen = choose_bundle(&ctx, &config, None, &project("/new"), false).unwrap();
+        assert_eq!(chosen.as_deref(), Some("b.tar"));
+        let asked = offered.borrow();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].len(), 2, "{asked:?}");
+    }
+
+    #[test]
+    fn picking_the_default_leaves_the_config_to_say_it() {
+        let dir = TempDir::new("choose-default").unwrap();
+        let (picks, _) = Picks::answering(Some(0));
+        let ctx = ctx_choosing(picks, &[], &dir);
+        let config = offering(Some("a.tar"), &["b.tar"]);
+        assert_eq!(
+            choose_bundle(&ctx, &config, None, &project("/new"), false).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn declining_the_question_is_the_default_too() {
+        let dir = TempDir::new("choose-decline").unwrap();
+        let (picks, offered) = Picks::answering(None);
+        let ctx = ctx_choosing(picks, &[], &dir);
+        let config = offering(Some("a.tar"), &["b.tar"]);
+        assert_eq!(
+            choose_bundle(&ctx, &config, None, &project("/new"), false).unwrap(),
+            None
+        );
+        assert_eq!(offered.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_bundle_asked_for_is_not_questioned() {
+        let dir = TempDir::new("choose-flag").unwrap();
+        let (picks, offered) = Picks::answering(Some(1));
+        let ctx = ctx_choosing(picks, &[], &dir);
+        let config = offering(Some("a.tar"), &["b.tar"]);
+        let chosen = choose_bundle(&ctx, &config, Some("c.tar"), &project("/new"), true).unwrap();
+        assert_eq!(chosen.as_deref(), Some("c.tar"));
+        assert!(offered.borrow().is_empty());
+    }
+
+    #[test]
+    fn with_one_bundle_there_is_nothing_to_ask() {
+        let dir = TempDir::new("choose-one").unwrap();
+        let (picks, offered) = Picks::answering(Some(0));
+        let ctx = ctx_choosing(picks, &[], &dir);
+        for config in [offering(Some("a.tar"), &[]), offering(None, &[])] {
+            assert_eq!(
+                choose_bundle(&ctx, &config, None, &project("/new"), true).unwrap(),
+                None
+            );
+        }
+        assert!(offered.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_place_opened_before_is_not_asked_about_unless_it_is_injected_again() {
+        let dir = TempDir::new("choose-known").unwrap();
+        let (picks, offered) = Picks::answering(Some(1));
+        let ctx = ctx_choosing(picks, &["/known"], &dir);
+        let config = offering(Some("a.tar"), &["b.tar"]);
+        let place = project("/known");
+        assert_eq!(
+            choose_bundle(&ctx, &config, None, &place, false).unwrap(),
+            None
+        );
+        assert!(offered.borrow().is_empty());
+        let again = choose_bundle(&ctx, &config, None, &place, true).unwrap();
+        assert_eq!(again.as_deref(), Some("b.tar"));
+        assert_eq!(offered.borrow().len(), 1);
+    }
+
+    #[test]
+    fn without_anybody_to_ask_the_default_is_used_and_nothing_is_asked() {
+        let dir = TempDir::new("choose-nobody").unwrap();
+        let ctx = ctx_choosing(Picks::nobody(), &[], &dir);
+        let config = offering(Some("a.tar"), &["b.tar"]);
+        assert_eq!(
+            choose_bundle(&ctx, &config, None, &project("/new"), true).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn the_packed_config_is_a_choice_when_it_is_the_default() {
+        let dir = TempDir::new("choose-live").unwrap();
+        let (picks, _) = Picks::answering(Some(1));
+        let ctx = ctx_choosing(picks, &[], &dir);
+        let config = offering(None, &["b.tar"]);
+        let chosen = choose_bundle(&ctx, &config, None, &project("/new"), false).unwrap();
+        assert_eq!(chosen.as_deref(), Some("b.tar"));
     }
 
     #[test]

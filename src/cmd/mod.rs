@@ -186,6 +186,8 @@ pub struct Ctx {
     pub forwarder: Box<dyn ForwardDaemon>,
     /// The places sessions were opened in, for a bare `ldg` to offer again.
     pub history: Box<dyn History>,
+    /// How a question with a few answers is put to the person.
+    pub choose: Box<dyn prompt::Choose>,
     /// How this run got here: the target and the remote it works through.
     pub route: Route,
     pub config_path: PathBuf,
@@ -206,11 +208,25 @@ impl Ctx {
     /// Notes that a session is being opened in `place`, under the name the endpoint
     /// gave itself, else the place's own. The history is a convenience: failing to
     /// keep it is said, and never stops the session.
-    pub fn remember(&self, place: Place, name: Option<&str>) {
+    pub fn remember(&self, place: Place, name: Option<&str>, bundle: Option<&str>) {
         let name = name.map_or_else(|| place.fallback_name(), str::to_string);
-        if let Err(e) = self.history.remember(place, self.route.clone(), name) {
+        let bundle = bundle.map(str::to_string);
+        if let Err(e) = self
+            .history
+            .remember(place, self.route.clone(), name, bundle)
+        {
             warning!("could not remember this session in the history: {e:#}");
         }
+    }
+
+    /// Whether a session was opened in `place` through this run's route before.
+    /// An unreadable history knows no place.
+    pub fn knows(&self, place: &Place) -> bool {
+        self.history
+            .entries()
+            .unwrap_or_default()
+            .iter()
+            .any(|e| e.is(place, &self.route))
     }
 
     /// The container `name` (a name or an id) on the target's engine, one lodge
@@ -285,7 +301,13 @@ fn configure_config(config: Option<PathBuf>) -> Result<()> {
         cwd: &cwd,
         bundles: &packer,
     };
-    configure::run(&path, &machine, &prompt::Terminal, &prompt::Terminal)?;
+    configure::run(
+        &path,
+        &machine,
+        &prompt::Terminal,
+        &prompt::Terminal,
+        &prompt::Terminal,
+    )?;
     Ok(())
 }
 
@@ -398,6 +420,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
             project.as_deref(),
         ))),
         history: Box::new(history),
+        choose: Box::new(prompt::Terminal),
         route,
         endpoints,
         bundles: bundle_stores(tools.oci.clone()),

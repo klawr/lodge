@@ -432,6 +432,63 @@ pub fn set_setting(path: &Path, which: Setting, to: Option<&str>) -> Result<()> 
     write(path, &doc)
 }
 
+/// The bundles listed under `bundles`, as written.
+pub fn bundles(path: &Path) -> Result<Vec<String>> {
+    let doc = read(path)?;
+    Ok(doc
+        .get("bundles")
+        .and_then(Item::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Adds `reference` to `bundles`. `false` when it was listed already.
+pub fn add_bundle(path: &Path, reference: &str) -> Result<bool> {
+    let mut list = bundles(path)?;
+    if list.iter().any(|b| b == reference) {
+        return Ok(false);
+    }
+    list.push(reference.to_string());
+    set_bundles(path, &list)?;
+    Ok(true)
+}
+
+/// Takes `reference` out of `bundles`. `false` when it was not there.
+pub fn remove_bundle(path: &Path, reference: &str) -> Result<bool> {
+    let mut list = bundles(path)?;
+    let before = list.len();
+    list.retain(|b| b != reference);
+    if list.len() == before {
+        return Ok(false);
+    }
+    set_bundles(path, &list)?;
+    Ok(true)
+}
+
+/// Writes the list, one reference to a line; no list is no key.
+pub fn set_bundles(path: &Path, list: &[String]) -> Result<()> {
+    let mut doc = read(path)?;
+    if list.is_empty() {
+        doc.remove("bundles");
+    } else {
+        let mut array = Array::new();
+        for reference in list {
+            array.push(reference.as_str());
+        }
+        array.set_trailing_comma(true);
+        for item in array.iter_mut() {
+            item.decor_mut().set_prefix("\n    ");
+        }
+        array.set_trailing("\n");
+        doc["bundles"] = value(array);
+    }
+    write(path, &doc)
+}
+
 /// Where a secret's value comes from, on this machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecretFrom {
@@ -671,6 +728,48 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, text).unwrap();
         (dir, path)
+    }
+
+    #[test]
+    fn a_bundle_is_listed_once_and_what_else_is_written_stays() {
+        let (_dir, path) = file("# mine\ntarget = \"docker\"\n\n[session]\nshell = \"/bin/zsh\"\n");
+        assert!(add_bundle(&path, "/a.tar").unwrap());
+        assert!(add_bundle(&path, "oci://r/x:1").unwrap());
+        assert!(!add_bundle(&path, "/a.tar").unwrap(), "listed already");
+        assert_eq!(bundles(&path).unwrap(), ["/a.tar", "oci://r/x:1"]);
+        let now = std::fs::read_to_string(&path).unwrap();
+        assert!(now.starts_with("# mine\ntarget"), "{now}");
+        assert!(now.contains("[session]\nshell = \"/bin/zsh\""), "{now}");
+        // Still a config lodge loads, with the list before the first table.
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.bundles, ["/a.tar", "oci://r/x:1"]);
+        assert!(
+            now.find("bundles").unwrap() < now.find("[session]").unwrap(),
+            "{now}"
+        );
+    }
+
+    #[test]
+    fn taking_the_last_bundle_off_the_list_takes_the_key_out() {
+        let (_dir, path) = file("bundles = [\"/a.tar\", \"/b.tar\"]\n");
+        assert!(remove_bundle(&path, "/a.tar").unwrap());
+        assert!(
+            !remove_bundle(&path, "/a.tar").unwrap(),
+            "not there any more"
+        );
+        assert_eq!(bundles(&path).unwrap(), ["/b.tar"]);
+        assert!(remove_bundle(&path, "/b.tar").unwrap());
+        let now = std::fs::read_to_string(&path).unwrap();
+        assert!(!now.contains("bundles"), "{now}");
+    }
+
+    #[test]
+    fn listing_a_bundle_in_a_file_that_is_not_there_makes_it() {
+        let dir = TempDir::new("config-edit-new").unwrap();
+        let path = dir.path().join("lodge").join("config.toml");
+        assert!(bundles(&path).unwrap().is_empty());
+        add_bundle(&path, "/a.tar").unwrap();
+        assert_eq!(bundles(&path).unwrap(), ["/a.tar"]);
     }
 
     #[test]

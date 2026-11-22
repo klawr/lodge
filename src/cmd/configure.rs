@@ -17,8 +17,11 @@ use super::add::add_binary;
 use super::browse::{self, Browsed, Want};
 use super::candidates::{self, Candidate, name_from};
 use super::init;
-use super::prompt::{Adding, Ask, Choice, Choose, Doc, DocLine, Hotkey, Item, Pick, Selection};
+use super::prompt::{
+    Adding, Ask, Choice, Choose, Doc, DocLine, Hotkey, Item, Pause, Pick, Selection,
+};
 use super::table::{Cell, Table, Tone};
+use crate::bundle::choice::{self, Offer};
 use crate::bundle::store::Replace;
 use crate::config::Config;
 use crate::config::edit::{
@@ -73,6 +76,9 @@ pub trait Bundles {
     fn default_file(&self) -> Result<String>;
     /// Whether `reference` is a registry (somewhere to publish to) and not a file.
     fn is_registry(&self, reference: &str) -> bool;
+    /// Whether this machine can pack the config, so "the config as it is" is a
+    /// bundle to choose.
+    fn can_pack(&self) -> bool;
 }
 
 /// What the screen works with on this machine.
@@ -133,6 +139,8 @@ struct File {
     binaries: Vec<RawEntry>,
     data: Vec<RawEntry>,
     secrets: Vec<RawSecret>,
+    /// The bundles listed besides the default, as written.
+    bundles: Vec<String>,
     /// What lodge does not know in it, to be shown and taken out.
     unknown: Vec<Unknown>,
     /// Why it does not load, when it does not: the form is shown all the same.
@@ -150,6 +158,7 @@ impl File {
             binaries: edit::list(path, Kind::Binary)?,
             data: edit::list(path, Kind::Data)?,
             secrets: edit::list_secrets(path)?,
+            bundles: edit::bundles(path)?,
             unknown: edit::unknown(path)?,
             problem: Config::load(path).err().map(|e| why(&e)),
         })
@@ -181,7 +190,13 @@ impl File {
     }
 }
 
-pub fn run(path: &Path, machine: &Machine, choose: &dyn Choose, ask: &dyn Ask) -> Result<()> {
+pub fn run(
+    path: &Path,
+    machine: &Machine,
+    choose: &dyn Choose,
+    ask: &dyn Ask,
+    wait: &dyn Pause,
+) -> Result<()> {
     let mut path = path.to_path_buf();
     let mut status = String::new();
     loop {
@@ -202,7 +217,15 @@ pub fn run(path: &Path, machine: &Machine, choose: &dyn Choose, ask: &dyn Ask) -
         let (doc, stops) = form(&file);
         let done = match choose.view(&title, &doc, KEYS)? {
             Some(Choice::Left) => return Ok(()),
-            Some(choice) => act(&mut path, choice, &stops, &file, machine, choose, ask),
+            Some(choice) => act(
+                &mut path,
+                choice,
+                &stops,
+                &file,
+                machine,
+                choose,
+                &Talk { ask, wait },
+            ),
             None => match table(&path, &file, machine, choose, ask)? {
                 Some(done) => done,
                 None => return Ok(()),
@@ -229,6 +252,12 @@ fn why(e: &anyhow::Error) -> String {
 /// What is said of a line that lodge does not know, when it is changed.
 const NOT_USED: &str = "this version of lodge does not use it: press r to remove it";
 
+/// What the person is asked in words, and waited for.
+struct Talk<'a> {
+    ask: &'a dyn Ask,
+    wait: &'a dyn Pause,
+}
+
 /// What a key or Enter on a line of the form does.
 fn act(
     path: &mut PathBuf,
@@ -237,8 +266,9 @@ fn act(
     file: &File,
     machine: &Machine,
     choose: &dyn Choose,
-    ask: &dyn Ask,
+    talk: &Talk,
 ) -> Result<String> {
+    let Talk { ask, wait } = *talk;
     let (key, row) = match choice {
         Choice::Key(key, row) => (Some(key), row),
         Choice::Row(row) => (None, row),
@@ -249,8 +279,8 @@ fn act(
         Some('b') => add(path, Kind::Binary, file, machine, choose, ask),
         Some('d') => add(path, Kind::Data, file, machine, choose, ask),
         Some('s') => add_secret(path, choose, ask),
-        Some('p') => pack(path, machine, ask, None),
-        Some('P') => publish(path, file, machine, ask),
+        Some('p') => pack(path, machine, ask, wait, None),
+        Some('P') => publish(path, file, machine, ask, wait),
         Some('o') => open_file(path, machine, choose, ask),
         Some('r') => match stop {
             Some(Stop::Entry { kind, entry, .. }) => {
@@ -281,6 +311,7 @@ fn act(
             None => Ok(String::new()),
         },
         None => match stop {
+            Some(Stop::Setting(Setting::Bundle)) => edit_bundle(path, file, machine, choose, ask),
             Some(Stop::Setting(which)) => edit_setting(path, which, file, choose, ask),
             Some(Stop::Entry { kind, entry, field }) => edit_field(
                 path,
@@ -374,6 +405,12 @@ fn form(file: &File) -> (Doc, Vec<Stop>) {
     if file.setting(Setting::Bundle).is_some() {
         f.text(
             "# a bundle is used instead of the entries below: pack again to use a change",
+            Tone::Muted,
+        );
+    }
+    if !file.bundles.is_empty() {
+        f.text(
+            format!("# also on offer: {}", file.bundles.join(", ")),
             Tone::Muted,
         );
     }
@@ -525,10 +562,8 @@ fn edit_setting(
                 None => return Ok(String::new()),
             }
         }
-        Setting::Bundle => match ask.ask("bundle: a file, or oci://… (a registry)")? {
-            Some(t) => t,
-            None => return Ok(String::new()),
-        },
+        // Chosen, not typed, in `edit_bundle`.
+        Setting::Bundle => anyhow::bail!("the bundle is chosen with `edit_bundle`"),
         Setting::Shell => match ask.ask("shell in the container")? {
             Some(t) => t,
             None => return Ok(String::new()),
@@ -541,6 +576,53 @@ fn edit_setting(
     let _ = file;
     edit::set_setting(path, which, Some(&typed))?;
     Ok(format!("{} is {typed}", which.key()))
+}
+
+/// Chooses the bundle in use: from the default and the others on offer (and the
+/// config as it is, where it can be packed), or one typed. With nothing to choose
+/// from, it is typed. The bundle that was in use stays on offer.
+fn edit_bundle(
+    path: &Path,
+    file: &File,
+    machine: &Machine,
+    choose: &dyn Choose,
+    ask: &dyn Ask,
+) -> Result<String> {
+    let current = file
+        .setting(Setting::Bundle)
+        .map(|b| b.trim_matches('"').to_string())
+        .map_or(Offer::Live, Offer::Reference);
+    let options = choice::selectable(&current, &file.bundles, machine.bundles.can_pack());
+    let typed = || ask.ask("bundle: a file, or oci://… (a registry)");
+    let new = if options.len() < 2 {
+        match typed()? {
+            Some(reference) => Offer::Reference(reference),
+            None => return Ok(String::new()),
+        }
+    } else {
+        let mut rows: Vec<(&str, &str)> = options
+            .iter()
+            .map(|c| (c.label(), if *c == current { "in use" } else { "" }))
+            .collect();
+        rows.push(("(type one)", "a file, or oci://… (a registry)"));
+        match pick_one(choose, "Use which bundle", &rows)? {
+            None => return Ok(String::new()),
+            Some(i) if i < options.len() => options[i].clone(),
+            Some(_) => match typed()? {
+                Some(reference) => Offer::Reference(reference),
+                None => return Ok(String::new()),
+            },
+        }
+    };
+    if new == current {
+        return Ok(format!("{} is in use already", new.label()));
+    }
+    edit::set_setting(path, Setting::Bundle, new.reference())?;
+    let kept = choice::after_switch(&file.bundles, &current, &new);
+    if kept != file.bundles {
+        edit::set_bundles(path, &kept)?;
+    }
+    Ok(format!("bundle is {}", new.label()))
 }
 
 fn clear_setting(path: &Path, which: Setting) -> Result<String> {
@@ -949,36 +1031,41 @@ fn clear_secret(path: &Path, secret: &RawSecret, field: SecretField) -> Result<S
 
 // ── the bundle ───────────────────────────────────────────────────────────────
 
-/// Waits for Enter, so what packing printed can be read before the form is drawn
-/// over it.
-fn pause(ask: &dyn Ask) {
-    // Nobody to ask is nobody to wait for.
-    drop(ask.ask("press Enter to go on"));
-}
-
 /// Packs the config at `path` into `output` and waits, so the person can read what
 /// was printed, as an error or as the account of what was made.
-fn pack_into(path: &Path, machine: &Machine, ask: &dyn Ask, output: &str) -> Result<()> {
+fn pack_into(path: &Path, machine: &Machine, wait: &dyn Pause, output: &str) -> Result<()> {
     let made = machine.bundles.pack(path, Some(output), Replace::Yes);
     if let Err(e) = &made {
         warning!("{e:#}");
     }
-    pause(ask);
+    wait.pause();
     made
 }
 
-fn pack(path: &Path, machine: &Machine, ask: &dyn Ask, _: Option<&str>) -> Result<String> {
+fn pack(
+    path: &Path,
+    machine: &Machine,
+    ask: &dyn Ask,
+    wait: &dyn Pause,
+    _: Option<&str>,
+) -> Result<String> {
     let default = machine.bundles.default_file()?;
     let output = ask
         .ask(&format!("write the bundle to [{default}]"))?
         .unwrap_or(default);
-    pack_into(path, machine, ask, &output)?;
+    pack_into(path, machine, wait, &output)?;
     Ok(format!("packed into {output}"))
 }
 
 /// Publishes the bundle to a registry: the reference the config already names,
 /// when it names one, or one typed.
-fn publish(path: &Path, file: &File, machine: &Machine, ask: &dyn Ask) -> Result<String> {
+fn publish(
+    path: &Path,
+    file: &File,
+    machine: &Machine,
+    ask: &dyn Ask,
+    wait: &dyn Pause,
+) -> Result<String> {
     let current = file
         .setting(Setting::Bundle)
         .map(|b| b.trim_matches('"').to_string())
@@ -995,7 +1082,7 @@ fn publish(path: &Path, file: &File, machine: &Machine, ask: &dyn Ask) -> Result
     if !machine.bundles.is_registry(&reference) {
         anyhow::bail!("`{reference}` is a file, not a registry: use `p` to pack to a file");
     }
-    pack_into(path, machine, ask, &reference)?;
+    pack_into(path, machine, wait, &reference)?;
     Ok(format!("published {reference}"))
 }
 
@@ -1205,6 +1292,7 @@ mod tests {
     struct Packs {
         asked: RefCell<Vec<(PathBuf, Option<String>)>>,
         fail: bool,
+        can_pack: bool,
     }
     impl Bundles for Packs {
         fn pack(&self, config: &Path, output: Option<&str>, _: Replace) -> Result<()> {
@@ -1221,6 +1309,9 @@ mod tests {
         }
         fn is_registry(&self, reference: &str) -> bool {
             reference.contains("://")
+        }
+        fn can_pack(&self) -> bool {
+            self.can_pack
         }
     }
 
@@ -1291,11 +1382,15 @@ mod tests {
         }
     }
 
+    struct NoWait;
+    impl Pause for NoWait {
+        fn pause(&self) {}
+    }
+
     struct Typed(RefCell<Vec<Option<&'static str>>>);
     impl Ask for Typed {
         fn ask(&self, _: &str) -> Result<Option<String>> {
             let mut left = self.0.borrow_mut();
-            // Past the script: the pause after packing, and nothing is typed.
             Ok(if left.is_empty() {
                 None
             } else {
@@ -1333,7 +1428,14 @@ mod tests {
             cwd: dir.path(),
             bundles: &packs,
         };
-        run(&config, &machine, &screen, &Typed(RefCell::new(typed))).unwrap();
+        run(
+            &config,
+            &machine,
+            &screen,
+            &Typed(RefCell::new(typed)),
+            &NoWait,
+        )
+        .unwrap();
         Run {
             config: std::fs::read_to_string(&config).unwrap(),
             screen,
@@ -1414,6 +1516,67 @@ mod tests {
         assert!(
             text.contains("a bundle is used instead of the entries"),
             "{text}"
+        );
+    }
+
+    const WITH_BUNDLES: &str = "bundle = \"a.tar\"\nbundles = [\"b.tar\"]\n";
+
+    #[test]
+    fn the_bundle_in_use_is_chosen_from_those_on_offer_and_the_old_one_stays_on_offer() {
+        let screen = Screen {
+            views: RefCell::new(vec![Choice::Row(1), Choice::Left]),
+            picks: RefCell::new(vec![Some(1)]),
+            ..Screen::default()
+        };
+        let r = drive(WITH_BUNDLES, screen, vec![]);
+        assert!(r.config.contains("bundle = \"b.tar\""), "{}", r.config);
+        assert!(r.config.contains("bundles = ["), "{}", r.config);
+        assert_eq!(
+            edit::bundles(&r.dir.path().join("config.toml")).unwrap(),
+            ["a.tar"]
+        );
+        // The form says what else is on offer.
+        let shown = r.screen.shown.borrow();
+        assert!(
+            shown[0].1.iter().any(|l| l == "# also on offer: b.tar"),
+            "{:?}",
+            shown[0].1
+        );
+    }
+
+    #[test]
+    fn a_bundle_can_still_be_typed_when_others_are_on_offer() {
+        let screen = Screen {
+            views: RefCell::new(vec![Choice::Row(1), Choice::Left]),
+            // a.tar, b.tar, then "(type one)".
+            picks: RefCell::new(vec![Some(2)]),
+            ..Screen::default()
+        };
+        let r = drive(WITH_BUNDLES, screen, vec![Some("c.tar")]);
+        assert!(r.config.contains("bundle = \"c.tar\""), "{}", r.config);
+        assert_eq!(
+            edit::bundles(&r.dir.path().join("config.toml")).unwrap(),
+            ["b.tar", "a.tar"]
+        );
+    }
+
+    #[test]
+    fn the_config_as_it_is_is_a_choice_where_it_can_be_packed() {
+        let screen = Screen {
+            views: RefCell::new(vec![Choice::Row(1), Choice::Left]),
+            // a.tar, b.tar, the config, "(type one)".
+            picks: RefCell::new(vec![Some(2)]),
+            ..Screen::default()
+        };
+        let packs = Packs {
+            can_pack: true,
+            ..Packs::default()
+        };
+        let r = drive_with(WITH_BUNDLES, screen, vec![], packs);
+        assert!(!r.config.contains("bundle = "), "{}", r.config);
+        assert_eq!(
+            edit::bundles(&r.dir.path().join("config.toml")).unwrap(),
+            ["b.tar", "a.tar"]
         );
     }
 
@@ -1627,11 +1790,11 @@ mod tests {
     }
 
     #[test]
-    fn p_packs_into_a_file_and_asks_again_to_wait_and_a_failure_is_shown_and_said() {
+    fn p_packs_into_a_file_and_a_failure_is_shown_and_said() {
         let r = drive(
             FILE,
             views(vec![Choice::Key('p', 0), Choice::Key('p', 0), Choice::Left]),
-            vec![None, None, Some("out/mine.tar"), None],
+            vec![None, Some("out/mine.tar")],
         );
         let asked = r.packs.asked.borrow();
         assert_eq!(
@@ -1677,7 +1840,7 @@ mod tests {
         let r = drive(
             "bundle = \"oci://ghcr.io/me/lodge:1\"\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\n",
             views(vec![Choice::Key('P', 0), Choice::Key('P', 0), Choice::Left]),
-            vec![None, None, Some("oci://other/x:2")],
+            vec![None, Some("oci://other/x:2")],
         );
         let asked = r.packs.asked.borrow();
         assert_eq!(
@@ -1855,7 +2018,7 @@ mod tests {
             bundles: &Packs::default(),
         };
         let typed = Typed(RefCell::new(vec![Some("/bin/true")]));
-        run(&config, &machine, &Words(screen), &typed).unwrap();
+        run(&config, &machine, &Words(screen), &typed, &NoWait).unwrap();
         let now = std::fs::read_to_string(&config).unwrap();
         assert!(!now.contains("name = \"b\""), "{now}");
         assert!(now.contains("[[data]]\npath = \"/bin/true\""), "{now}");

@@ -123,6 +123,42 @@ where it came from (`source`: the digest, for a registry), which answers "what i
 actually in my container?". `ldg doctor` only looks a bundle up, as `up` would: it
 says what the tag resolves to and whether it is cached, and fetches nothing.
 
+### Several bundles
+
+A config can name one bundle as the default (`bundle =`, or the packed config when
+it is not set) and list others (`bundles = [...]`, each written like `bundle`).
+Together they are what is **on offer**.
+
+```sh
+ldg bundle ls                       # what is on offer; the default is marked
+ldg bundle use oci://ghcr.io/me/lodge:2   # make it the default (fetched and checked first)
+ldg bundle use --live               # the default is the config's own entries, packed (Linux)
+ldg bundle use                      # choose from what is on offer
+ldg bundle add ~/work.tar           # put one on offer without making it the default
+ldg bundle rm ~/work.tar
+```
+
+- `use` fetches and checks the bundle **before** it touches the config, so a wrong
+  reference, or an image for another architecture, changes nothing. The bundle that
+  was the default stays on offer, and one that was on offer and is now the default
+  is no longer listed as well.
+- `ldg pack -o …` puts what it wrote on offer, a file by its absolute path and a
+  registry as written (the tag, not the digest). It does that when the config file
+  exists, and only says so if it cannot.
+- A container keeps the bundle it was injected from. After switching, `ldg up
+  --reinject` (or `--reinject -b REF` for one container only) injects the new one,
+  replacing what the old one placed. When what is injected differs from what a run
+  would use, `ldg up` says which bundle each side has. `ldg status` shows the one
+  in the container.
+- **Asking.** When `ldg up` or `ldg attach` is about to inject, with no `--bundle`,
+  into a place it has no history for (a new project) or with `--reinject`, and more
+  than one bundle is on offer, it asks which. Declining, or having no terminal
+  (`--no-attach`, CI, a pipe), takes the default. What you answered is used for that
+  run and kept in the history; the config is not changed.
+- The history (a bare `ldg`) shows the bundle each place was last opened with. It is
+  shown, not replayed: opening a place again uses the default.
+- The config screen (`c`) chooses the bundle in use on its `bundle` line.
+
 ## Secrets
 
 Things you want in the container but must **not** be in a bundle (an API key, a

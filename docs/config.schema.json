@@ -183,6 +183,14 @@
         "null"
       ]
     },
+    "bundles": {
+      "default": [],
+      "description": "Other bundles to choose from, as `bundle` is written. `ldg up` offers them\n(with `bundle`, or the packed config when that is not set) when it injects\ninto a project it has not opened before. `ldg pack -o` adds what it writes.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "data": {
       "default": [],
       "description": "Files and directories to inject, as they are.",

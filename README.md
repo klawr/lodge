@@ -96,6 +96,7 @@ for where to put them). Man page: `ldg man | man -l -`.
 | `ldg inject [ls]`, `add binary\|data …`, `rm binary\|data …` | List, add or remove the `[[binary]]` and `[[data]]` entries of your config without opening it (comments are kept). A program is added with what sits beside it. |
 | `ldg pack [-o FILE\|oci://REF]` | Pack your tools and their data into a portable bundle: a file (`lodge-<arch>.tar`), or published to a registry. |
 | `ldg bundle inspect\|verify FILE` | Show what a bundle holds; check it is intact. |
+| `ldg bundle use\|add\|rm\|ls` | Choose the default bundle (a file, `oci://…`, or `--live` for your config), and keep others on offer to pick from. |
 | `ldg cache [clear]` | Show or clear the cache of prepared bundles. |
 | `ldg completions SHELL`, `ldg man` | Shell completions and the man page. |
 

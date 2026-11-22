@@ -41,6 +41,13 @@ pub enum Selection {
 
 /// Asks the person to pick one of a few things.
 pub trait Choose {
+    /// Whether there is anybody to ask. A command that can go on with a default
+    /// asks only when this is so; one that needs the answer just asks, and gets
+    /// the error.
+    fn can_ask(&self) -> bool {
+        true
+    }
+
     /// The index of the option picked, or `None` when the person declines. An
     /// error when there is nobody to ask.
     fn choose(&self, question: &str, options: &Table) -> Result<Option<usize>>;
@@ -128,17 +135,45 @@ pub trait Ask {
     fn ask(&self, question: &str) -> Result<Option<String>>;
 }
 
+/// Waits for the person to have read what was just printed.
+pub trait Pause {
+    /// Waits for Enter, on the screen the person is already looking at. Nobody to
+    /// ask is nobody to wait for.
+    fn pause(&self);
+}
+
 impl Ask for Terminal {
     fn ask(&self, question: &str) -> Result<Option<String>> {
-        if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-            bail!("cannot ask \"{question}\" without a terminal");
-        }
-        prompt!("{question} > ");
-        let mut line = String::new();
-        io::stdin().lock().read_line(&mut line)?;
+        Self::check(question)?;
+        let line = match select::input(question)? {
+            select::Typed::Line(line) => line,
+            select::Typed::Left => return Ok(None),
+            // A terminal that can't give single keys: type on the line below.
+            select::Typed::NoRawMode => {
+                prompt!("{question} > ");
+                read_line()?
+            }
+        };
         let line = line.trim();
         Ok((!line.is_empty()).then(|| line.to_string()))
     }
+}
+
+impl Pause for Terminal {
+    fn pause(&self) {
+        // Not on the alternate screen: what is to be read was printed on the main one.
+        if self.can_ask() {
+            prompt!("press Enter to go on > ");
+            drop(read_line());
+        }
+    }
+}
+
+/// A line from the terminal's input.
+fn read_line() -> io::Result<String> {
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line)?;
+    Ok(line)
 }
 
 /// Asks on the terminal; without one, takes the safe default (or, for a question
@@ -155,6 +190,10 @@ impl Terminal {
 }
 
 impl Choose for Terminal {
+    fn can_ask(&self) -> bool {
+        io::stdin().is_terminal() && io::stderr().is_terminal()
+    }
+
     fn choose(&self, question: &str, options: &Table) -> Result<Option<usize>> {
         Ok(match self.choose_with(question, options, &[])? {
             Choice::Row(i) => Some(i),
