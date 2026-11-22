@@ -9,7 +9,6 @@ pub mod place;
 
 use anyhow::{Context, Result, bail};
 use std::fmt;
-use std::os::unix::ffi::OsStringExt;
 use std::time::Duration;
 
 use crate::config::secret::{SecretDecl, Source};
@@ -85,7 +84,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 pub fn resolve(decl: &SecretDecl, local: &dyn Local) -> Result<Secret> {
     let (what, bytes) = match &decl.from {
         Source::Env(var) => {
-            let v = local.var(var).map(OsStringExt::into_vec);
+            let v = local.var(var).map(crate::platform::os_string_bytes);
             (
                 format!("environment variable {var}"),
                 v.context("is not set"),

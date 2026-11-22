@@ -5,10 +5,10 @@
 //! a bundle, sizing the cache) goes through [`walk`], so they all agree on the
 //! order, on symlinks and on what an unreadable directory means.
 
+use crate::platform::{self, DirId};
 use anyhow::{Context, Result};
 use std::ffi::OsString;
 use std::fs::Metadata;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// How symlinks are treated.
@@ -60,8 +60,8 @@ pub fn walk(
 struct Walker<'v> {
     links: Links,
     denied: Denied,
-    /// (device, inode) of the directories being walked, root first.
-    open: Vec<(u64, u64)>,
+    /// The directories being walked, root first.
+    open: Vec<DirId>,
     visit: &'v mut dyn FnMut(&Entry) -> Result<()>,
 }
 
@@ -77,8 +77,12 @@ impl Walker<'_> {
             relative: &relative,
             meta: &meta,
         })?;
-        let id = (meta.dev(), meta.ino());
-        if !meta.is_dir() || self.open.contains(&id) {
+        if !meta.is_dir() {
+            return Ok(());
+        }
+        let id =
+            platform::dir_id(path, &meta).with_context(|| format!("reading {}", path.display()))?;
+        if self.open.contains(&id) {
             return Ok(());
         }
         let Some(children) = self.children(path)? else {
@@ -142,6 +146,7 @@ mod tests {
         seen
     }
 
+    #[cfg(unix)]
     #[test]
     fn directories_come_before_their_contents_in_name_order() {
         let t = TempDir::new("walk").unwrap();
@@ -149,7 +154,7 @@ mod tests {
         std::fs::create_dir_all(p.join("b/c")).unwrap();
         std::fs::write(p.join("b/c/x"), "").unwrap();
         std::fs::write(p.join("a"), "").unwrap();
-        std::os::unix::fs::symlink("b", p.join("z")).unwrap();
+        crate::platform::symlink("b", p.join("z")).unwrap();
         assert_eq!(
             visited(p, Links::Keep),
             ["D ", "F a", "D b", "D b/c", "F b/c/x", "L z"]
@@ -163,13 +168,14 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_link_loop_is_entered_once() {
         let t = TempDir::new("walk-loop").unwrap();
         let p = t.path();
         std::fs::create_dir_all(p.join("a")).unwrap();
         std::fs::write(p.join("a/f"), "").unwrap();
-        std::os::unix::fs::symlink("..", p.join("a/up")).unwrap();
+        crate::platform::symlink("..", p.join("a/up")).unwrap();
         assert_eq!(visited(p, Links::Follow), ["D ", "D a", "F a/f", "D a/up"]);
     }
 

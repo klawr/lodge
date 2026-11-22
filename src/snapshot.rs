@@ -3,7 +3,7 @@
 //! What lodge hashes and sends into a container is a *tree with Unix modes and
 //! links*. Where that tree is held is another matter: a directory on this
 //! machine, a bundle's tar, bytes in memory. A [`Snapshot`] is the one
-//! description of it that hashing ([`crate::bundle::hash`]) and copying
+//! description of it that hashing (`bundle::hash`) and copying
 //! ([`crate::runtime::tarball`]) are written against, so neither asks the
 //! filesystem of the machine lodge runs on what a mode is: a filesystem that has
 //! no such thing never has to be asked.
@@ -13,9 +13,9 @@
 
 use anyhow::{Context, Result, bail};
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::platform;
 use crate::tree::{self, Denied, Links};
 
 /// What a [`Node`] is.
@@ -119,11 +119,20 @@ impl DiskSnapshot {
         Ok(Node {
             relative: relative.into(),
             kind,
-            mode: meta.permissions().mode() & 0o7777,
-            mtime: u64::try_from(meta.mtime()).unwrap_or(0),
+            mode: platform::mode(meta),
+            mtime: mtime(meta).0,
             size: if meta.is_file() { meta.len() } else { 0 },
         })
     }
+}
+
+/// When `meta`'s file was last modified: whole seconds since the epoch and the
+/// nanoseconds after them (`(0, 0)` when unknown, or before the epoch).
+pub fn mtime(meta: &std::fs::Metadata) -> (u64, u32) {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or((0, 0), |d| (d.as_secs(), d.subsec_nanos()))
 }
 
 impl Snapshot for DiskSnapshot {
@@ -204,18 +213,15 @@ mod tests {
         seen
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_directory_is_walked_in_name_order_with_its_modes_and_links() {
         let dir = TempDir::new("snap-dir").unwrap();
         std::fs::create_dir_all(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub/run"), "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(
-            dir.path().join("sub/run"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        crate::platform::set_mode(dir.path().join("sub/run"), 0o755).unwrap();
         std::fs::write(dir.path().join("a"), "A").unwrap();
-        std::os::unix::fs::symlink("a", dir.path().join("link")).unwrap();
+        crate::platform::symlink("a", dir.path().join("link")).unwrap();
 
         let snapshot = DiskSnapshot::at(dir.path());
         let seen = walked(&snapshot);
@@ -249,11 +255,12 @@ mod tests {
         assert_eq!(text, "hello");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_link_is_followed_only_when_asked_to_resolve_it() {
         let dir = TempDir::new("snap-link").unwrap();
         std::fs::write(dir.path().join("real"), "x").unwrap();
-        std::os::unix::fs::symlink("real", dir.path().join("l")).unwrap();
+        crate::platform::symlink("real", dir.path().join("l")).unwrap();
         let link = dir.path().join("l");
         assert!(matches!(
             DiskSnapshot::at(&link).root().unwrap().kind,

@@ -152,16 +152,16 @@ mod tests {
         assert_eq!(printed.trim(), lodges.to_string_lossy());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_failed_removal_fails_the_script_after_trying_the_rest() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = crate::tmpfile::TempDir::new("clean-fail").unwrap();
         let prefix = dir.path().join("prefix");
         std::fs::create_dir_all(prefix.join("inner")).unwrap();
         std::fs::write(prefix.join("inner/f"), "x").unwrap();
         let wrapper = dir.path().join("wrapper");
         std::fs::write(&wrapper, "exec /nothing/").unwrap();
-        let set = |mode| std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(mode));
+        let set = |mode| crate::platform::set_mode(&prefix, mode);
         set(0o500).unwrap();
         let (ok, printed) = exec(&prefix, &[&wrapper], "exec /nothing/");
         set(0o700).unwrap();

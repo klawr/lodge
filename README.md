@@ -26,6 +26,29 @@ Downloads the latest static Linux binary (x86_64 or aarch64) into
 From source: `cargo install --git https://github.com/klawr/lodge`, or
 `make install` in a clone (`PREFIX=~/.local/bin` for a user install).
 
+### Windows
+
+`ldg` also builds and runs natively on Windows, as a **client**: the target is
+always Linux, reached with `--remote` over ssh or through Docker Desktop's
+engine. Each release has `ldg-x86_64-pc-windows-msvc.zip` (`ldg.exe` and PowerShell
+completions); unpack it somewhere on your `PATH`. `install.sh` is Linux only. To build
+it yourself: `cargo install --git https://github.com/klawr/lodge`.
+
+- It uses a bundle but never makes one: `ldg pack` needs Linux (`ldd`,
+  `patchelf`), so pack on a Linux or WSL2 machine and point `bundle =` at the
+  file or an `oci://` reference (see [Bundles and secrets](docs/bundles-and-secrets.md)).
+  `ldg doctor` does not ask for those tools there.
+- `--remote` runs the `ssh` that ships with Windows. Its OpenSSH cannot share one
+  connection between commands, so every step connects on its own: **use key or agent
+  auth**, not a password. See [Remote containers](docs/remote.md#from-windows).
+- Port forwarding works through `--remote`. With Docker Desktop as the local engine
+  only the ports a container publishes (`appPort`) are reachable, as on macOS.
+- Windows files have no execute bits, so a local file copied into a container gets
+  mode `0644` (`0755` for a directory). A bundle carries the modes it was packed
+  with, so put programs in the bundle.
+- Status: the build and the unit tests run in CI on Windows. The integration
+  tests, which drive a real engine, run on Linux only.
+
 ## Quickstart
 
 ```sh
@@ -157,9 +180,10 @@ linked binaries are copied as they are.
   git's `safe.directory = *`, and cannot act as another user. The machine must be
   Linux with `tar`; there is no devcontainer, so nothing is created, stopped or
   removed (`down`, `rm` and `ls` say so, and `ldg clean` takes lodge out).
-- `ldg` itself is tested on Linux, and on Windows through WSL2. There is no native
-  Windows client. macOS is Unix and should build and run, but nobody has tried it:
-  it is untested and there is no release binary (build from source).
+- `ldg` is developed and tested on Linux. On Windows it runs natively as a
+  client only (see [Windows](#windows)). macOS is Unix and should build and run,
+  but nobody has tried it: it is untested and has no release binary (build from
+  source).
 - Change detection covers `devcontainer.json`, the Dockerfile, compose files
   and local features, not the Dockerfile's build context.
 

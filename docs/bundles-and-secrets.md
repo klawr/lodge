@@ -17,7 +17,7 @@ To use your setup on a machine that isn't your Linux workstation, pack once and
 carry the file:
 
 ```sh
-ldg pack -o lodge-x86_64.tar             # on the Linux/WSL machine: resolves, relinks, snapshots
+ldg pack -o lodge-x86_64.tar             # on a Linux (or WSL2) machine: resolves, relinks, snapshots
 ldg bundle verify lodge-x86_64.tar       # after copying it somewhere
 ldg bundle inspect lodge-x86_64.tar      # what it holds (both also take oci://…)
 ldg up --bundle lodge-x86_64.tar         # anywhere with a container runtime (or just ssh with -r)

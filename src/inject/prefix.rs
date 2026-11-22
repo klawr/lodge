@@ -46,7 +46,6 @@ mod tests {
     use crate::runtime::RUN_PROBE_SCRIPT;
     use crate::runtime::fake::{FakeEnv, Who};
     use crate::shell::script_argv;
-    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
     fn dev() -> ContainerUser {
@@ -132,30 +131,31 @@ mod tests {
         assert!(run(&prefix, "any"), "and again");
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_real_probe_refuses_a_symlink_a_foreign_owner_and_an_unwritable_place() {
         let base = crate::tmpfile::TempDir::new("prefix-bad").unwrap();
         let real = base.path().join("real");
         std::fs::create_dir(&real).unwrap();
         let link = base.path().join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        crate::platform::symlink(&real, &link).unwrap();
         assert!(!run(&link, "any"), "a symlink could point anywhere");
         assert!(!run(&link, "own"));
 
         let locked = base.path().join("locked");
         std::fs::create_dir(&locked).unwrap();
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        crate::platform::set_mode(&locked, 0o500).unwrap();
         let writable = std::fs::File::create(locked.join(".t")).is_ok(); // root ignores modes
         if !writable {
             assert!(!run(&locked.join("lodge"), "any"));
         }
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::platform::set_mode(&locked, 0o700).unwrap();
 
         // A private directory is made 0700.
         let own = base.path().join("own");
         assert!(run(&own, "own"));
         assert_eq!(
-            std::fs::metadata(&own).unwrap().permissions().mode() & 0o777,
+            crate::platform::mode(&std::fs::metadata(&own).unwrap()) & 0o777,
             0o700
         );
     }

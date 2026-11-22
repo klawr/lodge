@@ -15,9 +15,7 @@ use crate::output::{info, line, note, warning};
 
 /// The home directory of the user running lodge, which paths under it are relative to.
 fn home_of(ctx: &Ctx) -> PathBuf {
-    ctx.local
-        .var("HOME")
-        .map_or_else(|| PathBuf::from("/"), PathBuf::from)
+    ctx.local.home()
 }
 
 pub fn run(ctx: &Ctx, command: Option<InjectCommand>) -> Result<()> {

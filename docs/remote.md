@@ -25,7 +25,7 @@ doesn't count as a change either.
 
 lodge opens one SSH connection first and reuses it for the dozens of commands a
 single `ldg up` issues (a `ControlMaster` socket under `$TMPDIR/lodge-ssh/`, kept
-for 10 minutes after the last use). It opens it before anything else, with your
+for 10 minutes after the last use; Windows has none, see [From Windows](#from-windows)). It opens it before anything else, with your
 terminal available, so a password, passphrase or 2FA prompt is answered once.
 The port-forwarding daemon has no terminal: it rides on that connection, or on
 key or agent auth if it has to reconnect. None of its ssh commands ever prompts. If the
@@ -49,5 +49,25 @@ own debug output. That goes to a file beside the connection's socket (`ldg` says
 where), not to the terminal: the connection's background process would keep the
 terminal's output open for as long as it lives.
 
-From a machine that isn't your Linux workstation (a CI runner, or WSL2 on Windows),
+From a machine that isn't your Linux workstation (a CI runner, or Windows),
 combine `--remote` with a bundle: see [Bundles and secrets](bundles-and-secrets.md).
+
+## From Windows
+
+`ldg` runs natively on Windows as a client for a Linux host (see the
+[README](../README.md#windows)). It uses the `ssh` that ships with Windows, whose
+OpenSSH has no `ControlMaster`, so lodge does not open a shared connection: each of
+the dozens of commands an `ldg up` issues connects, authenticates and ends on its
+own. That is slower than on Linux, and it means:
+
+- Log in with a **key or an agent** (`ssh-agent` with the key added). A password,
+  a passphrase that is not in the agent or a second factor would be asked for by
+  every command, and the port-forwarding daemon, which has no terminal, could
+  never answer it.
+- `ldg` still makes one connection first, with the terminal available, to tell you
+  early if the host cannot be reached.
+- The forwarding daemon runs in the background without a console window; `ldg
+  ports` and `ldg logs` show and explain it as elsewhere.
+
+The `Host` aliases, `IdentityFile`, jump hosts and ports of `%USERPROFILE%\.ssh\config`
+apply as on any ssh.

@@ -8,7 +8,6 @@
 use anyhow::Context as _;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
@@ -98,10 +97,7 @@ fn control_path(remote: &str) -> PathBuf {
     // If the directory can't be made, ssh can't bind its control socket and falls
     // back to a direct connection, so this failure only costs connection reuse.
     #[allow(clippy::let_underscore_must_use, reason = "see above")]
-    let _ = std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir);
+    let _ = crate::platform::private_dir(std::fs::DirBuilder::new().recursive(true)).create(&dir);
     dir.join(format!("{:x}.sock", hasher.finish()))
 }
 
@@ -126,7 +122,11 @@ fn base(remote: &str) -> (Command, String) {
     if let Some(p) = port {
         c.args(["-p", &p.to_string()]);
     }
-    c.args(["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]);
+    if crate::platform::HAS_SSH_MULTIPLEX {
+        c.args(["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]);
+        c.arg("-o")
+            .arg(format!("ControlPath={}", control_path(remote).display()));
+    }
     // A link that goes quiet is declared dead after about 45 s, so a step fails
     // (and can be retried) instead of hanging; see [`retry`].
     c.args([
@@ -135,8 +135,6 @@ fn base(remote: &str) -> (Command, String) {
         "-o",
         "ServerAliveCountMax=3",
     ]);
-    c.arg("-o")
-        .arg(format!("ControlPath={}", control_path(remote).display()));
     let v = crate::output::verbosity().min(3);
     if v > 0 {
         c.arg(format!("-{}", "v".repeat(v as usize)));
@@ -215,7 +213,8 @@ impl Child for Tunnel {
             clippy::let_underscore_must_use,
             reason = "the connection may be gone, and the forward with it"
         )]
-        let _ = cancel_forward(&self.remote, self.local, &self.to).status();
+        let _ = crate::platform::HAS_SSH_MULTIPLEX
+            .then(|| cancel_forward(&self.remote, self.local, &self.to).status());
         killed
     }
 
@@ -263,6 +262,9 @@ fn connection_lost(status: ExitStatus, stderr: &[u8]) -> bool {
 /// one even if the old one is dead but still holds its socket. Quiet; fails
 /// harmlessly when there is no master.
 fn drop_master(remote: &str) {
+    if !crate::platform::HAS_SSH_MULTIPLEX {
+        return; // every ssh has its own connection; nothing is held
+    }
     let (mut c, dest) = base(remote);
     c.args(["-O", "exit"])
         .arg(dest)
@@ -486,7 +488,6 @@ impl Host for SshHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::process::ExitStatusExt;
 
     #[test]
     fn plain_alias_and_user_host_pass_through() {
@@ -587,7 +588,11 @@ mod tests {
     {
         let a = args(&keep_running("user@host", "'kubectl' 'port-forward' 'x'"));
         assert!(a.contains(&"-tt".to_string()), "{a:?}");
-        assert!(a.contains(&"ControlMaster=auto".to_string()), "{a:?}");
+        assert_eq!(
+            a.contains(&"ControlMaster=auto".to_string()),
+            crate::platform::HAS_SSH_MULTIPLEX,
+            "{a:?}"
+        );
         assert_eq!(
             &a[a.len() - 3..],
             ["BatchMode=yes", "user@host", "'kubectl' 'port-forward' 'x'"]
@@ -600,7 +605,11 @@ mod tests {
             .interactive_command(&["docker", "exec", "-it", "c", "a b"]);
         let a = args(&c);
         assert_eq!(&a[..2], ["-p", "2222"]);
-        assert!(a.contains(&"ControlMaster=auto".to_string()), "{a:?}");
+        assert_eq!(
+            a.contains(&"ControlMaster=auto".to_string()),
+            crate::platform::HAS_SSH_MULTIPLEX,
+            "{a:?}"
+        );
         assert_eq!(
             &a[a.len() - 3..],
             ["-tt", "user@host", "'docker' 'exec' '-it' 'c' 'a b'"]
@@ -608,7 +617,7 @@ mod tests {
     }
 
     fn exit(code: i32) -> ExitStatus {
-        ExitStatus::from_raw(code << 8)
+        crate::platform::exit_status(code)
     }
 
     #[test]
@@ -616,8 +625,13 @@ mod tests {
         assert!(connection_lost(exit(255), b""));
         assert!(!connection_lost(exit(0), b""));
         assert!(!connection_lost(exit(1), b""));
+        // Only Unix has a process killed by a signal (9).
+        #[cfg(unix)]
         assert!(
-            !connection_lost(ExitStatus::from_raw(9), b""),
+            !connection_lost(
+                <ExitStatus as std::os::unix::process::ExitStatusExt>::from_raw(9),
+                b""
+            ),
             "killed by a signal"
         );
     }

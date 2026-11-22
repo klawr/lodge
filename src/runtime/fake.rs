@@ -85,11 +85,10 @@ impl Child for FakeRelay {
     }
 
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        use std::os::unix::process::ExitStatusExt as _;
         Ok(self
             .0
             .load(Ordering::Relaxed)
-            .then(|| std::process::ExitStatus::from_raw(0)))
+            .then(|| crate::platform::exit_status(0)))
     }
 }
 
@@ -409,9 +408,8 @@ impl Env for FakeEnv {
         workdir: &str,
         inner: &str,
     ) -> std::io::Result<std::process::ExitStatus> {
-        use std::os::unix::process::ExitStatusExt as _;
         self.record(&["interactive", workdir, inner], user);
-        Ok(std::process::ExitStatus::from_raw(0))
+        Ok(crate::platform::exit_status(0))
     }
 }
 

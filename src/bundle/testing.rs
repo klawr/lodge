@@ -1,17 +1,21 @@
 //! Bundles for tests: a directory laid out as `ldg pack` leaves it, the tar of
 //! one, and a [`Prepared`] built from a few files.
 
-use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 
 use super::archive::write_tar;
+#[cfg(unix)]
 use super::hash::hash_path;
-use super::manifest::{BIN_DIR, Binary, DATA_DIR, Data, LIB_DIR, Lib, MANIFEST_FILE, Manifest};
+#[cfg(unix)]
+use super::manifest::{BIN_DIR, DATA_DIR, LIB_DIR};
+use super::manifest::{Binary, Data, Lib, MANIFEST_FILE, Manifest};
 use super::reader::Bundle;
 use super::source::{Origin, Prepared};
 use crate::tmpfile::TempDir;
 
 /// A small but complete bundle directory, with its manifest.
+#[cfg(unix)]
 pub(crate) fn bundle_dir() -> (TempDir, Manifest) {
     let dir = TempDir::new("bundle").unwrap();
     let p = dir.path();
@@ -19,12 +23,12 @@ pub(crate) fn bundle_dir() -> (TempDir, Manifest) {
         std::fs::create_dir_all(p.join(sub)).unwrap();
     }
     std::fs::write(p.join("bin/hello"), "#!/bin/sh\necho hi\n").unwrap();
-    std::fs::set_permissions(p.join("bin/hello"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::platform::set_mode(p.join("bin/hello"), 0o755).unwrap();
     std::fs::write(p.join("lib/libx.so.1"), "library").unwrap();
     std::fs::create_dir_all(p.join("data/0/sub")).unwrap();
     std::fs::write(p.join("data/0/sub/rc"), "set x").unwrap();
     std::fs::write(p.join("data/0/a-b"), "dash").unwrap();
-    std::os::unix::fs::symlink("sub/rc", p.join("data/0/link")).unwrap();
+    crate::platform::symlink("sub/rc", p.join("data/0/link")).unwrap();
 
     let manifest = Manifest {
         lodge_version: "0".into(),
@@ -53,6 +57,7 @@ pub(crate) fn bundle_dir() -> (TempDir, Manifest) {
     (dir, manifest)
 }
 
+#[cfg(unix)]
 pub(crate) fn tar_of(dir: &Path, name: &str) -> (TempDir, PathBuf) {
     let out = TempDir::new(name).unwrap();
     let file = out.path().join("b.tar");

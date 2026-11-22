@@ -657,7 +657,7 @@ fn on_offer(
     let have: HashSet<String> = found.iter().map(|c| c.entry.path().to_string()).collect();
     let more: Vec<PathBuf> = browse::walk(scope, want)
         .into_iter()
-        .filter(|p| kind == Kind::Data || is_executable(p))
+        .filter(|p| kind == Kind::Data || crate::platform::is_executable(p))
         .filter(|p| !have.contains(&tilde(p, machine.home)))
         .collect();
     for (path, item) in more
@@ -691,11 +691,6 @@ fn scope(machine: &Machine, kind: Option<Kind>) -> browse::Scope {
         _ => vec![machine.home.join(".config")],
     };
     browse::Scope::new(roots, candidates::withheld(machine.home))
-}
-
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 fn list_name(kind: Kind) -> &'static str {

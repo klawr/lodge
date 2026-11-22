@@ -64,7 +64,6 @@ fn feed(mut file: impl Read, h: &mut Fingerprint) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::tmpfile::TempDir;
-    use std::os::unix::fs::PermissionsExt;
 
     fn tree(files: &[(&str, &str)]) -> TempDir {
         let dir = TempDir::new("tree").unwrap();
@@ -83,26 +82,24 @@ mod tests {
         assert_eq!(hash_path(a.path()).unwrap(), hash_path(b.path()).unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn any_change_to_content_name_or_mode_changes_the_hash() {
         let base = tree(&[("a", "1")]);
         let h = hash_path(base.path()).unwrap();
         assert_ne!(h, hash_path(tree(&[("a", "2")]).path()).unwrap(), "content");
         assert_ne!(h, hash_path(tree(&[("b", "1")]).path()).unwrap(), "name");
-        std::fs::set_permissions(
-            base.path().join("a"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        crate::platform::set_mode(base.path().join("a"), 0o755).unwrap();
         assert_ne!(h, hash_path(base.path()).unwrap(), "executable bit");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlink_counts_by_its_target_not_what_it_points_at() {
         let a = TempDir::new("link-a").unwrap();
-        std::os::unix::fs::symlink("one", a.path().join("l")).unwrap();
+        crate::platform::symlink("one", a.path().join("l")).unwrap();
         let b = TempDir::new("link-b").unwrap();
-        std::os::unix::fs::symlink("two", b.path().join("l")).unwrap();
+        crate::platform::symlink("two", b.path().join("l")).unwrap();
         assert_ne!(hash_path(a.path()).unwrap(), hash_path(b.path()).unwrap());
     }
 

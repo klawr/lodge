@@ -27,6 +27,7 @@ mod layout;
 mod local;
 mod output;
 mod plain_host;
+mod platform;
 mod port;
 mod provision;
 mod runtime;

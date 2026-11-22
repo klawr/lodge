@@ -18,7 +18,6 @@
 //! a single injector.
 
 use anyhow::{Context as _, Result};
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use super::manifest::Manifest;
@@ -29,6 +28,8 @@ use crate::arch::Arch;
 use crate::config::Config;
 use crate::fingerprint::Fingerprint;
 use crate::output::{info, warning};
+use crate::platform;
+use crate::snapshot::mtime;
 use crate::tools::Toolchain;
 use crate::tree::{self, Denied, Links};
 
@@ -266,13 +267,12 @@ fn stat_line(path: &Path) -> Result<String> {
     let real =
         std::fs::canonicalize(path).with_context(|| format!("reading {}", path.display()))?;
     let meta = std::fs::metadata(&real)?;
+    let (secs, nanos) = mtime(&meta);
     Ok(format!(
-        "{} {} {}.{} {:o}",
+        "{} {} {secs}.{nanos} {:o}",
         real.display(),
         meta.len(),
-        meta.mtime(),
-        meta.mtime_nsec(),
-        meta.mode()
+        platform::mode(&meta)
     ))
 }
 
@@ -287,14 +287,13 @@ fn stat_tree(root: &Path, out: &mut Vec<String>) -> Result<()> {
         out.push(if meta.is_symlink() {
             format!("L {relative} -> {}", std::fs::read_link(e.path)?.display())
         } else if meta.is_dir() {
-            format!("D {relative} {:o}", meta.mode())
+            format!("D {relative} {:o}", platform::mode(meta))
         } else {
+            let (secs, nanos) = mtime(meta);
             format!(
-                "F {relative} {} {}.{} {:o}",
+                "F {relative} {} {secs}.{nanos} {:o}",
                 meta.len(),
-                meta.mtime(),
-                meta.mtime_nsec(),
-                meta.mode()
+                platform::mode(meta)
             )
         });
         Ok(())

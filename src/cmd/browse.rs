@@ -59,7 +59,7 @@ const DENIED_NAMES: &[&str] = &[
 
 /// Where a search looks and what it leaves out: a whitelist of roots, then a
 /// blacklist of names and paths. No roots is no whitelist, which is `/`. The
-/// roots and the names can be edited from inside the search (see [`knobs`]); the
+/// roots and the names can be edited from inside the search (see [`Choose::find_knobs`]); the
 /// paths, which are credentials, cannot. The blacklist is only for walking: a
 /// path typed in full is never refused by it.
 #[derive(Debug, Clone, PartialEq, Eq)]

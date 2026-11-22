@@ -596,15 +596,20 @@ pub trait Host: Send + Sync {
     }
 
     /// The uid and gid of the user lodge runs as on the host (that is who owns a
-    /// bind-mounted workspace).
-    fn uid_gid(&self) -> Result<(u32, u32)> {
-        let out = self.sh_output("id -u; id -g")?;
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        let mut ids = stdout.lines().map(|l| l.trim().parse::<u32>());
-        match (ids.next(), ids.next()) {
-            (Some(Ok(uid)), Some(Ok(gid))) => Ok((uid, gid)),
-            _ => anyhow::bail!("could not read the host user's uid/gid (got {stdout:?})"),
-        }
+    /// bind-mounted workspace); `None` for a host whose files have no such owner.
+    fn uid_gid(&self) -> Result<Option<(u32, u32)>> {
+        ids_from_id_command(self).map(Some)
+    }
+}
+
+/// The ids `id` prints on `host`.
+fn ids_from_id_command<H: Host + ?Sized>(host: &H) -> Result<(u32, u32)> {
+    let out = host.sh_output("id -u; id -g")?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut ids = stdout.lines().map(|l| l.trim().parse::<u32>());
+    match (ids.next(), ids.next()) {
+        (Some(Ok(uid)), Some(Ok(gid))) => Ok((uid, gid)),
+        _ => anyhow::bail!("could not read the host user's uid/gid (got {stdout:?})"),
     }
 }
 
@@ -735,10 +740,9 @@ fn parse_read_first(out: &[u8]) -> Option<FirstFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::process::ExitStatusExt;
 
     fn exit(code: i32) -> ExitStatus {
-        ExitStatus::from_raw(code << 8)
+        crate::platform::exit_status(code)
     }
 
     /// Runs a step that answers with `codes` in turn, on a host that calls 255 a
@@ -830,11 +834,12 @@ mod tests {
         assert!(run(&none).paths.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_canonical_dir_script_resolves_like_the_local_lookup() {
         let tmp = crate::tmpfile::TempDir::new("canon").unwrap();
         std::fs::create_dir_all(tmp.path().join("a b/c")).unwrap();
-        std::os::unix::fs::symlink(tmp.path().join("a b"), tmp.path().join("link")).unwrap();
+        crate::platform::symlink(tmp.path().join("a b"), tmp.path().join("link")).unwrap();
         let spelled = tmp.path().join("link/c/../c/.");
         let out = Command::new("sh")
             .args(["-c", &canonical_dir_script(&spelled)])
@@ -852,10 +857,10 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_scratch_script_makes_a_private_file_and_prints_it() {
         use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
         let dir = crate::tmpfile::TempDir::new("scratch").unwrap();
         let mut child = Command::new("sh")
             .args(["-c", WRITE_SCRATCH_SCRIPT])
@@ -879,7 +884,7 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "services: {}\n");
         assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            crate::platform::mode(&std::fs::metadata(&path).unwrap()) & 0o777,
             0o600
         );
     }
@@ -921,6 +926,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
         drop(scratch);
         assert!(!path.exists());
-        assert_eq!(host.uid_gid().unwrap().0, LocalHost.uid_gid().unwrap().0);
+        assert_eq!(host.uid_gid().unwrap(), LocalHost.uid_gid().unwrap());
     }
 }

@@ -221,7 +221,7 @@ pub(super) fn prune(root: &Path, keep: &Path) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::bundle::testing::{bundle_dir, tar_of};
@@ -232,7 +232,6 @@ mod tests {
         let (_keep, tar) = tar_of(dir.path(), "cache-entry");
         std::fs::copy(tar, entry_path(root, key)).unwrap();
     }
-
     #[test]
     fn bundles_from_a_registry_are_pruned_like_the_others() {
         let root = TempDir::new("prune-o").unwrap();
@@ -248,7 +247,6 @@ mod tests {
         assert_eq!(left, KEEP + 1, "{left}");
         assert!(keep.exists());
     }
-
     #[test]
     fn clearing_the_cache_forgets_what_the_references_named() {
         let root = TempDir::new("clear-tags").unwrap();
@@ -259,7 +257,6 @@ mod tests {
         assert!(!root.path().join(TAGS_FILE).exists());
         assert!(entries(root.path()).is_empty());
     }
-
     #[test]
     fn an_entry_is_installed_whole_and_listed_with_its_manifest() {
         let root = TempDir::new("install").unwrap();
@@ -278,7 +275,6 @@ mod tests {
         assert_eq!(load(root.path(), "f-1").unwrap().manifest(), &manifest);
         assert!(load(root.path(), "f-2").is_none());
     }
-
     #[test]
     fn a_tar_a_store_fetched_into_staging_is_moved_not_copied() {
         let root = TempDir::new("stage-move").unwrap();

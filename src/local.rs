@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -17,10 +17,15 @@ pub trait Local: Send + Sync {
     /// An environment variable, `None` when it is unset.
     fn var(&self, name: &str) -> Option<OsString>;
 
+    /// The home directory of the user lodge runs as; `/` where there is none, so
+    /// that no path is relative to it.
+    fn home(&self) -> PathBuf;
+
     /// The contents of a file on this machine.
     fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>>;
 
-    /// Runs `script` with `sh -c` on this machine, with no input and the
+    /// Runs `script` with this machine's shell (`sh -c`, or `cmd /C` on
+    /// Windows), with no input and the
     /// terminal for its errors, and returns what it printed. An error when it
     /// exits non-zero or does not finish within `timeout`.
     fn run_sh(&self, script: &str, timeout: Duration) -> Result<Vec<u8>>;
@@ -55,6 +60,12 @@ impl Local for SystemLocal {
         std::env::var_os(name)
     }
 
+    /// Where the system says it is (`HOME` on Unix, the user's profile folder on
+    /// Windows, where `HOME` is not set), the same answer `~` in the config gets.
+    fn home(&self) -> PathBuf {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
+    }
+
     fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         std::fs::read(path)
     }
@@ -63,8 +74,7 @@ impl Local for SystemLocal {
     /// host is (`pass show x`), so this is deliberately not a
     /// [`Host`](crate::host::Host) command, which runs on the project's host.
     fn run_sh(&self, script: &str, timeout: Duration) -> Result<Vec<u8>> {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", script]);
+        let cmd = crate::platform::shell_command(script);
         let out = run(cmd, &[], Stdio::inherit(), timeout)?;
         if !out.success {
             bail!("{}", out.status);
@@ -206,6 +216,11 @@ pub mod fake {
             self.vars.get(name).cloned()
         }
 
+        fn home(&self) -> PathBuf {
+            self.var("HOME")
+                .map_or_else(|| PathBuf::from("/"), PathBuf::from)
+        }
+
         fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
             self.files
                 .get(path)
@@ -252,6 +267,8 @@ pub mod fake {
 mod tests {
     use super::*;
 
+    // Written in `sh` and run with `cat`: a Unix machine's.
+    #[cfg(unix)]
     #[test]
     fn a_script_runs_prints_fails_and_times_out() {
         let local = SystemLocal;
@@ -267,6 +284,8 @@ mod tests {
         assert!(slow.to_string().contains("timed out"));
     }
 
+    // Written in `sh` and run with `cat`: a Unix machine's.
+    #[cfg(unix)]
     #[test]
     fn a_program_is_fed_its_input_and_a_failure_is_an_answer() {
         let local = SystemLocal;

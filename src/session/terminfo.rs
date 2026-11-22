@@ -5,13 +5,15 @@
 //! features. So a session sets `TERM` itself, and, when the container has no
 //! terminfo entry for that terminal (kitty's `xterm-kitty`, say), lodge copies
 //! the entry over from the host, into the user's lodge prefix (`dir` below is its
-//! `terminfo/`).
+//! `terminfo/`). A host with no terminfo database (Windows) copies nothing and
+//! always gets the fallback.
 
 use anyhow::Result;
 use std::path::PathBuf;
 
 use crate::local::Local;
 use crate::output::warning;
+use crate::platform;
 use crate::runtime::Env;
 
 /// What a session falls back to when the user's own terminal can't be used.
@@ -75,6 +77,20 @@ fn container_knows(env: &dyn Env, dir: &str, term: &str) -> bool {
 /// if that isn't possible, a widely known fallback. Best effort: a missing entry
 /// only costs some colours.
 pub fn prepare(env: &dyn Env, dir: &str, term: Option<&str>, local: &dyn Local) -> Option<String> {
+    prepare_on(platform::HAS_TERMINFO, env, dir, term, local)
+}
+
+/// [`prepare`] for a host that does or does not have a terminfo database.
+fn prepare_on(
+    has_terminfo: bool,
+    env: &dyn Env,
+    dir: &str,
+    term: Option<&str>,
+    local: &dyn Local,
+) -> Option<String> {
+    if !has_terminfo {
+        return Some(FALLBACK.to_string());
+    }
     prepare_from(env, dir, term?, &host_dirs(local))
 }
 
@@ -178,7 +194,20 @@ mod tests {
             prepare_from(&env, DIR, "tmux-256color", &[]).as_deref(),
             Some("tmux-256color")
         );
-        assert_eq!(prepare(&env, DIR, None, &FakeLocal::new()), None);
+        assert_eq!(prepare_on(true, &env, DIR, None, &FakeLocal::new()), None);
+    }
+
+    #[test]
+    fn a_host_without_terminfo_sets_the_fallback_and_copies_nothing() {
+        let env = FakeEnv::new();
+        let local = FakeLocal::new().with_var("TERM", "xterm-kitty");
+        for term in [None, Some("xterm-kitty")] {
+            assert_eq!(
+                prepare_on(false, &env, DIR, term, &local).as_deref(),
+                Some("xterm-256color")
+            );
+        }
+        assert!(env.calls().is_empty(), "{:?}", env.calls());
     }
 
     #[test]

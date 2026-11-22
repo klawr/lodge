@@ -267,9 +267,7 @@ fn toolchain(oci: Arc<dyn OciFetcher>) -> Toolchain {
 /// Works on the config alone: no host, no target, no engine.
 fn configure_config(config: Option<PathBuf>) -> Result<()> {
     let path = crate::config::path_for(config)?;
-    let home = SystemLocal
-        .var("HOME")
-        .map_or_else(|| PathBuf::from("/"), PathBuf::from);
+    let home = SystemLocal.home();
     let path_var = SystemLocal.var("PATH").unwrap_or_default();
     let local: Arc<dyn Local> = Arc::new(SystemLocal);
     let registry = Arc::new(NativeOci::new(
@@ -320,9 +318,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                              give its path, `ldg --remote HOST up PATH`"
                         );
                     }
-                    let home = SystemLocal
-                        .var("HOME")
-                        .map_or_else(|| PathBuf::from("/"), PathBuf::from);
+                    let home = SystemLocal.home();
                     let scope = browse::Scope::new(vec![home.clone()], Vec::new());
                     match browse::pick(
                         &prompt::Terminal,

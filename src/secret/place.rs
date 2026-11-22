@@ -175,7 +175,6 @@ mod tests {
     use super::*;
     use crate::config::secret::Source;
     use crate::runtime::fake::FakeEnv;
-    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
     fn dev() -> ContainerUser {
@@ -298,6 +297,7 @@ mod tests {
             .success()
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_prepare_script_makes_a_private_directory_and_prunes_old_files() {
         let tmp = crate::tmpfile::TempDir::new("place").unwrap();
@@ -307,7 +307,7 @@ mod tests {
         std::fs::create_dir_all(base).unwrap();
         assert!(sh(PREPARE_SCRIPT, &[d, "KEEP"]));
         assert_eq!(
-            std::fs::metadata(d).unwrap().permissions().mode() & 0o777,
+            crate::platform::mode(&std::fs::metadata(d).unwrap()) & 0o777,
             0o700
         );
         std::fs::write(format!("{d}/KEEP"), "1").unwrap();
@@ -317,7 +317,7 @@ mod tests {
         assert!(!std::path::Path::new(&format!("{d}/GONE")).exists());
         // A symlinked directory (planted in a shared /dev/shm) is refused.
         let link = base.join("planted");
-        std::os::unix::fs::symlink(base, &link).unwrap();
+        crate::platform::symlink(base, &link).unwrap();
         assert!(!sh(PREPARE_SCRIPT, &[link.to_str().unwrap()]));
     }
 

@@ -6,6 +6,10 @@
 //! so they run in parallel, and a project removes its container when dropped.
 //!
 //! Needs: a running docker daemon with the compose plugin, and `patchelf`.
+//! Unix only: they pack bundles (Windows only consumes them) and drive the
+//! binary through shell scripts.
+
+#![cfg(unix)]
 
 mod support;
 

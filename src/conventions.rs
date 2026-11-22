@@ -91,8 +91,12 @@ fn kubectl_is_run_through_a_host_and_spelled_only_by_the_pod_endpoint() {
 fn local_shells_are_started_by_the_local_host_and_secrets_only() {
     // `host/local.rs` runs scripts on this machine as the project's host;
     // `local.rs` runs a secret's `command` source, which is on this machine
-    // whatever the host is.
-    assert_eq!(spawners("sh"), ["host/local.rs", "local.rs"]);
+    // whatever the host is. Which shell that is, is `platform`'s to know.
+    assert_eq!(spawners("sh"), ["platform/unix.rs"]);
+    assert_eq!(
+        files_containing(&["platform::shell_command"], &["platform/"]),
+        ["host/local.rs", "local.rs"]
+    );
 }
 
 #[test]
@@ -233,6 +237,7 @@ fn the_machine_lodge_runs_on_is_read_through_local_and_the_list_that_still_isnt_
                 "config/mod.rs",
                 "forward/mod.rs",
                 "history.rs",
+                "local.rs",
             ],
         ),
         (
@@ -248,7 +253,8 @@ fn the_machine_lodge_runs_on_is_read_through_local_and_the_list_that_still_isnt_
     ];
     for (needle, files) in known {
         assert_eq!(
-            files_containing(&[needle], &[]),
+            // `platform/` is where this machine's own behaviour lives, by design.
+            files_containing(&[needle], &["platform/"]),
             *files,
             "files that use `{needle}`"
         );
@@ -327,6 +333,7 @@ const FOUNDATION: &[&str] = &[
     "layout",
     "local",
     "output",
+    "platform",
     "port",
     "provision",
     "runtime",
@@ -396,6 +403,25 @@ fn root_is_asked_for_by_provisioning_and_the_runtime_only() {
         files_containing(
             &["exec_root", "User::Root", "ExecOpts::root"],
             &["devcontainer/", "runtime/", "plain_host.rs"]
+        ),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn what_differs_between_operating_systems_is_in_platform() {
+    // One place implements Unix and Windows (`platform/`); everything else calls
+    // it and does not know which it is on. (`cfg!(target_os = "linux")` is a
+    // different question: whether this machine can *pack*.)
+    assert_eq!(
+        files_containing(
+            &[
+                "std::os::unix",
+                "std::os::windows",
+                "cfg(unix)",
+                "cfg(windows)"
+            ],
+            &["platform/", "bundle/testing.rs"]
         ),
         Vec::<String>::new()
     );

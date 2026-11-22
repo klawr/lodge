@@ -55,6 +55,23 @@ jobs:
         with:
           command-arguments: --config .github/deny.toml
 
+  # Windows is a bundle consumer only (no packing; it reaches a Linux target over
+  # ssh or Docker Desktop), so this builds and tests the consumer side natively.
+  # A release gate, like the Linux jobs: its binary is published by
+  # `upload-windows`.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --target x86_64-pc-windows-msvc
+      - name: Test
+        run: cargo test --target x86_64-pc-windows-msvc
+
   # The static release binaries, built on every push and PR so a musl or
   # aarch64 break shows up before anything is tagged.
   musl:
@@ -101,7 +118,7 @@ jobs:
   # a release without assets. No changelog file is kept; the release notes are
   # generated from the commits.
   release:
-    needs: [check, msrv, deny, musl, integration]
+    needs: [check, msrv, deny, windows, musl, integration]
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
@@ -154,9 +171,36 @@ jobs:
           ref: refs/tags/${{ needs.release.outputs.tag }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  # The Windows client as a .zip, attached to the same draft. Built natively on
+  # a Windows runner. Completions are for PowerShell; there is no man page.
+  upload-windows:
+    needs: release
+    if: needs.release.outputs.tag != ''
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate completions
+        shell: bash
+        run: |
+          mkdir dist
+          cargo run --quiet -- completions powershell > dist/ldg.ps1
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: ldg
+          target: x86_64-pc-windows-msvc
+          archive: ldg-$target
+          include: dist/ldg.ps1
+          ref: refs/tags/${{ needs.release.outputs.tag }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   # Publish the draft once every asset is attached.
   publish:
-    needs: [release, upload]
+    needs: [release, upload, upload-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write

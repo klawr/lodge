@@ -31,9 +31,12 @@ pub fn write_tar(dir: &Path, out: impl Write) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::super::testing::{bundle_dir, tar_of};
+    #[cfg(unix)]
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn the_manifest_comes_first_so_reading_it_never_scans_the_archive() {
         let (dir, _) = bundle_dir();

@@ -62,13 +62,12 @@ pub fn pack(src: &dyn Snapshot, name: &str, owner: &ContainerUser, out: impl Wri
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::snapshot::DiskSnapshot;
     use crate::tmpfile::TempDir;
     use std::io::Read;
-    use std::os::unix::fs::PermissionsExt;
 
     fn owner() -> ContainerUser {
         ContainerUser {
@@ -112,12 +111,8 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("a"), "A").unwrap();
         std::fs::write(dir.path().join("sub/run"), "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(
-            dir.path().join("sub/run"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink("a", dir.path().join("link")).unwrap();
+        crate::platform::set_mode(dir.path().join("sub/run"), 0o755).unwrap();
+        crate::platform::symlink("a", dir.path().join("link")).unwrap();
 
         let mut buf = Vec::new();
         pack(&DiskSnapshot::at(dir.path()), "ignored", &owner(), &mut buf).unwrap();
@@ -139,7 +134,7 @@ mod tests {
         let dir = TempDir::new("tarball-file").unwrap();
         let file = dir.path().join("source-name");
         std::fs::write(&file, "hello").unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::platform::set_mode(&file, 0o700).unwrap();
 
         let mut buf = Vec::new();
         pack(&DiskSnapshot::at(&file), "dest-name", &owner(), &mut buf).unwrap();
@@ -157,7 +152,7 @@ mod tests {
         let real = dir.path().join("real");
         std::fs::write(&real, "contents").unwrap();
         let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        crate::platform::symlink(&real, &link).unwrap();
         let mut buf = Vec::new();
         pack(
             &DiskSnapshot::resolved(&link).unwrap(),
@@ -178,7 +173,7 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(sub.join("f"), "x").unwrap();
         let dir_link = dir.path().join("dl");
-        std::os::unix::fs::symlink(&sub, &dir_link).unwrap();
+        crate::platform::symlink(&sub, &dir_link).unwrap();
         let mut buf = Vec::new();
         pack(
             &DiskSnapshot::resolved(&dir_link).unwrap(),

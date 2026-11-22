@@ -2,7 +2,7 @@ PREFIX ?= /usr/local/bin
 BINDIR  = $(PREFIX)
 
 .DEFAULT_GOAL := help
-.PHONY: help all build install uninstall clean dev test lint doc fmt check integration deny hooks schema
+.PHONY: help all build install uninstall clean dev test lint lint-windows doc fmt check integration deny hooks schema
 
 help: ## Show this list
 	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -17,6 +17,9 @@ test: ## Unit tests (no docker needed)
 
 lint: ## Clippy with warnings as errors
 	cargo clippy --all-targets -- -D warnings
+
+lint-windows: ## Clippy for the Windows client (needs the devcontainer's mingw)
+	cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings
 
 doc: ## The code's docs, with broken links and markup as errors
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --quiet

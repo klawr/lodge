@@ -720,11 +720,10 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod write_secret_script_tests {
     use super::WRITE_SECRET_SCRIPT;
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
 
     fn run(dest: &str, mode: u32, input: &[u8]) -> bool {
@@ -749,7 +748,7 @@ mod write_secret_script_tests {
         assert!(run(dest, 0o600, b"one\0two"));
         assert_eq!(std::fs::read(dest).unwrap(), b"one\0two");
         assert_eq!(
-            std::fs::metadata(dest).unwrap().permissions().mode() & 0o777,
+            crate::platform::mode(&std::fs::metadata(dest).unwrap()) & 0o777,
             0o600
         );
         // A more restrictive mode, over an existing file, still works.
@@ -757,7 +756,7 @@ mod write_secret_script_tests {
         assert!(run(dest, 0o400, b"newer"));
         assert_eq!(std::fs::read(dest).unwrap(), b"newer");
         assert_eq!(
-            std::fs::metadata(dest).unwrap().permissions().mode() & 0o777,
+            crate::platform::mode(&std::fs::metadata(dest).unwrap()) & 0o777,
             0o400
         );
         // No leftovers; a missing directory fails cleanly.

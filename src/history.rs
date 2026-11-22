@@ -9,10 +9,10 @@
 //! [`History`] is the seam: the command layer takes it, and a test hands in
 //! a list in memory. [`FileHistory`] keeps the list in `~/.local/share/lodge/history.json`.
 
+use crate::platform;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 /// How many places are kept; the least recent one makes room for a new one.
@@ -169,11 +169,9 @@ impl History for FileHistory {
         let tmp = path.with_extension("json.tmp");
         // Private to the user, like a shell history: it names project folders and hosts.
         // A file that was there before comes out of the rename with these rights too.
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        let mut file = platform::private_file(&mut opts)
             .open(&tmp)
             .with_context(|| format!("writing {}", tmp.display()))?;
         file.write_all(serde_json::to_string_pretty(&entries)?.as_bytes())
@@ -337,17 +335,17 @@ mod tests {
         assert!(!path.with_extension("json.tmp").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_file_is_private_to_the_user_even_when_an_open_one_was_there_before() {
-        use std::os::unix::fs::PermissionsExt as _;
         let dir = TempDir::new("history-mode").unwrap();
         let path = dir.path().join("history.json");
         std::fs::write(&path, "[]").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        crate::platform::set_mode(&path, 0o644).unwrap();
         FileHistory::at(path.clone())
             .remember(project("/a"), route(None), "a".into())
             .unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        let mode = crate::platform::mode(&std::fs::metadata(&path).unwrap());
         assert_eq!(mode & 0o777, 0o600, "{mode:o}");
     }
 

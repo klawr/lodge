@@ -103,7 +103,12 @@ impl Layout {
 /// to: the same place as here.
 pub fn tilde(path: &Path, home: &Path) -> String {
     match path.strip_prefix(home) {
-        Ok(rest) if home != Path::new("/") => format!("~/{}", rest.display()),
+        // `/` between the parts whatever this machine uses: the path is for a
+        // container.
+        Ok(rest) if home != Path::new("/") => {
+            let parts: Vec<_> = rest.iter().map(|p| p.to_string_lossy()).collect();
+            format!("~/{}", parts.join("/"))
+        }
         _ => path.display().to_string(),
     }
 }

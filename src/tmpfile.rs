@@ -4,9 +4,9 @@
 //! trusted: each file or directory is created new (never opened if something
 //! is already there, symlink or not) and private to this user.
 
+use crate::platform;
 use anyhow::Result;
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -55,12 +55,9 @@ fn create_new_from(
 /// Creates the file `p`, owner-only, failing if anything (a symlink included)
 /// is already there.
 fn create_private_file(p: &Path) -> std::io::Result<()> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(p)
-        .map(drop)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    platform::private_file(&mut opts).open(p).map(drop)
 }
 
 /// A temp file that deletes itself on drop, so an error that short-circuits an
@@ -120,7 +117,7 @@ impl TempDir {
     /// renamed into place on the same filesystem.
     pub fn new_in(parent: &Path, name: &str) -> std::io::Result<Self> {
         let path = create_new(parent, name, |p| {
-            std::fs::DirBuilder::new().mode(0o700).create(p)
+            platform::private_dir(&mut std::fs::DirBuilder::new()).create(p)
         })?;
         Ok(Self { path })
     }
@@ -152,14 +149,16 @@ pub fn discard_dir(path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{TempDir, TempFile, create_new_from, create_private_file};
-    use std::os::unix::fs::PermissionsExt;
+    use super::TempFile;
+    #[cfg(unix)]
+    use super::{TempDir, create_new_from, create_private_file};
 
+    #[cfg(unix)]
     #[test]
     fn files_and_folders_are_private_and_never_reuse_what_is_there() {
         let dir = TempDir::new("private").unwrap();
         assert_eq!(
-            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            crate::platform::mode(&std::fs::metadata(dir.path()).unwrap()) & 0o777,
             0o700
         );
         // Names planted in advance (here: symlinks to a file of someone
@@ -169,7 +168,7 @@ mod tests {
         std::fs::write(&victim, "keep").unwrap();
         let name = |k: u64| format!("lodge-{}-{k}-x", std::process::id());
         for k in 0..3 {
-            std::os::unix::fs::symlink(&victim, dir.path().join(name(k))).unwrap();
+            crate::platform::symlink(&victim, dir.path().join(name(k))).unwrap();
         }
         let mut n = 0;
         let mut next = || {
@@ -186,7 +185,7 @@ mod tests {
         assert!(!f.path().is_symlink());
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
         assert_eq!(
-            std::fs::metadata(f.path()).unwrap().permissions().mode() & 0o777,
+            crate::platform::mode(&std::fs::metadata(f.path()).unwrap()) & 0o777,
             0o600
         );
     }

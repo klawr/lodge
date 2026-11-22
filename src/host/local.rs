@@ -8,6 +8,7 @@ use super::{
     Child, FirstFile, Host, Job, Line, Ran, ScratchFile, Stream, run_interactive, run_process,
     start_process,
 };
+use crate::platform;
 use crate::tmpfile::TempFile;
 
 /// This machine: commands run as child processes and files are read directly.
@@ -16,11 +17,7 @@ pub struct LocalHost;
 /// The local process that runs `line`, in `dir` if given.
 fn command(line: &Line, dir: Option<&Path>) -> Command {
     let mut c = match line {
-        Line::Shell(script) => {
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(script);
-            c
-        }
+        Line::Shell(script) => platform::shell_command(script),
         Line::Argv(argv) => match argv.split_first() {
             Some((program, args)) => {
                 let mut c = Command::new(program);
@@ -86,7 +83,7 @@ impl Host for LocalHost {
     }
 
     fn canonical_dir(&self, dir: &Path) -> Result<PathBuf> {
-        std::fs::canonicalize(dir)
+        platform::canonicalize(dir)
             .with_context(|| format!("project folder {} does not exist", dir.display()))
     }
 
@@ -99,6 +96,13 @@ impl Host for LocalHost {
             None => None,
         };
         Ok(FirstFile { paths, contents })
+    }
+
+    fn uid_gid(&self) -> Result<Option<(u32, u32)>> {
+        if !platform::HAS_UNIX_IDS {
+            return Ok(None);
+        }
+        super::ids_from_id_command(self).map(Some)
     }
 
     fn fetch_dir(&self, dir: &Path, _dest: &Path) -> Result<PathBuf> {

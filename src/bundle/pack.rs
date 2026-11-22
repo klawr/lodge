@@ -3,7 +3,6 @@
 
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use super::archive;
@@ -16,6 +15,7 @@ use super::manifest::{
 use crate::arch::Arch;
 use crate::config::{BinaryEntry, Config, DataEntry};
 use crate::output::warning;
+use crate::platform;
 use crate::shell::is_plain_name;
 use crate::tmpfile::{TempDir, TempFile, discard_file};
 use crate::tools::{ElfEditor, Toolchain};
@@ -156,7 +156,7 @@ impl Packer<'_, '_> {
             let real = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
             std::fs::copy(&real, &dst).with_context(|| format!("copying {}", real.display()))?;
         }
-        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
+        platform::set_mode(&dst, 0o755)?;
 
         Ok(Binary {
             name: name.clone(),
@@ -257,7 +257,7 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
             dst.join(e.relative)
         };
         if e.meta.is_symlink() {
-            std::os::unix::fs::symlink(std::fs::read_link(e.path)?, &to)
+            platform::symlink(&std::fs::read_link(e.path)?, &to)
                 .with_context(|| format!("copying the link {}", e.path.display()))?;
         } else if e.meta.is_dir() {
             std::fs::create_dir_all(&to)?;
@@ -328,10 +328,15 @@ pub(crate) fn patch_binary(binary: &str, editor: &dyn ElfEditor) -> Result<TempF
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::bundle::reader::Bundle;
     use crate::config::{BinaryEntry, DataEntry};
+    #[cfg(unix)]
     use crate::snapshot::{Kind, Snapshot};
-    use crate::tools::{self, Ldd, Patchelf};
+    #[cfg(unix)]
+    use crate::tools;
+    use crate::tools::{Ldd, Patchelf};
+    #[cfg(unix)]
     use std::io::Read as _;
 
     fn script_tool(dir: &Path, name: &str) -> BinaryEntry {
@@ -362,6 +367,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_binary_and_its_data_become_a_verifiable_bundle() {
         let work = TempDir::new("pack-src").unwrap();
@@ -369,7 +375,7 @@ mod tests {
         let cfg = work.path().join("hello-config");
         std::fs::create_dir_all(cfg.join("sub")).unwrap();
         std::fs::write(cfg.join("sub/rc"), "set x").unwrap();
-        std::os::unix::fs::symlink("sub/rc", cfg.join("link")).unwrap();
+        crate::platform::symlink("sub/rc", cfg.join("link")).unwrap();
         let single = work.path().join("one");
         std::fs::write(&single, "1").unwrap();
         let mut config = config_with(vec![tool]);

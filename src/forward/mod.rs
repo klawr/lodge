@@ -8,6 +8,7 @@ mod daemon;
 mod tunnel;
 
 use crate::output::{info, warning};
+use crate::platform;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -84,11 +85,7 @@ impl ForwardDaemon for DetachedDaemon {
             cmd.args(["--port", &p.encode()]);
         }
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
+        platform::detach(&mut cmd);
 
         if let Err(e) = cmd
             .stdin(Stdio::null())
@@ -159,15 +156,7 @@ pub fn active_ports(container_id: &str) -> std::io::Result<Option<Vec<ActivePort
     let Ok(text) = std::fs::read_to_string(ports_path(container_id)?) else {
         return Ok(None);
     };
-    Ok(parse_ports(&text, is_daemon))
-}
-
-/// Whether `pid` is a running `ldg _forward`. Read from /proc rather than by
-/// probing the daemon's lock, which could make a starting daemon think another
-/// one is running.
-fn is_daemon(pid: u32) -> bool {
-    std::fs::read(format!("/proc/{pid}/cmdline"))
-        .is_ok_and(|c| c.split(|&b| b == 0).any(|a| a == b"_forward"))
+    Ok(parse_ports(&text, platform::is_forward_daemon))
 }
 
 fn parse_ports(text: &str, alive: impl Fn(u32) -> bool) -> Option<Vec<ActivePort>> {

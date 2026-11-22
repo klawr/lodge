@@ -311,11 +311,14 @@ fn add_implied_directories(index: &mut BTreeMap<Names, Entry>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::super::testing::{bundle_dir, tar_of};
     use super::*;
+    #[cfg(unix)]
     use crate::snapshot::DiskSnapshot;
     use crate::tmpfile::TempDir;
 
+    #[cfg(unix)]
     fn walked(snapshot: &dyn Snapshot) -> Vec<String> {
         let mut seen = Vec::new();
         snapshot
@@ -327,6 +330,7 @@ mod tests {
         seen
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_bundle_is_read_in_place_and_verifies() {
         let (dir, manifest) = bundle_dir();
@@ -344,6 +348,7 @@ mod tests {
         assert_eq!(text, "set x");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_part_of_the_bundle_hashes_as_the_directory_it_was_packed_from() {
         // The manifest's hashes were made from directories; reading the same
@@ -361,6 +366,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_subtree_is_walked_like_a_directory_and_keeps_modes_and_links() {
         let (dir, _) = bundle_dir();
@@ -394,6 +400,7 @@ mod tests {
         assert_eq!(links, ["sub/rc"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_damaged_file_is_caught() {
         let (dir, _) = bundle_dir();
@@ -406,6 +413,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_missing_file_is_caught_too() {
         let (dir, _) = bundle_dir();
@@ -506,6 +514,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_part_the_bundle_lacks_is_an_error_not_an_empty_tree() {
         let (dir, _) = bundle_dir();

@@ -210,9 +210,11 @@ pub fn start(
     // workspace is writable. Only when the container was just created.
     if created
         && spec.sync_uid
-        && let Err(e) = host
-            .uid_gid()
-            .and_then(|(uid, gid)| uid::sync_user_uid(env, spec.remote_user.as_deref(), uid, gid))
+        && let Err(e) = host.uid_gid().and_then(|ids| {
+            ids.map_or(Ok(()), |(uid, gid)| {
+                uid::sync_user_uid(env, spec.remote_user.as_deref(), uid, gid)
+            })
+        })
     {
         warning!("could not align the container user with the host (continuing): {e:#}");
     }

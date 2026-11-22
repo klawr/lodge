@@ -6,12 +6,12 @@
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use super::init::Detected;
 use crate::config::edit::NewEntry;
 use crate::layout::tilde;
+use crate::platform;
 use crate::shell::is_plain_name;
 
 /// Something that can be added: what it is called and shown as, and the entry
@@ -228,9 +228,7 @@ fn path_programs(path_var: &OsStr) -> Vec<(String, PathBuf)> {
             .collect();
         names.sort();
         for (name, path) in names {
-            let runnable = std::fs::metadata(&path)
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
-            if runnable && is_plain_name(&name) && seen.insert(name.clone()) {
+            if platform::is_executable(&path) && is_plain_name(&name) && seen.insert(name.clone()) {
                 found.push((name, path));
             }
         }
@@ -239,7 +237,7 @@ fn path_programs(path_var: &OsStr) -> Vec<(String, PathBuf)> {
     found
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::tmpfile::TempDir;
@@ -247,7 +245,7 @@ mod tests {
     fn touch(path: &Path, mode: u32) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, "x").unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        crate::platform::set_mode(path, mode).unwrap();
     }
 
     fn names(c: &[Candidate]) -> Vec<&str> {

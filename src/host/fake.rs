@@ -5,7 +5,6 @@
 
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
-use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Mutex;
@@ -184,7 +183,7 @@ fn argv_of(line: &Line) -> Vec<String> {
 }
 
 fn status(code: i32) -> ExitStatus {
-    ExitStatus::from_raw(code << 8)
+    crate::platform::exit_status(code)
 }
 
 struct FakeChild {
@@ -349,8 +348,8 @@ impl Host for FakeHost {
         Ok(dest.to_path_buf())
     }
 
-    fn uid_gid(&self) -> Result<(u32, u32)> {
-        Ok((1000, 1000))
+    fn uid_gid(&self) -> Result<Option<(u32, u32)>> {
+        Ok(Some((1000, 1000)))
     }
 
     /// A remote fake loses its connection like ssh does: exit 255, and the step

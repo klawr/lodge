@@ -203,8 +203,8 @@ fn reconnect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::tmpfile::TempDir;
-    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
     fn layout() -> Layout {
@@ -212,6 +212,7 @@ mod tests {
     }
 
     /// Runs `script` with `sh -c`, the way the container does.
+    #[cfg(unix)]
     fn sh(script: &str, path: &str) -> String {
         let out = Command::new("sh")
             .args(["-c", script])
@@ -282,6 +283,7 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout), "unset");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_login_shell_that_resets_path_still_ends_up_with_the_tools_first() {
         // A stand-in shell: as a login shell (`-lc CMD`) it resets PATH like
@@ -293,7 +295,7 @@ mod tests {
             "#!/bin/sh\ncase \"$1\" in\n  -lc) export PATH=/usr/bin:/bin; eval \"$2\" ;;\n  -i) printf '%s\\n' \"$PATH\" ;;\nesac\n",
         )
         .unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::platform::set_mode(&shell, 0o755).unwrap();
 
         let script = startup_script(&layout(), &shell.to_string_lossy(), "");
         assert_eq!(
