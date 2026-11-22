@@ -776,7 +776,7 @@ x86_64 and aarch64. On `master`, once all of those pass, release-please
 open that bumps the version in `Cargo.toml` from the conventional commits (`feat`
 the minor version, `fix` the patch, a breaking change the minor before 1.0; no
 changelog file). Merging it tags the version and creates a *draft* release; the
-binaries (`ldg-<target>.tar.gz`, what `install.sh` downloads, with the shell completions and the man page beside `ldg`) are attached, and
+binaries (bare `ldg-<target>` files, each with a `.sha256`; what `install.sh` downloads) are attached, and
 only then is the release published, so "latest" never lacks them. `make check` runs the same gate locally, `make deny`
 the dependency check.
 

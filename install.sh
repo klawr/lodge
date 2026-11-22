@@ -26,7 +26,7 @@ case "$arch" in
   *) err "no prebuilt binary for $arch — build from source: cargo install --git https://github.com/$REPO" ;;
 esac
 
-asset="ldg-$target.tar.gz"
+asset="ldg-$target"
 if [ "$VERSION" = "latest" ]; then
   url="https://github.com/$REPO/releases/latest/download/$asset"
 else
@@ -45,8 +45,21 @@ mkdir -p "$BIN_DIR"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 info "downloading $asset ($VERSION)"
-fetch "$url" "$tmp/ldg.tar.gz" || err "download failed: $url"
-tar -xzf "$tmp/ldg.tar.gz" -C "$tmp" || err "could not extract $asset"
+fetch "$url" "$tmp/ldg" || err "download failed: $url"
+# Verify against the .sha256 published next to the binary. This catches a
+# corrupt or truncated download; it is not a signature.
+if command -v sha256sum >/dev/null 2>&1; then
+  sha() { sha256sum "$1" | cut -d' ' -f1; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
+else
+  err "need sha256sum or shasum to verify the download"
+fi
+fetch "$url.sha256" "$tmp/ldg.sha256" || err "download failed: $url.sha256"
+want="$(cut -d' ' -f1 "$tmp/ldg.sha256")"
+[ "$(sha "$tmp/ldg")" = "$want" ] || err "checksum mismatch for $asset"
+info "checksum ok"
+chmod +x "$tmp/ldg"
 install -m755 "$tmp/ldg" "$BIN_DIR/ldg" 2>/dev/null || { mv "$tmp/ldg" "$BIN_DIR/ldg"; chmod +x "$BIN_DIR/ldg"; }
 info "installed ldg to $BIN_DIR/ldg"
 
