@@ -11,12 +11,14 @@
 //! - [`inject`]: `inject add|rm|ls`, which edit the `[[inject]]` entries of the config
 //! - [`bundle`]: `pack`, `bundle`, `cache`
 //! - [`prompt`]: the questions asked on the terminal, and the interface they are asked through
+//! - [`browse`]: finding a file or a folder (or a project) by typing part of its name, on top of `select`
 //! - [`select`]: the list to choose from with the keyboard, behind `prompt`
 //! - [`table`]: rows of cells laid out for whatever width the terminal has
 //! - [`targets`]: the list of targets, the one place that says which there are
 
 mod add;
 mod attach;
+mod browse;
 mod bundle;
 mod candidates;
 mod configure;
@@ -269,6 +271,37 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                 cli.remote = resumed.route.remote;
                 cli.target = Some(resumed.route.target);
                 resumed.command
+            }
+            Some(resume::Home::New) => {
+                if cli.remote.is_some() {
+                    anyhow::bail!(
+                        "a project on another machine can't be browsed for: \
+                         give its path, `ldg --remote HOST up PATH`"
+                    );
+                }
+                let home = SystemLocal
+                    .var("HOME")
+                    .map_or_else(|| PathBuf::from("/"), PathBuf::from);
+                let scope = browse::Scope::new(vec![home.clone()], Vec::new());
+                match browse::pick(
+                    &prompt::Terminal,
+                    "New project",
+                    &scope,
+                    browse::Want::Project,
+                    &home,
+                )? {
+                    browse::Browsed::Chose(dir) => Command::Up {
+                        project: crate::cli::ProjectArg { path: Some(dir) },
+                        build: false,
+                        reinject: false,
+                        no_attach: false,
+                        bundle: None,
+                    },
+                    browse::Browsed::Left => return Ok(ExitCode::SUCCESS),
+                    browse::Browsed::Unsupported => {
+                        anyhow::bail!("no projects found; give a path, `ldg up PATH`")
+                    }
+                }
             }
             Some(resume::Home::Configure) => {
                 // Only the config is worked on: no host, no target, no engine.

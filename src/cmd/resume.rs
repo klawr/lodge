@@ -23,6 +23,8 @@ pub enum Home {
     Place(Resumed),
     /// To look at and change what is injected.
     Configure,
+    /// To find a project that is not remembered yet.
+    New,
 }
 
 /// What to run, and how to reach it.
@@ -34,6 +36,10 @@ pub struct Resumed {
 /// The keys besides Enter: the config, and the two ways to open a place again
 /// that Enter does not do.
 const KEYS: &[Hotkey] = &[
+    Hotkey {
+        key: 'n',
+        label: "new",
+    },
     Hotkey {
         key: 'c',
         label: "config",
@@ -70,6 +76,7 @@ pub fn pick(
         let (key, row) = match choose.choose_with("Where to?", &describe(&entries), KEYS)? {
             Choice::Left => return Ok(None),
             Choice::Key('c', _) => return Ok(Some(Home::Configure)),
+            Choice::Key('n', _) => return Ok(Some(Home::New)),
             Choice::Key(key, row) => (Some(key), row),
             Choice::Row(row) => (None, row),
         };
@@ -165,7 +172,7 @@ fn describe(entries: &[Entry]) -> Table {
         let none = |text: &str| Cell::new(text, Tone::Muted);
         rows.push(vec![
             none("no places yet"),
-            none("`ldg up` in a project or `ldg attach NAME` remembers one; c for the config"),
+            none("`ldg up` in a project or `ldg attach NAME` remembers one; n for a new one, c for the config"),
             none(""),
             none(""),
         ]);
@@ -200,18 +207,18 @@ mod tests {
         }
     }
 
-    /// Presses the config key.
-    struct PressesC;
-    impl Choose for PressesC {
+    /// Presses a key of the first screen.
+    struct PressesKey(char);
+    impl Choose for PressesKey {
         fn choose(&self, _: &str, _: &Table) -> Result<Option<usize>> {
             Ok(None)
         }
         fn choose_with(&self, _: &str, _: &Table, keys: &[Hotkey]) -> Result<Choice> {
             assert_eq!(
                 keys.iter().map(|k| k.key).collect::<Vec<_>>(),
-                vec!['c', 'r', 'b']
+                vec!['n', 'c', 'r', 'b']
             );
-            Ok(Choice::Key('c', 0))
+            Ok(Choice::Key(self.0, 0))
         }
     }
 
@@ -219,7 +226,7 @@ mod tests {
         fn place(self) -> Resumed {
             match self {
                 Home::Place(p) => p,
-                Home::Configure => panic!("not a place"),
+                _ => panic!("not a place"),
             }
         }
     }
@@ -343,12 +350,26 @@ mod tests {
 
     #[test]
     fn the_config_key_leads_to_the_config_with_places_or_without() {
-        let home = pick(&history(), &PressesC, None, None).unwrap().unwrap();
-        assert!(matches!(home, Home::Configure));
-        let home = pick(&Memory::default(), &PressesC, None, None)
+        let home = pick(&history(), &PressesKey('c'), None, None)
             .unwrap()
             .unwrap();
         assert!(matches!(home, Home::Configure));
+        let home = pick(&Memory::default(), &PressesKey('c'), None, None)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(home, Home::Configure));
+    }
+
+    #[test]
+    fn the_new_key_leads_to_a_new_project_with_places_or_without() {
+        let home = pick(&history(), &PressesKey('n'), None, None)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(home, Home::New));
+        let home = pick(&Memory::default(), &PressesKey('n'), None, None)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(home, Home::New));
     }
 
     #[test]

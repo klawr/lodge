@@ -313,6 +313,19 @@ fn normalize_env_value(v: &str, vars: &Vars) -> String {
     vars.apply(v).replace("${containerEnv:", "${")
 }
 
+/// Whether `dir`, on this machine, holds a devcontainer config: one of the
+/// places [`find_config`] looks, without the host. For choosing a project among
+/// the folders here.
+pub fn has_config(dir: &Path) -> bool {
+    let at = dir.join(".devcontainer");
+    if at.join("devcontainer.json").is_file() || dir.join(".devcontainer.json").is_file() {
+        return true;
+    }
+    std::fs::read_dir(&at).is_ok_and(|mut entries| {
+        entries.any(|e| e.is_ok_and(|e| e.path().join("devcontainer.json").is_file()))
+    })
+}
+
 // Devcontainer config lookup, per spec precedence: .devcontainer/devcontainer.json,
 // .devcontainer.json, then .devcontainer/<folder>/devcontainer.json (one level
 // deep). With several subfolder configs the first (alphabetically) wins, with a

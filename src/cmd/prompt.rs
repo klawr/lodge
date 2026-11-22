@@ -14,7 +14,7 @@ use super::table::Table;
 use crate::devcontainer::Prompt;
 use crate::output::{line_err, note, prompt, warning};
 
-pub use super::select::{Doc, DocLine, Hotkey, Item, Pick};
+pub use super::select::{Doc, DocLine, Hotkey, Item, Knob, Pick};
 
 /// How a question with hotkeys was answered.
 #[derive(Debug, PartialEq, Eq)]
@@ -32,6 +32,8 @@ pub enum Selection {
     Items(Vec<usize>),
     /// A path typed in full.
     Path(String),
+    /// A knob was edited, so the list is to be made again with the change.
+    Edited(usize, String),
     Left,
     /// The terminal can't do this; ask for what is wanted in words instead.
     Unsupported,
@@ -79,6 +81,44 @@ pub trait Choose {
     fn find(&self, _question: &str, _tabs: &[&str], _items: &[Item]) -> Result<Selection> {
         Ok(Selection::Unsupported)
     }
+
+    /// [`Choose::find`], with settings of the search that the person can edit
+    /// from inside it. Without a terminal that can, the settings are not offered.
+    fn find_knobs(
+        &self,
+        question: &str,
+        tabs: &[&str],
+        items: &[Item],
+        _knobs: &[Knob],
+    ) -> Result<Selection> {
+        self.find(question, tabs, items)
+    }
+
+    /// [`Choose::find_adding`], with settings of the search as in [`Choose::find_knobs`].
+    fn find_adding_knobs(
+        &self,
+        question: &str,
+        tabs: &[&str],
+        items: &[Item],
+        _knobs: &[Knob],
+        add: &mut dyn FnMut(Pick) -> Result<String, String>,
+    ) -> Result<Adding> {
+        Ok(if self.find_adding(question, tabs, items, add)? {
+            Adding::Done
+        } else {
+            Adding::Unsupported
+        })
+    }
+}
+
+/// How adding things from a list ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Adding {
+    Done,
+    /// The terminal can't do this; ask in words.
+    Unsupported,
+    /// A knob was edited, so the list is to be made again with the change.
+    Edited(usize, String),
 }
 
 /// Asks the person to type something.
@@ -148,6 +188,24 @@ impl Choose for Terminal {
         })
     }
 
+    fn find_adding_knobs(
+        &self,
+        question: &str,
+        tabs: &[&str],
+        items: &[Item],
+        knobs: &[Knob],
+        add: &mut dyn FnMut(Pick) -> Result<String, String>,
+    ) -> Result<Adding> {
+        Self::check(question)?;
+        Ok(
+            match select::find_adding(question, tabs, items, knobs, add)? {
+                select::Added::Done => Adding::Done,
+                select::Added::NoRawMode => Adding::Unsupported,
+                select::Added::Edited(at, text) => Adding::Edited(at, text),
+            },
+        )
+    }
+
     fn find_adding(
         &self,
         question: &str,
@@ -155,19 +213,32 @@ impl Choose for Terminal {
         items: &[Item],
         add: &mut dyn FnMut(Pick) -> Result<String, String>,
     ) -> Result<bool> {
-        Self::check(question)?;
-        Ok(select::find_adding(question, tabs, items, add)?)
+        Ok(matches!(
+            self.find_adding_knobs(question, tabs, items, &[], add)?,
+            Adding::Done
+        ))
     }
 
-    fn find(&self, question: &str, tabs: &[&str], items: &[Item]) -> Result<Selection> {
+    fn find_knobs(
+        &self,
+        question: &str,
+        tabs: &[&str],
+        items: &[Item],
+        knobs: &[Knob],
+    ) -> Result<Selection> {
         Self::check(question)?;
-        Ok(match select::find(question, tabs, items)? {
+        Ok(match select::find(question, tabs, items, knobs)? {
             select::Found::Chose(items) => Selection::Items(items),
             select::Found::One(i) => Selection::Items(vec![i]),
             select::Found::Path(p) => Selection::Path(p),
+            select::Found::Edited(at, text) => Selection::Edited(at, text),
             select::Found::Left => Selection::Left,
             select::Found::NoRawMode => Selection::Unsupported,
         })
+    }
+
+    fn find(&self, question: &str, tabs: &[&str], items: &[Item]) -> Result<Selection> {
+        self.find_knobs(question, tabs, items, &[])
     }
 }
 

@@ -380,8 +380,30 @@ pub struct Item {
     pub detail: String,
 }
 
+/// A setting of a search that is changed from inside it: pressing Ctrl and
+/// `key` opens its text for editing (Enter applies it, Esc leaves it as it was),
+/// or, when it is not `editable`, applies it at once. The search then ends with
+/// [`Found::Edited`], for the one that asked to look again with the change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Knob {
+    pub key: char,
+    /// What the setting is, as part of the line that says how it stands:
+    /// `looking in`.
+    pub name: &'static str,
+    /// What pressing the key does: `change where to look`.
+    pub action: String,
+    /// How it stands now. Empty for one that is not `editable`.
+    pub text: String,
+    pub editable: bool,
+    /// Whether it is other than it began.
+    pub changed: bool,
+}
+
 /// How a search ended.
 pub enum Found {
+    /// A knob was edited (its index, and the new text, empty for one that is
+    /// not editable): the search is asked again with that change.
+    Edited(usize, String),
     /// The items marked, or the one under the selection when none was.
     Chose(Vec<usize>),
     /// Adding as it goes: the item under the selection, to be added now.
@@ -458,6 +480,8 @@ enum FKey {
     Mark,
     Accept,
     Leave,
+    /// Ctrl and a letter: a [`Knob`], when there is one by that key.
+    Knob(char),
 }
 
 fn map_find_key(event: KeyEvent) -> Option<FKey> {
@@ -478,7 +502,8 @@ fn map_find_key(event: KeyEvent) -> Option<FKey> {
         KeyCode::Char('p') if ctrl => FKey::Up,
         KeyCode::Char('n') if ctrl => FKey::Down,
         KeyCode::Char('u') if ctrl => FKey::ClearAll,
-        KeyCode::Char(c) if !ctrl => FKey::Type(c),
+        KeyCode::Char(c) if ctrl => FKey::Knob(c),
+        KeyCode::Char(c) => FKey::Type(c),
         _ => return None,
     })
 }
@@ -495,6 +520,9 @@ struct Finder {
     /// Whether Enter acts on the item at once, and marks it so it is not added
     /// twice, instead of ending the search with what is marked.
     adding: bool,
+    knobs: Vec<Knob>,
+    /// The knob being edited and the text so far.
+    editing: Option<(usize, String)>,
 }
 
 impl Finder {
@@ -507,6 +535,8 @@ impl Finder {
             rows: Vec::new(),
             cursor: Cursor::new(0),
             adding: false,
+            knobs: Vec::new(),
+            editing: None,
         };
         f.marked = (0..items.len()).filter(|&i| items[i].added).collect();
         f.refresh(items);
@@ -528,6 +558,54 @@ impl Finder {
         self.rows = rows;
     }
 
+    /// Whether the search has settings.
+    fn knobs_here(&self) -> bool {
+        !self.knobs.is_empty()
+    }
+
+    /// How the settings stand, on a line of their own: what is other than it
+    /// began says so. `None` when there are none.
+    fn knob_state(&self) -> Option<Line> {
+        if !self.knobs_here() {
+            return None;
+        }
+        let mut spans = vec![Span::new(" ", Tone::Muted)];
+        for (n, k) in self.knobs.iter().filter(|k| k.editable).enumerate() {
+            if n > 0 {
+                spans.push(Span::new(" · ", Tone::Muted));
+            }
+            let tone = if k.changed {
+                Tone::Accent
+            } else {
+                Tone::Normal
+            };
+            let note = if k.changed { " (changed)" } else { "" };
+            spans.push(Span::new(format!("{} {}{note}", k.name, k.text), tone));
+        }
+        Some(Line {
+            spans,
+            selected: false,
+        })
+    }
+
+    /// What the keys of the settings do, in the line under the list.
+    fn knob_keys(&self) -> Option<Line> {
+        if !self.knobs_here() || self.editing.is_some() {
+            return None;
+        }
+        let keys: Vec<String> = self
+            .knobs
+            .iter()
+            .map(|k| format!("^{} {}", k.key.to_ascii_uppercase(), k.action))
+            .collect();
+        Some(Line::of(format!(" {}", keys.join(" · ")), Tone::Muted))
+    }
+
+    /// How many lines the screen has besides the rows.
+    fn chrome(&self) -> usize {
+        5 + 2 * usize::from(self.knobs_here())
+    }
+
     /// How many items of each list match what was typed.
     fn counts(&self, items: &[Item]) -> Vec<usize> {
         let mut counts = vec![0; self.tabs];
@@ -539,7 +617,34 @@ impl Finder {
 
     /// `Some` when the search is over.
     fn apply(&mut self, key: FKey, items: &[Item]) -> Option<Found> {
+        if let Some((at, mut text)) = self.editing.take() {
+            match key {
+                FKey::Accept => return Some(Found::Edited(at, text)),
+                FKey::Leave => {}
+                FKey::Type(c) => text.push(c),
+                FKey::Backspace => {
+                    text.pop();
+                }
+                FKey::ClearAll => text.clear(),
+                _ => {}
+            }
+            if !matches!(key, FKey::Leave) {
+                self.editing = Some((at, text));
+            }
+            return None;
+        }
         match key {
+            FKey::Knob(c) => {
+                if let Some(at) = self.knobs.iter().position(|k| k.key == c)
+                    && self.knobs_here()
+                {
+                    if self.knobs[at].editable {
+                        self.editing = Some((at, self.knobs[at].text.clone()));
+                    } else {
+                        return Some(Found::Edited(at, String::new()));
+                    }
+                }
+            }
             FKey::Type(c) => {
                 self.query.push(c);
                 self.refresh(items);
@@ -635,7 +740,18 @@ fn find_frame(
             spans: heads,
             selected: false,
         },
-        Line {
+    ];
+    lines.extend(finder.knob_state());
+    lines.push(match &finder.editing {
+        Some((at, text)) => Line {
+            spans: vec![
+                Span::new(format!(" {}: ", finder.knobs[*at].name), Tone::Accent),
+                Span::new(text.clone(), Tone::Normal),
+                Span::new("▏", Tone::Accent),
+            ],
+            selected: false,
+        },
+        None => Line {
             spans: vec![
                 Span::new(" > ", Tone::Muted),
                 Span::new(finder.query.clone(), Tone::Normal),
@@ -643,7 +759,7 @@ fn find_frame(
             ],
             selected: false,
         },
-    ];
+    });
     let shown = finder
         .rows
         .iter()
@@ -681,7 +797,11 @@ fn find_frame(
     } else {
         format!(" · {} marked", finder.marked.len())
     };
-    let keys = if finder.adding {
+    // The keys of the settings go above the hints, so a narrow window cuts the hints.
+    lines.extend(finder.knob_keys());
+    let keys = if finder.editing.is_some() {
+        " type the new value · Ctrl-U clear · Enter apply · Esc leave it".to_string()
+    } else if finder.adding {
         format!(" type to filter · ←/→ list · ↑/↓ move · Enter add · Esc done{marked}")
     } else {
         format!(" type to filter · ←/→ list · ↑/↓ move · Tab mark · Enter add · Esc back{marked}")
@@ -700,16 +820,17 @@ fn find_frame(
 }
 
 /// A list that narrows as the person types, where several things can be marked.
-pub fn find(question: &str, tabs: &[&str], items: &[Item]) -> io::Result<Found> {
+pub fn find(question: &str, tabs: &[&str], items: &[Item], knobs: &[Knob]) -> io::Result<Found> {
     let Ok(_raw) = RawMode::enter() else {
         return Ok(Found::NoRawMode);
     };
     let mut err = io::stderr();
     let mut finder = Finder::new(items, tabs.len());
+    finder.knobs = knobs.to_vec();
     loop {
         let (columns, height) = usable_size(terminal::size()?);
         let (columns, height) = (usize::from(columns), usize::from(height));
-        let rows = height.saturating_sub(5).max(1);
+        let rows = height.saturating_sub(finder.chrome()).max(1);
         finder.cursor.fit(rows);
         draw(
             &mut err,
@@ -728,6 +849,14 @@ pub fn find(question: &str, tabs: &[&str], items: &[Item]) -> io::Result<Found> 
     }
 }
 
+/// How adding ended.
+pub enum Added {
+    Done,
+    NoRawMode,
+    /// A knob was edited (see [`Found::Edited`]): look again with the change.
+    Edited(usize, String),
+}
+
 /// What was chosen while adding.
 pub enum Pick {
     Item(usize),
@@ -743,19 +872,21 @@ pub fn find_adding(
     question: &str,
     tabs: &[&str],
     items: &[Item],
+    knobs: &[Knob],
     add: &mut dyn FnMut(Pick) -> Result<String, String>,
-) -> io::Result<bool> {
+) -> io::Result<Added> {
     let Ok(_raw) = RawMode::enter() else {
-        return Ok(false);
+        return Ok(Added::NoRawMode);
     };
     let mut err = io::stderr();
     let mut finder = Finder::new(items, tabs.len());
+    finder.knobs = knobs.to_vec();
     finder.adding = true;
     let mut status = String::new();
     loop {
         let (columns, height) = usable_size(terminal::size()?);
         let (columns, height) = (usize::from(columns), usize::from(height));
-        let rows = height.saturating_sub(5).max(1);
+        let rows = height.saturating_sub(finder.chrome()).max(1);
         finder.cursor.fit(rows);
         let lines = find_frame(question, tabs, items, &finder, &status, rows, columns);
         draw(&mut err, &lines, columns)?;
@@ -767,7 +898,8 @@ pub fn find_adding(
         };
         match finder.apply(key, items) {
             None => {}
-            Some(Found::Left) => return Ok(true),
+            Some(Found::Left) => return Ok(Added::Done),
+            Some(Found::Edited(at, text)) => return Ok(Added::Edited(at, text)),
             Some(Found::One(i)) => match add(Pick::Item(i)) {
                 Ok(done) => {
                     finder.marked.insert(i);
@@ -1657,5 +1789,129 @@ mod tests {
         // The place is at the far end of the last line only.
         assert!(narrow.last().unwrap().ends_with("1/3 "));
         assert!(!narrow[0].ends_with("1/3 "));
+    }
+
+    fn knobs() -> Vec<Knob> {
+        vec![
+            Knob {
+                key: 'w',
+                name: "looking in",
+                action: "change where to look".into(),
+                text: "~".into(),
+                editable: true,
+                changed: false,
+            },
+            Knob {
+                key: 'a',
+                name: "everywhere",
+                action: "look everywhere".into(),
+                text: String::new(),
+                editable: false,
+                changed: false,
+            },
+        ]
+    }
+
+    fn with_knobs(list: &[Item]) -> Finder {
+        let mut f = Finder::new(list, 1);
+        f.knobs = knobs();
+        f
+    }
+
+    #[test]
+    fn ctrl_and_a_letter_is_a_knob_and_other_keys_are_still_typing() {
+        let ctrl = |c| map_find_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+        assert_eq!(ctrl('w'), Some(FKey::Knob('w')));
+        assert_eq!(ctrl('u'), Some(FKey::ClearAll), "Ctrl-U still clears");
+        assert_eq!(
+            map_find_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+            Some(FKey::Type('w'))
+        );
+    }
+
+    #[test]
+    fn an_editable_knob_is_edited_in_place_and_enter_hands_back_the_new_text() {
+        let list = items(&["alpha"]);
+        let mut f = with_knobs(&list);
+        assert!(f.apply(FKey::Knob('w'), &list).is_none());
+        assert_eq!(
+            f.editing,
+            Some((0, "~".to_string())),
+            "starts from what it is"
+        );
+        f.apply(FKey::Type('/'), &list);
+        f.apply(FKey::Type('x'), &list);
+        f.apply(FKey::Backspace, &list);
+        assert_eq!(
+            f.query, "",
+            "what is typed goes to the knob, not the search"
+        );
+        assert!(matches!(
+            f.apply(FKey::Accept, &list),
+            Some(Found::Edited(0, text)) if text == "~/"
+        ));
+    }
+
+    #[test]
+    fn escape_leaves_the_knob_as_it_was_and_the_search_goes_on() {
+        let list = items(&["alpha"]);
+        let mut f = with_knobs(&list);
+        f.apply(FKey::Knob('w'), &list);
+        f.apply(FKey::ClearAll, &list);
+        assert!(
+            f.apply(FKey::Leave, &list).is_none(),
+            "Esc ends the edit, not the search"
+        );
+        assert_eq!(f.editing, None);
+        assert!(matches!(f.apply(FKey::Leave, &list), Some(Found::Left)));
+    }
+
+    #[test]
+    fn a_knob_that_is_not_editable_applies_at_once_and_an_unknown_key_does_nothing() {
+        let list = items(&["alpha"]);
+        let mut f = with_knobs(&list);
+        assert!(matches!(
+            f.apply(FKey::Knob('a'), &list),
+            Some(Found::Edited(1, text)) if text.is_empty()
+        ));
+        assert!(f.apply(FKey::Knob('z'), &list).is_none());
+        assert_eq!(f.editing, None);
+    }
+
+    #[test]
+    fn the_screen_says_how_the_settings_stand_and_apart_from_it_what_the_keys_do() {
+        let list = items(&["alpha"]);
+        let mut f = with_knobs(&list);
+        let text = |f: &Finder| texts(&find_frame("Add", &["Files"], &list, f, "", 5, 80));
+        let shown = text(&f);
+        assert_eq!(shown[2], " looking in ~", "{shown:?}");
+        assert_eq!(
+            shown[shown.len() - 2],
+            " ^W change where to look · ^A look everywhere",
+            "{shown:?}"
+        );
+        assert_eq!(f.chrome(), 7, "the two lines take rows from the list");
+        f.apply(FKey::Knob('w'), &list);
+        let shown = text(&f);
+        assert!(
+            shown.iter().any(|l| l.contains("looking in: ~▏")),
+            "{shown:?}"
+        );
+        assert!(shown.last().unwrap().contains("Enter apply"), "{shown:?}");
+        assert!(
+            shown.iter().all(|l| !l.contains("^W")),
+            "no keys while editing: {shown:?}"
+        );
+        let plain = Finder::new(&list, 1);
+        assert_eq!(plain.chrome(), 5, "without knobs the screen is as it was");
+    }
+
+    #[test]
+    fn what_was_changed_says_so() {
+        let list = items(&["alpha"]);
+        let mut f = with_knobs(&list);
+        f.knobs[0].changed = true;
+        let shown = texts(&find_frame("Add", &["Files"], &list, &f, "", 5, 80));
+        assert_eq!(shown[2], " looking in ~ (changed)", "{shown:?}");
     }
 }

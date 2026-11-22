@@ -73,6 +73,17 @@ const NOT_OFFERED_IN_CONFIG: &[&str] = &[
     "lodge",
 ];
 
+/// What is never offered when looking through the home directory: the
+/// credentials and state of [`NOT_OFFERED`], and of `~/.config`.
+pub fn withheld(home: &Path) -> Vec<PathBuf> {
+    let top = NOT_OFFERED.iter().filter(|n| **n != ".config");
+    let config = NOT_OFFERED_IN_CONFIG.iter().map(|n| format!(".config/{n}"));
+    top.map(|n| n.to_string())
+        .chain(config)
+        .map(|n| home.join(n))
+        .collect()
+}
+
 /// The programs on offer: the known tools that are installed first, then the
 /// rest of `PATH`.
 pub fn programs(home: &Path, path_var: &OsStr, known: &[Detected]) -> Vec<Candidate> {

@@ -14,9 +14,10 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use super::add::add_binary;
+use super::browse::{self, Browsed, Want};
 use super::candidates::{self, Candidate, name_from};
 use super::init;
-use super::prompt::{Ask, Choice, Choose, Doc, DocLine, Hotkey, Item, Pick, Selection};
+use super::prompt::{Adding, Ask, Choice, Choose, Doc, DocLine, Hotkey, Item, Pick, Selection};
 use super::table::{Cell, Table, Tone};
 use crate::bundle::store::Replace;
 use crate::config::Config;
@@ -614,10 +615,20 @@ fn edit_field(
 /// What this machine has of `kind`, as items to look through, and the
 /// candidates they stand for. What is in the config already is on offer too,
 /// shown marked.
-fn on_offer(kind: Kind, file: &File, machine: &Machine) -> (Vec<Candidate>, Vec<Item>) {
+fn on_offer(
+    kind: Kind,
+    file: &File,
+    machine: &Machine,
+    scope: &browse::Scope,
+    added: &HashSet<String>,
+) -> (Vec<Candidate>, Vec<Item>) {
     let taken = file.entries(kind);
     let names: HashSet<&str> = taken.iter().filter_map(|e| e.name.as_deref()).collect();
-    let paths: HashSet<&str> = taken.iter().filter_map(|e| e.path.as_deref()).collect();
+    let paths: HashSet<&str> = taken
+        .iter()
+        .filter_map(|e| e.path.as_deref())
+        .chain(added.iter().map(String::as_str))
+        .collect();
     let found = match kind {
         Kind::Binary => {
             let known = init::detect(machine.home, machine.path_var);
@@ -636,7 +647,55 @@ fn on_offer(kind: Kind, file: &File, machine: &Machine) -> (Vec<Candidate>, Vec<
             detail: c.detail.clone(),
         })
         .collect();
+    let (mut found, mut items): (Vec<Candidate>, Vec<Item>) = (found, items);
+    // Then everything else the scope reaches, in the same list.
+    let want = match kind {
+        Kind::Binary => Want::File,
+        Kind::Data => Want::Any,
+    };
+    // What the list above has is not offered again.
+    let have: HashSet<String> = found.iter().map(|c| c.entry.path().to_string()).collect();
+    let more: Vec<PathBuf> = browse::walk(scope, want)
+        .into_iter()
+        .filter(|p| kind == Kind::Data || is_executable(p))
+        .filter(|p| !have.contains(&tilde(p, machine.home)))
+        .collect();
+    for (path, item) in more
+        .iter()
+        .zip(browse::items(&more, scope, want, machine.home))
+    {
+        let place = tilde(path, machine.home);
+        items.push(Item {
+            added: paths.contains(place.as_str()),
+            ..item
+        });
+        found.push(Candidate {
+            name: name_from(path),
+            kind: item.kind,
+            detail: String::new(),
+            entry: match kind {
+                Kind::Binary => NewEntry::binary(&name_from(path), place),
+                Kind::Data => NewEntry::data(place, None, None),
+            },
+        });
+    }
     (found, items)
+}
+
+/// Where the files of this machine are looked for, to begin with: the
+/// directories of the programs on `PATH` for a program, `~/.config` for the
+/// rest, leaving out credentials and state. It is changed from inside the list.
+fn scope(machine: &Machine, kind: Option<Kind>) -> browse::Scope {
+    let roots = match kind {
+        Some(Kind::Binary) => std::env::split_paths(machine.path_var).collect(),
+        _ => vec![machine.home.join(".config")],
+    };
+    browse::Scope::new(roots, candidates::withheld(machine.home))
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 fn list_name(kind: Kind) -> &'static str {
@@ -666,23 +725,31 @@ fn pick_path(
     choose: &dyn Choose,
     ask: &dyn Ask,
 ) -> Result<Option<String>> {
-    let (found, items) = on_offer(kind, file, machine);
     let title = format!("{} (type to filter, or a path)", kind.key());
-    let typed = match choose.find(&title, &[list_name(kind)], &items)? {
-        Selection::Left => return Ok(None),
-        Selection::Items(chosen) => {
-            let Some(c) = chosen.first().and_then(|&i| found.get(i)) else {
-                return Ok(None);
-            };
-            return Ok(Some(c.entry.path().to_string()));
+    let mut scope = scope(machine, Some(kind));
+    let chosen = loop {
+        let (found, items) = on_offer(kind, file, machine, &scope, &HashSet::new());
+        let tabs = [list_name(kind)];
+        let knobs = scope.knobs(machine.home);
+        match choose.find_knobs(&title, &tabs, &items, &knobs)? {
+            Selection::Left => return Ok(None),
+            Selection::Edited(knob, text) => scope = scope.edited(knob, &text),
+            Selection::Items(chosen) => {
+                let Some(c) = chosen.first().and_then(|&i| found.get(i)) else {
+                    return Ok(None);
+                };
+                return Ok(Some(c.entry.path().to_string()));
+            }
+            Selection::Path(typed) => {
+                break browse::settle(choose, kind.key(), &typed, Want::Any, &scope, machine.home)?;
+            }
+            Selection::Unsupported => break Browsed::Unsupported,
         }
-        Selection::Path(typed) => typed,
-        Selection::Unsupported => match ask.ask("path on this machine")? {
-            Some(typed) => typed,
-            None => return Ok(None),
-        },
     };
-    resolve(&typed, machine.home).map(Some)
+    let Some(typed) = chosen.or_ask(ask, "path on this machine")? else {
+        return Ok(None);
+    };
+    resolve(&typed.to_string_lossy(), machine.home).map(Some)
 }
 
 /// Adds entries of `kind`, chosen from what this machine has: each Enter adds the
@@ -695,34 +762,48 @@ fn add(
     choose: &dyn Choose,
     ask: &dyn Ask,
 ) -> Result<String> {
-    let (found, items) = on_offer(kind, file, machine);
     let title = format!("Add {} (type to filter, or a path)", kind.key());
-    let added = std::cell::Cell::new(0);
-    let mut add_one = |pick: Pick| -> std::result::Result<String, String> {
-        let typed;
-        let entry = match &pick {
-            Pick::Item(i) => &found.get(*i).ok_or("nothing there")?.entry,
-            Pick::Path(p) => {
-                typed = entry_for(kind, machine.home, p).map_err(|e| one_line(&e))?;
-                &typed
+    let count = std::cell::Cell::new(0);
+    // What was added, so it is shown marked when the list is made again.
+    let added = std::cell::RefCell::new(HashSet::new());
+    let mut scope = scope(machine, Some(kind));
+    loop {
+        let (found, items) = on_offer(kind, file, machine, &scope, &added.borrow());
+        let mut add_one = |pick: Pick| -> std::result::Result<String, String> {
+            let typed;
+            let entry = match &pick {
+                Pick::Item(i) => &found.get(*i).ok_or("nothing there")?.entry,
+                Pick::Path(p) => {
+                    typed = entry_for(kind, machine.home, p).map_err(|e| one_line(&e))?;
+                    &typed
+                }
+            };
+            let said = place(path, entry, machine.home).map_err(|e| one_line(&e))?;
+            count.set(count.get() + 1);
+            added.borrow_mut().insert(entry.path().to_string());
+            Ok(said)
+        };
+        let tabs = [list_name(kind)];
+        let knobs = scope.knobs(machine.home);
+        match choose.find_adding_knobs(&title, &tabs, &items, &knobs, &mut add_one)? {
+            Adding::Done => break,
+            Adding::Edited(knob, text) => scope = scope.edited(knob, &text),
+            Adding::Unsupported => {
+                // A terminal that can't show the list: the path is asked for in words.
+                let Some(typed) =
+                    ask.ask(&format!("path of the {} on this machine", kind.key()))?
+                else {
+                    return Ok(String::new());
+                };
+                return place(path, &entry_for(kind, machine.home, &typed)?, machine.home);
             }
-        };
-        let said = place(path, entry, machine.home).map_err(|e| one_line(&e))?;
-        added.set(added.get() + 1);
-        Ok(said)
-    };
-    if !choose.find_adding(&title, &[list_name(kind)], &items, &mut add_one)? {
-        // A terminal that can't show the list: the path is asked for in words.
-        let Some(typed) = ask.ask(&format!("path of the {} on this machine", kind.key()))? else {
-            return Ok(String::new());
-        };
-        return place(path, &entry_for(kind, machine.home, &typed)?, machine.home);
+        }
     }
     let (one, many) = match kind {
         Kind::Binary => ("binary", "binaries"),
         Kind::Data => ("data entry", "data entries"),
     };
-    Ok(match added.get() {
+    Ok(match count.get() {
         0 => String::new(),
         n => format!("added {}", plural(n, one, many)),
     })
@@ -977,32 +1058,61 @@ fn open_file(
     choose: &dyn Choose,
     ask: &dyn Ask,
 ) -> Result<String> {
-    let files = config_files(path, machine);
-    let items: Vec<Item> = files
-        .iter()
-        .map(|f| Item {
-            added: false,
-            tab: 0,
-            name: tilde(f, machine.home),
-            kind: if f == path { "current" } else { "" },
-            detail: String::new(),
-        })
-        .collect();
-    let chosen = match choose.find(
-        "Config file (type to filter, or a path)",
-        &["Files"],
-        &items,
-    )? {
-        Selection::Left => return Ok(String::new()),
-        Selection::Items(chosen) => match chosen.first().and_then(|&i| files.get(i)) {
-            Some(f) => f.clone(),
-            None => return Ok(String::new()),
-        },
-        Selection::Path(typed) => PathBuf::from(typed),
-        Selection::Unsupported => match ask.ask("path of the config file")? {
-            Some(typed) => PathBuf::from(typed),
-            None => return Ok(String::new()),
-        },
+    let known = config_files(path, machine);
+    let mut scope = scope(machine, None);
+    let chosen = loop {
+        // The config files that are known, then any other file the scope reaches.
+        let more: Vec<PathBuf> = browse::walk(&scope, Want::File)
+            .into_iter()
+            .filter(|f| !known.contains(f))
+            .collect();
+        let mut items: Vec<Item> = known
+            .iter()
+            .map(|f| Item {
+                added: false,
+                tab: 0,
+                name: tilde(f, machine.home),
+                kind: if f == path { "current" } else { "" },
+                detail: String::new(),
+            })
+            .collect();
+        items.extend(browse::items(&more, &scope, Want::File, machine.home));
+        let files: Vec<&PathBuf> = known.iter().chain(&more).collect();
+        let knobs = scope.knobs(machine.home);
+        match choose.find_knobs(
+            "Config file (type to filter, or a path)",
+            &["Files"],
+            &items,
+            &knobs,
+        )? {
+            Selection::Left => return Ok(String::new()),
+            Selection::Edited(knob, text) => scope = scope.edited(knob, &text),
+            Selection::Items(chosen) => match chosen.first().and_then(|&i| files.get(i)) {
+                Some(f) => break (*f).clone(),
+                None => return Ok(String::new()),
+            },
+            Selection::Path(typed) => {
+                match browse::settle(
+                    choose,
+                    "Config file",
+                    &typed,
+                    Want::File,
+                    &scope,
+                    machine.home,
+                )? {
+                    Browsed::Chose(file) => break file,
+                    Browsed::Left => return Ok(String::new()),
+                    Browsed::Unsupported => match ask.ask("path of the config file")? {
+                        Some(typed) => break PathBuf::from(typed),
+                        None => return Ok(String::new()),
+                    },
+                }
+            }
+            Selection::Unsupported => match ask.ask("path of the config file")? {
+                Some(typed) => break PathBuf::from(typed),
+                None => return Ok(String::new()),
+            },
+        }
     };
     // A file that is not there yet is made by the first thing added to it.
     let chosen = crate::config::expand_tilde(chosen);
