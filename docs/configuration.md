@@ -120,10 +120,10 @@ data in place, no longer for anything.
 | `b` | add programs |
 | `d` | add data |
 | `s` | add a secret (a name, where its value comes from) |
-| `p` | pack the bundle into a file (Enter takes `lodge-<arch>.tar` here) |
+| `p` | pack the bundle: lists the bundle files there are, to replace one, and a row to type the name of a new file on (Enter on it takes `lodge-<arch>.tar`); `x` deletes the one selected, unless it is in use |
 | `P` | publish the bundle to a registry (Enter takes the one `bundle =` names) |
 
-Enter on the `bundle` line chooses the bundle in use from those on offer (the default, `bundles`, and the config as it is where it can be packed), or lets you type one; the one that was in use stays on offer. A pack or a publish from here lists what it wrote, as `ldg pack` does.
+Enter on the `bundle` line chooses the bundle in use from those on offer (the default, `bundles`, and the config as it is where it can be packed), or lets you type one; the one that was in use stays on offer. A pack from here says what it made on the status line; if it printed a warning (a data entry that may hold secrets, say), it waits for Enter first so the warning can be read.
 
 | `o` | work on another config file: the ones beside the default and in the folder `ldg` was started in, or a path typed in full |
 

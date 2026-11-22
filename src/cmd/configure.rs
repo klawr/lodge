@@ -18,7 +18,8 @@ use super::browse::{self, Browsed, Want};
 use super::candidates::{self, Candidate, name_from};
 use super::init;
 use super::prompt::{
-    Adding, Ask, Choice, Choose, Doc, DocLine, Hotkey, Item, Pause, Pick, Selection,
+    Adding, Ask, Choice, Choose, Doc, DocLine, Entered, Hotkey, Item, Pause, Pick, Selection,
+    TextRow,
 };
 use super::table::{Cell, Table, Tone};
 use crate::bundle::choice::{self, Offer};
@@ -66,14 +67,25 @@ const KEYS: &[Hotkey] = &[
     },
 ];
 
+/// The keys while choosing which bundle file to pack into.
+const PACK_KEYS: &[Hotkey] = &[Hotkey {
+    key: 'x',
+    label: "delete",
+}];
+
 /// Packing a bundle, which needs the helper programs and the registry client: the
 /// composition root has them, the screen only asks.
 pub trait Bundles {
     /// Packs the config at `config` into `output`: a file, or an `oci://` reference
     /// to publish to (a file named for this machine, here, when none).
-    fn pack(&self, config: &Path, output: Option<&str>, replace: Replace) -> Result<()>;
+    /// Returns what was made, in a line.
+    fn pack(&self, config: &Path, output: Option<&str>, replace: Replace) -> Result<String>;
     /// The file a bundle is written to when none is named.
     fn default_file(&self) -> Result<String>;
+    /// Whether the bundle file `reference` is there.
+    fn exists(&self, reference: &str) -> bool;
+    /// Deletes the bundle file `reference`; a registry's bundles are not deleted here.
+    fn delete(&self, reference: &str) -> Result<()>;
     /// Whether `reference` is a registry (somewhere to publish to) and not a file.
     fn is_registry(&self, reference: &str) -> bool;
     /// Whether this machine can pack the config, so "the config as it is" is a
@@ -279,7 +291,7 @@ fn act(
         Some('b') => add(path, Kind::Binary, file, machine, choose, ask),
         Some('d') => add(path, Kind::Data, file, machine, choose, ask),
         Some('s') => add_secret(path, choose, ask),
-        Some('p') => pack(path, machine, ask, wait, None),
+        Some('p') => pack(path, file, machine, choose, ask, wait),
         Some('P') => publish(path, file, machine, ask, wait),
         Some('o') => open_file(path, machine, choose, ask),
         Some('r') => match stop {
@@ -949,7 +961,10 @@ fn ask_as(choose: &dyn Choose, ask: &dyn Ask) -> Result<Option<SecretAs>> {
             let Some(file) = ask.ask("path in the container")? else {
                 return Ok(None);
             };
-            let mode = ask.ask("permissions [0600]")?;
+            let Some(typed) = ask.ask_or("permissions [0600]", "0600")? else {
+                return Ok(None);
+            };
+            let mode = (typed != "0600").then_some(typed);
             Ok(Some(SecretAs::File { path: file, mode }))
         }
         None => Ok(None),
@@ -1031,30 +1046,132 @@ fn clear_secret(path: &Path, secret: &RawSecret, field: SecretField) -> Result<S
 
 // ── the bundle ───────────────────────────────────────────────────────────────
 
-/// Packs the config at `path` into `output` and waits, so the person can read what
-/// was printed, as an error or as the account of what was made.
-fn pack_into(path: &Path, machine: &Machine, wait: &dyn Pause, output: &str) -> Result<()> {
-    let made = machine.bundles.pack(path, Some(output), Replace::Yes);
-    if let Err(e) = &made {
-        warning!("{e:#}");
+/// Packs the config at `path` into `output`, and says what was made. What went
+/// wrong is the error. Warnings were printed on the terminal's main screen, which
+/// the form is about to cover, so those (and only those) are waited on.
+fn pack_into(
+    path: &Path,
+    machine: &Machine,
+    wait: &dyn Pause,
+    output: &str,
+    replace: Replace,
+) -> Result<String> {
+    let warned = crate::output::warnings();
+    let made = machine.bundles.pack(path, Some(output), replace);
+    if crate::output::warnings() != warned {
+        wait.pause();
     }
-    wait.pause();
     made
 }
 
+/// What `p` shows: the bundle files there are already, to pack into (replacing
+/// one) or delete with `x`, and a row to type the name of a new file on.
 fn pack(
     path: &Path,
+    file: &File,
     machine: &Machine,
+    choose: &dyn Choose,
     ask: &dyn Ask,
     wait: &dyn Pause,
-    _: Option<&str>,
 ) -> Result<String> {
     let default = machine.bundles.default_file()?;
-    let output = ask
-        .ask(&format!("write the bundle to [{default}]"))?
-        .unwrap_or(default);
-    pack_into(path, machine, wait, &output)?;
-    Ok(format!("packed into {output}"))
+    let mut existing: Vec<String> = Vec::new();
+    let in_use = file
+        .setting(Setting::Bundle)
+        .map(|b| b.trim_matches('"').to_string());
+    let known = in_use.iter().chain(file.bundles.iter());
+    for reference in known.chain(machine.bundles.exists(&default).then_some(&default)) {
+        if !machine.bundles.is_registry(reference) && !existing.contains(reference) {
+            existing.push(reference.clone());
+        }
+    }
+    let mut rows: Vec<Vec<Cell>> = existing
+        .iter()
+        .map(|e| {
+            let about = if in_use.as_deref() == Some(e) {
+                "in use · replace it"
+            } else {
+                "replace it"
+            };
+            vec![Cell::new(e, Tone::Strong), Cell::new(about, Tone::Muted)]
+        })
+        .collect();
+    let new_row = rows.len();
+    rows.push(vec![
+        Cell::new("(new file)", Tone::Strong),
+        Cell::new(&default, Tone::Muted),
+    ]);
+    let table = Table::new(vec!["", ""], rows, 1);
+    // A new name does not take the place of a file that is there.
+    let new_file = |name: &str| pack_into(path, machine, wait, name, Replace::No);
+    // What fails stays in the list, in red, with what was typed: it is tried again
+    // or left, and the form is not back until then.
+    let mut notice: Option<String> = None;
+    let mut typed = String::new();
+    loop {
+        let field = TextRow {
+            row: new_row,
+            column: 1,
+            text: typed.clone(),
+            placeholder: default.clone(),
+        };
+        let entered =
+            choose.choose_typing("Pack into", &table, PACK_KEYS, &field, notice.as_deref())?;
+        let tried = match entered {
+            Entered::Text(name) => {
+                let tried = new_file(&name);
+                typed = name;
+                tried
+            }
+            Entered::Chose(Choice::Key('x', row)) => match existing.get(row) {
+                Some(reference) => delete_bundle(path, file, machine, choose, reference),
+                None => return Ok(String::new()),
+            },
+            Entered::Chose(Choice::Row(row)) => match existing.get(row) {
+                Some(reference) => pack_into(path, machine, wait, reference, Replace::Yes),
+                // The row to type on, where the terminal can't type on it.
+                None => match ask.ask_or(&format!("write the bundle to [{default}]"), &default)? {
+                    Some(name) => {
+                        let tried = new_file(&name);
+                        typed = name;
+                        tried
+                    }
+                    None => return Ok(String::new()),
+                },
+            },
+            Entered::Chose(_) => return Ok(String::new()),
+        };
+        match tried {
+            Ok(said) => return Ok(said),
+            Err(e) => notice = Some(one_line(&e)),
+        }
+    }
+}
+
+/// Deletes the bundle file `reference` after the person agrees, and takes it off
+/// the list. The one in use is kept: it is changed first.
+fn delete_bundle(
+    path: &Path,
+    file: &File,
+    machine: &Machine,
+    choose: &dyn Choose,
+    reference: &str,
+) -> Result<String> {
+    let in_use = file.setting(Setting::Bundle).map(|b| b.trim_matches('"'));
+    if in_use == Some(reference) {
+        anyhow::bail!("{reference} is in use: choose another bundle first");
+    }
+    let sure = pick_one(
+        choose,
+        &format!("Delete {reference}"),
+        &[("delete", "the file is removed"), ("keep", "")],
+    )?;
+    if sure != Some(0) {
+        return Ok(String::new());
+    }
+    machine.bundles.delete(reference)?;
+    edit::remove_bundle(path, reference)?;
+    Ok(format!("deleted {reference}"))
 }
 
 /// Publishes the bundle to a registry: the reference the config already names,
@@ -1074,15 +1191,17 @@ fn publish(
         Some(c) => format!("publish to [{c}]"),
         None => "publish to (oci://registry/name:tag)".to_string(),
     };
-    let reference = match (ask.ask(&question)?, current) {
-        (Some(typed), _) => typed,
-        (None, Some(current)) => current,
-        (None, None) => return Ok(String::new()),
+    let typed = match &current {
+        Some(c) => ask.ask_or(&question, c)?,
+        None => ask.ask(&question)?,
+    };
+    let Some(reference) = typed else {
+        return Ok(String::new());
     };
     if !machine.bundles.is_registry(&reference) {
         anyhow::bail!("`{reference}` is a file, not a registry: use `p` to pack to a file");
     }
-    pack_into(path, machine, wait, &reference)?;
+    pack_into(path, machine, wait, &reference, Replace::Yes)?;
     Ok(format!("published {reference}"))
 }
 
@@ -1291,21 +1410,31 @@ mod tests {
     #[derive(Default)]
     struct Packs {
         asked: RefCell<Vec<(PathBuf, Option<String>)>>,
+        deleted: RefCell<Vec<String>>,
+        replaced: RefCell<Vec<Replace>>,
         fail: bool,
         can_pack: bool,
     }
     impl Bundles for Packs {
-        fn pack(&self, config: &Path, output: Option<&str>, _: Replace) -> Result<()> {
+        fn pack(&self, config: &Path, output: Option<&str>, replace: Replace) -> Result<String> {
+            self.replaced.borrow_mut().push(replace);
             self.asked
                 .borrow_mut()
                 .push((config.to_path_buf(), output.map(String::from)));
             if self.fail {
                 anyhow::bail!("ldd is missing");
             }
-            Ok(())
+            Ok(format!("packed into {}", output.unwrap_or_default()))
         }
         fn default_file(&self) -> Result<String> {
             Ok("lodge-x86_64.tar".into())
+        }
+        fn exists(&self, _: &str) -> bool {
+            false
+        }
+        fn delete(&self, reference: &str) -> Result<()> {
+            self.deleted.borrow_mut().push(reference.to_string());
+            Ok(())
         }
         fn is_registry(&self, reference: &str) -> bool {
             reference.contains("://")
@@ -1320,6 +1449,12 @@ mod tests {
     struct Screen {
         views: RefCell<Vec<Choice>>,
         picks: RefCell<Vec<Option<usize>>>,
+        /// For each question with hotkeys, the key pressed on the row picked.
+        keys: RefCell<Vec<char>>,
+        /// What is typed on the row of a list that can be typed on.
+        typed: RefCell<Vec<String>>,
+        /// The notice each question with a row to type on was given.
+        notices: RefCell<Vec<Option<String>>>,
         finds: RefCell<Vec<Selection>>,
         adds: RefCell<Vec<Vec<Pick>>>,
         results: RefCell<Vec<Result<String, String>>>,
@@ -1334,9 +1469,26 @@ mod tests {
         }
         fn choose_with(&self, _: &str, _: &Table, _: &[Hotkey]) -> Result<Choice> {
             Ok(match self.picks.borrow_mut().remove(0) {
+                Some(i) if !self.keys.borrow().is_empty() => {
+                    Choice::Key(self.keys.borrow_mut().remove(0), i)
+                }
                 Some(i) => Choice::Row(i),
                 None => Choice::Left,
             })
+        }
+        fn choose_typing(
+            &self,
+            q: &str,
+            t: &Table,
+            k: &[Hotkey],
+            _: &TextRow,
+            notice: Option<&str>,
+        ) -> Result<Entered> {
+            self.notices.borrow_mut().push(notice.map(String::from));
+            if self.typed.borrow().is_empty() {
+                return self.choose_with(q, t, k).map(Entered::Chose);
+            }
+            Ok(Entered::Text(self.typed.borrow_mut().remove(0)))
         }
         fn view(&self, title: &str, doc: &Doc, keys: &[Hotkey]) -> Result<Option<Choice>> {
             assert_eq!(keys, KEYS);
@@ -1388,14 +1540,32 @@ mod tests {
     }
 
     struct Typed(RefCell<Vec<Option<&'static str>>>);
+    /// What is typed to say that Esc was pressed, not Enter.
+    const ESC: &str = "\u{1b}";
+
     impl Ask for Typed {
         fn ask(&self, _: &str) -> Result<Option<String>> {
             let mut left = self.0.borrow_mut();
             Ok(if left.is_empty() {
                 None
             } else {
-                left.remove(0).map(Into::into)
+                left.remove(0).filter(|t| *t != ESC).map(Into::into)
             })
+        }
+
+        fn ask_or(&self, _: &str, default: &str) -> Result<Option<String>> {
+            let mut left = self.0.borrow_mut();
+            Ok(
+                match if left.is_empty() {
+                    None
+                } else {
+                    left.remove(0)
+                } {
+                    Some(ESC) => None,
+                    Some(typed) => Some(typed.into()),
+                    None => Some(default.into()),
+                },
+            )
         }
     }
 
@@ -1791,11 +1961,13 @@ mod tests {
 
     #[test]
     fn p_packs_into_a_file_and_a_failure_is_shown_and_said() {
-        let r = drive(
-            FILE,
-            views(vec![Choice::Key('p', 0), Choice::Key('p', 0), Choice::Left]),
-            vec![None, Some("out/mine.tar")],
-        );
+        // With no bundle yet the one row is the new file, which the terminal
+        // cannot type on here, so it is asked for in words.
+        let screen = Screen {
+            picks: RefCell::new(vec![Some(0), Some(0)]),
+            ..views(vec![Choice::Key('p', 0), Choice::Key('p', 0), Choice::Left])
+        };
+        let r = drive(FILE, screen, vec![None, Some("out/mine.tar")]);
         let asked = r.packs.asked.borrow();
         assert_eq!(
             asked[0].1.as_deref(),
@@ -1819,20 +1991,133 @@ mod tests {
             fail: true,
             ..Packs::default()
         };
-        let r = drive_with(
-            FILE,
-            views(vec![Choice::Key('p', 0), Choice::Left]),
-            vec![Some("x.tar")],
-            failing,
-        );
-        let titles: Vec<String> = r
-            .screen
+        // The name is asked for in words here; the list is left after the failure.
+        let screen = Screen {
+            picks: RefCell::new(vec![Some(0), None]),
+            ..views(vec![Choice::Key('p', 0), Choice::Left])
+        };
+        let r = drive_with(FILE, screen, vec![Some("x.tar")], failing);
+        // The list stays, asked again with why, and the form has nothing to say.
+        let notices = r.screen.notices.borrow();
+        assert_eq!(*notices, [None, Some("ldd is missing".to_string())]);
+        let shown = titles_of(&r);
+        assert!(!shown[1].contains('✗'), "{shown:?}");
+    }
+
+    fn titles_of(r: &Run) -> Vec<String> {
+        r.screen
             .shown
             .borrow()
             .iter()
             .map(|s| s.0.clone())
-            .collect();
-        assert!(titles[1].contains("✗ ldd is missing"), "{titles:?}");
+            .collect()
+    }
+
+    #[test]
+    fn p_shows_the_bundles_there_are_and_replaces_the_one_chosen() {
+        let screen = Screen {
+            views: RefCell::new(vec![Choice::Key('p', 0), Choice::Left]),
+            picks: RefCell::new(vec![Some(1)]),
+            ..Screen::default()
+        };
+        let r = drive(WITH_BUNDLES, screen, vec![]);
+        assert_eq!(r.packs.asked.borrow()[0].1.as_deref(), Some("b.tar"));
+        assert!(r.packs.replaced.borrow()[0] == Replace::Yes);
+    }
+
+    #[test]
+    fn a_new_file_is_never_written_over_what_is_there() {
+        let screen = Screen {
+            views: RefCell::new(vec![Choice::Key('p', 0), Choice::Left]),
+            picks: RefCell::new(vec![Some(2)]),
+            ..Screen::default()
+        };
+        let r = drive(WITH_BUNDLES, screen, vec![Some("c.tar")]);
+        assert_eq!(r.packs.asked.borrow()[0].1.as_deref(), Some("c.tar"));
+        assert!(r.packs.replaced.borrow()[0] == Replace::No);
+    }
+
+    #[test]
+    fn x_deletes_a_bundle_that_is_not_in_use_once_agreed_and_takes_it_off_the_list() {
+        let screen = Screen {
+            views: RefCell::new(vec![Choice::Key('p', 0), Choice::Left]),
+            // The row of b.tar, then "delete" at the question.
+            picks: RefCell::new(vec![Some(1), Some(0)]),
+            keys: RefCell::new(vec!['x']),
+            ..Screen::default()
+        };
+        let r = drive(WITH_BUNDLES, screen, vec![]);
+        assert_eq!(*r.packs.deleted.borrow(), ["b.tar"]);
+        assert!(r.packs.asked.borrow().is_empty());
+        assert!(
+            edit::bundles(&r.dir.path().join("config.toml"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            titles_of(&r)[1].contains("✓ deleted b.tar"),
+            "{:?}",
+            titles_of(&r)
+        );
+    }
+
+    #[test]
+    fn declining_keeps_the_bundle_and_the_one_in_use_cannot_be_deleted() {
+        let screen = Screen {
+            views: RefCell::new(vec![Choice::Key('p', 0), Choice::Left]),
+            picks: RefCell::new(vec![Some(1), Some(1)]),
+            keys: RefCell::new(vec!['x']),
+            ..Screen::default()
+        };
+        let r = drive(WITH_BUNDLES, screen, vec![]);
+        assert!(r.packs.deleted.borrow().is_empty());
+        assert_eq!(
+            edit::bundles(&r.dir.path().join("config.toml")).unwrap(),
+            ["b.tar"]
+        );
+        let screen = Screen {
+            views: RefCell::new(vec![Choice::Key('p', 0), Choice::Left]),
+            // The row of a.tar, which is in use; then the list is left.
+            picks: RefCell::new(vec![Some(0), None]),
+            keys: RefCell::new(vec!['x']),
+            ..Screen::default()
+        };
+        let r = drive(WITH_BUNDLES, screen, vec![]);
+        assert!(r.packs.deleted.borrow().is_empty());
+        // It stays in the list, which says why.
+        assert_eq!(
+            r.screen.notices.borrow()[1].as_deref(),
+            Some("a.tar is in use: choose another bundle first")
+        );
+    }
+
+    #[test]
+    fn a_name_typed_in_the_list_is_a_new_file_and_what_was_made_is_on_the_status_line() {
+        let screen = Screen {
+            typed: RefCell::new(vec!["mine.tar".into()]),
+            ..views(vec![Choice::Key('p', 0), Choice::Left])
+        };
+        let r = drive(WITH_BUNDLES, screen, vec![]);
+        assert_eq!(r.packs.asked.borrow()[0].1.as_deref(), Some("mine.tar"));
+        assert!(r.packs.replaced.borrow()[0] == Replace::No);
+        assert!(
+            titles_of(&r)[1].contains("✓ packed into mine.tar"),
+            "{:?}",
+            titles_of(&r)
+        );
+    }
+
+    #[test]
+    fn esc_at_a_question_with_a_default_backs_out_where_enter_takes_the_default() {
+        let leave = || Screen {
+            views: RefCell::new(vec![Choice::Key('p', 0), Choice::Key('P', 0), Choice::Left]),
+            picks: RefCell::new(vec![Some(0)]),
+            ..Screen::default()
+        };
+        let r = drive(FILE, leave(), vec![Some(ESC), Some(ESC)]);
+        assert!(r.packs.asked.borrow().is_empty(), "nothing was packed");
+        let r = drive(FILE, leave(), vec![None, Some(ESC)]);
+        assert_eq!(r.packs.asked.borrow().len(), 1, "Enter took the default");
     }
 
     #[test]

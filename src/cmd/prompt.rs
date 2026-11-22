@@ -14,7 +14,7 @@ use super::table::Table;
 use crate::devcontainer::Prompt;
 use crate::output::{line_err, note, prompt, warning};
 
-pub use super::select::{Doc, DocLine, Hotkey, Item, Knob, Pick};
+pub use super::select::{Doc, DocLine, Hotkey, Item, Knob, Pick, TextRow};
 
 /// How a question with hotkeys was answered.
 #[derive(Debug, PartialEq, Eq)]
@@ -23,6 +23,15 @@ pub enum Choice {
     /// A hotkey, with the row that was selected when it was pressed.
     Key(char, usize),
     Left,
+}
+
+/// How a question with a row to type on was answered.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Entered {
+    /// What was typed on that row.
+    Text(String),
+    /// Anything else, as for a question without one.
+    Chose(Choice),
 }
 
 /// What came of looking through a list of things.
@@ -60,6 +69,22 @@ pub trait Choose {
             Some(i) => Choice::Row(i),
             None => Choice::Left,
         })
+    }
+
+    /// [`Choose::choose_with`], where the row `field` names is a place to type:
+    /// what is typed there is the answer. Without a terminal that can, it is a row
+    /// like the others, and the caller asks for the text in words. A `notice` is
+    /// what went wrong the last time this was asked, shown in the list.
+    fn choose_typing(
+        &self,
+        question: &str,
+        options: &Table,
+        hotkeys: &[Hotkey],
+        _field: &TextRow,
+        _notice: Option<&str>,
+    ) -> Result<Entered> {
+        self.choose_with(question, options, hotkeys)
+            .map(Entered::Chose)
     }
 
     /// Shows `doc` and lets the person move over its blocks, with hotkeys as in
@@ -133,6 +158,16 @@ pub trait Ask {
     /// The line typed, trimmed; `None` when it is empty or the input ended, which
     /// is how a question is declined. An error when there is nobody to ask.
     fn ask(&self, question: &str) -> Result<Option<String>>;
+
+    /// Like [`Ask::ask`] for a question with an answer that Enter alone takes:
+    /// Enter gives `default`, and leaving (Esc, Ctrl-C) gives `None`, so backing
+    /// out is never taken for accepting. Where leaving cannot be told from Enter,
+    /// both give the default.
+    fn ask_or(&self, question: &str, default: &str) -> Result<Option<String>> {
+        Ok(Some(
+            self.ask(question)?.unwrap_or_else(|| default.to_string()),
+        ))
+    }
 }
 
 /// Waits for the person to have read what was just printed.
@@ -142,8 +177,10 @@ pub trait Pause {
     fn pause(&self);
 }
 
-impl Ask for Terminal {
-    fn ask(&self, question: &str) -> Result<Option<String>> {
+impl Terminal {
+    /// The line typed, trimmed (empty when only Enter was pressed); `None` when
+    /// the person left.
+    fn typed(question: &str) -> Result<Option<String>> {
         Self::check(question)?;
         let line = match select::input(question)? {
             select::Typed::Line(line) => line,
@@ -154,8 +191,23 @@ impl Ask for Terminal {
                 read_line()?
             }
         };
-        let line = line.trim();
-        Ok((!line.is_empty()).then(|| line.to_string()))
+        Ok(Some(line.trim().to_string()))
+    }
+}
+
+impl Ask for Terminal {
+    fn ask(&self, question: &str) -> Result<Option<String>> {
+        Ok(Self::typed(question)?.filter(|line| !line.is_empty()))
+    }
+
+    fn ask_or(&self, question: &str, default: &str) -> Result<Option<String>> {
+        Ok(Self::typed(question)?.map(|line| {
+            if line.is_empty() {
+                default.to_string()
+            } else {
+                line
+            }
+        }))
     }
 }
 
@@ -189,6 +241,25 @@ impl Terminal {
     }
 }
 
+impl Terminal {
+    /// How a pick ended, as the answer to the question.
+    fn picked(question: &str, options: &Table, picked: select::Picked) -> Result<Entered> {
+        Ok(match picked {
+            select::Picked::Chose(i) => Entered::Chose(Choice::Row(i)),
+            select::Picked::Key(c, at) => Entered::Chose(Choice::Key(c, at)),
+            select::Picked::Typed(text) => Entered::Text(text),
+            select::Picked::Left => Entered::Chose(Choice::Left),
+            // A terminal that can't give single keys (`TERM=dumb`): type a number.
+            select::Picked::NoRawMode => Entered::Chose(
+                match choose_from(question, &options.natural(), &mut io::stdin().lock())? {
+                    Some(i) => Choice::Row(i),
+                    None => Choice::Left,
+                },
+            ),
+        })
+    }
+}
+
 impl Choose for Terminal {
     fn can_ask(&self) -> bool {
         io::stdin().is_terminal() && io::stderr().is_terminal()
@@ -203,18 +274,27 @@ impl Choose for Terminal {
 
     fn choose_with(&self, question: &str, options: &Table, hotkeys: &[Hotkey]) -> Result<Choice> {
         Self::check(question)?;
-        match select::pick(question, options, hotkeys)? {
-            select::Picked::Chose(i) => Ok(Choice::Row(i)),
-            select::Picked::Key(c, at) => Ok(Choice::Key(c, at)),
-            select::Picked::Left => Ok(Choice::Left),
-            // A terminal that can't give single keys (`TERM=dumb`): type a number.
-            select::Picked::NoRawMode => Ok(
-                match choose_from(question, &options.natural(), &mut io::stdin().lock())? {
-                    Some(i) => Choice::Row(i),
-                    None => Choice::Left,
-                },
-            ),
+        match Self::picked(question, options, select::pick(question, options, hotkeys)?)? {
+            Entered::Chose(choice) => Ok(choice),
+            // Only a pick with a row to type on answers with text.
+            Entered::Text(_) => Ok(Choice::Left),
         }
+    }
+
+    fn choose_typing(
+        &self,
+        question: &str,
+        options: &Table,
+        hotkeys: &[Hotkey],
+        field: &TextRow,
+        notice: Option<&str>,
+    ) -> Result<Entered> {
+        Self::check(question)?;
+        let picked = select::pick_typing(question, options, hotkeys, field, notice)?;
+        if let (select::Picked::NoRawMode, Some(notice)) = (&picked, notice) {
+            warning!("{notice}");
+        }
+        Self::picked(question, options, picked)
     }
 
     fn view(&self, title: &str, doc: &Doc, hotkeys: &[Hotkey]) -> Result<Option<Choice>> {
@@ -222,7 +302,7 @@ impl Choose for Terminal {
         Ok(match select::view(title, doc, hotkeys)? {
             select::Picked::Key(c, at) => Some(Choice::Key(c, at)),
             select::Picked::Chose(at) => Some(Choice::Row(at)),
-            select::Picked::Left => Some(Choice::Left),
+            select::Picked::Typed(_) | select::Picked::Left => Some(Choice::Left),
             select::Picked::NoRawMode => None,
         })
     }

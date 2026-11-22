@@ -25,20 +25,33 @@ pub struct LivePacker {
 }
 
 impl super::configure::Bundles for LivePacker {
-    fn pack(&self, path: &Path, output: Option<&str>, replace: Replace) -> Result<()> {
+    fn pack(&self, path: &Path, output: Option<&str>, replace: Replace) -> Result<String> {
         let config = crate::config::Config::load(path)?;
-        pack_config(
+        let packed = pack_config(
             &config,
             path,
             &self.tools,
             &self.sinks,
             output.map(str::to_string),
             replace,
-        )
+        )?;
+        Ok(packed.summary)
     }
 
     fn default_file(&self) -> Result<String> {
         bundle::default_file_name()
+    }
+
+    fn exists(&self, reference: &str) -> bool {
+        Path::new(reference).is_file()
+    }
+
+    fn delete(&self, reference: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self.is_registry(reference),
+            "{reference} is in a registry: delete it there"
+        );
+        std::fs::remove_file(reference).with_context(|| format!("deleting {reference}"))
     }
 
     fn can_pack(&self) -> bool {
@@ -57,19 +70,33 @@ impl super::configure::Bundles for LivePacker {
 
 pub fn pack(ctx: &Ctx, output: Option<String>, replace: Replace) -> Result<()> {
     let config = ctx.config()?;
-    pack_config(
+    let packed = pack_config(
         &config,
         &ctx.config_path,
         &ctx.tools,
         &ctx.sinks,
         output,
         replace,
-    )
+    )?;
+    info!("{}", packed.summary);
+    if let Some(offered) = packed.offered {
+        info!("{offered}");
+    }
+    Ok(())
+}
+
+/// What packing made.
+pub struct Packed {
+    /// What was made and where, in a line.
+    pub summary: String,
+    /// What was said of the config, when the bundle was put on offer in it.
+    pub offered: Option<String>,
 }
 
 /// Packs `config`, read from `config_path`, into `output` (a file, or an `oci://`
-/// reference to publish to; `lodge-<arch>.tar` here when none is given), says
-/// what was made, and puts it on offer in the config (see [`offer`]).
+/// reference to publish to; `lodge-<arch>.tar` here when none is given), and puts
+/// it on offer in the config (see [`offer`]). What was made is returned, for the
+/// caller to say where it is said.
 pub fn pack_config(
     config: &crate::config::Config,
     config_path: &Path,
@@ -77,7 +104,7 @@ pub fn pack_config(
     sinks: &Sinks,
     output: Option<String>,
     replace: Replace,
-) -> Result<()> {
+) -> Result<Packed> {
     let output = match output {
         Some(o) => o,
         None => bundle::default_file_name()?,
@@ -93,7 +120,7 @@ pub fn pack_config(
     let tar = scratch.path().join("bundle.tar");
     let manifest = bundle::pack::pack_to_file(config, &tar, tools)?;
     let written = sink.put(&output, &tar, manifest.arch()?, replace)?;
-    info!(
+    let summary = format!(
         "packed {}, {} and {} for {} into {} (id {})",
         plural(manifest.binaries.len(), "binary", "binaries"),
         plural(manifest.data.len(), "data entry", "data entries"),
@@ -102,29 +129,33 @@ pub fn pack_config(
         written,
         manifest.id()
     );
-    offer(config, config_path, &output);
-    Ok(())
+    let offered = offer(config, config_path, &output);
+    Ok(Packed { summary, offered })
 }
 
 /// Lists `reference`, which was just written, in the config's `bundles`, so it can
 /// be chosen later: unless it is already on offer, or there is no config file to
 /// put it in (one is not made for this). The bundle is written either way, so a
-/// config that cannot be changed is said and not an error.
-fn offer(config: &crate::config::Config, config_path: &Path, reference: &str) {
+/// config that cannot be changed is said and not an error. What is to be said of
+/// it when it was put on offer is returned.
+fn offer(config: &crate::config::Config, config_path: &Path, reference: &str) -> Option<String> {
     if !config_path.is_file() {
-        return;
+        return None;
     }
     let reference = crate::config::absolute_reference(reference);
     if on_offer(config, &reference) {
-        return;
+        return None;
     }
     match edit::add_bundle(config_path, &reference) {
-        Ok(true) => info!(
+        Ok(true) => Some(format!(
             "{reference} is on offer now (`bundles` in {})",
             config_path.display()
-        ),
-        Ok(false) => {}
-        Err(e) => warning!("could not put {reference} on offer in the config: {e:#}"),
+        )),
+        Ok(false) => None,
+        Err(e) => {
+            warning!("could not put {reference} on offer in the config: {e:#}");
+            None
+        }
     }
 }
 

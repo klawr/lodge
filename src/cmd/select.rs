@@ -12,7 +12,7 @@
 //! half a list behind, and the screen the person came from is back as it was
 //! when the pick is over.
 
-use super::table::{Table, Tone};
+use super::table::{Cell, Table, Tone};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
@@ -298,6 +298,8 @@ fn usable_size((columns, rows): (u16, u16)) -> (u16, u16) {
 /// How a pick ended.
 pub enum Picked {
     Chose(usize),
+    /// What was typed on the row that is a text field.
+    Typed(String),
     /// A hotkey was pressed, with the row that was selected.
     Key(char, usize),
     Left,
@@ -332,8 +334,85 @@ impl Drop for RawMode {
     }
 }
 
+/// A row of the list that is a place to type: the text shows in one of its columns.
+#[derive(Debug, Clone)]
+pub struct TextRow {
+    pub row: usize,
+    pub column: usize,
+    /// What is in it at first, typed already (what was tried and failed, say).
+    pub text: String,
+    /// What is taken when nothing is typed: shown dimmed until something is.
+    pub placeholder: String,
+}
+
 /// Shows `options` and lets the person move over them and choose one.
 pub fn pick(question: &str, options: &Table, hotkeys: &[Hotkey]) -> io::Result<Picked> {
+    pick_in(question, options, hotkeys, None, None)
+}
+
+/// [`pick`], where one row is a place to type: on it the keys write into it
+/// (hotkeys included), Enter answers with the text, and Esc steps off it. A
+/// `notice` is what went wrong the last time, shown in red.
+pub fn pick_typing(
+    question: &str,
+    options: &Table,
+    hotkeys: &[Hotkey],
+    field: &TextRow,
+    notice: Option<&str>,
+) -> io::Result<Picked> {
+    pick_in(question, options, hotkeys, Some(field), notice)
+}
+
+/// Puts `notice` on the screen `lines`, in red: where the empty line before the
+/// hints is, or, on a screen with none, over the question.
+fn show_notice(lines: &mut [Line], plan: &Plan, notice: &str, width: usize) {
+    let line = Line::of(format!(" ✗ {notice}"), Tone::Error).clipped(width);
+    let at = if plan.section_gaps {
+        lines.len().saturating_sub(2)
+    } else {
+        0
+    };
+    if let Some(slot) = lines.get_mut(at) {
+        *slot = line;
+    }
+}
+
+/// What a key does while the selection is on the text row.
+#[derive(Debug, PartialEq, Eq)]
+enum Typing {
+    /// Nothing for the list: the text changed, or the key means nothing here.
+    Stay,
+    Move(Key),
+    /// Enter, with something to answer.
+    Accept,
+}
+
+/// What a key does to `text`, or to the selection, when the selection is on the
+/// text row. Enter answers when there is text, or a placeholder to take instead.
+/// Esc goes up a row: off the text, and from the only row, out.
+fn type_key(text: &mut String, placeholder: &str, key: KeyEvent, rows: usize) -> Typing {
+    match map_find_key(key) {
+        Some(FKey::Up) => Typing::Move(Key::Up),
+        Some(FKey::Down) => Typing::Move(Key::Down),
+        Some(FKey::Accept) if text.trim().is_empty() && placeholder.is_empty() => Typing::Stay,
+        Some(FKey::Accept) => Typing::Accept,
+        Some(FKey::Leave) if rows > 1 => Typing::Move(Key::Up),
+        Some(FKey::Leave) => Typing::Move(Key::Leave),
+        Some(key) => {
+            edit_text(text, key);
+            Typing::Stay
+        }
+        None => Typing::Stay,
+    }
+}
+
+fn pick_in(
+    question: &str,
+    options: &Table,
+    hotkeys: &[Hotkey],
+    field: Option<&TextRow>,
+    notice: Option<&str>,
+) -> io::Result<Picked> {
     if options.is_empty() {
         return Ok(Picked::Left);
     }
@@ -342,17 +421,56 @@ pub fn pick(question: &str, options: &Table, hotkeys: &[Hotkey]) -> io::Result<P
     };
     let mut err = io::stderr();
     let mut cursor = Cursor::new(options.len());
+    let mut text = field.map(|f| f.text.clone()).unwrap_or_default();
+    // Back where it was typed, when something typed is being tried again.
+    if let Some(f) = field.filter(|f| !f.text.is_empty() && f.row < options.len()) {
+        cursor.at = f.row;
+    }
+    let placeholder = field.map_or("", |f| f.placeholder.as_str());
     loop {
+        let typing = field.is_some_and(|f| f.row == cursor.at);
         let (columns, height) = usable_size(terminal::size()?);
         let (columns, height) = (usize::from(columns), usize::from(height));
         let plan = plan(height, options.len());
         cursor.fit(plan.rows);
-        let lines = frame(question, options, &cursor, &plan, columns, hotkeys);
+        let mut lines = match field {
+            Some(f) => {
+                let mut shown = options.clone();
+                shown.set(f.row, f.column, field_cell(&text, placeholder, typing));
+                frame(question, &shown, &cursor, &plan, columns, hotkeys)
+            }
+            None => frame(question, options, &cursor, &plan, columns, hotkeys),
+        };
+        if let Some(notice) = notice {
+            show_notice(&mut lines, &plan, notice, columns);
+        }
+        if typing && let Some(last) = lines.last_mut() {
+            *last = Line::of(
+                " type · Enter accept · ↑/↓ move · Esc back · ctrl-u clear",
+                Tone::Muted,
+            )
+            .clipped(columns);
+        }
         draw(&mut err, &lines, columns)?;
         // Anything but a key (a new size, say) only means the next draw fits it.
         let Event::Key(key) = event::read()? else {
             continue;
         };
+        if typing {
+            match type_key(&mut text, placeholder, key, options.len()) {
+                Typing::Stay => {}
+                Typing::Move(Key::Leave) => return Ok(Picked::Left),
+                Typing::Move(key) => {
+                    cursor.apply(key);
+                }
+                Typing::Accept => {
+                    let typed = text.trim();
+                    let answer = if typed.is_empty() { placeholder } else { typed };
+                    return Ok(Picked::Typed(answer.to_string()));
+                }
+            }
+            continue;
+        }
         if let KeyCode::Char(c) = key.code
             && key.kind != KeyEventKind::Release
             && !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -366,6 +484,17 @@ pub fn pick(question: &str, options: &Table, hotkeys: &[Hotkey]) -> io::Result<P
             Step::Chose(i) => return Ok(Picked::Chose(i)),
             Step::Left => return Ok(Picked::Left),
         }
+    }
+}
+
+/// The text row's cell: the text, with a caret where it is being typed, or the
+/// placeholder dimmed while there is none.
+fn field_cell(text: &str, placeholder: &str, typing: bool) -> Cell {
+    match (text.is_empty(), typing) {
+        (true, true) => Cell::new(format!("▏{placeholder}"), Tone::Muted),
+        (true, false) => Cell::new(placeholder, Tone::Muted),
+        (false, true) => Cell::new(format!("{text}▏"), Tone::Accent),
+        (false, false) => Cell::new(text, Tone::Normal),
     }
 }
 
@@ -1138,12 +1267,13 @@ fn paint(err: &mut impl Write, span: &Span, selected: bool) -> io::Result<()> {
         (Tone::Strong, _) => queue!(err, SetAttribute(Attribute::Bold))?,
         (Tone::Muted, false) => queue!(err, SetAttribute(Attribute::Dim))?,
         (Tone::Accent, false) => queue!(err, SetForegroundColor(Color::DarkCyan))?,
+        (Tone::Error, false) => queue!(err, SetForegroundColor(Color::DarkRed))?,
         _ => {}
     }
     queue!(err, Print(&span.text))?;
     match (span.tone, selected) {
         (Tone::Strong | Tone::Muted, _) => queue!(err, SetAttribute(Attribute::NormalIntensity))?,
-        (Tone::Accent, false) => queue!(err, ResetColor)?,
+        (Tone::Accent | Tone::Error, false) => queue!(err, ResetColor)?,
         _ => {}
     }
     Ok(())
@@ -1888,6 +2018,67 @@ mod tests {
         let mut f = Finder::new(list, 1);
         f.knobs = knobs();
         f
+    }
+
+    #[test]
+    fn on_the_text_row_every_letter_types_even_a_hotkey_and_enter_answers_with_the_text() {
+        let typed =
+            |text: &mut String, code, mods| type_key(text, "", KeyEvent::new(code, mods), 3);
+        let mut text = String::new();
+        for c in "xqj".chars() {
+            let key = KeyCode::Char(c);
+            assert_eq!(typed(&mut text, key, KeyModifiers::NONE), Typing::Stay);
+        }
+        assert_eq!(text, "xqj");
+        assert_eq!(
+            typed(&mut text, KeyCode::Backspace, KeyModifiers::NONE),
+            Typing::Stay
+        );
+        assert_eq!(text, "xq");
+        assert_eq!(
+            typed(&mut text, KeyCode::Enter, KeyModifiers::NONE),
+            Typing::Accept
+        );
+        assert_eq!(
+            typed(&mut text, KeyCode::Char('u'), KeyModifiers::CONTROL),
+            Typing::Stay
+        );
+        assert_eq!(text, "", "Ctrl-U clears");
+        assert_eq!(
+            typed(&mut text, KeyCode::Enter, KeyModifiers::NONE),
+            Typing::Stay,
+            "nothing typed is no answer"
+        );
+    }
+
+    #[test]
+    fn esc_and_ctrl_c_step_off_the_text_row_and_out_of_the_list_from_its_only_row() {
+        let text = String::from("a");
+        let leave =
+            |code, mods, rows| type_key(&mut text.clone(), "", KeyEvent::new(code, mods), rows);
+        assert_eq!(
+            leave(KeyCode::Esc, KeyModifiers::NONE, 3),
+            Typing::Move(Key::Up)
+        );
+        assert_eq!(
+            leave(KeyCode::Char('c'), KeyModifiers::CONTROL, 3),
+            Typing::Move(Key::Up)
+        );
+        assert_eq!(
+            leave(KeyCode::Esc, KeyModifiers::NONE, 1),
+            Typing::Move(Key::Leave)
+        );
+        assert_eq!(text, "a", "leaving does not type");
+    }
+
+    #[test]
+    fn enter_on_an_empty_text_row_takes_the_placeholder_if_there_is_one() {
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            type_key(&mut String::new(), "lodge.tar", enter, 2),
+            Typing::Accept
+        );
+        assert_eq!(type_key(&mut String::new(), "", enter, 2), Typing::Stay);
     }
 
     #[test]

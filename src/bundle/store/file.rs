@@ -58,7 +58,7 @@ impl BundleSink for FileSink {
 
     fn put(&self, reference: &str, tar: &Path, _arch: Arch, replace: Replace) -> Result<String> {
         if replace == Replace::No && Path::new(reference).exists() {
-            bail!("{reference} exists already; publish without --no-clobber to replace it");
+            bail!("{reference} exists already");
         }
         // On the same filesystem this is the whole job, and atomic.
         if std::fs::rename(tar, reference).is_ok() {
@@ -172,7 +172,7 @@ mod tests {
         let err = FileSink
             .put(out.to_str().unwrap(), &tar, Arch::X86_64, Replace::No)
             .unwrap_err();
-        assert!(err.to_string().contains("--no-clobber"), "{err}");
+        assert!(err.to_string().contains("exists already"), "{err}");
         assert_eq!(std::fs::read(&out).unwrap(), b"old");
         assert!(tar.exists());
         // Where nothing is, it is written.

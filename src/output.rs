@@ -30,9 +30,17 @@
 use std::fmt;
 use std::io::Write;
 use std::process::Command;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 static VERBOSITY: AtomicU8 = AtomicU8::new(0);
+static WARNINGS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many warnings have been printed so far: what a screen that covers the
+/// terminal compares before and after, to know whether there is something to
+/// read before it covers it again.
+pub fn warnings() -> usize {
+    WARNINGS.load(Ordering::Relaxed)
+}
 
 /// Sets the verbosity from the number of `-v` flags.
 pub fn set_verbosity(level: u8) {
@@ -74,6 +82,7 @@ pub fn print_info(args: fmt::Arguments) {
 }
 
 pub fn print_warn(args: fmt::Arguments) {
+    WARNINGS.fetch_add(1, Ordering::Relaxed);
     emit("lodge", "warning: ", args);
 }
 

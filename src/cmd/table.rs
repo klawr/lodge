@@ -26,6 +26,8 @@ pub enum Tone {
     Muted,
     /// Something that sets a row apart (a place that is not this machine).
     Accent,
+    /// What went wrong.
+    Error,
 }
 
 /// One cell: its text and how much it matters.
@@ -51,6 +53,7 @@ pub struct Grid {
 }
 
 /// Rows of cells, shown as aligned columns under titles.
+#[derive(Clone)]
 pub struct Table {
     titles: Vec<&'static str>,
     rows: Vec<Vec<Cell>>,
@@ -63,6 +66,13 @@ pub struct Table {
 impl Table {
     pub fn new(titles: Vec<&'static str>, rows: Vec<Vec<Cell>>, flex: usize) -> Self {
         Table { titles, rows, flex }
+    }
+
+    /// Puts `cell` where `row` and `column` meet, when there is such a place.
+    pub fn set(&mut self, row: usize, column: usize, cell: Cell) {
+        if let Some(slot) = self.rows.get_mut(row).and_then(|r| r.get_mut(column)) {
+            *slot = cell;
+        }
     }
 
     pub fn len(&self) -> usize {
