@@ -30,9 +30,15 @@ From source: `cargo install --git https://github.com/klawr/lodge`, or
 
 `ldg` also builds and runs natively on Windows, as a **client**: the target is
 always Linux, reached with `--remote` over ssh or through Docker Desktop's
-engine. Each release has `ldg-x86_64-pc-windows-msvc.zip` (`ldg.exe` and PowerShell
-completions); unpack it somewhere on your `PATH`. `install.sh` is Linux only. To build
-it yourself: `cargo install --git https://github.com/klawr/lodge`.
+engine. Download the single exe, no cargo needed:
+
+```powershell
+curl.exe -L -o ldg.exe https://github.com/klawr/lodge/releases/latest/download/ldg-x86_64-pc-windows-msvc.exe
+```
+
+Put it somewhere on your `PATH`. PowerShell completions: `ldg completions powershell`.
+`install.sh` is Linux only. To build it yourself:
+`cargo install --git https://github.com/klawr/lodge`.
 
 - It uses a bundle but never makes one: `ldg pack` needs Linux (`ldd`,
   `patchelf`), so pack on a Linux or WSL2 machine and point `bundle =` at the

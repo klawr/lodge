@@ -173,8 +173,9 @@ jobs:
           ref: refs/tags/${{ needs.release.outputs.tag }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  # The Windows client as a .zip, attached to the same draft. Built natively on
-  # a Windows runner. Completions are for PowerShell; there is no man page.
+  # The Windows client as a bare .exe, attached to the same draft. Built
+  # natively on a Windows runner. The fixed name (no version) keeps
+  # releases/latest/download/ldg-x86_64-pc-windows-msvc.exe a stable direct link.
   upload-windows:
     needs: release
     if: needs.release.outputs.tag != ''
@@ -186,19 +187,15 @@ jobs:
         with:
           ref: ${{ needs.release.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
-      - name: Generate completions
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Upload
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir dist
-          cargo run --quiet -- completions powershell > dist/ldg.ps1
-      - uses: taiki-e/upload-rust-binary-action@v1
-        with:
-          bin: ldg
-          target: x86_64-pc-windows-msvc
-          archive: ldg-$target
-          include: dist/ldg.ps1
-          ref: refs/tags/${{ needs.release.outputs.tag }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          cp target/x86_64-pc-windows-msvc/release/ldg.exe ldg-x86_64-pc-windows-msvc.exe
+          gh release upload "${{ needs.release.outputs.tag }}" ldg-x86_64-pc-windows-msvc.exe --repo "$GITHUB_REPOSITORY" --clobber
 
   # Publish the draft once every asset is attached.
   publish:

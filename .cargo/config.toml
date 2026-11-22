@@ -1,0 +1,4 @@
+# Link the MSVC C runtime into ldg.exe, so the Windows release is one file that
+# runs on a machine without the VC++ redistributable. Applies to this target only.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
