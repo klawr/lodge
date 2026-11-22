@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use super::prompt::{Ask, Choose, Item, Knob, Selection};
 use crate::config::expand_tilde;
 use crate::devcontainer::has_config;
+use crate::keys::Action;
 use crate::layout::tilde;
 
 /// What counts as an answer.
@@ -122,7 +123,7 @@ impl Scope {
         };
         vec![
             Knob {
-                key: 'w',
+                key: Action::LookWhere,
                 name: "looking in",
                 action: "change where to look".into(),
                 text: show(&self.roots()).join(" "),
@@ -130,7 +131,7 @@ impl Scope {
                 changed: self.roots() != self.default_roots_or_all(),
             },
             Knob {
-                key: 'b',
+                key: Action::Skip,
                 name: "skipping",
                 action: "change what is skipped".into(),
                 text: self.denied_names.join(" "),
@@ -138,7 +139,7 @@ impl Scope {
                 changed: self.denied_names != DENIED_NAMES,
             },
             Knob {
-                key: 'a',
+                key: Action::Everywhere,
                 name: "everywhere",
                 action: if everywhere {
                     format!("look only in {back}")

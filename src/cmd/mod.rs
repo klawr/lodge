@@ -281,7 +281,7 @@ fn toolchain(oci: Arc<dyn OciFetcher>) -> Toolchain {
 }
 
 /// Works on the config alone: no host, no target, no engine.
-fn configure_config(config: Option<PathBuf>) -> Result<()> {
+fn configure_config(config: Option<PathBuf>, terminal: &prompt::Terminal) -> Result<()> {
     let path = crate::config::path_for(config)?;
     let home = SystemLocal.home();
     let path_var = SystemLocal.var("PATH").unwrap_or_default();
@@ -301,13 +301,7 @@ fn configure_config(config: Option<PathBuf>) -> Result<()> {
         cwd: &cwd,
         bundles: &packer,
     };
-    configure::run(
-        &path,
-        &machine,
-        &prompt::Terminal,
-        &prompt::Terminal,
-        &prompt::Terminal,
-    )?;
+    configure::run(&path, &machine, terminal, terminal, terminal)?;
     Ok(())
 }
 
@@ -317,6 +311,11 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
     // else takes; a new way of reaching a machine or a new target is one more arm.
     // The helper tools (`ldd`, `patchelf`, the registry client) are chosen here too.
     let history = FileHistory::in_data_dir();
+    // The keys come from the config, which is read here on its own: the first
+    // screen is asked before any command has loaded it.
+    let terminal = prompt::Terminal::new(crate::config::keymap(&crate::config::path_for(
+        cli.config.clone(),
+    )?)?);
     // Without a subcommand, the person picks one of the places they were in. That
     // comes first because the pick says which host and target to build.
     let subcommand = match cli.command.take() {
@@ -324,7 +323,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
         None => loop {
             match resume::pick(
                 &history,
-                &prompt::Terminal,
+                &terminal,
                 cli.remote.as_deref(),
                 cli.target.as_deref(),
             )? {
@@ -343,7 +342,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                     let home = SystemLocal.home();
                     let scope = browse::Scope::new(vec![home.clone()], Vec::new());
                     match browse::pick(
-                        &prompt::Terminal,
+                        &terminal,
                         "New project",
                         &scope,
                         browse::Want::Project,
@@ -366,7 +365,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                 }
                 Some(resume::Home::Configure) => {
                     // Leaving the config goes back to the places, not out of ldg.
-                    configure_config(cli.config.clone())?;
+                    configure_config(cli.config.clone(), &terminal)?;
                     continue;
                 }
                 None => return Ok(ExitCode::SUCCESS),
@@ -420,7 +419,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
             project.as_deref(),
         ))),
         history: Box::new(history),
-        choose: Box::new(prompt::Terminal),
+        choose: Box::new(terminal),
         route,
         endpoints,
         bundles: bundle_stores(tools.oci.clone()),

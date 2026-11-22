@@ -110,7 +110,8 @@ is in the TOML, with every value a line you can move to (↑/↓ or j/k): `targe
 such (`target = (the same place as here)`). Enter changes the selected one: `path`
 opens the list of what this machine has, the rest is typed or chosen from a short
 list (`for`, `target`, how a secret is read and placed), `copy_deps` is turned over.
-`x` puts a value back to its default or clears it, and `r` removes the entry. What
+`x` removes the entry the line belongs to (on `target`, `bundle`, `[session]` and
+`[git]`, which are not entries, it puts the value back to its default). What
 each change did is on the first line, and a refused one says why and changes nothing.
 A binary that is renamed takes its data with it, and one that is removed leaves its
 data in place, no longer for anything.
@@ -138,7 +139,7 @@ state (`~/.ssh`, `~/.config/gh`, caches) are never listed.
 
 A config that does not load (after an upgrade that renamed a table, say) is still
 shown, with why on top, and what this version of lodge does not know (a table it
-dropped, a misspelled key) grouped at the end as lines of their own. `r` removes
+dropped, a misspelled key) grouped at the end as lines of their own. `x` removes
 one, and the rest of the file, its comments included, stays as it was. Any other
 change is kept while it leaves the file with fewer problems than it had, so a config
 with several can be mended one at a time; one that would add a problem is refused, as
@@ -161,6 +162,52 @@ ldg inject rm data ~/.config/nvim
 The file is edited in place (comments and order stay), and nothing is written
 unless the result is a valid config. With `bundle =` set, the entries are not
 used until you pack again or drop that line.
+
+## `[keys]`
+
+The keys of the interactive screens (the places `ldg` lists, the config screen, the
+searches) are the same everywhere, and are yours to change. Each action has the keys
+below; naming one under `[keys]` gives it exactly the keys you list (a list replaces
+the defaults, a single string is one key, `[]` unbinds), and what you leave out keeps
+its own. Every hint line on the screens is written from this, so it always says what
+the keys do.
+
+```toml
+[keys]
+up    = ["up", "ctrl-p"]      # drop j/k
+down  = ["down", "ctrl-n"]
+leave = ["esc", "ctrl-c"]     # q no longer leaves a list
+pack  = "ctrl-k"
+```
+
+A key is a character (`j`, `G`, `?`) or one of `up down left right home end enter esc
+tab backspace space`, after any `ctrl-` or `alt-` (`ctrl-n`, `alt-x`); a capital letter
+is shift. The digits `1`-`9` jump to that row and can't be bound. In a search, or
+where a line is typed, a plain character is text, so there only the named keys and
+Ctrl or Alt combinations act; a plain character given to such an action is not used
+there.
+
+Each key does one thing: two actions on the same key (in a list, or in a search)
+are reported with the rest of the problems in the config, as is a key that does not
+parse, an action that does not exist, and an empty `choose` or `leave`, which would
+leave no way out of a list. The keys are read from the file on this machine and are
+never part of a bundle, so they work the same without any config of injected
+programs: a file with only `[keys]` in it is enough.
+
+| action | default keys | |
+| --- | --- | --- |
+| `up`, `down` | `up` `k` `ctrl-p`, `down` `j` `ctrl-n` | move over a list |
+| `first`, `last` | `home` `g`, `end` `G` | the ends of a list |
+| `choose` | `enter` | open, accept, add |
+| `leave` | `esc` `q` `ctrl-c` `ctrl-d` | back out (`q` only in lists) |
+| `mark` | `tab` | mark in a search |
+| `prev_list`, `next_list` | `left`, `right` | switch the lists of a search |
+| `clear_line` | `ctrl-u` | empty the line being typed |
+| `look_where`, `skip`, `everywhere` | `ctrl-w`, `ctrl-b`, `ctrl-a` | the settings of a search for programs and data |
+| `add_binary`, `add_data`, `add_secret` | `b`, `d`, `s` | the config screen |
+| `remove` | `x` | remove the entry selected (a `[[binary]]`, `[[data]]` or `[[secret]]`, or a line lodge does not use); a setting goes back to its default; in the pack list, delete the bundle file |
+| `pack`, `publish`, `open_file` | `p`, `P`, `o` | the config screen |
+| `new`, `config`, `reinject`, `recreate` | `n`, `c`, `i`, `r` | the places `ldg` lists |
 
 ## `[session]`
 

@@ -81,7 +81,7 @@ for where to put them). Man page: `ldg man | man -l -`.
 
 | Command | What it does |
 | --- | --- |
-| `ldg` | Pick up where you left off: lists the projects and containers you opened a session in, most recent first (with the target and `--remote` host each was reached through), and opens the one you choose the same way as before. Move with the arrow keys or `j`/`k` (`g`/`G` or Home/End for the ends, a digit to jump, Enter to open, `q` or Esc to leave). The list fits the width of the terminal (and follows a resize); `NO_COLOR` turns its colour off. `--remote` and `--target` narrow the list. |
+| `ldg` | Pick up where you left off: lists the projects and containers you opened a session in, most recent first (with the target and `--remote` host each was reached through), and opens the one you choose the same way as before. Move with the arrow keys or `j`/`k` (`g`/`G` or Home/End for the ends, a digit to jump, Enter to open, `q` or Esc to leave). The list fits the width of the terminal (and follows a resize); `NO_COLOR` turns its colour off. The keys can be changed under [`[keys]`](docs/configuration.md#keys). `--remote` and `--target` narrow the list. |
 | `ldg up [PATH]` | Start the project's devcontainer and open a shell. The environment is injected when the container is created (or with `--reinject`). `--build` rebuilds and recreates; `--no-attach` sets up without a shell. |
 | `ldg attach CONTAINER` | Inject into a running container that something else made (a `docker run`, a compose service) and open a shell. Nothing is created or started; what is already in it is left alone. `ldg clean --container CONTAINER` takes lodge out again. |
 | `ldg down [PATH]` | Stop the project's container (resume later with `ldg up`). |

@@ -22,6 +22,7 @@ mod history;
 mod host;
 mod host_tools;
 mod inject;
+mod keys;
 mod kube;
 mod layout;
 mod local;

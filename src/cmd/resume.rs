@@ -15,6 +15,7 @@ use super::prompt::{Choice, Choose, Hotkey};
 use super::table::{Cell, Table, Tone};
 use crate::cli::{Command, ProjectArg};
 use crate::history::{Entry, History, Place, Route};
+use crate::keys::Action;
 use crate::output::note;
 
 /// What the person chose on the first screen.
@@ -37,25 +38,25 @@ pub struct Resumed {
 /// that Enter does not do.
 const KEYS: &[Hotkey] = &[
     Hotkey {
-        key: 'n',
+        action: Action::New,
         label: "new",
     },
     Hotkey {
-        key: 'c',
+        action: Action::Config,
         label: "config",
     },
     Hotkey {
-        key: 'r',
+        action: Action::Reinject,
         label: "reinject",
     },
     Hotkey {
-        key: 'b',
+        action: Action::Recreate,
         label: "recreate",
     },
 ];
 
-/// Offers the remembered places, most recent first, with `c` for the config,
-/// `r` to open one and inject again, and `b` to recreate its container, and
+/// Offers the remembered places, most recent first, with keys for the config,
+/// to open one and inject again, and to recreate its container, and
 /// returns what was chosen: `None` when the person leaves. `remote` and
 /// `target` are the flags given on the command line; when there are any, only
 /// the places reached that way are offered.
@@ -75,8 +76,8 @@ pub fn pick(
     loop {
         let (key, row) = match choose.choose_with("Where to?", &describe(&entries), KEYS)? {
             Choice::Left => return Ok(None),
-            Choice::Key('c', _) => return Ok(Some(Home::Configure)),
-            Choice::Key('n', _) => return Ok(Some(Home::New)),
+            Choice::Key(Action::Config, _) => return Ok(Some(Home::Configure)),
+            Choice::Key(Action::New, _) => return Ok(Some(Home::New)),
             Choice::Key(key, row) => (Some(key), row),
             Choice::Row(row) => (None, row),
         };
@@ -84,11 +85,11 @@ pub fn pick(
         let Some(entry) = entries.get(row) else {
             continue;
         };
-        let (reinject, build) = (key == Some('r'), key == Some('b'));
+        let (reinject, build) = (key == Some(Action::Reinject), key == Some(Action::Recreate));
         if build {
             if !matches!(entry.place, Place::Project { .. }) {
                 note!(
-                    "{} is a container ldg did not make: it can be reinjected (r), not recreated",
+                    "{} is a container ldg did not make: it can be reinjected, not recreated",
                     entry.name
                 );
                 continue;
@@ -222,15 +223,20 @@ mod tests {
     }
 
     /// Presses a key of the first screen.
-    struct PressesKey(char);
+    struct PressesKey(Action);
     impl Choose for PressesKey {
         fn choose(&self, _: &str, _: &Table) -> Result<Option<usize>> {
             Ok(None)
         }
         fn choose_with(&self, _: &str, _: &Table, keys: &[Hotkey]) -> Result<Choice> {
             assert_eq!(
-                keys.iter().map(|k| k.key).collect::<Vec<_>>(),
-                vec!['n', 'c', 'r', 'b']
+                keys.iter().map(|k| k.action).collect::<Vec<_>>(),
+                vec![
+                    Action::New,
+                    Action::Config,
+                    Action::Reinject,
+                    Action::Recreate
+                ]
             );
             Ok(Choice::Key(self.0, 0))
         }
@@ -386,11 +392,11 @@ mod tests {
 
     #[test]
     fn the_config_key_leads_to_the_config_with_places_or_without() {
-        let home = pick(&history(), &PressesKey('c'), None, None)
+        let home = pick(&history(), &PressesKey(Action::Config), None, None)
             .unwrap()
             .unwrap();
         assert!(matches!(home, Home::Configure));
-        let home = pick(&Memory::default(), &PressesKey('c'), None, None)
+        let home = pick(&Memory::default(), &PressesKey(Action::Config), None, None)
             .unwrap()
             .unwrap();
         assert!(matches!(home, Home::Configure));
@@ -398,11 +404,11 @@ mod tests {
 
     #[test]
     fn the_new_key_leads_to_a_new_project_with_places_or_without() {
-        let home = pick(&history(), &PressesKey('n'), None, None)
+        let home = pick(&history(), &PressesKey(Action::New), None, None)
             .unwrap()
             .unwrap();
         assert!(matches!(home, Home::New));
-        let home = pick(&Memory::default(), &PressesKey('n'), None, None)
+        let home = pick(&Memory::default(), &PressesKey(Action::New), None, None)
             .unwrap()
             .unwrap();
         assert!(matches!(home, Home::New));
@@ -452,7 +458,7 @@ mod tests {
 
     /// Presses `key` on a row, then answers the confirmation (if there is one).
     struct Presses {
-        key: char,
+        key: Action,
         row: usize,
         confirm: Option<usize>,
         asked: RefCell<Vec<String>>,
@@ -474,7 +480,7 @@ mod tests {
         }
     }
 
-    fn presses(key: char, row: usize, confirm: Option<usize>) -> Presses {
+    fn presses(key: Action, row: usize, confirm: Option<usize>) -> Presses {
         Presses {
             key,
             row,
@@ -487,7 +493,7 @@ mod tests {
     #[test]
     fn r_opens_the_place_again_with_reinject_and_nothing_else_asked_for() {
         // Row 2 is the project, row 1 the container: both can be reinjected.
-        let project = pick(&history(), &presses('r', 2, None), None, None)
+        let project = pick(&history(), &presses(Action::Reinject, 2, None), None, None)
             .unwrap()
             .unwrap()
             .place();
@@ -498,7 +504,7 @@ mod tests {
             panic!("not up");
         };
         assert!(reinject && !build);
-        let container = pick(&history(), &presses('r', 1, None), None, None)
+        let container = pick(&history(), &presses(Action::Reinject, 1, None), None, None)
             .unwrap()
             .unwrap()
             .place();
@@ -512,7 +518,7 @@ mod tests {
 
     #[test]
     fn b_recreates_a_project_after_asking_and_cancelling_asks_for_the_list_again() {
-        let yes = presses('b', 2, Some(0));
+        let yes = presses(Action::Recreate, 2, Some(0));
         let recreated = pick(&history(), &yes, None, None).unwrap().unwrap().place();
         let Command::Up {
             build, reinject, ..
@@ -527,18 +533,18 @@ mod tests {
             yes.asked
         );
         // Cancelled: nothing is recreated, and the list is shown again (and left).
-        let no = presses('b', 2, Some(1));
+        let no = presses(Action::Recreate, 2, Some(1));
         assert!(pick(&history(), &no, None, None).unwrap().is_none());
         assert_eq!(no.asked.borrow().len(), 1);
     }
 
     #[test]
     fn a_container_that_ldg_did_not_make_is_not_recreated_and_nobody_is_asked() {
-        let container = presses('b', 1, Some(0));
+        let container = presses(Action::Recreate, 1, Some(0));
         assert!(pick(&history(), &container, None, None).unwrap().is_none());
         assert!(container.asked.borrow().is_empty());
         // With nothing remembered the keys mean nothing either.
-        let none = presses('r', 0, None);
+        let none = presses(Action::Reinject, 0, None);
         assert!(
             pick(&Memory::default(), &none, None, None)
                 .unwrap()

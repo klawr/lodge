@@ -29,47 +29,44 @@ use crate::config::edit::{
     self, Field, Kind, NewEntry, NewSecret, RawEntry, RawSecret, SecretAs, SecretFrom, Setting,
 };
 use crate::config::unknown::Unknown;
+use crate::keys::Action;
 use crate::layout::tilde;
 use crate::output::{plural, warning};
 
 const KEYS: &[Hotkey] = &[
     Hotkey {
-        key: 'b',
+        action: Action::AddBinary,
         label: "+binary",
     },
     Hotkey {
-        key: 'd',
+        action: Action::AddData,
         label: "+data",
     },
     Hotkey {
-        key: 's',
+        action: Action::AddSecret,
         label: "+secret",
     },
     Hotkey {
-        key: 'r',
-        label: "remove",
-    },
-    Hotkey {
-        key: 'x',
+        action: Action::Remove,
         label: "clear",
     },
     Hotkey {
-        key: 'p',
+        action: Action::Pack,
         label: "pack",
     },
     Hotkey {
-        key: 'P',
+        action: Action::Publish,
         label: "publish",
     },
     Hotkey {
-        key: 'o',
+        action: Action::OpenFile,
         label: "open file",
     },
 ];
 
 /// The keys while choosing which bundle file to pack into.
 const PACK_KEYS: &[Hotkey] = &[Hotkey {
-    key: 'x',
+    action: Action::Remove,
     label: "delete",
 }];
 
@@ -262,7 +259,7 @@ fn why(e: &anyhow::Error) -> String {
 }
 
 /// What is said of a line that lodge does not know, when it is changed.
-const NOT_USED: &str = "this version of lodge does not use it: press r to remove it";
+const NOT_USED: &str = "this version of lodge does not use it: remove it";
 
 /// What the person is asked in words, and waited for.
 struct Talk<'a> {
@@ -288,13 +285,15 @@ fn act(
     };
     let stop = stops.get(row).copied();
     match key {
-        Some('b') => add(path, Kind::Binary, file, machine, choose, ask),
-        Some('d') => add(path, Kind::Data, file, machine, choose, ask),
-        Some('s') => add_secret(path, choose, ask),
-        Some('p') => pack(path, file, machine, choose, ask, wait),
-        Some('P') => publish(path, file, machine, ask, wait),
-        Some('o') => open_file(path, machine, choose, ask),
-        Some('r') => match stop {
+        Some(Action::AddBinary) => add(path, Kind::Binary, file, machine, choose, ask),
+        Some(Action::AddData) => add(path, Kind::Data, file, machine, choose, ask),
+        Some(Action::AddSecret) => add_secret(path, choose, ask),
+        Some(Action::Pack) => pack(path, file, machine, choose, ask, wait),
+        Some(Action::Publish) => publish(path, file, machine, ask, wait),
+        Some(Action::OpenFile) => open_file(path, machine, choose, ask),
+        // The entry the line belongs to is taken out, with all its fields; a
+        // setting, which can't be, goes back to its default.
+        Some(Action::Remove) => match stop {
             Some(Stop::Entry { kind, entry, .. }) => {
                 let key = file.entries(kind)[entry].key();
                 edit::remove(path, kind, key)?;
@@ -313,15 +312,7 @@ fn act(
             }
             None => Ok(String::new()),
         },
-        Some(_) => match stop {
-            Some(Stop::Setting(which)) => clear_setting(path, which),
-            Some(Stop::Entry { kind, entry, field }) => {
-                clear(path, &file.entries(kind)[entry], field)
-            }
-            Some(Stop::Secret { entry, field }) => clear_secret(path, &file.secrets[entry], field),
-            Some(Stop::Unknown(_)) => anyhow::bail!(NOT_USED),
-            None => Ok(String::new()),
-        },
+        Some(_) => Ok(String::new()),
         None => match stop {
             Some(Stop::Setting(Setting::Bundle)) => edit_bundle(path, file, machine, choose, ask),
             Some(Stop::Setting(which)) => edit_setting(path, which, file, choose, ask),
@@ -643,16 +634,6 @@ fn clear_setting(path: &Path, which: Setting) -> Result<String> {
 }
 
 // ── binaries and configs ─────────────────────────────────────────────────────
-
-/// Takes a field out of an entry (`copy_deps` goes back to its default).
-fn clear(path: &Path, entry: &RawEntry, field: Field) -> Result<String> {
-    let key = entry.key();
-    match field {
-        Field::CopyDeps => edit::set_copy_deps(path, key, true)?,
-        _ => edit::set_field(path, entry.kind, key, field, None)?,
-    }
-    Ok(format!("cleared {} of `{key}`", field.key()))
-}
 
 /// Changes one field of an entry: the path is chosen from the machine's own, a
 /// name or a target is typed, `for` is chosen among the programs, `copy_deps` is
@@ -1034,16 +1015,6 @@ fn edit_secret(
     }
 }
 
-fn clear_secret(path: &Path, secret: &RawSecret, field: SecretField) -> Result<String> {
-    match field {
-        SecretField::Targets => {
-            edit::set_secret_targets(path, &secret.name, &[])?;
-            Ok(format!("`{}` may go anywhere", secret.name))
-        }
-        _ => anyhow::bail!("a secret needs its {}: change it with Enter", field.key()),
-    }
-}
-
 // ── the bundle ───────────────────────────────────────────────────────────────
 
 /// Packs the config at `path` into `output`, and says what was made. What went
@@ -1065,7 +1036,8 @@ fn pack_into(
 }
 
 /// What `p` shows: the bundle files there are already, to pack into (replacing
-/// one) or delete with `x`, and a row to type the name of a new file on.
+/// one) or delete with `x`, and a row to type the name of a new file on. A delete
+/// leaves the list as it was, less the file: the config is back when the list is.
 fn pack(
     path: &Path,
     file: &File,
@@ -1074,6 +1046,38 @@ fn pack(
     ask: &dyn Ask,
     wait: &dyn Pause,
 ) -> Result<String> {
+    let mut said = String::new();
+    let mut reread: Option<File> = None;
+    loop {
+        let shown = reread.as_ref().unwrap_or(file);
+        match pack_list(path, shown, machine, choose, ask, wait)? {
+            Listed::Done(made) => return Ok(made),
+            Listed::Left => return Ok(said),
+            Listed::Deleted(what) => {
+                said = what;
+                reread = Some(File::read(path)?);
+            }
+        }
+    }
+}
+
+/// How the list of bundle files ended.
+enum Listed {
+    /// Something was packed, and this is what was said of it.
+    Done(String),
+    Left,
+    /// A bundle file was deleted: the list is to be shown again without it.
+    Deleted(String),
+}
+
+fn pack_list(
+    path: &Path,
+    file: &File,
+    machine: &Machine,
+    choose: &dyn Choose,
+    ask: &dyn Ask,
+    wait: &dyn Pause,
+) -> Result<Listed> {
     let default = machine.bundles.default_file()?;
     let mut existing: Vec<String> = Vec::new();
     let in_use = file
@@ -1123,9 +1127,14 @@ fn pack(
                 typed = name;
                 tried
             }
-            Entered::Chose(Choice::Key('x', row)) => match existing.get(row) {
-                Some(reference) => delete_bundle(path, file, machine, choose, reference),
-                None => return Ok(String::new()),
+            Entered::Chose(Choice::Key(Action::Remove, row)) => match existing.get(row) {
+                Some(reference) => match delete_bundle(path, file, machine, choose, reference) {
+                    Ok(Some(said)) => return Ok(Listed::Deleted(said)),
+                    // Kept: the list stays as it was.
+                    Ok(None) => continue,
+                    Err(e) => Err(e),
+                },
+                None => return Ok(Listed::Left),
             },
             Entered::Chose(Choice::Row(row)) => match existing.get(row) {
                 Some(reference) => pack_into(path, machine, wait, reference, Replace::Yes),
@@ -1136,27 +1145,28 @@ fn pack(
                         typed = name;
                         tried
                     }
-                    None => return Ok(String::new()),
+                    None => return Ok(Listed::Left),
                 },
             },
-            Entered::Chose(_) => return Ok(String::new()),
+            Entered::Chose(_) => return Ok(Listed::Left),
         };
         match tried {
-            Ok(said) => return Ok(said),
+            Ok(said) => return Ok(Listed::Done(said)),
             Err(e) => notice = Some(one_line(&e)),
         }
     }
 }
 
 /// Deletes the bundle file `reference` after the person agrees, and takes it off
-/// the list. The one in use is kept: it is changed first.
+/// the list; what it did, or `None` when they did not agree. The one in use is
+/// kept: it is changed first.
 fn delete_bundle(
     path: &Path,
     file: &File,
     machine: &Machine,
     choose: &dyn Choose,
     reference: &str,
-) -> Result<String> {
+) -> Result<Option<String>> {
     let in_use = file.setting(Setting::Bundle).map(|b| b.trim_matches('"'));
     if in_use == Some(reference) {
         anyhow::bail!("{reference} is in use: choose another bundle first");
@@ -1167,11 +1177,11 @@ fn delete_bundle(
         &[("delete", "the file is removed"), ("keep", "")],
     )?;
     if sure != Some(0) {
-        return Ok(String::new());
+        return Ok(None);
     }
     machine.bundles.delete(reference)?;
     edit::remove_bundle(path, reference)?;
-    Ok(format!("deleted {reference}"))
+    Ok(Some(format!("deleted {reference}")))
 }
 
 /// Publishes the bundle to a registry: the reference the config already names,
@@ -1450,7 +1460,7 @@ mod tests {
         views: RefCell<Vec<Choice>>,
         picks: RefCell<Vec<Option<usize>>>,
         /// For each question with hotkeys, the key pressed on the row picked.
-        keys: RefCell<Vec<char>>,
+        keys: RefCell<Vec<Action>>,
         /// What is typed on the row of a list that can be typed on.
         typed: RefCell<Vec<String>>,
         /// The notice each question with a row to type on was given.
@@ -1751,18 +1761,17 @@ mod tests {
     }
 
     #[test]
-    fn enter_changes_the_value_x_clears_it_r_removes_the_entry() {
+    fn enter_changes_the_value_and_x_removes_the_entry() {
         let screen = Screen {
             views: RefCell::new(vec![
-                Choice::Row(2),      // shell: typed
-                Choice::Row(3),      // safe_directories: typed
-                Choice::Row(0),      // target: chosen from the list (the third)
-                Choice::Row(1),      // bundle: typed
-                Choice::Key('x', 2), // shell: back to the default
-                Choice::Row(6),      // target of binary a: typed
-                Choice::Row(7),      // copy_deps of a: turned off
-                Choice::Key('x', 6), // target of a: cleared
-                Choice::Key('r', 9), // an entry of b: removed
+                Choice::Row(2),                 // shell: typed
+                Choice::Row(3),                 // safe_directories: typed
+                Choice::Row(0),                 // target: chosen from the list (the third)
+                Choice::Row(1),                 // bundle: typed
+                Choice::Key(Action::Remove, 2), // shell: back to the default
+                Choice::Row(6),                 // target of binary a: typed
+                Choice::Row(7),                 // copy_deps of a: turned off
+                Choice::Key(Action::Remove, 9), // an entry of b: removed
                 Choice::Left,
             ]),
             picks: RefCell::new(vec![Some(2)]),
@@ -1797,8 +1806,9 @@ mod tests {
             r.config
         );
         assert!(
-            r.config
-                .contains("name = \"a\"\npath = \"/bin/sh\"\ncopy_deps = false"),
+            r.config.contains(
+                "name = \"a\"\npath = \"/bin/sh\"\ntarget = \"~/.local/bin/a\"\ncopy_deps = false"
+            ),
             "{}",
             r.config
         );
@@ -1830,7 +1840,11 @@ mod tests {
     #[test]
     fn b_and_d_add_one_enter_at_a_time_and_what_is_there_already_is_marked() {
         let screen = Screen {
-            views: RefCell::new(vec![Choice::Key('d', 0), Choice::Key('b', 0), Choice::Left]),
+            views: RefCell::new(vec![
+                Choice::Key(Action::AddData, 0),
+                Choice::Key(Action::AddBinary, 0),
+                Choice::Left,
+            ]),
             adds: RefCell::new(vec![
                 vec![
                     Pick::Item(0),
@@ -1883,7 +1897,7 @@ mod tests {
     #[test]
     fn what_the_config_has_already_is_marked_in_the_list() {
         let screen = Screen {
-            views: RefCell::new(vec![Choice::Key('d', 0), Choice::Left]),
+            views: RefCell::new(vec![Choice::Key(Action::AddData, 0), Choice::Left]),
             adds: RefCell::new(vec![vec![]]),
             ..Screen::default()
         };
@@ -1901,13 +1915,11 @@ mod tests {
         // added comes after it, at 19-22.
         let screen = Screen {
             views: RefCell::new(vec![
-                Choice::Key('s', 0),  // add: name, kind (a command), value
-                Choice::Row(21),      // as: a file in the container, and its mode
-                Choice::Row(22),      // targets
-                Choice::Row(16),      // from of TOKEN: an environment variable
-                Choice::Key('x', 22), // targets cleared
-                Choice::Key('x', 20), // from can't be cleared
-                Choice::Key('r', 15), // TOKEN removed
+                Choice::Key(Action::AddSecret, 0), // add: name, kind (a command), value
+                Choice::Row(21),                   // as: a file in the container, and its mode
+                Choice::Row(22),                   // targets
+                Choice::Row(16),                   // from of TOKEN: an environment variable
+                Choice::Key(Action::Remove, 15),   // TOKEN removed
                 Choice::Left,
             ]),
             picks: RefCell::new(vec![Some(2), Some(1), Some(0)]),
@@ -1936,7 +1948,7 @@ mod tests {
             "{}",
             r.config
         );
-        assert!(!r.config.contains("targets"), "cleared: {}", r.config);
+        assert!(r.config.contains("targets"), "{}", r.config);
         assert!(
             !r.config.contains("name = \"TOKEN\""),
             "removed: {}",
@@ -1953,10 +1965,7 @@ mod tests {
             titles[3].contains("✓ `GH_TOKEN` may go to me@box, dev-*"),
             "{titles:?}"
         );
-        assert!(
-            titles[6].contains("✗ a secret needs its from"),
-            "{titles:?}"
-        );
+        assert!(titles[5].contains("✓ removed secret `TOKEN`"), "{titles:?}");
     }
 
     #[test]
@@ -1965,7 +1974,11 @@ mod tests {
         // cannot type on here, so it is asked for in words.
         let screen = Screen {
             picks: RefCell::new(vec![Some(0), Some(0)]),
-            ..views(vec![Choice::Key('p', 0), Choice::Key('p', 0), Choice::Left])
+            ..views(vec![
+                Choice::Key(Action::Pack, 0),
+                Choice::Key(Action::Pack, 0),
+                Choice::Left,
+            ])
         };
         let r = drive(FILE, screen, vec![None, Some("out/mine.tar")]);
         let asked = r.packs.asked.borrow();
@@ -1994,7 +2007,7 @@ mod tests {
         // The name is asked for in words here; the list is left after the failure.
         let screen = Screen {
             picks: RefCell::new(vec![Some(0), None]),
-            ..views(vec![Choice::Key('p', 0), Choice::Left])
+            ..views(vec![Choice::Key(Action::Pack, 0), Choice::Left])
         };
         let r = drive_with(FILE, screen, vec![Some("x.tar")], failing);
         // The list stays, asked again with why, and the form has nothing to say.
@@ -2016,7 +2029,7 @@ mod tests {
     #[test]
     fn p_shows_the_bundles_there_are_and_replaces_the_one_chosen() {
         let screen = Screen {
-            views: RefCell::new(vec![Choice::Key('p', 0), Choice::Left]),
+            views: RefCell::new(vec![Choice::Key(Action::Pack, 0), Choice::Left]),
             picks: RefCell::new(vec![Some(1)]),
             ..Screen::default()
         };
@@ -2028,7 +2041,7 @@ mod tests {
     #[test]
     fn a_new_file_is_never_written_over_what_is_there() {
         let screen = Screen {
-            views: RefCell::new(vec![Choice::Key('p', 0), Choice::Left]),
+            views: RefCell::new(vec![Choice::Key(Action::Pack, 0), Choice::Left]),
             picks: RefCell::new(vec![Some(2)]),
             ..Screen::default()
         };
@@ -2040,10 +2053,11 @@ mod tests {
     #[test]
     fn x_deletes_a_bundle_that_is_not_in_use_once_agreed_and_takes_it_off_the_list() {
         let screen = Screen {
-            views: RefCell::new(vec![Choice::Key('p', 0), Choice::Left]),
-            // The row of b.tar, then "delete" at the question.
-            picks: RefCell::new(vec![Some(1), Some(0)]),
-            keys: RefCell::new(vec!['x']),
+            views: RefCell::new(vec![Choice::Key(Action::Pack, 0), Choice::Left]),
+            // The row of b.tar, then "delete" at the question, and the list is
+            // still there: it is left.
+            picks: RefCell::new(vec![Some(1), Some(0), None]),
+            keys: RefCell::new(vec![Action::Remove]),
             ..Screen::default()
         };
         let r = drive(WITH_BUNDLES, screen, vec![]);
@@ -2064,9 +2078,10 @@ mod tests {
     #[test]
     fn declining_keeps_the_bundle_and_the_one_in_use_cannot_be_deleted() {
         let screen = Screen {
-            views: RefCell::new(vec![Choice::Key('p', 0), Choice::Left]),
-            picks: RefCell::new(vec![Some(1), Some(1)]),
-            keys: RefCell::new(vec!['x']),
+            views: RefCell::new(vec![Choice::Key(Action::Pack, 0), Choice::Left]),
+            // Declining leaves the list as it was.
+            picks: RefCell::new(vec![Some(1), Some(1), Some(0), None]),
+            keys: RefCell::new(vec![Action::Remove, Action::Remove]),
             ..Screen::default()
         };
         let r = drive(WITH_BUNDLES, screen, vec![]);
@@ -2076,10 +2091,10 @@ mod tests {
             ["b.tar"]
         );
         let screen = Screen {
-            views: RefCell::new(vec![Choice::Key('p', 0), Choice::Left]),
+            views: RefCell::new(vec![Choice::Key(Action::Pack, 0), Choice::Left]),
             // The row of a.tar, which is in use; then the list is left.
             picks: RefCell::new(vec![Some(0), None]),
-            keys: RefCell::new(vec!['x']),
+            keys: RefCell::new(vec![Action::Remove]),
             ..Screen::default()
         };
         let r = drive(WITH_BUNDLES, screen, vec![]);
@@ -2095,7 +2110,7 @@ mod tests {
     fn a_name_typed_in_the_list_is_a_new_file_and_what_was_made_is_on_the_status_line() {
         let screen = Screen {
             typed: RefCell::new(vec!["mine.tar".into()]),
-            ..views(vec![Choice::Key('p', 0), Choice::Left])
+            ..views(vec![Choice::Key(Action::Pack, 0), Choice::Left])
         };
         let r = drive(WITH_BUNDLES, screen, vec![]);
         assert_eq!(r.packs.asked.borrow()[0].1.as_deref(), Some("mine.tar"));
@@ -2110,7 +2125,11 @@ mod tests {
     #[test]
     fn esc_at_a_question_with_a_default_backs_out_where_enter_takes_the_default() {
         let leave = || Screen {
-            views: RefCell::new(vec![Choice::Key('p', 0), Choice::Key('P', 0), Choice::Left]),
+            views: RefCell::new(vec![
+                Choice::Key(Action::Pack, 0),
+                Choice::Key(Action::Publish, 0),
+                Choice::Left,
+            ]),
             picks: RefCell::new(vec![Some(0)]),
             ..Screen::default()
         };
@@ -2124,7 +2143,11 @@ mod tests {
     fn shift_p_publishes_to_the_reference_in_the_config_or_one_typed_and_only_to_a_registry() {
         let r = drive(
             "bundle = \"oci://ghcr.io/me/lodge:1\"\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\n",
-            views(vec![Choice::Key('P', 0), Choice::Key('P', 0), Choice::Left]),
+            views(vec![
+                Choice::Key(Action::Publish, 0),
+                Choice::Key(Action::Publish, 0),
+                Choice::Left,
+            ]),
             vec![None, Some("oci://other/x:2")],
         );
         let asked = r.packs.asked.borrow();
@@ -2138,7 +2161,11 @@ mod tests {
         // and nothing typed, nothing happens.
         let r = drive(
             FILE,
-            views(vec![Choice::Key('P', 0), Choice::Key('P', 0), Choice::Left]),
+            views(vec![
+                Choice::Key(Action::Publish, 0),
+                Choice::Key(Action::Publish, 0),
+                Choice::Left,
+            ]),
             vec![Some("lodge.tar"), None],
         );
         assert!(r.packs.asked.borrow().is_empty());
@@ -2161,7 +2188,7 @@ mod tests {
         let other = dir.path().join("deploy.toml");
         std::fs::write(&other, "[[binary]]\nname = \"other\"\npath = \"/bin/ls\"\n").unwrap();
         let screen = Screen {
-            views: RefCell::new(vec![Choice::Key('o', 0), Choice::Left]),
+            views: RefCell::new(vec![Choice::Key(Action::OpenFile, 0), Choice::Left]),
             finds: RefCell::new(vec![Selection::Path(other.display().to_string())]),
             ..Screen::default()
         };
@@ -2187,7 +2214,7 @@ mod tests {
         // The stops are the four settings, the four of binary a, then what lodge does not know.
         let r = drive(
             "# mine\ntarget = \"podman\"\n\n[[inject]]\nname = \"x\"\n\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\ncopy_dep = true\n",
-            views(vec![Choice::Row(8), Choice::Key('x', 9), Choice::Left]),
+            views(vec![Choice::Row(8), Choice::Row(9), Choice::Left]),
             vec![],
         );
         let shown = r.screen.shown.borrow();
@@ -2221,10 +2248,14 @@ mod tests {
     }
 
     #[test]
-    fn what_a_config_does_not_know_is_removed_with_r_until_it_loads_again() {
+    fn what_a_config_does_not_know_is_removed_with_x_until_it_loads_again() {
         let r = drive(
             "# mine\ntarget = \"podman\"\n\n[[inject]]\nname = \"x\"\n\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\ncopy_dep = true\n",
-            views(vec![Choice::Key('r', 8), Choice::Key('r', 8), Choice::Left]),
+            views(vec![
+                Choice::Key(Action::Remove, 8),
+                Choice::Key(Action::Remove, 8),
+                Choice::Left,
+            ]),
             vec![],
         );
         assert!(

@@ -136,6 +136,14 @@ fn the_config_schema_is_current() {
     names.push(serde_json::Value::Null);
     schema["properties"]["target"]["enum"] = names.into();
     schema["properties"]["targets"]["additionalProperties"] = false.into();
+    // The actions a key can be given to are known, so the editor can offer them.
+    let any_keys = schema["properties"]["keys"]["additionalProperties"].clone();
+    let actions: serde_json::Map<String, serde_json::Value> = crate::keys::Action::ALL
+        .iter()
+        .map(|a| (a.name().to_string(), any_keys.clone()))
+        .collect();
+    schema["properties"]["keys"]["properties"] = actions.into();
+    schema["properties"]["keys"]["additionalProperties"] = false.into();
     let text = serde_json::to_string_pretty(&schema).unwrap() + "\n";
     let path = root().join("docs/config.schema.json");
     if std::env::var_os("UPDATE_SCHEMA").is_some() {

@@ -51,7 +51,7 @@ impl super::configure::Bundles for LivePacker {
             !self.is_registry(reference),
             "{reference} is in a registry: delete it there"
         );
-        std::fs::remove_file(reference).with_context(|| format!("deleting {reference}"))
+        remove_if_there(reference)
     }
 
     fn can_pack(&self) -> bool {
@@ -65,6 +65,17 @@ impl super::configure::Bundles for LivePacker {
             .find(reference)
             .ok()
             .is_some_and(|s| Some(s.form()) != file)
+    }
+}
+
+/// Deletes the file; one that is gone already is as good as deleted (a list can
+/// name a bundle that was removed by hand, and it has to be able to leave it).
+fn remove_if_there(reference: &str) -> Result<()> {
+    match std::fs::remove_file(reference) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("deleting {reference}"))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -432,6 +443,19 @@ mod tests {
         std::fs::write(&path, text).unwrap();
         let config = Config::load(&path).unwrap();
         (dir, path, config)
+    }
+
+    #[test]
+    fn a_bundle_file_that_is_gone_already_is_deleted_all_the_same() {
+        let dir = TempDir::new("bundle-delete").unwrap();
+        let file = dir.path().join("b.tar");
+        std::fs::write(&file, "x").unwrap();
+        let name = file.to_str().unwrap();
+        remove_if_there(name).unwrap();
+        assert!(!file.exists());
+        remove_if_there(name).unwrap();
+        // Anything else wrong with it is still an error.
+        assert!(remove_if_there(dir.path().to_str().unwrap()).is_err());
     }
 
     #[test]

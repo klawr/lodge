@@ -13,17 +13,60 @@
 //! when the pick is over.
 
 use super::table::{Cell, Table, Tone};
+use crate::keys::{self, Action, Code, Context, Keymap};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, queue};
 use std::io::{self, Write};
 
-/// A key of its own that a list answers to, with what it does for the hints.
+/// Something a list answers to besides moving, with what it is called in the
+/// hints. Which key asks for it is the [`Keymap`]'s to say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hotkey {
-    pub key: char,
+    pub action: Action,
     pub label: &'static str,
+}
+
+/// What a screen answers to: the keymap, and the actions of its own.
+#[derive(Clone, Copy)]
+struct Bindings<'a> {
+    keys: &'a Keymap,
+    hotkeys: &'a [Hotkey],
+}
+
+impl Hotkey {
+    /// How a hint says it: the key, and what it does.
+    fn hint(&self, keys: &Keymap) -> String {
+        format!("{} {}", keys.label(self.action), self.label)
+    }
+}
+
+/// What the terminal sent as a [`keys::Key`]; `None` for a key being let go of
+/// and for the ones nothing binds.
+fn key_of(event: KeyEvent) -> Option<keys::Key> {
+    if event.kind == KeyEventKind::Release {
+        return None;
+    }
+    let code = match event.code {
+        KeyCode::Char(c) => Code::Char(c),
+        KeyCode::Up => Code::Up,
+        KeyCode::Down => Code::Down,
+        KeyCode::Left => Code::Left,
+        KeyCode::Right => Code::Right,
+        KeyCode::Home => Code::Home,
+        KeyCode::End => Code::End,
+        KeyCode::Enter => Code::Enter,
+        KeyCode::Esc => Code::Esc,
+        KeyCode::Tab => Code::Tab,
+        KeyCode::Backspace => Code::Backspace,
+        _ => return None,
+    };
+    Some(keys::Key::new(
+        code,
+        event.modifiers.contains(KeyModifiers::CONTROL),
+        event.modifiers.contains(KeyModifiers::ALT),
+    ))
 }
 
 /// What a keypress asks for.
@@ -39,31 +82,28 @@ enum Key {
     Leave,
 }
 
-/// The key bindings: the arrows, and vim's (`j` `k` `g` `G`) with the readline
-/// ones (`ctrl-n`, `ctrl-p`) that go with them.
-fn map_key(event: KeyEvent) -> Option<Key> {
-    if event.kind == KeyEventKind::Release {
-        return None;
+/// What a key does to a list: the keymap's, and the digits, which jump to the
+/// row of that number and are not to be moved.
+fn map_key(keys: &Keymap, event: KeyEvent) -> Option<Key> {
+    let key = key_of(event)?;
+    if let (Code::Char(c @ '1'..='9'), false, false) = (key.code, key.ctrl, key.alt) {
+        return Some(Key::Jump(c as usize - '0' as usize));
     }
-    let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
-    Some(match event.code {
-        KeyCode::Up => Key::Up,
-        KeyCode::Down => Key::Down,
-        KeyCode::Home => Key::First,
-        KeyCode::End => Key::Last,
-        KeyCode::Enter => Key::Choose,
-        KeyCode::Esc => Key::Leave,
-        KeyCode::Char('c' | 'd') if ctrl => Key::Leave,
-        KeyCode::Char('p') if ctrl => Key::Up,
-        KeyCode::Char('n') if ctrl => Key::Down,
-        KeyCode::Char('k') => Key::Up,
-        KeyCode::Char('j') => Key::Down,
-        KeyCode::Char('g') => Key::First,
-        KeyCode::Char('G') => Key::Last,
-        KeyCode::Char('q') => Key::Leave,
-        KeyCode::Char(c @ '1'..='9') => Key::Jump(c as usize - '0' as usize),
+    Some(match keys.action(Context::List, key)? {
+        Action::Up => Key::Up,
+        Action::Down => Key::Down,
+        Action::First => Key::First,
+        Action::Last => Key::Last,
+        Action::Choose => Key::Choose,
+        Action::Leave => Key::Leave,
         _ => return None,
     })
+}
+
+/// The action of the screen that `event` asks for, if it is one of `hotkeys`.
+fn hotkey(keys: &Keymap, hotkeys: &[Hotkey], event: KeyEvent) -> Option<Action> {
+    let action = keys.action(Context::List, key_of(event)?)?;
+    hotkeys.iter().any(|h| h.action == action).then_some(action)
 }
 
 /// What a key did.
@@ -238,7 +278,7 @@ fn frame(
     cursor: &Cursor,
     plan: &Plan,
     width: usize,
-    hotkeys: &[Hotkey],
+    bind: Bindings,
 ) -> Vec<Line> {
     // A space at each end of a row.
     let grid = options.grid(width.saturating_sub(2));
@@ -265,17 +305,22 @@ fn frame(
     if plan.section_gaps {
         lines.push(blank());
     }
-    lines.push(hints(cursor, width, hotkeys));
+    lines.push(hints(cursor, width, bind));
     lines.into_iter().map(|l| l.clipped(width)).collect()
 }
 
 /// What the keys do, and where the selection is, at the far end when there is room.
-fn hints(cursor: &Cursor, width: usize, hotkeys: &[Hotkey]) -> Line {
-    let mut keys = String::from(" ↑/↓ or j/k move · Enter open");
-    for h in hotkeys {
-        keys.push_str(&format!(" · {} {}", h.key, h.label));
+fn hints(cursor: &Cursor, width: usize, bind: Bindings) -> Line {
+    let k = bind.keys;
+    let mut keys = format!(
+        " {} move · {} open",
+        k.pair(Action::Up, Action::Down),
+        k.label(Action::Choose)
+    );
+    for h in bind.hotkeys {
+        keys.push_str(&format!(" · {}", h.hint(k)));
     }
-    keys.push_str(" · q quit");
+    keys.push_str(&format!(" · {} quit", k.label(Action::Leave)));
     let place = format!("{}/{} ", cursor.at + 1, cursor.len);
     let room = width.saturating_sub(keys.chars().count() + place.chars().count());
     let gap = if room > 0 {
@@ -301,7 +346,7 @@ pub enum Picked {
     /// What was typed on the row that is a text field.
     Typed(String),
     /// A hotkey was pressed, with the row that was selected.
-    Key(char, usize),
+    Key(Action, usize),
     Left,
     /// The terminal can't be taken over for single keys; ask some other way.
     NoRawMode,
@@ -346,21 +391,27 @@ pub struct TextRow {
 }
 
 /// Shows `options` and lets the person move over them and choose one.
-pub fn pick(question: &str, options: &Table, hotkeys: &[Hotkey]) -> io::Result<Picked> {
-    pick_in(question, options, hotkeys, None, None)
+pub fn pick(
+    keys: &Keymap,
+    question: &str,
+    options: &Table,
+    hotkeys: &[Hotkey],
+) -> io::Result<Picked> {
+    pick_in(keys, question, options, hotkeys, None, None)
 }
 
 /// [`pick`], where one row is a place to type: on it the keys write into it
 /// (hotkeys included), Enter answers with the text, and Esc steps off it. A
 /// `notice` is what went wrong the last time, shown in red.
 pub fn pick_typing(
+    keys: &Keymap,
     question: &str,
     options: &Table,
     hotkeys: &[Hotkey],
     field: &TextRow,
     notice: Option<&str>,
 ) -> io::Result<Picked> {
-    pick_in(question, options, hotkeys, Some(field), notice)
+    pick_in(keys, question, options, hotkeys, Some(field), notice)
 }
 
 /// Puts `notice` on the screen `lines`, in red: where the empty line before the
@@ -387,11 +438,28 @@ enum Typing {
     Accept,
 }
 
+/// What the keys do while the selection is on the text row.
+fn typing_hint(keys: &Keymap) -> String {
+    format!(
+        " type · {} accept · {} move · {} back · {} clear",
+        keys.label(Action::Choose),
+        keys.pair(Action::Up, Action::Down),
+        keys.label(Action::Leave),
+        keys.label(Action::ClearLine),
+    )
+}
+
 /// What a key does to `text`, or to the selection, when the selection is on the
 /// text row. Enter answers when there is text, or a placeholder to take instead.
 /// Esc goes up a row: off the text, and from the only row, out.
-fn type_key(text: &mut String, placeholder: &str, key: KeyEvent, rows: usize) -> Typing {
-    match map_find_key(key) {
+fn type_key(
+    keys: &Keymap,
+    text: &mut String,
+    placeholder: &str,
+    key: KeyEvent,
+    rows: usize,
+) -> Typing {
+    match map_find_key(keys, key) {
         Some(FKey::Up) => Typing::Move(Key::Up),
         Some(FKey::Down) => Typing::Move(Key::Down),
         Some(FKey::Accept) if text.trim().is_empty() && placeholder.is_empty() => Typing::Stay,
@@ -407,6 +475,7 @@ fn type_key(text: &mut String, placeholder: &str, key: KeyEvent, rows: usize) ->
 }
 
 fn pick_in(
+    keys: &Keymap,
     question: &str,
     options: &Table,
     hotkeys: &[Hotkey],
@@ -427,6 +496,7 @@ fn pick_in(
         cursor.at = f.row;
     }
     let placeholder = field.map_or("", |f| f.placeholder.as_str());
+    let bind = Bindings { keys, hotkeys };
     loop {
         let typing = field.is_some_and(|f| f.row == cursor.at);
         let (columns, height) = usable_size(terminal::size()?);
@@ -437,19 +507,15 @@ fn pick_in(
             Some(f) => {
                 let mut shown = options.clone();
                 shown.set(f.row, f.column, field_cell(&text, placeholder, typing));
-                frame(question, &shown, &cursor, &plan, columns, hotkeys)
+                frame(question, &shown, &cursor, &plan, columns, bind)
             }
-            None => frame(question, options, &cursor, &plan, columns, hotkeys),
+            None => frame(question, options, &cursor, &plan, columns, bind),
         };
         if let Some(notice) = notice {
             show_notice(&mut lines, &plan, notice, columns);
         }
         if typing && let Some(last) = lines.last_mut() {
-            *last = Line::of(
-                " type · Enter accept · ↑/↓ move · Esc back · ctrl-u clear",
-                Tone::Muted,
-            )
-            .clipped(columns);
+            *last = Line::of(typing_hint(keys), Tone::Muted).clipped(columns);
         }
         draw(&mut err, &lines, columns)?;
         // Anything but a key (a new size, say) only means the next draw fits it.
@@ -457,7 +523,7 @@ fn pick_in(
             continue;
         };
         if typing {
-            match type_key(&mut text, placeholder, key, options.len()) {
+            match type_key(keys, &mut text, placeholder, key, options.len()) {
                 Typing::Stay => {}
                 Typing::Move(Key::Leave) => return Ok(Picked::Left),
                 Typing::Move(key) => {
@@ -471,14 +537,12 @@ fn pick_in(
             }
             continue;
         }
-        if let KeyCode::Char(c) = key.code
-            && key.kind != KeyEventKind::Release
-            && !key.modifiers.contains(KeyModifiers::CONTROL)
-            && hotkeys.iter().any(|h| h.key == c)
-        {
-            return Ok(Picked::Key(c, cursor.at));
+        if let Some(action) = hotkey(keys, hotkeys, key) {
+            return Ok(Picked::Key(action, cursor.at));
         }
-        let Some(key) = map_key(key) else { continue };
+        let Some(key) = map_key(keys, key) else {
+            continue;
+        };
         match cursor.apply(key) {
             Step::Stay => {}
             Step::Chose(i) => return Ok(Picked::Chose(i)),
@@ -509,13 +573,12 @@ pub struct Item {
     pub detail: String,
 }
 
-/// A setting of a search that is changed from inside it: pressing Ctrl and
-/// `key` opens its text for editing (Enter applies it, Esc leaves it as it was),
+/// A setting of a search that is changed from inside it: pressing `key` opens its text for editing (Enter applies it, Esc leaves it as it was),
 /// or, when it is not `editable`, applies it at once. The search then ends with
 /// [`Found::Edited`], for the one that asked to look again with the change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Knob {
-    pub key: char,
+    pub key: Action,
     /// What the setting is, as part of the line that says how it stands:
     /// `looking in`.
     pub name: &'static str,
@@ -609,32 +672,33 @@ enum FKey {
     Mark,
     Accept,
     Leave,
-    /// Ctrl and a letter: a [`Knob`], when there is one by that key.
-    Knob(char),
+    /// The key of a [`Knob`], when the search has one by that action.
+    Knob(Action),
 }
 
-fn map_find_key(event: KeyEvent) -> Option<FKey> {
-    if event.kind == KeyEventKind::Release {
-        return None;
+/// What a key does in a search or a line being typed: the keymap's, and
+/// otherwise what is typed, a plain character.
+fn map_find_key(keys: &Keymap, event: KeyEvent) -> Option<FKey> {
+    let key = key_of(event)?;
+    if let Some(action) = keys.action(Context::Search, key) {
+        return Some(match action {
+            Action::Up => FKey::Up,
+            Action::Down => FKey::Down,
+            Action::Choose => FKey::Accept,
+            Action::Leave => FKey::Leave,
+            Action::Mark => FKey::Mark,
+            Action::PrevList => FKey::Prev,
+            Action::NextList => FKey::Next,
+            Action::ClearLine => FKey::ClearAll,
+            Action::LookWhere | Action::Skip | Action::Everywhere => FKey::Knob(action),
+            _ => return None,
+        });
     }
-    let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
-    Some(match event.code {
-        KeyCode::Up => FKey::Up,
-        KeyCode::Down => FKey::Down,
-        KeyCode::Tab => FKey::Mark,
-        KeyCode::Left => FKey::Prev,
-        KeyCode::Right => FKey::Next,
-        KeyCode::Enter => FKey::Accept,
-        KeyCode::Esc => FKey::Leave,
-        KeyCode::Backspace => FKey::Backspace,
-        KeyCode::Char('c' | 'd') if ctrl => FKey::Leave,
-        KeyCode::Char('p') if ctrl => FKey::Up,
-        KeyCode::Char('n') if ctrl => FKey::Down,
-        KeyCode::Char('u') if ctrl => FKey::ClearAll,
-        KeyCode::Char(c) if ctrl => FKey::Knob(c),
-        KeyCode::Char(c) => FKey::Type(c),
-        _ => return None,
-    })
+    match key.code {
+        Code::Backspace => Some(FKey::Backspace),
+        Code::Char(c) if !key.ctrl && !key.alt => Some(FKey::Type(c)),
+        _ => None,
+    }
 }
 
 /// The state of a search: what was typed, what is marked, which row is selected.
@@ -652,6 +716,8 @@ struct Finder {
     knobs: Vec<Knob>,
     /// The knob being edited and the text so far.
     editing: Option<(usize, String)>,
+    /// What the hints call the keys.
+    keys: Keymap,
 }
 
 impl Finder {
@@ -666,6 +732,7 @@ impl Finder {
             adding: false,
             knobs: Vec::new(),
             editing: None,
+            keys: Keymap::default(),
         };
         f.marked = (0..items.len()).filter(|&i| items[i].added).collect();
         f.refresh(items);
@@ -725,7 +792,7 @@ impl Finder {
         let keys: Vec<String> = self
             .knobs
             .iter()
-            .map(|k| format!("^{} {}", k.key.to_ascii_uppercase(), k.action))
+            .map(|k| format!("{} {}", self.keys.label(k.key), k.action))
             .collect();
         Some(Line::of(format!(" {}", keys.join(" · ")), Tone::Muted))
     }
@@ -757,8 +824,8 @@ impl Finder {
             return None;
         }
         match key {
-            FKey::Knob(c) => {
-                if let Some(at) = self.knobs.iter().position(|k| k.key == c)
+            FKey::Knob(action) => {
+                if let Some(at) = self.knobs.iter().position(|k| k.key == action)
                     && self.knobs_here()
                 {
                     if self.knobs[at].editable {
@@ -914,12 +981,31 @@ fn find_frame(
     };
     // The keys of the settings go above the hints, so a narrow window cuts the hints.
     lines.extend(finder.knob_keys());
+    let k = &finder.keys;
     let keys = if finder.editing.is_some() {
-        " type the new value · Ctrl-U clear · Enter apply · Esc leave it".to_string()
+        format!(
+            " type the new value · {} clear · {} apply · {} leave it",
+            k.label(Action::ClearLine),
+            k.label(Action::Choose),
+            k.label(Action::Leave)
+        )
     } else if finder.adding {
-        format!(" type to filter · ←/→ list · ↑/↓ move · Enter add · Esc done{marked}")
+        format!(
+            " type to filter · {} list · {} move · {} add · {} done{marked}",
+            k.pair(Action::PrevList, Action::NextList),
+            k.pair(Action::Up, Action::Down),
+            k.label(Action::Choose),
+            k.label(Action::Leave)
+        )
     } else {
-        format!(" type to filter · ←/→ list · ↑/↓ move · Tab mark · Enter add · Esc back{marked}")
+        format!(
+            " type to filter · {} list · {} move · {} mark · {} add · {} back{marked}",
+            k.pair(Action::PrevList, Action::NextList),
+            k.pair(Action::Up, Action::Down),
+            k.label(Action::Mark),
+            k.label(Action::Choose),
+            k.label(Action::Leave)
+        )
     };
     let place = format!(
         "{}/{} ",
@@ -935,13 +1021,20 @@ fn find_frame(
 }
 
 /// A list that narrows as the person types, where several things can be marked.
-pub fn find(question: &str, tabs: &[&str], items: &[Item], knobs: &[Knob]) -> io::Result<Found> {
+pub fn find(
+    keys: &Keymap,
+    question: &str,
+    tabs: &[&str],
+    items: &[Item],
+    knobs: &[Knob],
+) -> io::Result<Found> {
     let Ok(_raw) = RawMode::enter() else {
         return Ok(Found::NoRawMode);
     };
     let mut err = io::stderr();
     let mut finder = Finder::new(items, tabs.len());
     finder.knobs = knobs.to_vec();
+    finder.keys = keys.clone();
     loop {
         let (columns, height) = usable_size(terminal::size()?);
         let (columns, height) = (usize::from(columns), usize::from(height));
@@ -955,7 +1048,7 @@ pub fn find(question: &str, tabs: &[&str], items: &[Item], knobs: &[Knob]) -> io
         let Event::Key(key) = event::read()? else {
             continue;
         };
-        let Some(key) = map_find_key(key) else {
+        let Some(key) = map_find_key(keys, key) else {
             continue;
         };
         if let Some(done) = finder.apply(key, items) {
@@ -984,6 +1077,7 @@ pub enum Pick {
 /// stays open for the next; Esc ends it. Returns `false` when the terminal can't
 /// do this.
 pub fn find_adding(
+    keys: &Keymap,
     question: &str,
     tabs: &[&str],
     items: &[Item],
@@ -996,6 +1090,7 @@ pub fn find_adding(
     let mut err = io::stderr();
     let mut finder = Finder::new(items, tabs.len());
     finder.knobs = knobs.to_vec();
+    finder.keys = keys.clone();
     finder.adding = true;
     let mut status = String::new();
     loop {
@@ -1008,7 +1103,7 @@ pub fn find_adding(
         let Event::Key(key) = event::read()? else {
             continue;
         };
-        let Some(key) = map_find_key(key) else {
+        let Some(key) = map_find_key(keys, key) else {
             continue;
         };
         match finder.apply(key, items) {
@@ -1087,13 +1182,14 @@ fn view_top(doc: &Doc, at: usize, top: usize, rows: usize) -> usize {
 
 /// The hints of a view: what the keys do, over as many lines as the width needs
 /// (each key stays whole), and where the selection is at the far end of the last.
-fn view_hints(doc: &Doc, at: usize, hotkeys: &[Hotkey], width: usize) -> Vec<String> {
-    let mut parts = vec!["↑/↓ j/k move".to_string()];
+fn view_hints(doc: &Doc, at: usize, bind: Bindings, width: usize) -> Vec<String> {
+    let k = bind.keys;
+    let mut parts = vec![format!("{} move", k.pair(Action::Up, Action::Down))];
     if !doc.stops.is_empty() {
-        parts.push("Enter edit".into());
+        parts.push(format!("{} edit", k.label(Action::Choose)));
     }
-    parts.extend(hotkeys.iter().map(|h| format!("{} {}", h.key, h.label)));
-    parts.push("q back".into());
+    parts.extend(bind.hotkeys.iter().map(|h| h.hint(k)));
+    parts.push(format!("{} back", k.label(Action::Leave)));
     let place = if doc.stops.is_empty() {
         String::new()
     } else {
@@ -1129,7 +1225,7 @@ fn view_frame(
     top: usize,
     rows: usize,
     width: usize,
-    hotkeys: &[Hotkey],
+    bind: Bindings,
 ) -> Vec<Line> {
     let mut lines = vec![Line::of(format!(" {question}"), Tone::Strong)];
     let chosen = doc.stops.get(at).copied();
@@ -1137,7 +1233,7 @@ fn view_frame(
         let span = Span::new(line.text.clone(), line.tone);
         lines.push(Line::row(std::iter::once(span), Some(i) == chosen));
     }
-    for hint in view_hints(doc, at, hotkeys, width) {
+    for hint in view_hints(doc, at, bind, width) {
         lines.push(Line::of(hint, Tone::Muted));
     }
     lines.into_iter().map(|l| l.clipped(width)).collect()
@@ -1146,34 +1242,31 @@ fn view_frame(
 /// Shows `doc` and lets the person move over its selectable lines. Ends with
 /// Enter (the stop selected), a hotkey (and the stop that was selected), or by
 /// leaving.
-pub fn view(question: &str, doc: &Doc, hotkeys: &[Hotkey]) -> io::Result<Picked> {
+pub fn view(keys: &Keymap, question: &str, doc: &Doc, hotkeys: &[Hotkey]) -> io::Result<Picked> {
     let Ok(_raw) = RawMode::enter() else {
         return Ok(Picked::NoRawMode);
     };
     let mut err = io::stderr();
     let mut cursor = Cursor::new(doc.stops.len());
     let mut top = 0;
+    let bind = Bindings { keys, hotkeys };
     loop {
         let (columns, height) = usable_size(terminal::size()?);
         let (columns, height) = (usize::from(columns), usize::from(height));
         // The question, the hints, and a line left free.
         let rows = height
-            .saturating_sub(2 + view_hints(doc, cursor.at, hotkeys, columns).len())
+            .saturating_sub(2 + view_hints(doc, cursor.at, bind, columns).len())
             .max(1);
         top = view_top(doc, cursor.at, top, rows);
-        let lines = view_frame(question, doc, cursor.at, top, rows, columns, hotkeys);
+        let lines = view_frame(question, doc, cursor.at, top, rows, columns, bind);
         draw(&mut err, &lines, columns)?;
         let Event::Key(key) = event::read()? else {
             continue;
         };
-        if let KeyCode::Char(c) = key.code
-            && key.kind != KeyEventKind::Release
-            && !key.modifiers.contains(KeyModifiers::CONTROL)
-            && hotkeys.iter().any(|h| h.key == c)
-        {
-            return Ok(Picked::Key(c, cursor.at));
+        if let Some(action) = hotkey(keys, hotkeys, key) {
+            return Ok(Picked::Key(action, cursor.at));
         }
-        match map_key(key) {
+        match map_key(keys, key) {
             Some(Key::Leave) => return Ok(Picked::Left),
             // Nothing to move over, and nothing for Enter to open.
             _ if doc.stops.is_empty() => {}
@@ -1209,7 +1302,7 @@ fn edit_text(text: &mut String, key: FKey) -> bool {
     true
 }
 
-fn input_frame(question: &str, text: &str, width: usize) -> Vec<Line> {
+fn input_frame(keys: &Keymap, question: &str, text: &str, width: usize) -> Vec<Line> {
     vec![
         Line::of(format!(" {question}"), Tone::Strong),
         Line::of("", Tone::Normal),
@@ -1222,7 +1315,15 @@ fn input_frame(question: &str, text: &str, width: usize) -> Vec<Line> {
             selected: false,
         },
         Line::of("", Tone::Normal),
-        Line::of(" Enter accept · Esc cancel · ctrl-u clear", Tone::Muted),
+        Line::of(
+            format!(
+                " {} accept · {} cancel · {} clear",
+                keys.label(Action::Choose),
+                keys.label(Action::Leave),
+                keys.label(Action::ClearLine)
+            ),
+            Tone::Muted,
+        ),
     ]
     .into_iter()
     .map(|l| l.clipped(width))
@@ -1231,7 +1332,7 @@ fn input_frame(question: &str, text: &str, width: usize) -> Vec<Line> {
 
 /// Asks for a line of text on the alternate screen, like the lists, so the
 /// person is not thrown out to the shell to answer.
-pub fn input(question: &str) -> io::Result<Typed> {
+pub fn input(keys: &Keymap, question: &str) -> io::Result<Typed> {
     let Ok(_raw) = RawMode::enter() else {
         return Ok(Typed::NoRawMode);
     };
@@ -1241,13 +1342,13 @@ pub fn input(question: &str) -> io::Result<Typed> {
         let (columns, _) = usable_size(terminal::size()?);
         draw(
             &mut err,
-            &input_frame(question, &text, usize::from(columns)),
+            &input_frame(keys, question, &text, usize::from(columns)),
             usize::from(columns),
         )?;
         let Event::Key(key) = event::read()? else {
             continue;
         };
-        match map_find_key(key) {
+        match map_find_key(keys, key) {
             Some(FKey::Accept) => return Ok(Typed::Line(text)),
             Some(FKey::Leave) => return Ok(Typed::Left),
             Some(key) => {
@@ -1307,8 +1408,17 @@ fn draw(err: &mut impl Write, lines: &[Line], width: usize) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// What a screen with `hotkeys` answers to, with the default keys.
+    fn bind(hotkeys: &[Hotkey]) -> Bindings<'_> {
+        static KEYS: std::sync::OnceLock<Keymap> = std::sync::OnceLock::new();
+        Bindings {
+            keys: KEYS.get_or_init(Keymap::default),
+            hotkeys,
+        }
+    }
+
     fn press(code: KeyCode, modifiers: KeyModifiers) -> Option<Key> {
-        map_key(KeyEvent::new(code, modifiers))
+        map_key(&Keymap::default(), KeyEvent::new(code, modifiers))
     }
 
     fn plain(c: char) -> Option<Key> {
@@ -1382,7 +1492,7 @@ mod tests {
     fn a_key_being_let_go_is_not_a_second_press() {
         let mut release = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
         release.kind = KeyEventKind::Release;
-        assert_eq!(map_key(release), None);
+        assert_eq!(map_key(&Keymap::default(), release), None);
     }
 
     #[test]
@@ -1470,7 +1580,7 @@ mod tests {
     fn the_frame_has_the_question_the_titles_the_entries_and_the_hints() {
         let mut c = Cursor::new(3);
         c.apply(Key::Down);
-        let lines = frame("Where to?", &options(3), &c, &compact(10), 80, &[]);
+        let lines = frame("Where to?", &options(3), &c, &compact(10), 80, bind(&[]));
         let text = texts(&lines);
         assert_eq!(text[0], " Where to?");
         assert_eq!(text[1].trim_end(), " NAME");
@@ -1479,7 +1589,7 @@ mod tests {
             ["entry 1", "entry 2", "entry 3"]
         );
         assert!(
-            text[5].contains("j/k") && text[5].ends_with("2/3 "),
+            text[5].contains("k/j") && text[5].ends_with("2/3 "),
             "{text:?}"
         );
         // Only the entry the cursor is on is the bar.
@@ -1490,10 +1600,10 @@ mod tests {
     #[test]
     fn the_hints_put_the_position_at_the_far_end_when_there_is_room_and_drop_it_when_not() {
         let c = Cursor::new(12);
-        let wide = hints(&c, 80, &[]).text();
+        let wide = hints(&c, 80, bind(&[])).text();
         assert_eq!(wide.chars().count(), 80);
         assert!(wide.ends_with("1/12 "), "{wide:?}");
-        let tight = hints(&c, 10, &[]).text();
+        let tight = hints(&c, 10, bind(&[])).text();
         assert!(tight.starts_with(" ↑/↓"), "{tight:?}");
     }
 
@@ -1504,7 +1614,7 @@ mod tests {
             c.apply(Key::Down);
         }
         c.fit(4);
-        let lines = frame("Where to?", &options(20), &c, &compact(4), 80, &[]);
+        let lines = frame("Where to?", &options(20), &c, &compact(4), 80, bind(&[]));
         assert_eq!(lines.len(), 7);
         let shown: Vec<String> = texts(&lines)[2..6]
             .iter()
@@ -1531,12 +1641,12 @@ mod tests {
             1,
         );
         let c = Cursor::new(1);
-        let wide = texts(&frame("Where to?", &table, &c, &compact(5), 100, &[]));
+        let wide = texts(&frame("Where to?", &table, &c, &compact(5), 100, bind(&[])));
         assert!(wide.iter().all(|l| l.chars().count() <= 100), "{wide:?}");
         assert!(wide[2].contains("/home/me/devel/projects/api"), "{wide:?}");
         // The row reaches the far end: the time is the last thing before the margin.
         assert!(wide[2].ends_with("2 h ago "), "{wide:?}");
-        let narrow = texts(&frame("Where to?", &table, &c, &compact(5), 50, &[]));
+        let narrow = texts(&frame("Where to?", &table, &c, &compact(5), 50, bind(&[])));
         assert!(narrow.iter().all(|l| l.chars().count() <= 50), "{narrow:?}");
         // The path gave way, and the time at the end of the row is still there.
         assert!(
@@ -1556,7 +1666,14 @@ mod tests {
             vec![vec![Cell::new("x".repeat(100), Tone::Normal)]],
             0,
         );
-        let lines = frame("Where to?", &one, &Cursor::new(1), &compact(5), 30, &[]);
+        let lines = frame(
+            "Where to?",
+            &one,
+            &Cursor::new(1),
+            &compact(5),
+            30,
+            bind(&[]),
+        );
         assert!(
             texts(&lines).iter().all(|l| l.chars().count() <= 30),
             "{:?}",
@@ -1661,7 +1778,7 @@ mod tests {
                 section_gaps,
                 rows: 3,
             };
-            let lines = frame("Where to?", &table, &c, &p, 100, &[]);
+            let lines = frame("Where to?", &table, &c, &p, 100, bind(&[]));
             assert_eq!(lines.len(), Plan::height(section_gaps, 3), "{section_gaps}");
         }
     }
@@ -1673,7 +1790,14 @@ mod tests {
             section_gaps: true,
             rows: 2,
         };
-        let lines = frame("Where to?", &options(2), &Cursor::new(2), &p, 100, &[]);
+        let lines = frame(
+            "Where to?",
+            &options(2),
+            &Cursor::new(2),
+            &p,
+            100,
+            bind(&[]),
+        );
         let text = texts(&lines);
         assert_eq!(text[0], " Where to?");
         assert_eq!(text[1], "", "a gap after the question: {text:?}");
@@ -1685,7 +1809,7 @@ mod tests {
             "no gap between entries: {text:?}"
         );
         assert_eq!(text[5], "", "a gap before the hints: {text:?}");
-        assert!(text[6].contains("q quit"));
+        assert!(text[6].contains("Esc quit"));
         // Only an entry is ever the bar, the gaps never are.
         let bars: Vec<usize> = lines
             .iter()
@@ -1704,7 +1828,7 @@ mod tests {
             &Cursor::new(2),
             &compact(2),
             40,
-            &[],
+            bind(&[]),
         );
         let text = drawn(&lines, 40);
         // Reverse video on, the entry, its padding out to column 40, reverse off.
@@ -1797,10 +1921,10 @@ mod tests {
     fn hotkeys_are_named_in_the_hints() {
         let c = Cursor::new(3);
         let keys = [Hotkey {
-            key: 'c',
+            action: Action::Config,
             label: "config",
         }];
-        assert!(hints(&c, 80, &keys).text().contains("c config"));
+        assert!(hints(&c, 80, bind(&keys)).text().contains("c config"));
     }
 
     #[test]
@@ -1861,10 +1985,10 @@ mod tests {
     fn a_view_selects_the_line_of_the_stop_and_names_which_it_is() {
         let doc = form();
         let keys = [Hotkey {
-            key: 'a',
+            action: Action::AddData,
             label: "add",
         }];
-        let lines = view_frame("Form", &doc, 1, 0, 20, 70, &keys);
+        let lines = view_frame("Form", &doc, 1, 0, 20, 70, bind(&keys));
         let marked: Vec<String> = lines
             .iter()
             .filter(|l| l.selected)
@@ -1873,7 +1997,7 @@ mod tests {
         assert_eq!(marked, vec![" binary = (not set) "]);
         let hint = lines.last().unwrap().text();
         assert!(
-            hint.contains("Enter edit") && hint.contains("a add"),
+            hint.contains("Enter edit") && hint.contains("d add"),
             "{hint}"
         );
         assert!(hint.ends_with("2/3 "), "{hint}");
@@ -1882,7 +2006,7 @@ mod tests {
             lines: form().lines,
             stops: vec![],
         };
-        let lines = view_frame("Form", &plain, 0, 0, 20, 70, &[]);
+        let lines = view_frame("Form", &plain, 0, 0, 20, 70, bind(&[]));
         assert!(lines.iter().all(|l| !l.selected));
         assert!(!lines.last().unwrap().text().contains("Enter"));
     }
@@ -1961,31 +2085,31 @@ mod tests {
         let doc = form();
         let keys = [
             Hotkey {
-                key: 'b',
+                action: Action::AddBinary,
                 label: "+binary",
             },
             Hotkey {
-                key: 'c',
+                action: Action::Config,
                 label: "+config",
             },
             Hotkey {
-                key: 'P',
+                action: Action::Publish,
                 label: "publish",
             },
         ];
-        let wide = view_hints(&doc, 0, &keys, 120);
+        let wide = view_hints(&doc, 0, bind(&keys), 120);
         assert_eq!(wide.len(), 1);
         assert!(
             wide[0].contains("b +binary") && wide[0].ends_with("1/3 "),
             "{wide:?}"
         );
-        let narrow = view_hints(&doc, 0, &keys, 40);
+        let narrow = view_hints(&doc, 0, bind(&keys), 40);
         assert!(narrow.len() > 1, "{narrow:?}");
         for line in &narrow {
             assert!(line.chars().count() <= 40, "{line:?}");
         }
         let joined = narrow.join(" ");
-        for key in ["b +binary", "c +config", "P publish", "q back"] {
+        for key in ["b +binary", "c +config", "P publish", "Esc back"] {
             assert!(joined.contains(key), "{key} lost in {narrow:?}");
         }
         // The place is at the far end of the last line only.
@@ -1996,7 +2120,7 @@ mod tests {
     fn knobs() -> Vec<Knob> {
         vec![
             Knob {
-                key: 'w',
+                key: Action::LookWhere,
                 name: "looking in",
                 action: "change where to look".into(),
                 text: "~".into(),
@@ -2004,7 +2128,7 @@ mod tests {
                 changed: false,
             },
             Knob {
-                key: 'a',
+                key: Action::Everywhere,
                 name: "everywhere",
                 action: "look everywhere".into(),
                 text: String::new(),
@@ -2022,8 +2146,9 @@ mod tests {
 
     #[test]
     fn on_the_text_row_every_letter_types_even_a_hotkey_and_enter_answers_with_the_text() {
-        let typed =
-            |text: &mut String, code, mods| type_key(text, "", KeyEvent::new(code, mods), 3);
+        let typed = |text: &mut String, code, mods| {
+            type_key(&Keymap::default(), text, "", KeyEvent::new(code, mods), 3)
+        };
         let mut text = String::new();
         for c in "xqj".chars() {
             let key = KeyCode::Char(c);
@@ -2054,8 +2179,15 @@ mod tests {
     #[test]
     fn esc_and_ctrl_c_step_off_the_text_row_and_out_of_the_list_from_its_only_row() {
         let text = String::from("a");
-        let leave =
-            |code, mods, rows| type_key(&mut text.clone(), "", KeyEvent::new(code, mods), rows);
+        let leave = |code, mods, rows| {
+            type_key(
+                &Keymap::default(),
+                &mut text.clone(),
+                "",
+                KeyEvent::new(code, mods),
+                rows,
+            )
+        };
         assert_eq!(
             leave(KeyCode::Esc, KeyModifiers::NONE, 3),
             Typing::Move(Key::Up)
@@ -2075,19 +2207,36 @@ mod tests {
     fn enter_on_an_empty_text_row_takes_the_placeholder_if_there_is_one() {
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(
-            type_key(&mut String::new(), "lodge.tar", enter, 2),
+            type_key(
+                &Keymap::default(),
+                &mut String::new(),
+                "lodge.tar",
+                enter,
+                2
+            ),
             Typing::Accept
         );
-        assert_eq!(type_key(&mut String::new(), "", enter, 2), Typing::Stay);
+        assert_eq!(
+            type_key(&Keymap::default(), &mut String::new(), "", enter, 2),
+            Typing::Stay
+        );
     }
 
     #[test]
     fn ctrl_and_a_letter_is_a_knob_and_other_keys_are_still_typing() {
-        let ctrl = |c| map_find_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
-        assert_eq!(ctrl('w'), Some(FKey::Knob('w')));
+        let ctrl = |c| {
+            map_find_key(
+                &Keymap::default(),
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL),
+            )
+        };
+        assert_eq!(ctrl('w'), Some(FKey::Knob(Action::LookWhere)));
         assert_eq!(ctrl('u'), Some(FKey::ClearAll), "Ctrl-U still clears");
         assert_eq!(
-            map_find_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+            map_find_key(
+                &Keymap::default(),
+                KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)
+            ),
             Some(FKey::Type('w'))
         );
     }
@@ -2096,7 +2245,7 @@ mod tests {
     fn an_editable_knob_is_edited_in_place_and_enter_hands_back_the_new_text() {
         let list = items(&["alpha"]);
         let mut f = with_knobs(&list);
-        assert!(f.apply(FKey::Knob('w'), &list).is_none());
+        assert!(f.apply(FKey::Knob(Action::LookWhere), &list).is_none());
         assert_eq!(
             f.editing,
             Some((0, "~".to_string())),
@@ -2119,7 +2268,7 @@ mod tests {
     fn escape_leaves_the_knob_as_it_was_and_the_search_goes_on() {
         let list = items(&["alpha"]);
         let mut f = with_knobs(&list);
-        f.apply(FKey::Knob('w'), &list);
+        f.apply(FKey::Knob(Action::LookWhere), &list);
         f.apply(FKey::ClearAll, &list);
         assert!(
             f.apply(FKey::Leave, &list).is_none(),
@@ -2134,10 +2283,10 @@ mod tests {
         let list = items(&["alpha"]);
         let mut f = with_knobs(&list);
         assert!(matches!(
-            f.apply(FKey::Knob('a'), &list),
+            f.apply(FKey::Knob(Action::Everywhere), &list),
             Some(Found::Edited(1, text)) if text.is_empty()
         ));
-        assert!(f.apply(FKey::Knob('z'), &list).is_none());
+        assert!(f.apply(FKey::Knob(Action::Skip), &list).is_none());
         assert_eq!(f.editing, None);
     }
 
@@ -2154,7 +2303,7 @@ mod tests {
             "{shown:?}"
         );
         assert_eq!(f.chrome(), 7, "the two lines take rows from the list");
-        f.apply(FKey::Knob('w'), &list);
+        f.apply(FKey::Knob(Action::LookWhere), &list);
         let shown = text(&f);
         assert!(
             shown.iter().any(|l| l.contains("looking in: ~▏")),

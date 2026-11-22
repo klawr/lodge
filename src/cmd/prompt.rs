@@ -12,6 +12,7 @@ use std::io::{self, BufRead, IsTerminal};
 use super::select;
 use super::table::Table;
 use crate::devcontainer::Prompt;
+use crate::keys::{Action, Keymap};
 use crate::output::{line_err, note, prompt, warning};
 
 pub use super::select::{Doc, DocLine, Hotkey, Item, Knob, Pick, TextRow};
@@ -21,7 +22,7 @@ pub use super::select::{Doc, DocLine, Hotkey, Item, Knob, Pick, TextRow};
 pub enum Choice {
     Row(usize),
     /// A hotkey, with the row that was selected when it was pressed.
-    Key(char, usize),
+    Key(Action, usize),
     Left,
 }
 
@@ -180,9 +181,9 @@ pub trait Pause {
 impl Terminal {
     /// The line typed, trimmed (empty when only Enter was pressed); `None` when
     /// the person left.
-    fn typed(question: &str) -> Result<Option<String>> {
+    fn typed(&self, question: &str) -> Result<Option<String>> {
         Self::check(question)?;
-        let line = match select::input(question)? {
+        let line = match select::input(&self.keys, question)? {
             select::Typed::Line(line) => line,
             select::Typed::Left => return Ok(None),
             // A terminal that can't give single keys: type on the line below.
@@ -197,11 +198,11 @@ impl Terminal {
 
 impl Ask for Terminal {
     fn ask(&self, question: &str) -> Result<Option<String>> {
-        Ok(Self::typed(question)?.filter(|line| !line.is_empty()))
+        Ok(self.typed(question)?.filter(|line| !line.is_empty()))
     }
 
     fn ask_or(&self, question: &str, default: &str) -> Result<Option<String>> {
-        Ok(Self::typed(question)?.map(|line| {
+        Ok(self.typed(question)?.map(|line| {
             if line.is_empty() {
                 default.to_string()
             } else {
@@ -230,9 +231,19 @@ fn read_line() -> io::Result<String> {
 
 /// Asks on the terminal; without one, takes the safe default (or, for a question
 /// with no safe default, says there is nobody to ask).
-pub struct Terminal;
+///
+/// What the keys do is the keymap's; `Terminal::default()` is for the questions
+/// that are asked in words, where no key is pressed.
+#[derive(Default, Clone)]
+pub struct Terminal {
+    keys: Keymap,
+}
 
 impl Terminal {
+    pub fn new(keys: Keymap) -> Self {
+        Terminal { keys }
+    }
+
     fn check(question: &str) -> Result<()> {
         if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
             bail!("cannot ask \"{question}\" without a terminal");
@@ -274,7 +285,11 @@ impl Choose for Terminal {
 
     fn choose_with(&self, question: &str, options: &Table, hotkeys: &[Hotkey]) -> Result<Choice> {
         Self::check(question)?;
-        match Self::picked(question, options, select::pick(question, options, hotkeys)?)? {
+        match Self::picked(
+            question,
+            options,
+            select::pick(&self.keys, question, options, hotkeys)?,
+        )? {
             Entered::Chose(choice) => Ok(choice),
             // Only a pick with a row to type on answers with text.
             Entered::Text(_) => Ok(Choice::Left),
@@ -290,7 +305,7 @@ impl Choose for Terminal {
         notice: Option<&str>,
     ) -> Result<Entered> {
         Self::check(question)?;
-        let picked = select::pick_typing(question, options, hotkeys, field, notice)?;
+        let picked = select::pick_typing(&self.keys, question, options, hotkeys, field, notice)?;
         if let (select::Picked::NoRawMode, Some(notice)) = (&picked, notice) {
             warning!("{notice}");
         }
@@ -299,7 +314,7 @@ impl Choose for Terminal {
 
     fn view(&self, title: &str, doc: &Doc, hotkeys: &[Hotkey]) -> Result<Option<Choice>> {
         Self::check(title)?;
-        Ok(match select::view(title, doc, hotkeys)? {
+        Ok(match select::view(&self.keys, title, doc, hotkeys)? {
             select::Picked::Key(c, at) => Some(Choice::Key(c, at)),
             select::Picked::Chose(at) => Some(Choice::Row(at)),
             select::Picked::Typed(_) | select::Picked::Left => Some(Choice::Left),
@@ -317,7 +332,7 @@ impl Choose for Terminal {
     ) -> Result<Adding> {
         Self::check(question)?;
         Ok(
-            match select::find_adding(question, tabs, items, knobs, add)? {
+            match select::find_adding(&self.keys, question, tabs, items, knobs, add)? {
                 select::Added::Done => Adding::Done,
                 select::Added::NoRawMode => Adding::Unsupported,
                 select::Added::Edited(at, text) => Adding::Edited(at, text),
@@ -346,14 +361,16 @@ impl Choose for Terminal {
         knobs: &[Knob],
     ) -> Result<Selection> {
         Self::check(question)?;
-        Ok(match select::find(question, tabs, items, knobs)? {
-            select::Found::Chose(items) => Selection::Items(items),
-            select::Found::One(i) => Selection::Items(vec![i]),
-            select::Found::Path(p) => Selection::Path(p),
-            select::Found::Edited(at, text) => Selection::Edited(at, text),
-            select::Found::Left => Selection::Left,
-            select::Found::NoRawMode => Selection::Unsupported,
-        })
+        Ok(
+            match select::find(&self.keys, question, tabs, items, knobs)? {
+                select::Found::Chose(items) => Selection::Items(items),
+                select::Found::One(i) => Selection::Items(vec![i]),
+                select::Found::Path(p) => Selection::Path(p),
+                select::Found::Edited(at, text) => Selection::Edited(at, text),
+                select::Found::Left => Selection::Left,
+                select::Found::NoRawMode => Selection::Unsupported,
+            },
+        )
     }
 
     fn find(&self, question: &str, tabs: &[&str], items: &[Item]) -> Result<Selection> {

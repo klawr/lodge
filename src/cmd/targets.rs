@@ -60,7 +60,7 @@ fn devcontainer(rt: Box<dyn Runtime>, with: Wiring) -> Box<dyn Endpoints> {
         with.local,
         rt,
         with.oci,
-        Arc::new(prompt::Terminal),
+        Arc::new(prompt::Terminal::default()),
     ))
 }
 

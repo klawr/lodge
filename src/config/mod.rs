@@ -11,6 +11,7 @@ pub mod edit;
 pub mod secret;
 pub mod unknown;
 
+use crate::keys::{KeyList, Keymap};
 use crate::shell::{container_path_problem, is_plain_name};
 use secret::{RawSecret, SecretDecl};
 
@@ -64,6 +65,11 @@ pub struct Config<S = SecretDecl> {
     // Generic, so schemars can't work the default out itself.
     #[cfg_attr(test, schemars(extend("default" = [])))]
     pub secret: Vec<S>,
+    /// The keys of the interactive screens, by what they do: `up = ["up", "k"]`.
+    /// An action given here has only the keys given; one left out keeps its own.
+    /// Local only, never in a bundle.
+    #[serde(default)]
+    pub keys: BTreeMap<String, KeyList>,
 }
 
 impl<S> Default for Config<S> {
@@ -78,6 +84,7 @@ impl<S> Default for Config<S> {
             session: SessionConfig::default(),
             git: GitConfig::default(),
             secret: Vec::new(),
+            keys: BTreeMap::new(),
         }
     }
 }
@@ -317,6 +324,28 @@ pub fn project_target_settings(dir: &Path, name: &str) -> Result<toml::Table> {
         .with_context(|| format!("invalid [targets.{name}] in {}", path.display()))
 }
 
+/// The keys of the interactive screens, from the config at `path` and read on
+/// its own like [`target_setting`]: the first screen comes before any command
+/// loads the config. A file that is missing, or not TOML, gives the defaults (the
+/// command that loads the config reports the latter); a `[keys]` that is wrong
+/// is an error, with everything that is wrong with it.
+pub fn keymap(path: &Path) -> Result<Keymap> {
+    let Some(file) = peek(path) else {
+        return Ok(Keymap::default());
+    };
+    let Some(table) = file.get("keys") else {
+        return Ok(Keymap::default());
+    };
+    let settings: BTreeMap<String, KeyList> = table
+        .clone()
+        .try_into()
+        .with_context(|| format!("invalid [keys] in {}", path.display()))?;
+    Keymap::build(&settings).map_err(|problems| {
+        anyhow::anyhow!("\n  - {}", problems.join("\n  - "))
+            .context(format!("invalid [keys] in {}", path.display()))
+    })
+}
+
 /// The config file as a raw table, `None` if it is missing or not TOML.
 fn peek(path: &Path) -> Option<toml::Table> {
     std::fs::read_to_string(path).ok()?.parse().ok()
@@ -382,6 +411,7 @@ impl Config {
             session,
             git,
             secret,
+            keys,
         } = file;
         for item in &mut binaries {
             item.path = expand_tilde(std::mem::take(&mut item.path));
@@ -412,6 +442,7 @@ impl Config {
             session,
             git,
             secret,
+            keys,
         }
     }
 
@@ -420,6 +451,7 @@ impl Config {
         let mut problems = self.binary_problems();
         problems.extend(self.data_problems(&home_dir()));
         problems.extend(secret::problems(&self.secret));
+        problems.extend(Keymap::build(&self.keys).err().unwrap_or_default());
         problems
     }
 
@@ -521,6 +553,40 @@ mod tests {
 
     fn parse(toml: &str) -> Result<Config> {
         Config::parse(toml, Path::new("/srv/lodge/config.toml"))
+    }
+
+    #[test]
+    fn keys_are_checked_with_the_rest_of_the_config() {
+        assert!(parse("[keys]\nleave = [\"esc\"]\npack = \"ctrl-k\"\n").is_ok());
+        let e = format!(
+            "{:#}",
+            parse("[keys]\nlieve = [\"q\"]\nup = [\"bogus\"]\n[[binary]]\nname = \"a b\"\npath = \"/x\"\n")
+                .unwrap_err()
+        );
+        assert!(e.contains("`lieve` is not something a key does"), "{e}");
+        assert!(e.contains("`up`: `bogus` is not a key"), "{e}");
+        assert!(e.contains("[[binary]] `a b`"), "all together: {e}");
+    }
+
+    #[test]
+    fn the_keymap_is_read_on_its_own_and_a_missing_file_gives_the_defaults() {
+        use crate::keys::{Action, Context};
+        let dir = std::env::temp_dir().join(format!("lodge-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        let q = "q".parse().unwrap();
+        assert_eq!(
+            keymap(&dir.join("none.toml"))
+                .unwrap()
+                .action(Context::List, q),
+            Some(Action::Leave)
+        );
+        std::fs::write(&file, "[keys]\nleave = [\"esc\"]\n").unwrap();
+        assert_eq!(keymap(&file).unwrap().action(Context::List, q), None);
+        std::fs::write(&file, "[keys]\nup = [\"nope\"]\n").unwrap();
+        let e = format!("{:#}", keymap(&file).unwrap_err());
+        assert!(e.contains("invalid [keys]") && e.contains("`up`"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
