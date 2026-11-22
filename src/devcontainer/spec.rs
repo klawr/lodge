@@ -326,10 +326,14 @@ pub const CONFIG_LOCATIONS: Markers = &[
 ];
 
 /// The config's places as one path each, `*` kept for the host to expand.
+/// Joined as text with `/`: the project is on the host, which may not be the
+/// machine lodge runs on (`PathBuf::join` would use `\` on Windows).
 fn config_patterns(project_path: &Path) -> Vec<PathBuf> {
+    let base = project_path.to_string_lossy();
+    let base = base.trim_end_matches('/');
     CONFIG_LOCATIONS
         .iter()
-        .map(|parts| project_path.join(parts.iter().collect::<PathBuf>()))
+        .map(|parts| PathBuf::from(format!("{base}/{}", parts.join("/"))))
         .collect()
 }
 
