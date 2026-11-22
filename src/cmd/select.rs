@@ -388,6 +388,8 @@ pub struct TextRow {
     pub text: String,
     /// What is taken when nothing is typed: shown dimmed until something is.
     pub placeholder: String,
+    /// Whether the selection begins on it, as it does when something was typed.
+    pub focus: bool,
 }
 
 /// Shows `options` and lets the person move over them and choose one.
@@ -492,7 +494,7 @@ fn pick_in(
     let mut cursor = Cursor::new(options.len());
     let mut text = field.map(|f| f.text.clone()).unwrap_or_default();
     // Back where it was typed, when something typed is being tried again.
-    if let Some(f) = field.filter(|f| !f.text.is_empty() && f.row < options.len()) {
+    if let Some(f) = field.filter(|f| (f.focus || !f.text.is_empty()) && f.row < options.len()) {
         cursor.at = f.row;
     }
     let placeholder = field.map_or("", |f| f.placeholder.as_str());

@@ -65,10 +65,16 @@ const KEYS: &[Hotkey] = &[
 ];
 
 /// The keys while choosing which bundle file to pack into.
-const PACK_KEYS: &[Hotkey] = &[Hotkey {
-    action: Action::Remove,
-    label: "delete",
-}];
+const PACK_KEYS: &[Hotkey] = &[
+    Hotkey {
+        action: Action::New,
+        label: "new",
+    },
+    Hotkey {
+        action: Action::Remove,
+        label: "delete",
+    },
+];
 
 /// Packing a bundle, which needs the helper programs and the registry client: the
 /// composition root has them, the screen only asks.
@@ -1112,8 +1118,11 @@ fn pack_list(
     // or left, and the form is not back until then.
     let mut notice: Option<String> = None;
     let mut typed = String::new();
+    // `n` puts the selection on the row to type on, which is after the last file.
+    let mut focus = false;
     loop {
         let field = TextRow {
+            focus,
             row: new_row,
             column: 1,
             text: typed.clone(),
@@ -1122,6 +1131,10 @@ fn pack_list(
         let entered =
             choose.choose_typing("Pack into", &table, PACK_KEYS, &field, notice.as_deref())?;
         let tried = match entered {
+            Entered::Chose(Choice::Key(Action::New, _)) => {
+                focus = true;
+                continue;
+            }
             Entered::Text(name) => {
                 let tried = new_file(&name);
                 typed = name;
@@ -1465,6 +1478,8 @@ mod tests {
         typed: RefCell<Vec<String>>,
         /// The notice each question with a row to type on was given.
         notices: RefCell<Vec<Option<String>>>,
+        /// Whether the selection began on the row to type on, each time.
+        focused: RefCell<Vec<bool>>,
         finds: RefCell<Vec<Selection>>,
         adds: RefCell<Vec<Vec<Pick>>>,
         results: RefCell<Vec<Result<String, String>>>,
@@ -1491,9 +1506,10 @@ mod tests {
             q: &str,
             t: &Table,
             k: &[Hotkey],
-            _: &TextRow,
+            field: &TextRow,
             notice: Option<&str>,
         ) -> Result<Entered> {
+            self.focused.borrow_mut().push(field.focus);
             self.notices.borrow_mut().push(notice.map(String::from));
             if self.typed.borrow().is_empty() {
                 return self.choose_with(q, t, k).map(Entered::Chose);
@@ -2036,6 +2052,19 @@ mod tests {
         let r = drive(WITH_BUNDLES, screen, vec![]);
         assert_eq!(r.packs.asked.borrow()[0].1.as_deref(), Some("b.tar"));
         assert!(r.packs.replaced.borrow()[0] == Replace::Yes);
+    }
+
+    #[test]
+    fn n_in_the_list_goes_to_the_row_after_the_last_file_to_type_on() {
+        let screen = Screen {
+            views: RefCell::new(vec![Choice::Key(Action::Pack, 0), Choice::Left]),
+            picks: RefCell::new(vec![Some(0), Some(0)]),
+            keys: RefCell::new(vec![Action::New]),
+            ..Screen::default()
+        };
+        let r = drive(WITH_BUNDLES, screen, vec![]);
+        // Asked again after `n`, now with the selection on the row.
+        assert_eq!(*r.screen.focused.borrow(), vec![false, true]);
     }
 
     #[test]
