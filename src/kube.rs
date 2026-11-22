@@ -441,6 +441,7 @@ impl Endpoints for KubeEndpoints {
             // record in its prefix to say.
             created: false,
             workdir,
+            name: None,
             forward_ports: Vec::<PortForward>::new(),
             remote_user: None,
             post_attach: None,

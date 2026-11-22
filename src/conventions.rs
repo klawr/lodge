@@ -156,6 +156,17 @@ fn where_a_bundle_comes_from_is_a_store_and_only_the_command_layer_picks_them() 
 }
 
 #[test]
+fn the_terminal_is_taken_over_in_one_file() {
+    // Raw mode and key events are a dependency like the network: `crossterm` is
+    // named only by the picker, and everything that asks a question goes through
+    // `cmd::prompt`.
+    assert_eq!(
+        files_containing(&["crossterm::"], &["cmd/select.rs"]),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
 fn the_registry_client_names_its_crates_in_one_file_each() {
     // The network and the hash are dependencies like any other: the HTTP crate is
     // named only in the `Http` implementation, the hash crate only where digests
@@ -221,6 +232,7 @@ fn the_machine_lodge_runs_on_is_read_through_local_and_the_list_that_still_isnt_
                 "cmd/init.rs",
                 "config/mod.rs",
                 "forward/mod.rs",
+                "history.rs",
             ],
         ),
         (

@@ -28,6 +28,7 @@ tar = { version = "0.4", default-features = false }
 ureq = "3"
 sha2 = "0.11.1"
 base64 = "0.23.1"
+crossterm = { version = "0.29.0", default-features = false, features = ["events"] }
 
 [dev-dependencies]
 schemars = "1"

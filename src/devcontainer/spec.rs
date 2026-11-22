@@ -23,6 +23,8 @@ use crate::port::PortForward;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DevcontainerConfig {
+    // What the project calls itself; only shown to people.
+    name: Option<String>,
     workspace_folder: Option<String>,
     forward_ports: Option<Vec<serde_json::Value>>,
     features: Option<serde_json::Map<String, serde_json::Value>>,
@@ -122,6 +124,7 @@ pub(super) struct BuildConfig {
 
 // The backend-agnostic parts of a parsed devcontainer.
 pub(super) struct Spec {
+    pub(super) name: Option<String>,
     pub(super) config_path: PathBuf,
     // Directory the devcontainer.json lives in: used as cwd for initializeCommand, and as the base for local feature refs.
     pub(super) base_dir: PathBuf,
@@ -175,6 +178,7 @@ fn build_spec(
     local: &dyn Local,
 ) -> Result<Spec> {
     let DevcontainerConfig {
+        name,
         workspace_folder,
         forward_ports,
         features,
@@ -213,6 +217,7 @@ fn build_spec(
     let env = build_env(container_env, remote_env, &vars);
 
     Ok(Spec {
+        name,
         config_path,
         base_dir,
         hash_extra: built.hash_extra,
@@ -468,6 +473,13 @@ mod tests {
     fn the_workspace_folder_defaults_to_workspaces_slash_name() {
         let spec = spec_from(r#"{"image":"debian"}"#).unwrap();
         assert_eq!(spec.workspace_folder, "/workspaces/proj");
+    }
+
+    #[test]
+    fn a_project_keeps_the_name_it_gives_itself() {
+        let named = spec_from(r#"{"name":"Demo API","image":"debian"}"#).unwrap();
+        assert_eq!(named.name.as_deref(), Some("Demo API"));
+        assert_eq!(spec_from(r#"{"image":"debian"}"#).unwrap().name, None);
     }
 
     #[test]

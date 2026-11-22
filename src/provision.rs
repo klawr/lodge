@@ -28,6 +28,9 @@ pub struct Attached {
     /// been injected into it yet.
     pub created: bool,
     pub workdir: String,
+    /// What the endpoint calls itself (a devcontainer's `name`), for people to
+    /// recognise it by; `None` when it has no name of its own.
+    pub name: Option<String>,
     pub forward_ports: Vec<PortForward>,
     /// The user to run as. `None` means the endpoint's default user.
     pub remote_user: Option<String>,

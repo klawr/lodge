@@ -18,6 +18,7 @@ mod devcontainer;
 mod doc_facts;
 mod fingerprint;
 mod forward;
+mod history;
 mod host;
 mod host_tools;
 mod inject;

@@ -2,12 +2,15 @@
 //! the work. This is the only layer that loads the config (once per command) and
 //! decides what to print.
 //!
-//! - [`attach`]: `up`, which ends in an interactive session
+//! - [`attach`]: `up` and `attach`, which end in an interactive session
+//! - [`resume`]: `ldg` on its own, which offers the places a session was opened in
 //! - [`project`]: `down`, `status`, `rm`, `ls`, `ports`, `logs`, `clean`
 //! - [`doctor`]: the `doctor` command
 //! - [`init`]: the `init` command
 //! - [`bundle`]: `pack`, `bundle`, `cache`
-//! - [`prompt`]: the questions `up` asks on the terminal
+//! - [`prompt`]: the questions asked on the terminal, and the interface they are asked through
+//! - [`select`]: the list to choose from with the keyboard, behind `prompt`
+//! - [`table`]: rows of cells laid out for whatever width the terminal has
 //! - [`targets`]: the list of targets, the one place that says which there are
 
 mod attach;
@@ -16,6 +19,9 @@ mod doctor;
 mod init;
 mod project;
 mod prompt;
+mod resume;
+mod select;
+mod table;
 pub(crate) mod targets;
 
 use anyhow::{Context, Result};
@@ -28,8 +34,10 @@ use crate::bundle::store::{FileSink, FileStore, OciSink, OciStore, Replace, Sink
 use crate::cli::{Cli, Command};
 use crate::config::Config;
 use crate::forward::{DetachedDaemon, ForwardDaemon};
+use crate::history::{FileHistory, History, Place, Route};
 use crate::host::{HostRef, LocalHost, SshHost};
 use crate::local::{Local, SystemLocal};
+use crate::output::warning;
 use crate::provision::{Endpoints, Wiring};
 use crate::tools::{
     DockerConfig, Ldd, NativeOci, OciFetcher, OciPusher, Patchelf, Toolchain, UreqHttp,
@@ -117,12 +125,12 @@ pub fn parse() -> Cli {
 /// same host and work in the same target as this one, in front of its subcommand.
 /// The command-line surface is the command layer's to know, not the host's or the
 /// target's.
-fn respawn_args(remote: Option<&str>, target: &str, project: Option<&Path>) -> Vec<String> {
+fn respawn_args(route: &Route, project: Option<&Path>) -> Vec<String> {
     let mut args = Vec::new();
-    if let Some(remote) = remote {
-        args.extend(["--remote".to_string(), remote.to_string()]);
+    if let Some(remote) = &route.remote {
+        args.extend(["--remote".to_string(), remote.clone()]);
     }
-    args.extend(["--target".to_string(), target.to_string()]);
+    args.extend(["--target".to_string(), route.target.clone()]);
     if let Some(project) = project {
         args.extend(["--project-dir".to_string(), project.display().to_string()]);
     }
@@ -168,6 +176,10 @@ pub struct Ctx {
     pub sinks: Sinks,
     /// Starts port forwarding for a container once it is up.
     pub forwarder: Box<dyn ForwardDaemon>,
+    /// The places sessions were opened in, for a bare `ldg` to offer again.
+    pub history: Box<dyn History>,
+    /// How this run got here: the target and the remote it works through.
+    pub route: Route,
     pub config_path: PathBuf,
 }
 
@@ -181,6 +193,16 @@ impl Ctx {
                 .with_context(|| format!("`[targets.{name}]` in {}", self.config_path.display()))?;
         }
         Ok(config)
+    }
+
+    /// Notes that a session is being opened in `place`, under the name the endpoint
+    /// gave itself, else the place's own. The history is a convenience: failing to
+    /// keep it is said, and never stops the session.
+    pub fn remember(&self, place: Place, name: Option<&str>) {
+        let name = name.map_or_else(|| place.fallback_name(), str::to_string);
+        if let Err(e) = self.history.remember(place, self.route.clone(), name) {
+            warning!("could not remember this session in the history: {e:#}");
+        }
     }
 
     /// The container `name` (a name or an id) on the target's engine, one lodge
@@ -221,14 +243,33 @@ fn bundle_sinks(oci: Arc<dyn OciPusher>) -> Sinks {
     Sinks::new(vec![Box::new(FileSink), Box::new(OciSink::new(oci))])
 }
 
-pub fn run(cli: Cli) -> Result<ExitCode> {
+pub fn run(mut cli: Cli) -> Result<ExitCode> {
     // The composition root: the one place that picks how the project's machine
     // is reached and which target is worked in on it. Each is an interface everything
     // else takes; a new way of reaching a machine or a new target is one more arm.
     // The helper tools (`ldd`, `patchelf`, the registry client) are chosen here too.
+    let history = FileHistory::in_data_dir();
+    // Without a subcommand, the person picks one of the places they were in. That
+    // comes first because the pick says which host and target to build.
+    let subcommand = match cli.command.take() {
+        Some(subcommand) => subcommand,
+        None => match resume::pick(
+            &history,
+            &prompt::Terminal,
+            cli.remote.as_deref(),
+            cli.target.as_deref(),
+        )? {
+            Some(resumed) => {
+                cli.remote = resumed.route.remote;
+                cli.target = Some(resumed.route.target);
+                resumed.command
+            }
+            None => return Ok(ExitCode::SUCCESS),
+        },
+    };
     let remote = cli.remote.clone();
     // The forward daemon has no terminal, so its ssh commands must never prompt.
-    let daemon = matches!(cli.command, Command::Forward { .. });
+    let daemon = matches!(subcommand, Command::Forward { .. });
     let host: HostRef = match cli.remote {
         Some(remote) if daemon => Arc::new(SshHost::unattended(remote)),
         Some(remote) => Arc::new(SshHost::new(remote)),
@@ -241,7 +282,11 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         host.connect()?;
     }
     let config_path = crate::config::path_for(cli.config)?;
-    let target = choose_target(cli.target, &cli.command, &config_path)?;
+    let target = choose_target(cli.target, &subcommand, &config_path)?;
+    let route = Route {
+        target: target.to_string(),
+        remote,
+    };
     let local: Arc<dyn Local> = Arc::new(SystemLocal);
     // One registry client, handed to what reads from a registry and to what
     // writes to one: they are separate interfaces and the same implementation.
@@ -255,7 +300,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         oci: registry.clone(),
     };
     // Read on this machine, even with `--remote`: the folder you stand in is here.
-    let project = project_dir(&cli.command, cli.project_dir);
+    let project = project_dir(&subcommand, cli.project_dir);
     let endpoints = build_endpoints(
         target,
         &config_path,
@@ -265,14 +310,15 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
             local: local.clone(),
             oci: tools.oci.clone(),
         },
-        &cli.command,
+        &subcommand,
     )?;
     let ctx = Ctx {
         forwarder: Box::new(DetachedDaemon::new(respawn_args(
-            remote.as_deref(),
-            target,
+            &route,
             project.as_deref(),
         ))),
+        history: Box::new(history),
+        route,
         endpoints,
         bundles: bundle_stores(tools.oci.clone()),
         sinks: bundle_sinks(registry),
@@ -282,7 +328,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
         config_path,
     };
 
-    match cli.command {
+    match subcommand {
         Command::Up {
             project,
             build,
@@ -435,7 +481,7 @@ mod tests {
 
     #[test]
     fn the_target_comes_from_the_flag_then_the_config_then_the_default() {
-        let ls = Cli::try_parse_from(["ldg", "ls"]).unwrap().command;
+        let ls = Cli::try_parse_from(["ldg", "ls"]).unwrap().command.unwrap();
         let (_dir, with) = config_with("target = \"podman\"\n");
         let (_dir2, without) = config_with("");
         assert_eq!(choose_target(None, &ls, &with).unwrap(), "podman");
@@ -459,8 +505,19 @@ mod tests {
         // Commands that never use a target don't read it, so `init` can fix it.
         let init = Cli::try_parse_from(["ldg", "init", "--force"])
             .unwrap()
-            .command;
+            .command
+            .unwrap();
         assert_eq!(choose_target(None, &init, &bad).unwrap(), "docker");
+    }
+
+    #[test]
+    fn without_a_subcommand_ldg_parses_and_keeps_the_flags_that_narrow_the_history() {
+        let cli = Cli::try_parse_from(["ldg"]).unwrap();
+        assert!(cli.command.is_none());
+        let cli = Cli::try_parse_from(["ldg", "--remote", "me@box", "--target", "podman"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.remote.as_deref(), Some("me@box"));
+        assert_eq!(cli.target.as_deref(), Some("podman"));
     }
 
     #[test]
@@ -469,7 +526,7 @@ mod tests {
             let up = Cli::try_parse_from(["ldg", "up", flag, "oci://ghcr.io/me/lodge:1"])
                 .unwrap()
                 .command;
-            let Command::Up { bundle, build, .. } = up else {
+            let Some(Command::Up { bundle, build, .. }) = up else {
                 panic!("not up");
             };
             assert_eq!(
@@ -493,7 +550,7 @@ mod tests {
         };
         let (_dir, path) =
             config_with("[targets.docker]\ncontext = \"colima\"\n[targets.podman]\nbogus = 1\n");
-        let ls = Cli::try_parse_from(["ldg", "ls"]).unwrap().command;
+        let ls = Cli::try_parse_from(["ldg", "ls"]).unwrap().command.unwrap();
         // Docker's own table is fine; podman's mistake is not docker's problem.
         build_endpoints("docker", &path, None, wiring(), &ls).unwrap();
         let err = build_endpoints("podman", &path, None, wiring(), &ls)
@@ -501,7 +558,10 @@ mod tests {
             .unwrap();
         assert!(format!("{err:#}").contains("[targets.podman]"), "{err:#}");
         // `init` builds from no settings at all.
-        let init = Cli::try_parse_from(["ldg", "init"]).unwrap().command;
+        let init = Cli::try_parse_from(["ldg", "init"])
+            .unwrap()
+            .command
+            .unwrap();
         build_endpoints("podman", &path, None, wiring(), &init).unwrap();
     }
 
@@ -509,7 +569,11 @@ mod tests {
     fn a_child_lodge_is_pointed_at_the_same_target_and_host() {
         for target in targets::names() {
             let mut args = vec!["ldg".to_string()];
-            args.extend(respawn_args(Some("me@h:22"), target, None));
+            let route = Route {
+                target: target.to_string(),
+                remote: Some("me@h:22".into()),
+            };
+            args.extend(respawn_args(&route, None));
             args.push("ls".into());
             let matches = command().try_get_matches_from(args).unwrap();
             let cli = Cli::from_arg_matches(&matches).unwrap();
@@ -536,7 +600,10 @@ mod tests {
             "[targets.kubernetes]\npod = \"dev-0\"\nnamespace = \"mine\"\n",
         )
         .unwrap();
-        let down = Cli::try_parse_from(["ldg", "down"]).unwrap().command;
+        let down = Cli::try_parse_from(["ldg", "down"])
+            .unwrap()
+            .command
+            .unwrap();
         let endpoints =
             build_endpoints("kubernetes", &path, Some(project.path()), wiring(), &down).unwrap();
         // The pod and the namespace are the project's: `kubectl` is asked about them.
@@ -547,14 +614,18 @@ mod tests {
         // A target that takes nothing per project ignores the file.
         build_endpoints("docker", &path, Some(project.path()), wiring(), &down).unwrap();
         // The folder reaches a child lodge, which has no project argument of its own.
-        let args = respawn_args(None, "kubernetes", Some(project.path()));
+        let route = Route {
+            target: "kubernetes".into(),
+            remote: None,
+        };
+        let args = respawn_args(&route, Some(project.path()));
         let mut full = vec!["ldg".to_string()];
         full.extend(args);
         full.extend(["_forward".into(), "pod".into()]);
         let cli = Cli::from_arg_matches(&command().try_get_matches_from(full).unwrap()).unwrap();
         assert_eq!(cli.project_dir.as_deref(), Some(project.path()));
         assert_eq!(
-            project_dir(&cli.command, cli.project_dir.clone()).as_deref(),
+            project_dir(cli.command.as_ref().unwrap(), cli.project_dir.clone()).as_deref(),
             Some(project.path())
         );
     }

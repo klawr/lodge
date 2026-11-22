@@ -12,6 +12,9 @@ use std::path::PathBuf;
         you into a shell. It also drives devcontainers: `ldg up` reads \
         devcontainer.json, starts the container, installs features, runs lifecycle \
         hooks, injects your environment on top, and forwards container ports to the host.\n\n\
+        Run `ldg` alone to pick up where you left off: it lists the projects and \
+        containers you opened sessions in, most recent first, and takes you back \
+        into the one you choose, the same way you got there.\n\n\
         New here? `ldg init` writes a starting config, `ldg doctor` checks the host.",
     after_help = "Docs: https://github.com/klawr/lodge#readme"
 )]
@@ -46,8 +49,9 @@ pub struct Cli {
     #[arg(long, global = true, hide = true, value_name = "DIR")]
     pub project_dir: Option<PathBuf>,
 
+    /// What to do. Without one, `ldg` offers the places you were in before.
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 /// A project folder argument.

@@ -155,6 +155,7 @@ impl Endpoints for PlainHostEndpoints {
             // record in its prefix to say.
             created: false,
             workdir: project.to_string_lossy().into_owned(),
+            name: None,
             forward_ports: Vec::<PortForward>::new(),
             remote_user: None,
             post_attach: None,

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use super::Ctx;
 use crate::config::Config;
+use crate::history::Place;
 use crate::output::note;
 use crate::provision::Attached;
 use crate::runtime::ContainerUser;
@@ -30,7 +31,10 @@ pub fn up(
     // How an endpoint is made, or found, is the endpoints' business; which
     // endpoints is chosen once, in `cmd::run`.
     let attached = ctx.endpoints.provision(&project, build)?;
-    attach(ctx, &attached, &config, &prepared, reinject, no_attach)
+    let place = Place::Project { path: project };
+    attach(
+        ctx, &attached, &config, &prepared, reinject, no_attach, place,
+    )
 }
 
 /// Works in a container that is running and that lodge did not make: the same
@@ -54,6 +58,7 @@ pub fn attach_to(
         );
     }
     let prepared = bundle::source::prepare(&config, bundle, &ctx.bundles, &ctx.tools)?;
+    let workdir_flag = workdir.clone();
     let workdir = match workdir {
         Some(dir) => dir,
         None => ContainerUser::resolve(container.as_ref(), None)?.home,
@@ -64,16 +69,24 @@ pub fn attach_to(
         // in its prefix to say.
         created: false,
         workdir,
+        name: None,
         forward_ports: Vec::new(),
         remote_user: None,
         post_attach: None,
     };
-    attach(ctx, &attached, &config, &prepared, reinject, no_attach)
+    let place = Place::Container {
+        name: name.to_string(),
+        workdir: workdir_flag,
+    };
+    attach(
+        ctx, &attached, &config, &prepared, reinject, no_attach, place,
+    )
 }
 
 /// Works in an endpoint that is up: forwards its ports, injects (unless that was
 /// done already), delivers the secrets and opens the session. Knows nothing of
-/// how the endpoint was made.
+/// how the endpoint was made, except `place`, which is what the history is told
+/// once a session is about to open.
 fn attach(
     ctx: &Ctx,
     attached: &Attached,
@@ -81,6 +94,7 @@ fn attach(
     prepared: &bundle::source::Prepared,
     reinject: bool,
     no_attach: bool,
+    place: Place,
 ) -> Result<()> {
     let container = attached.container.as_ref();
     // After provisioning, which may have changed the user's uid.
@@ -113,6 +127,7 @@ fn attach(
     if no_attach {
         return Ok(());
     }
+    ctx.remember(place, attached.name.as_deref());
     attached.run_post_attach();
     let setup = secret::deliver::deliver(
         container,
@@ -231,12 +246,18 @@ mod tests {
             tools: tools::external(),
             bundles: crate::bundle::store::Stores::new(vec![]),
             sinks: crate::bundle::store::Sinks::new(vec![]),
+            history: Box::new(crate::history::Memory::default()),
+            route: crate::history::Route {
+                target: "docker".into(),
+                remote: None,
+            },
             config_path: dir.path().join("config.toml"),
         };
         let attached = Attached {
             container: rt.container("c1"),
             created: false,
             workdir: "/w".into(),
+            name: None,
             forward_ports: Vec::new(),
             remote_user: None,
             post_attach: None,
@@ -248,7 +269,19 @@ mod tests {
             source: None,
         };
 
-        attach(&ctx, &attached, &Config::default(), &prepared, false, true).unwrap();
+        let place = Place::Project { path: "/p".into() };
+        attach(
+            &ctx,
+            &attached,
+            &Config::default(),
+            &prepared,
+            false,
+            true,
+            place,
+        )
+        .unwrap();
+        // Setting up without a shell is not a session, so it is not remembered.
+        assert!(ctx.history.entries().unwrap().is_empty());
 
         let injected = inject::installed(attached.container.as_ref(), &user())
             .unwrap()
@@ -283,8 +316,38 @@ mod tests {
             tools: tools::external(),
             bundles: crate::bundle::store::Stores::new(vec![]),
             sinks: crate::bundle::store::Sinks::new(vec![]),
+            history: Box::new(crate::history::Memory::default()),
+            route: crate::history::Route {
+                target: "docker".into(),
+                remote: None,
+            },
             config_path: dir.path().join("config.toml"),
         }
+    }
+
+    #[test]
+    fn a_session_is_remembered_under_the_endpoints_name_else_the_places_own() {
+        let dir = TempDir::new("attach-remember").unwrap();
+        let rt = Rc::new(FakeRuntime::new(FakeEnv::new));
+        let ctx = ctx_with(
+            Box::new(Devcontainer::new(
+                fake(),
+                Arc::new(FakeLocal::new()),
+                Box::new(rt),
+                Arc::new(tools::NoRegistry),
+                Arc::new(NoQuestions),
+            )),
+            &dir,
+        );
+        let project = |path: &str| Place::Project { path: path.into() };
+        ctx.remember(project("/work/api"), Some("Demo API"));
+        ctx.remember(project("/work/web"), None);
+        let entries = ctx.history.entries().unwrap();
+        let seen: Vec<_> = entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.route.target.as_str()))
+            .collect();
+        assert_eq!(seen, [("web", "docker"), ("Demo API", "docker")]);
     }
 
     #[test]
