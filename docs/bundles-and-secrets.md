@@ -273,9 +273,10 @@ Limits:
 
 - Secrets live in `/dev/shm` and only as long as the session that placed them:
   when the shell lodge started ends, they are removed (unless another client has
-  taken the container over, when they are its secrets). A multiplexer you started
-  from that shell keeps running, but the secrets it was given are gone, and a
-  session that ends without lodge getting to clean up (a killed terminal, a lost
+  taken the container over, when they are its secrets). A `file` secret is gone for
+  everything. An `env` secret is not: every process the session started has it in
+  its environment, so a multiplexer or any background process you started from that
+  shell keeps it until it ends. A session that ends without lodge getting to clean up (a killed terminal, a lost
   connection that is not restored) leaves them until the container stops or the
   next attach. What is placed is what the client that attached last declares: any
   other value is removed, so removing some or *every* `[[secret]]` takes effect on

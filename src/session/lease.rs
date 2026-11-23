@@ -35,28 +35,43 @@ pub fn new_id() -> String {
     format!("{:x}{nanos:x}", std::process::id())
 }
 
-/// A name for this machine and user, as `user@host`, kept to characters that are
-/// safe in a record and on a terminal. Two sessions opened from the same
-/// machine by the same user have the same name; that is all it is for.
-pub fn client(local: &dyn Local) -> String {
+/// This machine's name: the `hostname` program, else what the kernel or
+/// `/etc/hostname` says (a minimal Linux has no such program), else the
+/// variables some shells and Windows set.
+fn host_name(local: &dyn Local) -> Option<String> {
     let var = |n: &str| local.var(n).map(|v| v.to_string_lossy().into_owned());
-    let user = var("USER")
-        .or_else(|| var("USERNAME"))
-        .or_else(|| var("LOGNAME"));
-    let host = local
+    let file = |p: &str| {
+        local
+            .read_file(std::path::Path::new(p))
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+    };
+    local
         .run_program("hostname", &[], b"", std::time::Duration::from_secs(2))
         .ok()
         .filter(|o| o.success)
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|h| !h.is_empty())
-        .or_else(|| var("HOSTNAME"))
-        .or_else(|| var("COMPUTERNAME"));
-    let name = match (user, host) {
-        (Some(u), Some(h)) => format!("{u}@{h}"),
-        (None, Some(h)) => h,
-        (Some(u), None) => u,
-        (None, None) => "unknown".into(),
-    };
+        .or_else(|| file("/proc/sys/kernel/hostname").filter(|h| !h.is_empty()))
+        .or_else(|| file("/etc/hostname").filter(|h| !h.is_empty()))
+        .or_else(|| var("HOSTNAME").filter(|h| !h.is_empty()))
+        .or_else(|| var("COMPUTERNAME").filter(|h| !h.is_empty()))
+}
+
+/// A name for this machine and user, as `user@host`, kept to characters that are
+/// safe in a record and on a terminal. Two sessions opened from the same machine
+/// by the same user have the same name, and that is what lets the second replace
+/// the first without asking. When the machine's name cannot be found, nothing is
+/// known to be the same machine, so the name carries this process's id: every
+/// attach is then another client's and is asked about, rather than ended silently.
+pub fn client(local: &dyn Local) -> String {
+    let var = |n: &str| local.var(n).map(|v| v.to_string_lossy().into_owned());
+    let user = var("USER")
+        .or_else(|| var("USERNAME"))
+        .or_else(|| var("LOGNAME"))
+        .unwrap_or_else(|| "unknown".into());
+    let host = host_name(local).unwrap_or_else(|| format!("unknown-{}", std::process::id()));
+    let name = format!("{user}@{host}");
     name.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || "_.@-".contains(c) {
@@ -308,12 +323,24 @@ mod tests {
                 .with_var("USER", "kai")
                 .with_program("hostname", true, b"lap top\n");
         assert_eq!(client(&local), "kai@lap_top");
-        // No `hostname`: the variable is used; neither: just what is known.
+        // No `hostname` program (a minimal Linux): the kernel's name, then the file,
+        // then the variables.
+        let local = FakeLocal::new()
+            .with_var("USER", "kai")
+            .with_file("/proc/sys/kernel/hostname", b"arch-box\n");
+        assert_eq!(client(&local), "kai@arch-box");
+        let local = FakeLocal::new()
+            .with_var("USER", "kai")
+            .with_file("/etc/hostname", b"etc-box\n");
+        assert_eq!(client(&local), "kai@etc-box");
         let local = FakeLocal::new()
             .with_var("USERNAME", "kai")
             .with_var("COMPUTERNAME", "WIN-1");
         assert_eq!(client(&local), "kai@WIN-1");
-        assert_eq!(client(&FakeLocal::new()), "unknown");
+        // No name for the machine at all: never equal to another attach's, so it
+        // is asked about rather than replaced silently.
+        let anon = client(&FakeLocal::new().with_var("USER", "kai"));
+        assert!(anon.starts_with("kai@unknown-"), "{anon}");
         // Nothing that could end the quoting in a script.
         let local = FakeLocal::new().with_var("USER", "a'; rm -rf /; '");
         assert!(

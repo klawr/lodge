@@ -837,12 +837,21 @@ fn secrets_reach_the_session_and_never_the_image_the_trace_or_the_disk() {
         traced.tail(15)
     );
 
-    // The session has the variable and the credential file.
+    // The session has the variable and the credential file, in memory only and
+    // owner-only (checked from inside, since the secrets last as long as the session).
+    let dir = "/dev/shm/lodge-secrets-0";
     let session = p.attach(
         &[],
         &host_env,
-        "printf 'GOT=%s\\n' \"$API_KEY\"; printf 'FILE=%s\\n' \"$(cat /root/.cfg/gh-token)\"; \
-         printf 'WORK=[%s]\\n' \"${WORK_KEY:-}\"; exit\n",
+        &format!(
+            "printf 'GOT=%s\\n' \"$API_KEY\"; printf 'FILE=%s\\n' \"$(cat /root/.cfg/gh-token)\"; \
+             printf 'WORK=[%s]\\n' \"${{WORK_KEY:-}}\"; \
+             printf 'TMPFS=%s\\n' \"$(stat -f -c %T /dev/shm)\"; \
+             printf 'DIRMODE=%s\\n' \"$(stat -c %a {dir})\"; \
+             printf 'ENVMODE=%s\\n' \"$(stat -c %a {dir}/API_KEY)\"; \
+             printf 'FILEMODE=%s\\n' \"$(stat -c %a {dir}/GH)\"; \
+             printf 'LS=%s\\n' \"$(ls {dir} | tr '\\n' ' ')\"; exit\n"
+        ),
     );
     assert!(
         session.has(&format!("GOT={SECRET}")),
@@ -858,17 +867,29 @@ fn secrets_reach_the_session_and_never_the_image_the_trace_or_the_disk() {
         session.has("WORK=[]"),
         "a secret for another target arrived"
     );
+    for line in [
+        "TMPFS=tmpfs",
+        "DIRMODE=700",
+        "ENVMODE=600",
+        "FILEMODE=640",
+        "LS=API_KEY GH ",
+    ] {
+        assert!(session.has(line), "{line} missing:\n{}", session.tail(15));
+    }
 
-    // In memory only, owner-only.
+    // And they end with the session: the directory and the session record are gone.
     let c = p.container();
-    assert_eq!(p.sh("stat -f -c %T /dev/shm").trim(), "tmpfs");
-    assert_eq!(p.sh("stat -c %a /dev/shm/lodge-secrets-0").trim(), "700");
     assert_eq!(
-        p.sh("stat -c %a /dev/shm/lodge-secrets-0/API_KEY").trim(),
-        "600"
+        p.sh(&format!("[ -e {dir} ] && echo there || echo gone"))
+            .trim(),
+        "gone",
+        "the secrets outlived the session"
     );
-    assert_eq!(p.sh("stat -c %a /dev/shm/lodge-secrets-0/GH").trim(), "640");
-    assert_eq!(p.sh("ls /dev/shm/lodge-secrets-0").lines().count(), 2);
+    assert_eq!(
+        p.sh("[ -e /root/.local/share/lodge/session ] && echo there || echo gone")
+            .trim(),
+        "gone"
+    );
 
     // Not in the container's configuration, nor in any layer or file on disk.
     let inspect = docker(&["inspect", &c]);
@@ -896,8 +917,8 @@ fn secrets_reach_the_session_and_never_the_image_the_trace_or_the_disk() {
     // status and doctor show names and states, never values.
     let status = p.ldg("status", &[]);
     assert!(
-        status.has("API_KEY (placed)") && status.has("GH (placed)"),
-        "{}",
+        status.has("API_KEY (not placed)") && status.has("GH (not placed)"),
+        "secrets are removed when the session ends:\n{}",
         status.tail(8)
     );
     assert!(status.has("WORK_KEY (not placed)"), "{}", status.tail(8));
@@ -917,22 +938,18 @@ fn secrets_reach_the_session_and_never_the_image_the_trace_or_the_disk() {
         assert!(!doctor.contains(value), "doctor printed a secret value");
     }
 
-    // Dropping a declaration removes its value on the next attach.
-    sb.config("");
-    let again = p.attach(&[], &host_env, "exit\n");
-    assert!(again.ok, "{}", again.tail(10));
-    // (no secrets declared at all: nothing runs, the old files stay until stop)
-    secrets_config(&sb);
-    let one = std::fs::read_to_string(sb.root().join("config/lodge/config.toml"))
-        .unwrap()
-        .replace("name = \"GH\"", "name = \"GH_RENAMED\"");
-    std::fs::write(sb.root().join("config/lodge/config.toml"), one).unwrap();
-    p.attach(&[], &host_env, "exit\n");
-    let left = p.sh("ls /dev/shm/lodge-secrets-0");
-    assert!(
-        left.contains("GH_RENAMED") && !left.lines().any(|l| l == "GH"),
-        "{left}"
+    // A value an earlier session left behind (a killed terminal never cleaned up)
+    // that this client does not declare is removed at the next attach.
+    p.sh(&format!(
+        "umask 077; mkdir -p {dir}; echo old > {dir}/STALE"
+    ));
+    let again = p.attach(
+        &[],
+        &host_env,
+        &format!("printf 'LS=%s\\n' \"$(ls {dir} | tr '\\n' ' ')\"; exit\n"),
     );
+    assert!(again.has("LS=API_KEY GH "), "{}", again.tail(10));
+    assert!(!again.has("STALE"), "{}", again.tail(10));
 }
 
 #[test]
