@@ -7,13 +7,14 @@
 //! typing the command that made it, and nothing here knows what a command is.
 //!
 //! [`History`] is the seam: the command layer takes it, and a test hands in
-//! a list in memory. [`FileHistory`] keeps the list in `~/.local/share/lodge/history.json`.
+//! a list in memory. [`FileHistory`] keeps the list in `~/.local/share/lodge/history.json`,
+//! through [`Files`], so it is tested without a folder on disk.
 
-use crate::platform;
+use crate::files::Files;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// How many places are kept; the least recent one makes room for a new one.
 const MAX_ENTRIES: usize = 50;
@@ -118,19 +119,24 @@ fn put_first(entries: &mut Vec<Entry>, entry: Entry) {
 pub struct FileHistory {
     /// `None` when this system has no data directory.
     path: Option<PathBuf>,
+    files: Arc<dyn Files>,
 }
 
 impl FileHistory {
     /// `~/.local/share/lodge/history.json`, next to the port-forwarding state.
-    pub fn in_data_dir() -> Self {
+    pub fn in_data_dir(files: Arc<dyn Files>) -> Self {
         FileHistory {
             path: dirs::data_local_dir().map(|dir| dir.join("lodge").join("history.json")),
+            files,
         }
     }
 
     #[cfg(test)]
-    pub fn at(path: PathBuf) -> Self {
-        FileHistory { path: Some(path) }
+    pub fn at(path: PathBuf, files: Arc<dyn Files>) -> Self {
+        FileHistory {
+            path: Some(path),
+            files,
+        }
     }
 
     fn file(&self) -> Result<&Path> {
@@ -143,10 +149,12 @@ impl FileHistory {
 impl History for FileHistory {
     fn entries(&self) -> Result<Vec<Entry>> {
         let path = self.file()?;
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        let Some(text) = self
+            .files
+            .read(path)
+            .with_context(|| format!("reading {}", path.display()))?
+        else {
+            return Ok(Vec::new());
         };
         serde_json::from_str(&text).with_context(|| {
             format!(
@@ -180,20 +188,10 @@ impl History for FileHistory {
                 bundle,
             },
         );
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        }
-        let tmp = path.with_extension("json.tmp");
         // Private to the user, like a shell history: it names project folders and hosts.
-        // A file that was there before comes out of the rename with these rights too.
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        let mut file = platform::private_file(&mut opts)
-            .open(&tmp)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        file.write_all(serde_json::to_string_pretty(&entries)?.as_bytes())
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
+        self.files
+            .write_private(path, &serde_json::to_string_pretty(&entries)?)
+            .with_context(|| format!("writing {}", path.display()))
     }
 }
 
@@ -239,7 +237,13 @@ impl History for Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tmpfile::TempDir;
+    use crate::files::MemoryFiles;
+
+    const PATH: &str = "/data/lodge/history.json";
+
+    fn kept_in(files: &Arc<MemoryFiles>) -> FileHistory {
+        FileHistory::at(PATH.into(), files.clone())
+    }
 
     fn route(remote: Option<&str>) -> Route {
         Route {
@@ -332,15 +336,12 @@ mod tests {
     }
 
     #[test]
-    fn a_history_written_before_bundles_were_kept_is_still_read() {
-        let dir = TempDir::new("history-old").unwrap();
-        let path = dir.path().join("history.json");
-        std::fs::write(
-            &path,
+    fn an_entry_without_a_bundle_reads_as_no_bundle() {
+        let files = MemoryFiles::new().with(
+            PATH,
             r#"[{"place":{"kind":"project","path":"/a"},"route":{"target":"docker","remote":null},"name":"a","last_used":1}]"#,
-        )
-        .unwrap();
-        let entries = FileHistory::at(path).entries().unwrap();
+        );
+        let entries = kept_in(&files).entries().unwrap();
         assert_eq!(entries[0].bundle, None);
     }
 
@@ -376,45 +377,37 @@ mod tests {
 
     #[test]
     fn the_file_keeps_the_list_between_runs_and_starts_empty() {
-        let dir = TempDir::new("history").unwrap();
-        let path = dir.path().join("lodge").join("history.json");
-        assert!(FileHistory::at(path.clone()).entries().unwrap().is_empty());
-        FileHistory::at(path.clone())
+        let files = MemoryFiles::new();
+        assert!(kept_in(&files).entries().unwrap().is_empty());
+        kept_in(&files)
             .remember(project("/a"), route(Some("me@box")), "a".into(), None)
             .unwrap();
-        FileHistory::at(path.clone())
+        kept_in(&files)
             .remember(project("/b"), route(None), "b".into(), None)
             .unwrap();
-        let entries = FileHistory::at(path.clone()).entries().unwrap();
+        let entries = kept_in(&files).entries().unwrap();
         assert_eq!(
             entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
             ["b", "a"]
         );
         assert_eq!(entries[1].route, route(Some("me@box")));
         assert!(entries[0].last_used > 0);
-        assert!(!path.with_extension("json.tmp").exists());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn the_file_is_private_to_the_user_even_when_an_open_one_was_there_before() {
-        let dir = TempDir::new("history-mode").unwrap();
-        let path = dir.path().join("history.json");
-        std::fs::write(&path, "[]").unwrap();
-        crate::platform::set_mode(&path, 0o644).unwrap();
-        FileHistory::at(path.clone())
+    fn the_file_is_written_for_this_user_alone() {
+        // How that is done is `Files`'; what is asked of it is private.
+        let files = MemoryFiles::new();
+        kept_in(&files)
             .remember(project("/a"), route(None), "a".into(), None)
             .unwrap();
-        let mode = crate::platform::mode(&std::fs::metadata(&path).unwrap());
-        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        assert!(files.is_private(PATH));
     }
 
     #[test]
     fn a_file_that_is_not_a_history_is_named_and_replaced_by_the_next_session() {
-        let dir = TempDir::new("history-bad").unwrap();
-        let path = dir.path().join("history.json");
-        std::fs::write(&path, "not json").unwrap();
-        let history = FileHistory::at(path.clone());
+        let files = MemoryFiles::new().with(PATH, "not json");
+        let history = kept_in(&files);
         let err = format!("{:#}", history.entries().unwrap_err());
         assert!(
             err.contains("history.json") && err.contains("remove it"),
@@ -427,8 +420,29 @@ mod tests {
     }
 
     #[test]
+    fn a_disk_that_refuses_is_an_error_that_names_the_file_and_keeps_the_list() {
+        let files = MemoryFiles::new();
+        kept_in(&files)
+            .remember(project("/a"), route(None), "a".into(), None)
+            .unwrap();
+        let files = files.refusing("disk full");
+        let err = kept_in(&files)
+            .remember(project("/b"), route(None), "b".into(), None)
+            .unwrap_err();
+        let said = format!("{err:#}");
+        assert!(
+            said.contains("history.json") && said.contains("disk full"),
+            "{said}"
+        );
+        assert_eq!(names(&kept_in(&files)), ["a"]);
+    }
+
+    #[test]
     fn a_system_without_a_data_directory_says_so() {
-        let history = FileHistory { path: None };
+        let history = FileHistory {
+            path: None,
+            files: MemoryFiles::new(),
+        };
         let err = history.entries().unwrap_err().to_string();
         assert!(err.contains("no data directory"), "{err}");
     }

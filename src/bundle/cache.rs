@@ -211,12 +211,7 @@ pub(super) fn prune(root: &Path, keep: &Path) {
     cached.sort_by_key(|entry| std::cmp::Reverse(entry.0)); // newest first
     for (_, path) in cached.into_iter().skip(KEEP) {
         if path != keep {
-            // (Entries of an older layout were directories.)
-            if path.is_dir() {
-                discard_dir(&path);
-            } else {
-                discard_file(&path);
-            }
+            discard_file(&path);
         }
     }
 }

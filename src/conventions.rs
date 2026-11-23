@@ -279,14 +279,14 @@ fn the_machine_lodge_runs_on_is_read_through_local_and_the_list_that_still_isnt_
 
 #[test]
 fn lodges_own_files_are_read_and_written_through_files_and_only_the_command_layer_picks_them() {
-    // `config.toml` and `client.toml` are loaded, edited and written through
-    // `files::Files`, which a test replaces with files in memory. Nothing in
-    // `config/` touches the disk itself, and the real files are named only by
+    // `config.toml`, `client.toml` and the history are loaded, edited and written
+    // through `files::Files`, which a test replaces with files in memory. Nothing in
+    // `config/` or `history.rs` touches the disk itself, and the real files are named only by
     // their own module and the command layer.
     assert_eq!(
         files_containing(&["std::fs", "File::open", "File::create"], &[])
             .into_iter()
-            .filter(|f| f.starts_with("config/"))
+            .filter(|f| f.starts_with("config/") || f == "history.rs")
             .collect::<Vec<_>>(),
         Vec::<String>::new()
     );

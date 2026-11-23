@@ -1,4 +1,5 @@
-//! The text files lodge keeps for itself: `config.toml` and `client.toml`.
+//! The text files lodge keeps for itself: `config.toml` and `client.toml`, and the
+//! history of places a session was opened in.
 //!
 //! Reading and replacing them is a dependency like the network or the terminal:
 //! it sits behind [`Files`], the command layer hands in [`DiskFiles`], and a test
@@ -17,6 +18,10 @@ pub trait Files: Send + Sync {
     /// Makes the file at `path` hold `text` (and its folder, if it is not there):
     /// all of it or, if that fails, what was there before.
     fn write(&self, path: &Path, text: &str) -> io::Result<()>;
+
+    /// As [`write`](Files::write), and the file is for this user alone, even when
+    /// a more open one was there before: for what names project folders and hosts.
+    fn write_private(&self, path: &Path, text: &str) -> io::Result<()>;
 
     /// Whether there is a file at `path`.
     fn exists(&self, path: &Path) -> bool {
@@ -37,19 +42,34 @@ impl Files for DiskFiles {
     }
 
     fn write(&self, path: &Path, text: &str) -> io::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        // Written beside it and moved over it, so a failure half way leaves the
-        // old file whole.
-        let mut staged = path.as_os_str().to_owned();
-        staged.push(".tmp");
-        let staged = std::path::PathBuf::from(staged);
-        std::fs::write(&staged, text)?;
-        std::fs::rename(&staged, path).inspect_err(|_| {
-            std::fs::remove_file(&staged).ok();
-        })
+        stage(path, text, false)
     }
+
+    fn write_private(&self, path: &Path, text: &str) -> io::Result<()> {
+        stage(path, text, true)
+    }
+}
+
+/// Writes `text` beside `path` and moves it over `path`, so a failure half way
+/// leaves the old file whole. With `private`, the staged file is made for this
+/// user alone, and comes out of the move with those rights whatever was there.
+fn stage(path: &Path, text: &str, private: bool) -> io::Result<()> {
+    use std::io::Write as _;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(".tmp");
+    let staged = std::path::PathBuf::from(staged);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    if private {
+        crate::platform::private_file(&mut opts);
+    }
+    opts.open(&staged)?.write_all(text.as_bytes())?;
+    std::fs::rename(&staged, path).inspect_err(|_| {
+        std::fs::remove_file(&staged).ok();
+    })
 }
 
 #[cfg(test)]
@@ -58,7 +78,7 @@ pub use fake::{MemoryFiles, disk};
 #[cfg(test)]
 mod fake {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
@@ -72,6 +92,7 @@ mod fake {
     #[derive(Default)]
     pub struct MemoryFiles {
         files: Mutex<BTreeMap<PathBuf, String>>,
+        private: Mutex<BTreeSet<PathBuf>>,
         refuse: Mutex<Option<String>>,
         writes: Mutex<usize>,
     }
@@ -100,9 +121,34 @@ mod fake {
             self.files.lock().unwrap().get(Path::new(path)).cloned()
         }
 
+        /// Whether the file at `path` was last written for this user alone.
+        pub fn is_private(&self, path: &str) -> bool {
+            self.private.lock().unwrap().contains(Path::new(path))
+        }
+
         /// How many times something was written.
         pub fn writes(&self) -> usize {
             *self.writes.lock().unwrap()
+        }
+    }
+
+    impl MemoryFiles {
+        fn put(&self, path: &Path, text: &str, private: bool) -> io::Result<()> {
+            if let Some(why) = self.refuse.lock().unwrap().clone() {
+                return Err(io::Error::other(why));
+            }
+            *self.writes.lock().unwrap() += 1;
+            self.files
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), text.to_string());
+            let mut kept = self.private.lock().unwrap();
+            if private {
+                kept.insert(path.to_path_buf());
+            } else {
+                kept.remove(path);
+            }
+            Ok(())
         }
     }
 
@@ -112,15 +158,11 @@ mod fake {
         }
 
         fn write(&self, path: &Path, text: &str) -> io::Result<()> {
-            if let Some(why) = self.refuse.lock().unwrap().clone() {
-                return Err(io::Error::other(why));
-            }
-            *self.writes.lock().unwrap() += 1;
-            self.files
-                .lock()
-                .unwrap()
-                .insert(path.to_path_buf(), text.to_string());
-            Ok(())
+            self.put(path, text, false)
+        }
+
+        fn write_private(&self, path: &Path, text: &str) -> io::Result<()> {
+            self.put(path, text, true)
         }
     }
 
@@ -160,5 +202,18 @@ mod fake {
         assert!(e.to_string().contains("disk full"));
         assert_eq!(files.writes(), 1);
         assert!(files.text("/a/d.toml").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_write_is_for_this_user_even_over_an_open_file() {
+        let dir = crate::tmpfile::TempDir::new("disk-private").unwrap();
+        let path = dir.path().join("history.json");
+        std::fs::write(&path, "[]").unwrap();
+        crate::platform::set_mode(&path, 0o644).unwrap();
+        DiskFiles.write_private(&path, "[1]").unwrap();
+        let mode = crate::platform::mode(&std::fs::metadata(&path).unwrap());
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        assert_eq!(DiskFiles.read(&path).unwrap().as_deref(), Some("[1]"));
     }
 }

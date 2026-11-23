@@ -348,11 +348,11 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
     // is reached and which target is worked in on it. Each is an interface everything
     // else takes; a new way of reaching a machine or a new target is one more arm.
     // The helper tools (`ldd`, `patchelf`, the registry client) are chosen here too.
-    let history = FileHistory::in_data_dir();
-    // The keys come from the client file, which is read here on its own: the first
-    // screen is asked before any command has loaded it.
     // The files lodge keeps for itself are this machine's, chosen here.
     let files: Arc<dyn Files> = Arc::new(DiskFiles);
+    let history = FileHistory::in_data_dir(files.clone());
+    // The keys come from the client file, which is read here on its own: the first
+    // screen is asked before any command has loaded it.
     let paths = Paths::for_run(cli.config.clone(), files)?;
     let terminal = prompt::Terminal::new(client::keymap(&paths.client)?);
     // Without a subcommand, the person picks one of the places they were in. That

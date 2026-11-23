@@ -279,9 +279,9 @@ mod tests {
     }
 
     #[test]
-    fn a_config_in_the_old_format_loses_its_old_tables_in_one_step_each() {
-        // What lodge wrote before data had a table of its own: every [[config]] is one
-        // thing that is not known, however many entries it has.
+    fn a_table_that_repeats_is_one_unknown_thing_however_many_entries_it_has() {
+        // `[[config]]` is not a table of this config: it is one thing that is not
+        // known, however many entries it has.
         let raw = "[[config]]\nname = \"nvim\"\npath = \"~/.config/nvim\"\ntarget = \"~/.config/nvim\"\n\n\
                    [[config]]\nname = \"tmux\"\npath = \"~/.config/tmux\"\ntarget = \"~/.config/tmux\"\n\n\
                    [[binary]]\nname = \"nvim\"\npath = \"/usr/local/bin/nvim\"\n";
