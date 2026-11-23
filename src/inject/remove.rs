@@ -90,7 +90,9 @@ mod tests {
     use super::*;
     use crate::layout::Layout;
     use crate::runtime::fake::{FakeEnv, Who};
+    #[cfg(unix)]
     use std::path::Path;
+    #[cfg(unix)]
     use std::process::Command;
 
     fn dev() -> ContainerUser {
@@ -105,6 +107,7 @@ mod tests {
 
     /// Runs the script for real against `prefix`, with `recorded` as the recorded
     /// wrappers: whether it succeeded, and the paths it printed.
+    #[cfg(unix)]
     fn exec(prefix: &Path, recorded: &[&Path], marker: &str) -> (bool, String) {
         let script = script(&prefix.to_string_lossy(), marker);
         let recorded: Vec<String> = recorded

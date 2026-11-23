@@ -174,11 +174,15 @@ pub mod fake {
         }
 
         /// What gets fetched, for a test to read after the store is handed away.
+        // Only the tests that run a unix shell read it: unused on Windows.
+        #[cfg_attr(not(unix), allow(dead_code))]
         pub fn fetched(&self) -> Arc<Mutex<Vec<String>>> {
             self.fetched.clone()
         }
 
         /// A place that cannot be reached at all.
+        // Only the tests that run a unix shell use it: unused on Windows.
+        #[cfg_attr(not(unix), allow(dead_code))]
         pub fn unreachable(mut self) -> Self {
             self.offline = true;
             self

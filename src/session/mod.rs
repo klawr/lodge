@@ -264,6 +264,7 @@ mod tests {
     }
 
     /// The `PATH` a command run by [`path_script`] sees.
+    #[cfg(unix)]
     fn path_after(login: &str, orig: &str) -> String {
         let out = Command::new("sh")
             .args(["-c", &path_script(&layout()), "sh", "printenv", "PATH"])

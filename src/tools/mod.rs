@@ -224,6 +224,8 @@ impl FakeRegistry {
     }
 
     /// What was pulled, in order.
+    // Only the tests that run a unix shell read it: unused on Windows.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn pulled(&self) -> Vec<String> {
         self.pulled.lock().unwrap().clone()
     }

@@ -300,20 +300,28 @@ fn stat_tree(root: &Path, out: &mut Vec<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bundle::store::FileStore;
+    #[cfg(unix)]
+    use crate::bundle::store::OciStore;
+    #[cfg(unix)]
     use crate::bundle::store::fake::FakeStore;
-    use crate::bundle::store::{FileStore, OciStore};
     use crate::bundle::testing::{manifest, prepared};
     use crate::config::BinaryEntry;
+    #[cfg(unix)]
     use crate::snapshot::Snapshot;
     use crate::tmpfile::TempDir;
-    use crate::tools::{self, FakeRegistry, Ldd};
+    #[cfg(unix)]
+    use crate::tools::FakeRegistry;
+    use crate::tools::{self, Ldd};
+    #[cfg(unix)]
     use std::sync::Arc;
 
     fn files() -> Stores {
         Stores::new(vec![Box::new(FileStore)])
     }
 
-    /// A packed bundle, as the bytes of its tar.
+    /// A packed bundle, as the bytes of its tar (it packs a shell script).
+    #[cfg(unix)]
     fn bundle_tar(dir: &Path, body: &str) -> Vec<u8> {
         let out = dir.join("packed.tar");
         let cfg = config(vec![script_tool(dir, "t", body)]);
@@ -627,6 +635,7 @@ mod tests {
     }
 
     /// Prepares `fake://a` from `stores` into `cache`.
+    #[cfg(unix)]
     fn prepare_a(cache: &TempDir, stores: &Stores) -> Result<Prepared> {
         prepare_in(
             cache.path(),

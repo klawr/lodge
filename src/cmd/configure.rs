@@ -534,7 +534,7 @@ fn form(file: &File) -> (Doc, Vec<Stop>) {
     if !file.unknown.is_empty() {
         f.blank();
         f.text(
-            "# not known to this version of lodge: r removes",
+            "# not known to this version of lodge: x removes",
             Tone::Accent,
         );
         for (n, (in_file, u)) in file.unknown.iter().enumerate() {

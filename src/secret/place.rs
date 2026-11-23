@@ -306,6 +306,7 @@ mod tests {
     }
 
     // The scripts, run for real against a temp directory.
+    #[cfg(unix)]
     fn sh(script: &str, args: &[&str]) -> bool {
         let argv = script_argv(script, args);
         Command::new(argv[0])
