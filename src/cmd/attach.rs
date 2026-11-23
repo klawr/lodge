@@ -5,12 +5,15 @@ use std::path::PathBuf;
 
 use super::Ctx;
 use super::bundle as bundle_cmd;
+use super::prompt::Choose;
+use super::table::{Cell, Table, Tone};
 use crate::bundle::choice;
 use crate::config::Config;
 use crate::history::Place;
-use crate::output::note;
+use crate::layout::Layout;
+use crate::output::{note, warning};
 use crate::provision::Attached;
-use crate::runtime::ContainerUser;
+use crate::runtime::{Container, ContainerUser};
 use crate::session::{self, Session};
 use crate::{bundle, inject, secret};
 
@@ -213,8 +216,10 @@ fn attach(
     attached.run_post_attach();
     // The container is one person's workspace and the secrets are about to become
     // this client's, so a session an earlier client left running goes first.
-    if session::lease::take_over(container, &user, &layout)? {
-        note!("ended the session another client had in this container");
+    let client = session::lease::client(ctx.local.as_ref());
+    if !make_room(ctx.choose.as_ref(), container, &user, &layout, &client)? {
+        note!("not attaching; the other session is still there");
+        return Ok(());
     }
     let session_id = session::lease::new_id();
     let setup = secret::deliver::deliver(
@@ -224,7 +229,7 @@ fn attach(
         &config.secret,
         ctx.local.as_ref(),
     )?;
-    session::enter(
+    let result = session::enter(
         container,
         ctx.host.as_ref(),
         ctx.local.as_ref(),
@@ -235,8 +240,69 @@ fn attach(
             layout: &layout,
             setup: &setup,
             id: &session_id,
+            client: &client,
         },
-    )
+    );
+    // The secrets last as long as the session: now they go, unless another client
+    // has taken the container over, and they are its secrets. This runs whether the
+    // shell ended well or not.
+    let secrets = crate::layout::secrets_dir(&user.uid.to_string());
+    if let Err(e) = session::lease::release(container, &user, &layout, &session_id, &[&secrets]) {
+        warning!(
+            "could not remove the secrets from {}: {e:#}; they stay until it stops",
+            container.display_name()
+        );
+    }
+    result
+}
+
+/// Ends the session that holds the container so this client's can open. A
+/// session from this same client (same user, same machine) is replaced without
+/// asking: it is almost always one that was left behind. One from another client
+/// is asked about first, since ending it also takes its secrets away. False when
+/// the person says no. An error when there is a session of another client and
+/// nobody to ask.
+fn make_room(
+    choose: &dyn Choose,
+    container: &dyn Container,
+    user: &ContainerUser,
+    layout: &Layout,
+    client: &str,
+) -> Result<bool> {
+    let name = container.display_name();
+    match session::lease::holder(container, user, layout)? {
+        None => return Ok(true),
+        Some(holder) if holder == client => {
+            note!("replacing the session this machine left open in {name}");
+        }
+        Some(holder) => {
+            if !choose.can_ask() {
+                anyhow::bail!(
+                    "{holder} has a session open in {name}; attaching would end it and \
+                     remove its secrets. Run this from a terminal to confirm"
+                );
+            }
+            let options = Table::new(
+                vec!["DO"],
+                vec![
+                    vec![Cell::new("end it and attach", Tone::Strong)],
+                    vec![Cell::new("cancel", Tone::Muted)],
+                ],
+                0,
+            );
+            let question = format!(
+                "{holder} has a session open in {name}. Attaching ends it and removes the \
+                 secrets placed for it (a connection that is only stale is fine to end)"
+            );
+            if choose.choose(&question, &options)? != Some(0) {
+                return Ok(false);
+            }
+        }
+    }
+    if session::lease::take_over(container, user, layout)? {
+        note!("ended the session that was open in {name}");
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -427,6 +493,63 @@ mod tests {
         // What each session was injected from is kept with it.
         let bundles: Vec<_> = entries.iter().map(|e| e.bundle.as_deref()).collect();
         assert_eq!(bundles, [None, Some("a.tar")]);
+    }
+
+    /// Whether a command that ends a session ran in container `c`.
+    fn ended_a_session(rt: &FakeRuntime) -> bool {
+        rt.calls("c")
+            .iter()
+            .any(|(argv, _)| argv.iter().any(|a| a.contains("kill -HUP")))
+    }
+
+    fn make_room_with(holder: Option<&str>, choose: &Picks) -> (Result<bool>, bool) {
+        let layout = Layout::new("/home/dev/.local/share/lodge");
+        let env = session::lease::with_holder(FakeEnv::new(), &layout, holder);
+        let rt = FakeRuntime::new(FakeEnv::new).with_container("c", env);
+        let container = rt.container("c");
+        let go = make_room(choose, container.as_ref(), &user(), &layout, "kai@laptop");
+        (go, ended_a_session(&rt))
+    }
+
+    #[test]
+    fn nobody_in_the_container_means_nothing_to_end_or_ask() {
+        let (go, ended) = make_room_with(None, &Picks::nobody());
+        assert!(go.unwrap());
+        assert!(!ended);
+    }
+
+    #[test]
+    fn a_session_this_client_left_is_replaced_without_asking() {
+        // `nobody` would be an error if it were asked.
+        let (go, ended) = make_room_with(Some("kai@laptop"), &Picks::nobody());
+        assert!(go.unwrap());
+        assert!(ended);
+    }
+
+    #[test]
+    fn another_clients_session_is_ended_only_when_the_person_agrees() {
+        let (agree, asked) = Picks::answering(Some(0));
+        let (go, ended) = make_room_with(Some("kai@desktop"), &agree);
+        assert!(go.unwrap() && ended);
+        assert_eq!(asked.borrow().len(), 1);
+
+        let (decline, _) = Picks::answering(Some(1));
+        let (go, ended) = make_room_with(Some("kai@desktop"), &decline);
+        assert!(!go.unwrap() && !ended, "declining leaves the session alone");
+        let (leave, _) = Picks::answering(None);
+        let (go, ended) = make_room_with(Some("kai@desktop"), &leave);
+        assert!(!go.unwrap() && !ended);
+    }
+
+    #[test]
+    fn another_clients_session_with_nobody_to_ask_is_an_error_that_names_it() {
+        let (go, ended) = make_room_with(Some("kai@desktop"), &Picks::nobody());
+        let err = format!("{:#}", go.unwrap_err());
+        assert!(
+            err.contains("kai@desktop") && err.contains("terminal"),
+            "{err}"
+        );
+        assert!(!ended);
     }
 
     /// Answers a question with a row, or says there is nobody to ask, and keeps

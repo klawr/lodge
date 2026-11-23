@@ -216,19 +216,30 @@ used.
 
 Limits:
 
-- Secrets live in `/dev/shm`, so they last until the container stops, and a
-  multiplexer you started in the container outlives a detach. What is placed is
-  what the client that attached last declares: any other value is removed, so
-  removing some or *every* `[[secret]]` takes effect on the next attach, and so does
-  `ldg clean`. A secret you declare whose source can't be read this time keeps the
-  value already placed, with a warning.
-- A container is one person's workspace. Another client that attaches replaces the
-  secrets with its own and ends the session an earlier client left in it (the shell
-  lodge started, found through a record in `~/.local/share/lodge/session`; the
-  earlier client's shell just ends, and a client whose connection dropped does not
-  reopen a session once another has taken over). A
-  multiplexer you started from that shell keeps running, and a hand-run
-  `docker exec` or an IDE terminal is not a lodge session and is left alone.
+- Secrets live in `/dev/shm` and only as long as the session that placed them:
+  when the shell lodge started ends, they are removed (unless another client has
+  taken the container over, when they are its secrets). A multiplexer you started
+  from that shell keeps running, but the secrets it was given are gone, and a
+  session that ends without lodge getting to clean up (a killed terminal, a lost
+  connection that is not restored) leaves them until the container stops or the
+  next attach. What is placed is what the client that attached last declares: any
+  other value is removed, so removing some or *every* `[[secret]]` takes effect on
+  the next attach, and so does `ldg clean`. A secret you declare whose source can't
+  be read this time keeps the value already placed, with a warning.
+- A container is one person's workspace, with one lodge session at a time. Attaching
+  ends the session lodge opened earlier (the shell it started, found through a record
+  in `~/.local/share/lodge/session` that names the user and machine it was opened
+  from), and the secrets become the new client's.
+  - From the same user and machine, the earlier session is replaced without asking:
+    it is nearly always one that was left behind, and a second terminal from the
+    same machine ends the first, so use a multiplexer for several panes.
+  - From another client, lodge asks first (ending it also takes its secrets away; a
+    stale connection is fine to end). Without a terminal to ask on, it refuses and
+    says whose session is there.
+  - The earlier client's shell just ends. A client whose connection dropped does not
+    reopen a session once another has taken over. A multiplexer started from the
+    ended shell keeps running; a hand-run `docker exec` or an IDE terminal is not a
+    lodge session and is left alone.
 - What this protects, and what it does not. A value is never in a bundle, an image
   layer, a command line, lodge's output or the config. It is not hidden from anyone
   who can run a command in the container as the same user or as root, such as a

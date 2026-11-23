@@ -494,6 +494,11 @@ impl FakeRuntime {
         self.containers.borrow()[name].env.relays()
     }
 
+    /// The commands run in container `name` so far; see [`FakeEnv::calls`].
+    pub fn calls(&self, name: &str) -> Vec<(Vec<String>, Who)> {
+        self.containers.borrow()[name].env.calls()
+    }
+
     /// Ends the `index`th relay of container `name`, as a process that died would.
     pub fn end_relay(&self, name: &str, index: usize) {
         self.containers.borrow()[name].env.end_relay(index);

@@ -33,6 +33,8 @@ pub struct Session<'a> {
     pub setup: &'a str,
     /// This session's id: what [`lease`] records and a later attach looks for.
     pub id: &'a str,
+    /// The machine and user the session is opened from; see [`lease::client`].
+    pub client: &'a str,
 }
 
 /// The `sh -c` script that starts the session's shell.
@@ -116,7 +118,7 @@ pub fn enter(
         shell,
         &format!(
             "{}{}{term_setup}{set_title}; ",
-            lease::claim(s.layout, s.id),
+            lease::claim(s.layout, s.id, s.client),
             s.setup
         ),
     );
@@ -336,10 +338,14 @@ mod tests {
         crate::platform::set_mode(&shell, 0o755).unwrap();
         let l = Layout::new(dir.path().to_str().unwrap());
 
-        let script = startup_script(&l, &shell.to_string_lossy(), &lease::claim(&l, "abc123"));
+        let script = startup_script(
+            &l,
+            &shell.to_string_lossy(),
+            &lease::claim(&l, "abc123", "kai@laptop"),
+        );
         let pid = sh(&script, "/usr/bin:/bin");
         let record = std::fs::read_to_string(l.session()).unwrap();
-        assert_eq!(record.trim(), format!("{pid} abc123"));
+        assert_eq!(record.trim(), format!("{pid} abc123 kai@laptop"));
     }
 
     #[test]
