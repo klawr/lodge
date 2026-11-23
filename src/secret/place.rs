@@ -11,8 +11,10 @@
 //! - a `file` secret is symlinked from the path the tool expects to its file in
 //!   the directory, so the tool sees an ordinary credential file.
 //!
-//! A file in the directory whose secret is no longer declared is removed, so
-//! dropping a `[[secret]]` takes effect without restarting the container.
+//! A file in the directory whose secret is not declared by the client that is
+//! attaching is removed, so the container holds what that client is entitled to
+//! and dropping a `[[secret]]` takes effect without restarting it. (A declared
+//! secret whose source cannot be read this time keeps its value.)
 
 use anyhow::{Context, Result};
 
@@ -78,10 +80,14 @@ impl Placed {
 
 /// Places `items` in the container for `user`, and removes older ones that are no
 /// longer wanted. The caller has already decided these may go to this container.
+/// `unresolved` names declared secrets whose value could not be read this time: a
+/// value already placed for one of them is left alone (it is declared, only its
+/// source is missing), not removed with the ones nobody declares.
 pub fn place(
     env: &dyn Env,
     user: &ContainerUser,
     items: &[(&SecretDecl, &Secret)],
+    unresolved: &[&str],
 ) -> Result<Placed> {
     // Every step below leaves the same state when run again.
     let opts = ExecOpts::as_user(user.exec_as()).repeatable();
@@ -91,6 +97,7 @@ pub fn place(
     // shell variable names.
     let mut args = vec![dir.as_str()];
     args.extend(items.iter().map(|(d, _)| d.name.as_str()));
+    args.extend(unresolved);
     env.exec(&script_argv(PREPARE_SCRIPT, &args), &opts)
         .context("preparing the secrets directory")?;
 
@@ -213,7 +220,7 @@ mod tests {
             Secret::new(b"k-123".to_vec()),
             Secret::new(b"g-456".to_vec()),
         );
-        let placed = place(&env, &dev(), &[(&a, &va), (&b, &vb)]).unwrap();
+        let placed = place(&env, &dev(), &[(&a, &va), (&b, &vb)], &[]).unwrap();
 
         let dir = "/dev/shm/lodge-secrets-1000";
         assert_eq!(
@@ -240,9 +247,22 @@ mod tests {
     #[test]
     fn nothing_to_place_still_prunes_and_exports_nothing() {
         let env = FakeEnv::new();
-        let placed = place(&env, &ContainerUser::root(), &[]).unwrap();
+        let placed = place(&env, &ContainerUser::root(), &[], &[]).unwrap();
         assert!(placed.session_setup().is_empty());
         assert!(env.ran_matching(|c| c.get(4).is_some_and(|d| d == "/dev/shm/lodge-secrets-0")));
+    }
+
+    #[test]
+    fn a_declared_secret_without_a_value_is_kept_and_an_undeclared_one_is_pruned() {
+        let env = FakeEnv::new();
+        let a = decl("A", As::Env);
+        let va = Secret::new(b"1".to_vec());
+        place(&env, &dev(), &[(&a, &va)], &["B"]).unwrap();
+        // The names handed to the script are the ones to keep: A and B, not C.
+        assert!(env.ran_matching(|c| c.len() == 7
+            && c[4] == "/dev/shm/lodge-secrets-1000"
+            && c[5] == "A"
+            && c[6] == "B"));
     }
 
     #[test]

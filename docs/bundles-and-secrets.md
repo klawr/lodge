@@ -217,9 +217,14 @@ used.
 Limits:
 
 - Secrets live in `/dev/shm`, so they last until the container stops, and a
-  multiplexer you started in the container outlives a detach. Removing *every*
-  `[[secret]]` does not clear values already placed (nothing runs when none are
-  declared); removing some does, and so does `ldg clean`.
+  multiplexer you started in the container outlives a detach. What is placed is
+  what the client that attached last declares: any other value is removed, so
+  removing some or *every* `[[secret]]` takes effect on the next attach, and so does
+  `ldg clean`. A secret you declare whose source can't be read this time keeps the
+  value already placed, with a warning.
+- A container is one person's workspace. Another client that attaches replaces the
+  secrets with its own, and a tool still running from the earlier client loses the
+  file secrets it was using.
 - A tool that refreshes a credential file may replace the symlink with a real
   file in the home directory, which then stays on disk.
 - `/dev/shm` is 64 MB by default in Docker: enough for tokens, not for large files.
