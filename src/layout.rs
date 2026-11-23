@@ -90,6 +90,12 @@ impl Layout {
         format!("{}/injected", self.prefix)
     }
 
+    /// Which session holds the container: `<pid> <id>`, written by the session's
+    /// own start-up script (see [`crate::session::lease`]). No secret in it.
+    pub fn session(&self) -> String {
+        format!("{}/session", self.prefix)
+    }
+
     /// Terminfo entries copied from the host, for [`TERMINFO_DIRS`](
     /// https://man7.org/linux/man-pages/man5/terminfo.5.html).
     pub fn terminfo(&self) -> String {

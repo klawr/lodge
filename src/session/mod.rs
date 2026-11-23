@@ -8,6 +8,7 @@
 //! prefix `bin/` the first directory on `PATH` ([`startup_script`]), so that
 //! nothing outside the prefix needs a wrapper or a hook in a startup file.
 
+pub mod lease;
 pub mod terminfo;
 
 use crate::config::SessionConfig;
@@ -30,6 +31,8 @@ pub struct Session<'a> {
     pub layout: &'a Layout,
     /// Shell lines run before the login shell (secret exports).
     pub setup: &'a str,
+    /// This session's id: what [`lease`] records and a later attach looks for.
+    pub id: &'a str,
 }
 
 /// The `sh -c` script that starts the session's shell.
@@ -111,7 +114,11 @@ pub fn enter(
     let inner = startup_script(
         s.layout,
         shell,
-        &format!("{}{term_setup}{set_title}; ", s.setup),
+        &format!(
+            "{}{}{term_setup}{set_title}; ",
+            lease::claim(s.layout, s.id),
+            s.setup
+        ),
     );
 
     // Opens the interactive session; how it reaches the container (docker exec,
@@ -144,6 +151,13 @@ pub fn enter(
             RECONNECT_WAIT,
             std::thread::sleep,
         )?;
+        // Another client may have taken the container over while this one was
+        // away; a new shell here would run without the secrets it replaced and
+        // claim the container back. Not being able to ask goes on as before.
+        if matches!(lease::holds(&env, s.user, s.layout, s.id), Ok(false)) {
+            note!("another client has taken over {container_id}; not opening a new session");
+            return Ok(());
+        }
         info!("entering {container_id}");
         started = Instant::now();
         status = start()?;
@@ -304,6 +318,28 @@ mod tests {
             sh(&script, "/opt/go/bin:/usr/bin:/bin"),
             "/home/dev/.local/share/lodge/bin:/usr/bin:/bin:/opt/go/bin"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_recorded_pid_is_the_one_the_final_shell_runs_as() {
+        // The whole start-up chain only `exec`s, so the pid the claim records is
+        // the interactive shell's: what a later attach ends. The stand-in shell
+        // reports its own pid as `-i`.
+        let dir = TempDir::new("claim").unwrap();
+        let shell = dir.path().join("fakeshell");
+        std::fs::write(
+            &shell,
+            "#!/bin/sh\ncase \"$1\" in\n  -lc) eval \"$2\" ;;\n  -i) printf '%s' \"$$\" ;;\nesac\n",
+        )
+        .unwrap();
+        crate::platform::set_mode(&shell, 0o755).unwrap();
+        let l = Layout::new(dir.path().to_str().unwrap());
+
+        let script = startup_script(&l, &shell.to_string_lossy(), &lease::claim(&l, "abc123"));
+        let pid = sh(&script, "/usr/bin:/bin");
+        let record = std::fs::read_to_string(l.session()).unwrap();
+        assert_eq!(record.trim(), format!("{pid} abc123"));
     }
 
     #[test]

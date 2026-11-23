@@ -223,8 +223,20 @@ Limits:
   `ldg clean`. A secret you declare whose source can't be read this time keeps the
   value already placed, with a warning.
 - A container is one person's workspace. Another client that attaches replaces the
-  secrets with its own, and a tool still running from the earlier client loses the
-  file secrets it was using.
+  secrets with its own and ends the session an earlier client left in it (the shell
+  lodge started, found through a record in `~/.local/share/lodge/session`; the
+  earlier client's shell just ends, and a client whose connection dropped does not
+  reopen a session once another has taken over). A
+  multiplexer you started from that shell keeps running, and a hand-run
+  `docker exec` or an IDE terminal is not a lodge session and is left alone.
+- What this protects, and what it does not. A value is never in a bundle, an image
+  layer, a command line, lodge's output or the config. It is not hidden from anyone
+  who can run a command in the container as the same user or as root, such as a
+  `docker exec` or another ssh login: they can read the 0600 file, and an `env`
+  secret is also in the environment (`/proc/<pid>/environ`) of the processes that
+  have it. For a remote target the value crosses ssh and sits in the remote
+  container's memory, so you trust that machine's root. Whoever controls the
+  container engine controls its secrets.
 - A tool that refreshes a credential file may replace the symlink with a real
   file in the home directory, which then stays on disk.
 - `/dev/shm` is 64 MB by default in Docker: enough for tokens, not for large files.

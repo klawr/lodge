@@ -211,6 +211,12 @@ fn attach(
     }
     ctx.remember(place, attached.name.as_deref(), used);
     attached.run_post_attach();
+    // The container is one person's workspace and the secrets are about to become
+    // this client's, so a session an earlier client left running goes first.
+    if session::lease::take_over(container, &user, &layout)? {
+        note!("ended the session another client had in this container");
+    }
+    let session_id = session::lease::new_id();
     let setup = secret::deliver::deliver(
         container,
         ctx.host.as_ref(),
@@ -228,6 +234,7 @@ fn attach(
             user: &user,
             layout: &layout,
             setup: &setup,
+            id: &session_id,
         },
     )
 }
