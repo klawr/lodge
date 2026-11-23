@@ -9,7 +9,7 @@ use super::Ctx;
 use super::add::add_binary;
 use crate::cli::{AddCommand, InjectCommand, RemoveCommand};
 use crate::config::edit::{self, Kind, NewBinary, NewEntry};
-use crate::config::expand_tilde;
+use crate::config::{ConfigFile, expand_tilde};
 use crate::layout::tilde;
 use crate::output::{info, line, note, warning};
 
@@ -19,7 +19,7 @@ fn home_of(ctx: &Ctx) -> PathBuf {
 }
 
 pub fn run(ctx: &Ctx, command: Option<InjectCommand>) -> Result<()> {
-    let path = &ctx.config_path;
+    let path = &ctx.paths.config;
     let home = home_of(ctx);
     match command.unwrap_or(InjectCommand::Ls) {
         InjectCommand::Ls => return list(ctx, &home),
@@ -70,7 +70,7 @@ pub fn run(ctx: &Ctx, command: Option<InjectCommand>) -> Result<()> {
     Ok(())
 }
 
-fn add(path: &Path, entry: NewEntry) -> Result<()> {
+fn add(path: &ConfigFile, entry: NewEntry) -> Result<()> {
     edit::add(path, &entry)?;
     info!(
         "added {} `{}` to {}",
@@ -84,7 +84,7 @@ fn add(path: &Path, entry: NewEntry) -> Result<()> {
 /// The key of the data in the config at `path` that comes from `given`: the entry
 /// is found by the place it means, however the config writes it (`~/x` or the
 /// whole path).
-fn data_key(path: &Path, given: PathBuf) -> Result<String> {
+fn data_key(path: &ConfigFile, given: PathBuf) -> Result<String> {
     let want = std::path::absolute(expand_tilde(given.clone())).unwrap_or(given);
     edit::list(path, Kind::Data)?
         .into_iter()
@@ -107,12 +107,13 @@ pub(super) fn host_path(path: PathBuf, home: &Path) -> Result<String> {
 /// A configured bundle is injected instead of the entries, which would leave an
 /// edit looking like it did nothing.
 fn bundle_note(ctx: &Ctx) {
-    if let Ok(config) = ctx.config()
-        && let Some(bundle) = config.bundle
+    if let Ok(settings) = ctx.client()
+        && let Some(bundle) = settings.bundle
     {
         warning!(
-            "the config sets `bundle = \"{bundle}\"`, which is injected instead of these \
-             entries: pack again (`ldg pack`) or remove that line to use the change"
+            "{} sets `bundle = \"{bundle}\"`, which is injected instead of these \
+             entries: pack again (`ldg pack`) or remove that line to use the change",
+            ctx.paths.client.display()
         );
     }
 }
@@ -122,7 +123,7 @@ fn list(ctx: &Ctx, home: &Path) -> Result<()> {
     if config.binaries.is_empty() && config.data.is_empty() {
         note!(
             "nothing is injected by {} (`ldg inject add binary NAME` adds a program)",
-            ctx.config_path.display()
+            ctx.paths.config.display()
         );
         return Ok(());
     }

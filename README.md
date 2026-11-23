@@ -81,7 +81,8 @@ make install                                         # in a clone; PREFIX=~/.loc
 ## Quickstart
 
 ```sh
-ldg init          # write ~/.config/lodge/config.toml, with the tools found here filled in
+ldg init          # write ~/.config/lodge/config.toml (what is injected, with the tools found here
+                  # filled in) and client.toml (this machine's own: target, secrets, keys)
 $EDITOR ~/.config/lodge/config.toml   # uncomment the tools you want
 ldg doctor        # check the host and the config
 cd my-project     # a project with a .devcontainer
@@ -110,7 +111,7 @@ for where to put them). Man page: `ldg man | man -l -`.
 
 | Command | What it does |
 | --- | --- |
-| `ldg` | Pick up where you left off: lists the projects and containers you opened a session in, most recent first (with the target and `--remote` host each was reached through), and opens the one you choose the same way as before. Move with the arrow keys or `j`/`k` (`g`/`G` or Home/End for the ends, a digit to jump, Enter to open, `q` or Esc to leave). The list fits the width of the terminal (and follows a resize); `NO_COLOR` turns its colour off. The keys can be changed under [`[keys]`](docs/configuration.md#keys). `--remote` and `--target` narrow the list. |
+| `ldg` | Pick up where you left off: lists the projects and containers you opened a session in, most recent first (with the target and `--remote` host each was reached through), and opens the one you choose the same way as before. Move with the arrow keys or `j`/`k` (`g`/`G` or Home/End for the ends, a digit to jump, Enter to open, `q` or Esc to leave). The list fits the width of the terminal (and follows a resize); `NO_COLOR` turns its colour off. The keys can be changed under [`[keys]`](docs/configuration.md#keys) in `client.toml`. `--remote` and `--target` narrow the list. |
 | `ldg up [PATH]` | Start the project's devcontainer and open a shell. The environment is injected when the container is created (or with `--reinject`). `--build` rebuilds and recreates; `--no-attach` sets up without a shell. |
 | `ldg attach CONTAINER` | Inject into a running container that something else made (a `docker run`, a compose service) and open a shell. Nothing is created or started; what is already in it is left alone. `ldg clean --container CONTAINER` takes lodge out again. |
 | `ldg down [PATH]` | Stop the project's container (resume later with `ldg up`). |
@@ -120,7 +121,7 @@ for where to put them). Man page: `ldg man | man -l -`.
 | `ldg ports [PATH]` | The ports forwarded to this machine for the project's container. |
 | `ldg logs [PATH]` | The port-forwarding log (`-f` to follow). |
 | `ldg clean [PATH]` | Remove what lodge injected from the container (data is kept and listed), and stop its port forwarding. `--container NAME` for one that `ldg attach` worked in. |
-| `ldg init` | Write a starting config (`--print` to see it first). |
+| `ldg init` | Write a starting `config.toml` and `client.toml` (`--print` to see the config first, `--print --client` the client file). |
 | `ldg doctor [PATH]` | Check the host, the config, and what the project's devcontainer needs. |
 | `ldg inject [ls]`, `add binary\|data …`, `rm binary\|data …` | List, add or remove the `[[binary]]` and `[[data]]` entries of your config without opening it (comments are kept). A program is added with what sits beside it. |
 | `ldg pack [-o FILE\|oci://REF]` | Pack your tools and their data into a portable bundle: a file (`lodge-<arch>.tar`), or published to a registry. |
@@ -133,8 +134,8 @@ for where to put them). Man page: `ldg man | man -l -`.
 
 Global flags, on every command: `-r/--remote HOST` runs against an engine on
 another machine over SSH, `--target docker` picks the container engine (also
-`target = "docker"` in the config; `docker`, `podman`, `kubernetes` for a running pod, or `host` for no container at all, docker by default), `-c/--config FILE` uses another config
-file, and `-v/--verbose` prints
+`target = "docker"` in `client.toml`; `docker`, `podman`, `kubernetes` for a running pod, or `host` for no container at all, docker by default), `-c/--config FILE` uses another config
+file (and the `client.toml` beside it), and `-v/--verbose` prints
 every docker/ssh command lodge runs (`-vv`, `-vvv` add ssh's own debug output).
 `status`, `ls`, `ports` and `doctor` take `--json`.
 
@@ -153,8 +154,8 @@ On the host:
 
 ## Documentation
 
-- [Configuration](docs/configuration.md): `config.toml`, every field, and the
-  JSON schema for editor completion.
+- [Configuration](docs/configuration.md): `config.toml` and `client.toml`, every
+  field, and the JSON schemas for editor completion.
 - [Devcontainers](docs/devcontainers.md): which parts of the spec lodge runs,
   features, lifecycle hooks, change detection, port forwarding.
 - [Remote containers](docs/remote.md): `--remote` over SSH.

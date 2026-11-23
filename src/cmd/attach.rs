@@ -9,6 +9,7 @@ use super::prompt::Choose;
 use super::table::{Cell, Table, Tone};
 use crate::bundle::choice;
 use crate::config::Config;
+use crate::config::client::Client;
 use crate::history::Place;
 use crate::layout::Layout;
 use crate::output::{note, warning};
@@ -31,24 +32,25 @@ pub fn up(
 ) -> Result<()> {
     let project = ctx.project(path)?;
     let config = ctx.config()?;
+    let settings = ctx.client()?;
     let place = Place::Project {
         path: project.clone(),
     };
     // Which bundle comes first, and is readied before anything starts, so a
     // problem with it fails before a container is made.
-    let bundle = choose_bundle(ctx, &config, bundle, &place, reinject)?;
+    let bundle = choose_bundle(ctx, &settings, bundle, &place, reinject)?
+        .or_else(|| settings.bundle.clone());
     let prepared = bundle::source::prepare(&config, bundle.as_deref(), &ctx.bundles, &ctx.tools)?;
     // How an endpoint is made, or found, is the endpoints' business; which
     // endpoints is chosen once, in `cmd::run`.
     let attached = ctx.endpoints.provision(&project, build)?;
-    let used = bundle.or_else(|| config.bundle.clone());
     attach(
         ctx,
         &attached,
-        &config,
+        (&config, &settings),
         &Injection {
             prepared: &prepared,
-            used: used.as_deref(),
+            used: bundle.as_deref(),
             reinject,
             no_attach,
         },
@@ -72,7 +74,7 @@ fn describe(id: &str, source: Option<&str>) -> String {
 /// declining, is the default.
 fn choose_bundle(
     ctx: &Ctx,
-    config: &Config,
+    settings: &Client,
     explicit: Option<&str>,
     place: &Place,
     reinject: bool,
@@ -80,8 +82,8 @@ fn choose_bundle(
     if explicit.is_some() {
         return Ok(explicit.map(str::to_string));
     }
-    let default = choice::default(config);
-    let offered = choice::options(&default, &config.bundles);
+    let default = choice::default(settings);
+    let offered = choice::options(&default, &settings.bundles);
     if offered.len() < 2 || !(reinject || !ctx.knows(place)) || !ctx.choose.can_ask() {
         return Ok(None);
     }
@@ -106,6 +108,7 @@ pub fn attach_to(
     bundle: Option<&str>,
 ) -> Result<()> {
     let config = ctx.config()?;
+    let settings = ctx.client()?;
     let container = ctx.existing_container(name)?;
     if !container.is_running()? {
         anyhow::bail!(
@@ -117,7 +120,8 @@ pub fn attach_to(
         name: name.to_string(),
         workdir: workdir.clone(),
     };
-    let bundle = choose_bundle(ctx, &config, bundle, &place, reinject)?;
+    let bundle = choose_bundle(ctx, &settings, bundle, &place, reinject)?
+        .or_else(|| settings.bundle.clone());
     let prepared = bundle::source::prepare(&config, bundle.as_deref(), &ctx.bundles, &ctx.tools)?;
     let workdir = match workdir {
         Some(dir) => dir,
@@ -134,14 +138,13 @@ pub fn attach_to(
         remote_user: None,
         post_attach: None,
     };
-    let used = bundle.or_else(|| config.bundle.clone());
     attach(
         ctx,
         &attached,
-        &config,
+        (&config, &settings),
         &Injection {
             prepared: &prepared,
-            used: used.as_deref(),
+            used: bundle.as_deref(),
             reinject,
             no_attach,
         },
@@ -166,7 +169,7 @@ struct Injection<'a> {
 fn attach(
     ctx: &Ctx,
     attached: &Attached,
-    config: &Config,
+    (config, settings): (&Config, &Client),
     injection: &Injection,
     place: Place,
 ) -> Result<()> {
@@ -227,7 +230,7 @@ fn attach(
         container,
         ctx.host.as_ref(),
         &user,
-        &config.secret,
+        &settings.secret,
         ctx.local.as_ref(),
     )?;
     let result = session::enter(
@@ -416,7 +419,10 @@ mod tests {
                 target: "docker".into(),
                 remote: None,
             },
-            config_path: dir.path().join("config.toml"),
+            paths: crate::config::Paths::beside(
+                dir.path().join("config.toml"),
+                crate::files::disk(),
+            ),
         };
         let attached = Attached {
             container: rt.container("c1"),
@@ -433,7 +439,7 @@ mod tests {
         attach(
             &ctx,
             &attached,
-            &Config::default(),
+            (&Config::default(), &Client::default()),
             &Injection {
                 prepared: &prepared,
                 used: None,
@@ -485,7 +491,10 @@ mod tests {
                 target: "docker".into(),
                 remote: None,
             },
-            config_path: dir.path().join("config.toml"),
+            paths: crate::config::Paths::beside(
+                dir.path().join("config.toml"),
+                crate::files::disk(),
+            ),
         }
     }
 
@@ -639,11 +648,11 @@ mod tests {
         ctx
     }
 
-    fn offering(default: Option<&str>, others: &[&str]) -> Config {
-        Config {
+    fn offering(default: Option<&str>, others: &[&str]) -> Client {
+        Client {
             bundle: default.map(Into::into),
             bundles: others.iter().map(|o| o.to_string()).collect(),
-            ..Config::default()
+            ..Client::default()
         }
     }
 

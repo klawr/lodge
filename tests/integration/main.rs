@@ -793,7 +793,7 @@ const FILE_SECRET: &str = "f1le-VALUE-77c1";
 fn secrets_config(sb: &Sandbox) {
     let host_file = sb.root().join("gh-token");
     std::fs::write(&host_file, format!("{FILE_SECRET}\n")).unwrap();
-    sb.config(&format!(
+    sb.client(&format!(
         r#"
 [[secret]]
 name = "API_KEY"
@@ -956,7 +956,7 @@ fn secrets_reach_the_session_and_never_the_image_the_trace_or_the_disk() {
 #[ignore = "needs docker"]
 fn a_secret_that_cannot_be_resolved_warns_and_the_session_still_opens() {
     let sb = Sandbox::new();
-    sb.config(
+    sb.client(
         r#"
 [[secret]]
 name = "MISSING"
@@ -998,7 +998,7 @@ fn running(p: &Project, cmd: &str) -> String {
 #[ignore = "needs docker"]
 fn a_new_attach_ends_the_session_in_the_container_and_asks_before_ending_another_clients() {
     let sb = Sandbox::new();
-    sb.config(
+    sb.client(
         r#"
 [[secret]]
 name = "TK"
@@ -1125,9 +1125,12 @@ fn secrets_are_added_on_the_machine_that_uses_a_tarred_bundle() {
     // The packing machine declares a secret too; it must stay out of the bundle.
     let script = script_tool_config(&sb, "hello", "#!/bin/sh\necho tool-ran-from-bundle\n");
     sb.config(&format!(
-        "[[binary]]\nname = \"hello\"\npath = \"{}\"\ncopy_deps = false\n\n[[secret]]\nname = \"API_KEY\"\nfrom = {{ env = \"LODGE_IT_API_KEY\" }}\nas = \"env\"\n",
+        "[[binary]]\nname = \"hello\"\npath = \"{}\"\ncopy_deps = false\n",
         script.display()
     ));
+    sb.client(
+        "[[secret]]\nname = \"API_KEY\"\nfrom = { env = \"LODGE_IT_API_KEY\" }\nas = \"env\"\n",
+    );
     let bundle = sb.root().join("b.tar");
     assert!(sb.run(&["pack", "-o", &bundle.to_string_lossy()]).ok);
     let tar = std::process::Command::new("tar")
@@ -1146,8 +1149,9 @@ fn secrets_are_added_on_the_machine_that_uses_a_tarred_bundle() {
     std::fs::create_dir_all(&deploy).unwrap();
     std::fs::copy(&bundle, deploy.join("bundle.tar")).unwrap();
     let deploy_config = deploy.join("config.toml");
+    std::fs::write(&deploy_config, "").unwrap();
     std::fs::write(
-        &deploy_config,
+        deploy.join("client.toml"),
         "bundle = \"bundle.tar\"\n\n\
          [[secret]]\nname = \"API_KEY\"\nfrom = { env = \"LODGE_IT_API_KEY\" }\nas = \"env\"\n",
     )
@@ -1927,9 +1931,9 @@ fn a_pod_is_injected_entered_and_its_ports_forwarded_through_kubectl() {
     let pod = Pod::greeting_on(port);
     let home = sb.root().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    sb.config(&format!(
-        "[[binary]]\nname = \"hostsh\"\npath = \"/bin/sh\"\n\
-         [targets.kubernetes]\npod = \"{}\"\ncontext = \"test\"\nnamespace = \"work\"\n\
+    sb.config("[[binary]]\nname = \"hostsh\"\npath = \"/bin/sh\"\n");
+    sb.client(&format!(
+        "[targets.kubernetes]\npod = \"{}\"\ncontext = \"test\"\nnamespace = \"work\"\n\
          workdir = \"/tmp\"\n",
         pod.0
     ));
@@ -1964,9 +1968,8 @@ fn a_pod_is_injected_entered_and_its_ports_forwarded_through_kubectl() {
 
     // The same pod, found by a label instead of its name, is the same pod: nothing
     // is injected again, and the lookup asked for running pods with that label.
-    sb.config(&format!(
-        "[[binary]]\nname = \"hostsh\"\npath = \"/bin/sh\"\n\
-         [targets.kubernetes]\nselector = \"app={}\"\ncontext = \"test\"\nnamespace = \"work\"\n\
+    sb.client(&format!(
+        "[targets.kubernetes]\nselector = \"app={}\"\ncontext = \"test\"\nnamespace = \"work\"\n\
          workdir = \"/tmp\"\n",
         pod.0
     ));
@@ -1982,9 +1985,9 @@ fn a_pod_is_injected_entered_and_its_ports_forwarded_through_kubectl() {
         "{}",
         sb.kubectl_calls()
     );
-    sb.config(&format!(
-        "[[binary]]\nname = \"hostsh\"\npath = \"/bin/sh\"\n\
-         [targets.kubernetes]\npod = \"{}\"\ncontext = \"test\"\nnamespace = \"work\"\n\
+    sb.config("[[binary]]\nname = \"hostsh\"\npath = \"/bin/sh\"\n");
+    sb.client(&format!(
+        "[targets.kubernetes]\npod = \"{}\"\ncontext = \"test\"\nnamespace = \"work\"\n\
          workdir = \"/tmp\"\n",
         pod.0
     ));
@@ -2102,11 +2105,11 @@ fn a_container_lodge_did_not_make_is_attached_to_left_alone_and_cleaned() {
 fn a_pod_that_is_not_there_is_refused_before_anything_is_changed() {
     let mut sb = Sandbox::new();
     sb.use_fake_kubectl();
-    sb.config("[targets.kubernetes]\npod = \"no-such-pod\"\n");
+    sb.client("[targets.kubernetes]\npod = \"no-such-pod\"\n");
     let up = sb.run(&["--target", "kubernetes", "up", "--no-attach"]);
     assert!(!up.ok && up.has("no pod (no-such-pod)"), "{}", up.tail(10));
     // And a config without a pod says what to set.
-    sb.config("");
+    sb.client("");
     let up = sb.run(&["--target", "kubernetes", "up", "--no-attach"]);
     assert!(!up.ok && up.has("set `pod`"), "{}", up.tail(10));
 }

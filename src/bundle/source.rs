@@ -73,8 +73,7 @@ pub(crate) fn prepare_in(
     stores: &Stores,
     tools: &Toolchain,
 ) -> Result<Prepared> {
-    let explicit = reference.or(config.bundle.as_deref());
-    let prepared = match explicit {
+    let prepared = match reference {
         Some(reference) => {
             if !config.binaries.is_empty() || !config.data.is_empty() {
                 warning!(
@@ -775,13 +774,11 @@ mod tests {
     }
 
     #[test]
-    fn the_config_names_a_bundle_too_and_an_unknown_scheme_is_refused() {
+    fn an_unknown_scheme_is_refused() {
         let cache = TempDir::new("cache-s3").unwrap();
-        let cfg = Config {
-            bundle: Some("ftp://host/b.tar".into()),
-            ..Config::default()
-        };
-        let err = prepare_in(cache.path(), &cfg, None, &files(), &tools::external())
+        let cfg = Config::default();
+        let reference = Some("ftp://host/b.tar");
+        let err = prepare_in(cache.path(), &cfg, reference, &files(), &tools::external())
             .err()
             .unwrap();
         assert!(format!("{err:#}").contains("a file path"), "{err:#}");

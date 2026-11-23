@@ -70,15 +70,15 @@ fn remove(store: &dyn CredentialStore, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Lists the store entries the config's secrets read from, and whether each is
+/// Lists the store entries the client file's secrets read from, and whether each is
 /// set. (The OS stores cannot be listed, so an entry no `[[secret]]` names is not
 /// shown here; `ldg secret rm NAME` still removes it.)
 fn ls(ctx: &Ctx) -> Result<()> {
-    let config = ctx.config()?;
+    let settings = ctx.client()?;
     let store = ctx.local.store();
     let mut rows = Vec::new();
     let mut failure = None;
-    for decl in &config.secret {
+    for decl in &settings.secret {
         let Source::Store(entry) = &decl.from else {
             continue;
         };

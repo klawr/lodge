@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::{Ctx, print_json};
-use crate::config::Config;
+use crate::config::client::Client;
 use crate::output::{info, line, note, warning};
 use crate::provision::{ConfigState, Endpoints, Found, Lifecycle};
 use crate::runtime::ContainerUser;
@@ -52,8 +52,8 @@ pub fn rm(ctx: &Ctx, path: Option<PathBuf>) -> Result<()> {
 
 pub fn status(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<()> {
     let project = ctx.project(path)?;
-    let config = ctx.config()?;
-    let report = StatusReport::gather(&project, ctx.endpoints.as_ref(), &config)?;
+    let settings = ctx.client()?;
+    let report = StatusReport::gather(&project, ctx.endpoints.as_ref(), &settings)?;
     if as_json {
         return print_json(&report.to_json());
     }
@@ -91,7 +91,7 @@ struct ContainerStatus {
 }
 
 impl StatusReport {
-    fn gather(project: &Path, endpoints: &dyn Endpoints, config: &Config) -> Result<Self> {
+    fn gather(project: &Path, endpoints: &dyn Endpoints, settings: &Client) -> Result<Self> {
         let Some(status) = endpoints.status(project)? else {
             return Ok(Self {
                 project: project.to_path_buf(),
@@ -124,16 +124,16 @@ impl StatusReport {
             }
         };
         // Secrets live in memory, so a stopped container has none.
-        let secrets = if !running || config.secret.is_empty() {
+        let secrets = if !running || settings.secret.is_empty() {
             Some(
-                config
+                settings
                     .secret
                     .iter()
                     .map(|d| (d.name.clone(), false))
                     .collect(),
             )
         } else {
-            user.and_then(|user| crate::secret::place::status(c, &user, &config.secret))
+            user.and_then(|user| crate::secret::place::status(c, &user, &settings.secret))
                 .map_err(|e| warning!("could not tell which secrets are placed: {e:#}"))
                 .ok()
         };
@@ -395,7 +395,7 @@ mod tests {
         let dir = project();
         let rt = engine(FakeEnv::new);
         let r =
-            StatusReport::gather(dir.path(), &endpoints(&dir, &rt), &Config::default()).unwrap();
+            StatusReport::gather(dir.path(), &endpoints(&dir, &rt), &Client::default()).unwrap();
         assert_eq!(r.lines()[1], "container  none (run `ldg up` to create it)");
         assert_eq!(r.to_json()["container"], serde_json::Value::Null);
     }
@@ -407,8 +407,8 @@ mod tests {
             .container
     }
 
-    fn one_secret() -> Config {
-        Config::parse(
+    fn one_secret() -> Client {
+        Client::parse(
             "[[secret]]\nname = \"T\"\nfrom = { env = \"X\" }\nas = \"env\"\n",
             Path::new("/c.toml"),
         )

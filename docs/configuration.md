@@ -1,23 +1,36 @@
 # Configuration
 
-lodge reads `~/.config/lodge/config.toml`, or the file given with the global
-`-c FILE` (which must exist). Without a config nothing is injected, and you
-still get a shell. `ldg init` writes a commented starting point, with the tools
-it finds on your `PATH` filled in.
+lodge reads two files, both in `~/.config/lodge/`, and neither has to exist:
 
-The config is checked as a whole before anything starts: an unknown key (with a
-suggestion for a likely typo), a duplicate name, a target path that is neither absolute nor under `~/`, and a malformed
-secret are all reported together. `ldg doctor` shows the
-same report.
+| file | holds | travels with a bundle |
+| --- | --- | --- |
+| `config.toml` | what is injected and how a session opens: [`[[binary]]`](#binary), [`[[data]]`](#data), [`[session]`](#session), [`[git]`](#git) | yes: `ldg pack` makes a bundle from it |
+| `client.toml` | what is this machine's and this person's own: [`target`](#target), [`bundle`](#bundle) and `bundles`, [`[[secret]]`](#secret), [`[keys]`](#keys) | never |
 
-**Editor completion.** A JSON schema describes the file:
-[`config.schema.json`](config.schema.json). Configs written by `ldg init` start
-with a `#:schema` line that taplo / Even Better TOML pick up; add it by hand to
-an older one:
+The line between them is whether a setting describes what is injected or depends on
+where lodge runs and who runs it. Nothing in `client.toml` can reach a bundle, because
+a bundle is made from `config.toml` alone. `-c FILE` replaces `config.toml` (the file
+must exist); `client.toml` is the one in the same folder as the config in use, so a
+folder with both is a complete setup (`ldg -c deploy/config.toml …`). Without a
+config nothing is injected, and you still get a shell. `ldg init` writes a commented
+starting point for each, with the tools it finds on your `PATH` filled in; an existing
+`client.toml` is left as it is, even with `--force`.
+
+Each file is checked as a whole before anything starts: an unknown key (with a
+suggestion for a likely typo), a duplicate name, a target
+path that is neither absolute nor under `~/`, and a malformed secret are all reported
+together. `ldg doctor` shows the same report for both.
+
+**Editor completion.** A JSON schema describes each file:
+[`config.schema.json`](config.schema.json) and
+[`client.schema.json`](client.schema.json). Files written by `ldg init` start with a
+`#:schema` line that taplo / Even Better TOML pick up; add it by hand to a file that lacks it:
 
 ```toml
 #:schema https://raw.githubusercontent.com/klawr/lodge/master/docs/config.schema.json
 ```
+
+(and `client.schema.json` for `client.toml`).
 
 ## Example
 
@@ -105,10 +118,11 @@ where the container user's shell reads it.
 
 ## Editing the config
 
-Run `ldg` alone and press `c` for the config screen: the whole file as the form it
-is in the TOML, with every value a line you can move to (↑/↓ or j/k): `target` and
-`bundle`, `[session]` and `[git]`, then each `[[binary]]`, `[[data]]` and
-`[[secret]]` with all of its fields under it, the ones that are not set shown as
+Run `ldg` alone and press `c` for the config screen: both files as the form they
+are in the TOML, with every value a line you can move to (↑/↓ or j/k). First the
+client's, under a line that says so: `target` and `bundle`, then each `[[secret]]`;
+then the config's: `[session]` and `[git]`, then each `[[binary]]` and `[[data]]`,
+each with all of its fields under it, the ones that are not set shown as
 such (`target = (the same place as here)`). Enter changes the selected one: `path`
 opens the list of what this machine has, the rest is typed or chosen from a short
 list (`for`, `target`, how a secret is read and placed), `copy_deps` is turned over.
@@ -139,9 +153,10 @@ config already is in the list too, marked from the start; a path typed in full (
 `~/…`) is offered as it is, and goes where it is on this machine. Credentials and
 state (`~/.ssh`, `~/.config/gh`, caches) are never listed.
 
-A config that does not load (after an upgrade that renamed a table, say) is still
-shown, with why on top, and what this version of lodge does not know (a table it
-dropped, a misspelled key) grouped at the end as lines of their own. `x` removes
+A file that does not load (a misspelled key, say, or one that belongs in the other
+file) is still shown, with why on top, and what this version of lodge does not know (a table it
+dropped, a misspelled key, a setting written into the wrong file) grouped at the end
+as lines of their own (those of `client.toml` say so). `x` removes
 one, and the rest of the file, its comments included, stays as it was. Any other
 change is kept while it leaves the file with fewer problems than it had, so a config
 with several can be mended one at a time; one that would add a problem is refused, as
@@ -167,7 +182,7 @@ used until you pack again or drop that line.
 
 ## `[keys]`
 
-The keys of the interactive screens (the places `ldg` lists, the config screen, the
+In `client.toml`. The keys of the interactive screens (the places `ldg` lists, the config screen, the
 searches) are the same everywhere, and are yours to change. Each action has the keys
 below; naming one under `[keys]` gives it exactly the keys you list (a list replaces
 the defaults, a single string is one key, `[]` unbinds), and what you leave out keeps
@@ -190,11 +205,11 @@ Ctrl or Alt combinations act; a plain character given to such an action is not u
 there.
 
 Each key does one thing: two actions on the same key (in a list, or in a search)
-are reported with the rest of the problems in the config, as is a key that does not
+are reported with the rest of the problems in `client.toml`, as is a key that does not
 parse, an action that does not exist, and an empty `choose` or `leave`, which would
-leave no way out of a list. The keys are read from the file on this machine and are
+leave no way out of a list. The keys are read from `client.toml` on this machine and are
 never part of a bundle, so they work the same without any config of injected
-programs: a file with only `[keys]` in it is enough.
+programs: a `client.toml` with only `[keys]` in it is enough.
 
 | action | default keys | |
 | --- | --- | --- |
@@ -281,7 +296,7 @@ This is covered by an integration test, so it keeps working.
 
 ## `target`
 
-A top-level `target = "docker"` says where lodge works: a devcontainer on `docker` or
+In `client.toml`. A top-level `target = "docker"` says where lodge works: a devcontainer on `docker` or
 `podman`, a running pod (`kubernetes`), or `host` for the machine itself (see below). `--target` on the command line
 overrides it, and without either it is `docker`. It is on the machine `--remote`
 names, or on this one. A value that is not a target is an error.
@@ -415,9 +430,8 @@ session. A pod is someone's workload, so, as for `host`:
 
 ## `bundle`
 
-A top-level `bundle = "path/to/lodge.tar"` injects from that bundle instead of
-packing the `[[binary]]` and `[[data]]` entries. A relative path is relative to the config
-file's folder. A reference with a scheme is not a path: `bundle =
+In `client.toml`. A top-level `bundle = "path/to/lodge.tar"` injects from that bundle instead of
+packing the `[[binary]]` and `[[data]]` entries. A relative path is relative to that file's folder. A reference with a scheme is not a path: `bundle =
 "oci://ghcr.io/me/lodge:1"` reads the bundle from a registry. `--bundle` on the
 command line (a file or such a reference) overrides it. See
 [Bundles and secrets](bundles-and-secrets.md).
@@ -431,7 +445,7 @@ before. `ldg bundle use|add|rm|ls` change both keys without opening the file, an
 
 ## `[[secret]]`
 
-Values (API keys, tokens, credential files) delivered when you attach, and
+In `client.toml`. Values (API keys, tokens, credential files) delivered when you attach, and
 never stored in a bundle. A value comes from an environment variable, a file, a
 command or this machine's credential store (`ldg secret set`), and appears in the
 session as a variable or a file. See [Bundles and secrets](bundles-and-secrets.md#secrets)

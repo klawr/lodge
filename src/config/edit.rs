@@ -1,5 +1,9 @@
-//! Changing the `[[binary]]` and `[[data]]` entries of the config file from the
-//! command line and the config screen.
+//! Changing the `[[binary]]` and `[[data]]` entries of the config file, and the
+//! settings and `[[secret]]` entries of the client file, from the command line
+//! and the config screen. A function works on the file it is given and checks it
+//! as the kind of file it is: the functions for entries take a [`ConfigFile`], those
+//! for secrets and bundles a [`ClientFile`], and one for a setting the [`Paths`] and
+//! finds the file the setting belongs in.
 //!
 //! The file is edited as text (comments, order and layout stay as the person
 //! wrote them), and what would be written is parsed and checked as a whole
@@ -7,11 +11,10 @@
 //! refuses to load.
 
 use anyhow::{Context, Result, bail};
-use std::path::Path;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value, value};
 
-use super::Config;
 use super::unknown::{self, Unknown};
+use super::{ClientFile, ConfigFile, Document, Paths};
 
 /// The two kinds of entry, each a table of its own name in the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,7 +160,7 @@ impl RawEntry {
 }
 
 /// Adds an entry to the config at `path` (created when missing).
-pub fn add(path: &Path, entry: &NewEntry) -> Result<()> {
+pub fn add(path: &ConfigFile, entry: &NewEntry) -> Result<()> {
     let mut doc = read(path)?;
     let kind = entry.kind();
     let key = kind.key();
@@ -211,7 +214,7 @@ pub fn add(path: &Path, entry: &NewEntry) -> Result<()> {
 
 /// Removes the entry of `kind` known as `key` (see [`RawEntry::key`]). Data that
 /// was for a removed binary stays, no longer for anything.
-pub fn remove(path: &Path, kind: Kind, key: &str) -> Result<()> {
+pub fn remove(path: &ConfigFile, kind: Kind, key: &str) -> Result<()> {
     let mut doc = read(path)?;
     let missing = || format!("no [[{}]] `{key}` in {}", kind.key(), path.display());
     let Some(list) = doc
@@ -235,7 +238,7 @@ pub fn remove(path: &Path, kind: Kind, key: &str) -> Result<()> {
 
 /// The entries of the config at `path` of `kind`, as written (none when it is
 /// missing).
-pub fn list(path: &Path, kind: Kind) -> Result<Vec<RawEntry>> {
+pub fn list(path: &ConfigFile, kind: Kind) -> Result<Vec<RawEntry>> {
     let doc = read(path)?;
     let text = |t: &Table, key: &str| t.get(key).and_then(Item::as_str).map(String::from);
     Ok(entries(&doc, kind)
@@ -252,23 +255,34 @@ pub fn list(path: &Path, kind: Kind) -> Result<Vec<RawEntry>> {
 
 /// What the config at `path` holds that this version of lodge does not know (none
 /// when it is missing).
-pub fn unknown(path: &Path) -> Result<Vec<Unknown>> {
-    Ok(unknown::find(&read_text(path)?))
+pub fn unknown(file: &dyn Document) -> Result<Vec<Unknown>> {
+    Ok(unknown::find(&text(file)?, file))
 }
 
 /// Takes `which` out of the config at `path`. It is the one edit that needs no
 /// valid config as its result: what it takes out is what keeps one from loading.
-pub fn remove_unknown(path: &Path, which: &Unknown) -> Result<()> {
-    let text = unknown::remove(&read_text(path)?, which)
-        .with_context(|| format!("`{}` is no longer in {}", which.label, path.display()))?;
-    store(path, &text)
+pub fn remove_unknown(file: &dyn Document, which: &Unknown) -> Result<()> {
+    let changed = unknown::remove(&text(file)?, which, file).with_context(|| {
+        format!(
+            "`{}` is no longer in {}",
+            which.label,
+            file.path().display()
+        )
+    })?;
+    file.write_text(&changed)
 }
 
 /// Sets a text field of the entry of `kind` known as `key`, or takes it out with
 /// `None` (`copy_deps` is not text: see [`set_copy_deps`]). The result is checked as
 /// a whole, so a name in use or a target the container can't use is refused. The
 /// data that is for a binary follows it when the binary is renamed.
-pub fn set_field(path: &Path, kind: Kind, key: &str, field: Field, to: Option<&str>) -> Result<()> {
+pub fn set_field(
+    path: &ConfigFile,
+    kind: Kind,
+    key: &str,
+    field: Field,
+    to: Option<&str>,
+) -> Result<()> {
     if !kind.fields().contains(&field) {
         bail!("a [[{}]] has no `{}`", kind.key(), field.key());
     }
@@ -296,7 +310,7 @@ pub fn set_field(path: &Path, kind: Kind, key: &str, field: Field, to: Option<&s
 
 /// Sets `copy_deps` of the binary called `name`; `true` is the default, so it is
 /// taken out of the file instead of written.
-pub fn set_copy_deps(path: &Path, name: &str, on: bool) -> Result<()> {
+pub fn set_copy_deps(path: &ConfigFile, name: &str, on: bool) -> Result<()> {
     let mut doc = read(path)?;
     change_in(&mut doc, path, Kind::Binary, name, |t| {
         if on {
@@ -310,7 +324,7 @@ pub fn set_copy_deps(path: &Path, name: &str, on: bool) -> Result<()> {
 
 fn change_in(
     doc: &mut DocumentMut,
-    path: &Path,
+    path: &ConfigFile,
     kind: Kind,
     key: &str,
     edit: impl FnOnce(&mut Table),
@@ -378,10 +392,19 @@ impl Setting {
     }
 }
 
+/// The file a setting belongs in: the client's own for `target` and `bundle`, the
+/// config's for the rest. The one place that knows.
+fn home(paths: &Paths, which: Setting) -> &dyn Document {
+    match which {
+        Setting::Target | Setting::Bundle => &paths.client,
+        Setting::Shell | Setting::SafeDirs => &paths.config,
+    }
+}
+
 /// A setting as it is written in the file (a quoted string, or a list like `["*"]`), none when it is
 /// not there.
-pub fn setting(path: &Path, which: Setting) -> Result<Option<String>> {
-    let doc = read(path)?;
+pub fn setting(paths: &Paths, which: Setting) -> Result<Option<String>> {
+    let doc = read(home(paths, which))?;
     let table = match which.section() {
         None => Some(doc.as_table()),
         Some(name) => doc.get(name).and_then(Item::as_table),
@@ -394,8 +417,9 @@ pub fn setting(path: &Path, which: Setting) -> Result<Option<String>> {
 /// Sets a setting, or takes it out (back to its default) with `None`.
 /// `safe_directories` is a list: the text is split at commas, and `none` is an
 /// empty list, which switches the setting off.
-pub fn set_setting(path: &Path, which: Setting, to: Option<&str>) -> Result<()> {
-    let mut doc = read(path)?;
+pub fn set_setting(paths: &Paths, which: Setting, to: Option<&str>) -> Result<()> {
+    let file = home(paths, which);
+    let mut doc = read(file)?;
     if which.section().is_some_and(|s| doc.get(s).is_none()) && to.is_some() {
         doc[which.section().unwrap_or_default()] = Item::Table(Table::new());
     }
@@ -429,11 +453,11 @@ pub fn set_setting(path: &Path, which: Setting, to: Option<&str>) -> Result<()> 
             doc.remove(name);
         }
     }
-    write(path, &doc)
+    write(file, &doc)
 }
 
 /// The bundles listed under `bundles`, as written.
-pub fn bundles(path: &Path) -> Result<Vec<String>> {
+pub fn bundles(path: &ClientFile) -> Result<Vec<String>> {
     let doc = read(path)?;
     Ok(doc
         .get("bundles")
@@ -447,7 +471,7 @@ pub fn bundles(path: &Path) -> Result<Vec<String>> {
 }
 
 /// Adds `reference` to `bundles`. `false` when it was listed already.
-pub fn add_bundle(path: &Path, reference: &str) -> Result<bool> {
+pub fn add_bundle(path: &ClientFile, reference: &str) -> Result<bool> {
     let mut list = bundles(path)?;
     if list.iter().any(|b| b == reference) {
         return Ok(false);
@@ -458,7 +482,7 @@ pub fn add_bundle(path: &Path, reference: &str) -> Result<bool> {
 }
 
 /// Takes `reference` out of `bundles`. `false` when it was not there.
-pub fn remove_bundle(path: &Path, reference: &str) -> Result<bool> {
+pub fn remove_bundle(path: &ClientFile, reference: &str) -> Result<bool> {
     let mut list = bundles(path)?;
     let before = list.len();
     list.retain(|b| b != reference);
@@ -470,7 +494,7 @@ pub fn remove_bundle(path: &Path, reference: &str) -> Result<bool> {
 }
 
 /// Writes the list, one reference to a line; no list is no key.
-pub fn set_bundles(path: &Path, list: &[String]) -> Result<()> {
+pub fn set_bundles(path: &ClientFile, list: &[String]) -> Result<()> {
     let mut doc = read(path)?;
     if list.is_empty() {
         doc.remove("bundles");
@@ -561,7 +585,7 @@ pub struct RawSecret {
     pub targets: Option<String>,
 }
 
-pub fn list_secrets(path: &Path) -> Result<Vec<RawSecret>> {
+pub fn list_secrets(path: &ClientFile) -> Result<Vec<RawSecret>> {
     let doc = read(path)?;
     let text = |t: &Table, key: &str| t.get(key).map(|i| i.to_string().trim().to_string());
     Ok(secrets(&doc)
@@ -578,7 +602,7 @@ pub fn list_secrets(path: &Path) -> Result<Vec<RawSecret>> {
         .collect())
 }
 
-pub fn add_secret(path: &Path, secret: &NewSecret) -> Result<()> {
+pub fn add_secret(path: &ClientFile, secret: &NewSecret) -> Result<()> {
     let mut doc = read(path)?;
     if secrets(&doc).any(|t| name_of(t) == Some(secret.name.as_str())) {
         bail!(
@@ -600,7 +624,7 @@ pub fn add_secret(path: &Path, secret: &NewSecret) -> Result<()> {
     write(path, &doc)
 }
 
-pub fn remove_secret(path: &Path, name: &str) -> Result<()> {
+pub fn remove_secret(path: &ClientFile, name: &str) -> Result<()> {
     let mut doc = read(path)?;
     let missing = || format!("no [[secret]] `{name}` in {}", path.display());
     let Some(list) = doc.get_mut("secret").and_then(Item::as_array_of_tables_mut) else {
@@ -616,20 +640,20 @@ pub fn remove_secret(path: &Path, name: &str) -> Result<()> {
     write(path, &doc)
 }
 
-pub fn rename_secret(path: &Path, name: &str, to: &str) -> Result<()> {
+pub fn rename_secret(path: &ClientFile, name: &str, to: &str) -> Result<()> {
     change_secret(path, name, |t| t["name"] = value(to))
 }
 
-pub fn set_secret_from(path: &Path, name: &str, from: &SecretFrom) -> Result<()> {
+pub fn set_secret_from(path: &ClientFile, name: &str, from: &SecretFrom) -> Result<()> {
     change_secret(path, name, |t| t["from"] = from.item())
 }
 
-pub fn set_secret_as(path: &Path, name: &str, as_: &SecretAs) -> Result<()> {
+pub fn set_secret_as(path: &ClientFile, name: &str, as_: &SecretAs) -> Result<()> {
     change_secret(path, name, |t| t["as"] = as_.item())
 }
 
 /// The hosts and container names a secret may go to; none means anywhere.
-pub fn set_secret_targets(path: &Path, name: &str, targets: &[String]) -> Result<()> {
+pub fn set_secret_targets(path: &ClientFile, name: &str, targets: &[String]) -> Result<()> {
     change_secret(path, name, |t| {
         if targets.is_empty() {
             t.remove("targets");
@@ -643,7 +667,7 @@ pub fn set_secret_targets(path: &Path, name: &str, targets: &[String]) -> Result
     })
 }
 
-fn change_secret(path: &Path, name: &str, edit: impl FnOnce(&mut Table)) -> Result<()> {
+fn change_secret(path: &ClientFile, name: &str, edit: impl FnOnce(&mut Table)) -> Result<()> {
     let mut doc = read(path)?;
     let table = doc
         .get_mut("secret")
@@ -677,63 +701,67 @@ fn identity_of(kind: Kind, table: &Table) -> Option<&str> {
     table.get(kind.identity().key()).and_then(Item::as_str)
 }
 
-fn read_text(path: &Path) -> Result<String> {
-    match std::fs::read_to_string(path) {
-        Ok(raw) => Ok(raw),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-    }
+/// What the file holds; nothing, when it is not there.
+fn text(file: &dyn Document) -> Result<String> {
+    Ok(file.read_text()?.unwrap_or_default())
 }
 
-fn read(path: &Path) -> Result<DocumentMut> {
-    read_text(path)?
+fn read(file: &dyn Document) -> Result<DocumentMut> {
+    text(file)?
         .parse()
-        .with_context(|| format!("{} is not valid TOML", path.display()))
+        .with_context(|| format!("{} is not valid TOML", file.path().display()))
 }
 
 /// Checks the edited text as a config, then replaces the file in one step. A file
 /// that is invalid already may be mended a step at a time: an edit that leaves it
 /// with fewer problems than it had is let through, though it is not yet valid.
-fn write(path: &Path, doc: &DocumentMut) -> Result<()> {
-    let text = doc.to_string();
-    if let Err(refused) = Config::parse(&text, path)
-        && !mends(path, &text)
+fn write(file: &dyn Document, doc: &DocumentMut) -> Result<()> {
+    let now = doc.to_string();
+    if let Err(refused) = file.check(&now)
+        && !mends(file, &now)
     {
         return Err(refused);
     }
-    store(path, &text)
+    file.write_text(&now)
 }
 
-/// Whether `text` has fewer problems than the file at `path` has now.
-fn mends(path: &Path, text: &str) -> bool {
-    let Ok(now) = read_text(path) else {
+/// Whether `edited` has fewer problems than the file has now.
+fn mends(file: &dyn Document, edited: &str) -> bool {
+    let Ok(now) = text(file) else {
         return false;
     };
-    let before = Config::problem_count(&now, path);
-    before > 0 && Config::problem_count(text, path) < before
-}
-
-fn store(path: &Path, text: &str) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    }
-    let mut staged = path.as_os_str().to_owned();
-    staged.push(".tmp");
-    let staged = std::path::PathBuf::from(staged);
-    std::fs::write(&staged, text).with_context(|| format!("writing {}", staged.display()))?;
-    std::fs::rename(&staged, path).with_context(|| format!("replacing {}", path.display()))
+    let before = file.problem_count(&now);
+    before > 0 && file.problem_count(edited) < before
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tmpfile::TempDir;
+    use crate::config::Config;
+    use crate::files::MemoryFiles;
+    use std::sync::Arc;
 
-    fn file(text: &str) -> (TempDir, std::path::PathBuf) {
-        let dir = TempDir::new("config-edit").unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, text).unwrap();
-        (dir, path)
+    /// A config holding `text`, kept in memory.
+    fn file(text: &str) -> (Arc<MemoryFiles>, ConfigFile) {
+        let files = MemoryFiles::new().with("/c/config.toml", text);
+        (
+            files.clone(),
+            ConfigFile::new("/c/config.toml", files.clone()),
+        )
+    }
+
+    /// A client file holding `text`, kept in memory: checked as one because it is one.
+    fn client_file(text: &str) -> (Arc<MemoryFiles>, ClientFile) {
+        let files = MemoryFiles::new().with("/c/client.toml", text);
+        (
+            files.clone(),
+            ClientFile::new("/c/client.toml", files.clone()),
+        )
+    }
+
+    /// What the file holds now.
+    fn read_back(file: &dyn Document) -> String {
+        file.read_text().unwrap().unwrap_or_default()
     }
 
     // TODO(windows): `/a.tar` is read back as `C:/a.tar` there; assert on a path
@@ -741,26 +769,27 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_bundle_is_listed_once_and_what_else_is_written_stays() {
-        let (_dir, path) = file("# mine\ntarget = \"docker\"\n\n[session]\nshell = \"/bin/zsh\"\n");
+        let (_dir, path) =
+            client_file("# mine\ntarget = \"docker\"\n\n[targets.docker]\ncontext = \"x\"\n");
         assert!(add_bundle(&path, "/a.tar").unwrap());
         assert!(add_bundle(&path, "oci://r/x:1").unwrap());
         assert!(!add_bundle(&path, "/a.tar").unwrap(), "listed already");
         assert_eq!(bundles(&path).unwrap(), ["/a.tar", "oci://r/x:1"]);
-        let now = std::fs::read_to_string(&path).unwrap();
+        let now = read_back(&path);
         assert!(now.starts_with("# mine\ntarget"), "{now}");
-        assert!(now.contains("[session]\nshell = \"/bin/zsh\""), "{now}");
-        // Still a config lodge loads, with the list before the first table.
-        let config = Config::load(&path).unwrap();
-        assert_eq!(config.bundles, ["/a.tar", "oci://r/x:1"]);
+        assert!(now.contains("[targets.docker]\ncontext = \"x\""), "{now}");
+        // Still a client file lodge loads, with the list before the first table.
+        let settings = path.load().unwrap();
+        assert_eq!(settings.bundles, ["/a.tar", "oci://r/x:1"]);
         assert!(
-            now.find("bundles").unwrap() < now.find("[session]").unwrap(),
+            now.find("bundles").unwrap() < now.find("[targets.docker]").unwrap(),
             "{now}"
         );
     }
 
     #[test]
     fn taking_the_last_bundle_off_the_list_takes_the_key_out() {
-        let (_dir, path) = file("bundles = [\"/a.tar\", \"/b.tar\"]\n");
+        let (_dir, path) = client_file("bundles = [\"/a.tar\", \"/b.tar\"]\n");
         assert!(remove_bundle(&path, "/a.tar").unwrap());
         assert!(
             !remove_bundle(&path, "/a.tar").unwrap(),
@@ -768,14 +797,13 @@ mod tests {
         );
         assert_eq!(bundles(&path).unwrap(), ["/b.tar"]);
         assert!(remove_bundle(&path, "/b.tar").unwrap());
-        let now = std::fs::read_to_string(&path).unwrap();
+        let now = read_back(&path);
         assert!(!now.contains("bundles"), "{now}");
     }
 
     #[test]
     fn listing_a_bundle_in_a_file_that_is_not_there_makes_it() {
-        let dir = TempDir::new("config-edit-new").unwrap();
-        let path = dir.path().join("lodge").join("config.toml");
+        let path = ClientFile::new("/c/lodge/client.toml", MemoryFiles::new());
         assert!(bundles(&path).unwrap().is_empty());
         add_bundle(&path, "/a.tar").unwrap();
         assert_eq!(bundles(&path).unwrap(), ["/a.tar"]);
@@ -783,7 +811,7 @@ mod tests {
 
     #[test]
     fn an_entry_is_added_and_everything_else_stays_as_written() {
-        let text = "# mine\ntarget = \"docker\"\n\n# the editor\n[[binary]]\nname = \"nvim\"\npath = \"/usr/bin/nvim\"\n\n[session]\nshell = \"/bin/zsh\"\n";
+        let text = "# mine\n[git]\nsafe_directories = [\"/w\"]\n\n# the editor\n[[binary]]\nname = \"nvim\"\npath = \"/usr/bin/nvim\"\n\n[session]\nshell = \"/bin/zsh\"\n";
         let (_dir, path) = file(text);
         add(&path, &NewEntry::binary("rg", "/usr/bin/rg".into())).unwrap();
         add(
@@ -791,8 +819,8 @@ mod tests {
             &NewEntry::data("~/.config/nvim".into(), None, Some("nvim".into())),
         )
         .unwrap();
-        let now = std::fs::read_to_string(&path).unwrap();
-        assert!(now.starts_with("# mine\ntarget"), "{now}");
+        let now = read_back(&path);
+        assert!(now.starts_with("# mine\n[git]"), "{now}");
         assert!(now.contains("# the editor\n[[binary]]"), "{now}");
         assert!(
             now.contains("name = \"rg\"\npath = \"/usr/bin/rg\""),
@@ -802,15 +830,14 @@ mod tests {
             now.contains("[[data]]\npath = \"~/.config/nvim\"\nfor = \"nvim\""),
             "{now}"
         );
-        let config = Config::load(&path).unwrap();
+        let config = path.load().unwrap();
         assert_eq!((config.binaries.len(), config.data.len()), (2, 1));
         assert_eq!(config.session.shell, "/bin/zsh");
     }
 
     #[test]
     fn a_missing_file_is_created_and_a_comments_only_file_keeps_its_comments_on_top() {
-        let dir = TempDir::new("config-edit-new").unwrap();
-        let path = dir.path().join("lodge/config.toml");
+        let path = ConfigFile::new("/c/lodge/config.toml", MemoryFiles::new());
         let e = NewEntry::Binary(NewBinary {
             name: "rg".into(),
             path: "/usr/bin/rg".into(),
@@ -818,10 +845,10 @@ mod tests {
             copy_deps: false,
         });
         add(&path, &e).unwrap();
-        assert!(!Config::load(&path).unwrap().binaries[0].copy_deps);
+        assert!(!path.load().unwrap().binaries[0].copy_deps);
         let (_dir, path) = file("# a starting point\n# [[binary]]\n");
         add(&path, &NewEntry::binary("rg", "/usr/bin/rg".into())).unwrap();
-        let now = std::fs::read_to_string(&path).unwrap();
+        let now = read_back(&path);
         assert!(
             now.starts_with("# a starting point\n# [[binary]]\n"),
             "{now}"
@@ -832,7 +859,7 @@ mod tests {
     fn an_entry_is_refused_when_its_name_or_its_path_is_taken() {
         let (_dir, path) = file("[[binary]]\nname = \"nvim\"\npath = \"/usr/bin/nvim\"\n");
         add(&path, &NewEntry::data("/etc/nvim".into(), None, None)).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
+        let text = read_back(&path);
         let err = add(&path, &NewEntry::binary("nvim", "/x".into())).unwrap_err();
         assert!(err.to_string().contains("already in"), "{err:#}");
         let err = add(&path, &NewEntry::data("/etc/nvim".into(), None, None)).unwrap_err();
@@ -846,7 +873,7 @@ mod tests {
         ] {
             assert!(add(&path, &bad).is_err());
         }
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(read_back(&path), text);
     }
 
     #[test]
@@ -854,12 +881,12 @@ mod tests {
         let text = "[[binary]]\nname = \"a\"\npath = \"/a\"\n\n[[data]]\npath = \"/da\"\n\n[[binary]]\nname = \"b\"\npath = \"/b\"\n\n[session]\nshell = \"/bin/sh\"\n";
         let (_dir, path) = file(text);
         remove(&path, Kind::Binary, "a").unwrap();
-        let config = Config::load(&path).unwrap();
+        let config = path.load().unwrap();
         assert_eq!(config.binaries.len(), 1);
         assert_eq!(config.data.len(), 1, "the data stays");
         remove(&path, Kind::Binary, "b").unwrap();
         remove(&path, Kind::Data, "/da").unwrap();
-        let now = std::fs::read_to_string(&path).unwrap();
+        let now = read_back(&path);
         assert!(!now.contains("[[") && now.contains("[session]"), "{now}");
         let err = remove(&path, Kind::Binary, "b").unwrap_err();
         assert!(err.to_string().contains("no [[binary]] `b`"), "{err:#}");
@@ -896,7 +923,7 @@ mod tests {
         assert_eq!((data[0].copy_deps, data[0].key()), (None, "/etc/b"));
         set_field(&path, Kind::Data, "/etc/b", Field::Target, Some("~/.b")).unwrap();
         set_copy_deps(&path, "a", true).unwrap();
-        let now = std::fs::read_to_string(&path).unwrap();
+        let now = read_back(&path);
         assert!(now.starts_with("# keep"), "{now}");
         assert!(!now.contains("copy_deps"), "{now}");
         assert!(now.contains("target = \"~/.b\""), "{now}");
@@ -905,7 +932,7 @@ mod tests {
         // missing entry, a field the kind does not have, and text for copy_deps:
         // refused, the file left as it was.
         add(&path, &NewEntry::binary("c", "/c".into())).unwrap();
-        let before = std::fs::read_to_string(&path).unwrap();
+        let before = read_back(&path);
         for result in [
             set_field(&path, Kind::Binary, "a", Field::Path, None),
             set_field(&path, Kind::Binary, "a", Field::Name, None),
@@ -919,32 +946,34 @@ mod tests {
         ] {
             assert!(result.is_err());
         }
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(read_back(&path), before);
         set_field(&path, Kind::Binary, "a", Field::Name, Some("d")).unwrap();
         assert_eq!(list(&path, Kind::Binary).unwrap()[0].key(), "d");
     }
 
     #[test]
     fn a_config_that_does_not_load_is_mended_by_taking_out_what_it_does_not_know() {
-        let text = "# mine\ntarget = \"docker\"\n\n[[config]]\nname = \"nvim\"\n\n[[binary]]\nname = \"a\"\npath = \"/a\"\ncopy_dep = true\n";
+        let text = "# mine\n[git]\nsafe_directories = [\"/w\"]\nbogus = 1\n\n[[config]]\nname = \"nvim\"\n\n[[binary]]\nname = \"a\"\npath = \"/a\"\ncopy_dep = true\n";
         let (_dir, path) = file(text);
         // The edits a valid config allows are refused for one that is not.
         assert!(add(&path, &NewEntry::binary("b", "/b".into())).is_err());
         let all = unknown(&path).unwrap();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 3);
         // Taking one out is allowed though the file is not yet valid, and the rest of
         // the text is as it was.
         remove_unknown(&path, &all[0]).unwrap();
-        let now = std::fs::read_to_string(&path).unwrap();
+        let now = read_back(&path);
         assert!(
-            now.starts_with("# mine\ntarget") && now.contains("copy_dep"),
+            now.starts_with("# mine\n[git]") && now.contains("copy_dep"),
             "{now}"
         );
-        assert!(Config::load(&path).is_err());
+        assert!(path.load().is_err());
         // What is no longer there cannot be taken out again.
         assert!(remove_unknown(&path, &all[0]).is_err());
         remove_unknown(&path, &unknown(&path).unwrap()[0]).unwrap();
-        Config::load(&path).unwrap();
+        assert!(path.load().is_err());
+        remove_unknown(&path, &unknown(&path).unwrap()[0]).unwrap();
+        path.load().unwrap();
         add(&path, &NewEntry::binary("b", "/b".into())).unwrap();
     }
 
@@ -953,72 +982,82 @@ mod tests {
         let text = "[[binary]]\nname = \"a\"\npath = \"/a\"\ntarget = \"rel/a\"\n\n\
                     [[data]]\npath = \"/d\"\nfor = \"nope\"\n";
         let (_dir, path) = file(text);
-        assert_eq!(Config::problem_count(text, &path), 2);
+        assert_eq!(Config::problem_count(text), 2);
         // Not an edit that leaves it as bad, nor one that adds a problem...
         assert!(set_field(&path, Kind::Binary, "a", Field::Path, Some("/b")).is_err());
         assert!(add(&path, &NewEntry::binary("c", "/c".into())).is_err());
         // ...but each that takes one away.
         set_field(&path, Kind::Binary, "a", Field::Target, Some("~/bin/a")).unwrap();
-        assert_eq!(
-            Config::problem_count(&std::fs::read_to_string(&path).unwrap(), &path),
-            1
-        );
+        assert_eq!(Config::problem_count(&read_back(&path)), 1);
         set_field(&path, Kind::Data, "/d", Field::For, None).unwrap();
-        Config::load(&path).unwrap();
+        path.load().unwrap();
     }
 
     #[test]
     fn settings_are_read_set_and_put_back_to_their_default() {
-        let (_dir, path) = file("# mine\n[[binary]]\nname = \"a\"\npath = \"/a\"\n");
-        assert_eq!(setting(&path, Setting::Shell).unwrap(), None);
-        set_setting(&path, Setting::Target, Some("host")).unwrap();
-        set_setting(&path, Setting::Shell, Some("/bin/zsh")).unwrap();
-        set_setting(&path, Setting::SafeDirs, Some("/work, /srv")).unwrap();
+        let (files, path) = file("# mine\n[[binary]]\nname = \"a\"\npath = \"/a\"\n");
+        let paths = Paths::beside("/c/config.toml".into(), files);
+        assert_eq!(setting(&paths, Setting::Shell).unwrap(), None);
+        set_setting(&paths, Setting::Shell, Some("/bin/zsh")).unwrap();
+        set_setting(&paths, Setting::SafeDirs, Some("/work, /srv")).unwrap();
         assert_eq!(
-            setting(&path, Setting::Target).unwrap().as_deref(),
-            Some("\"host\"")
-        );
-        assert_eq!(
-            setting(&path, Setting::Shell).unwrap().as_deref(),
+            setting(&paths, Setting::Shell).unwrap().as_deref(),
             Some("\"/bin/zsh\"")
         );
         assert_eq!(
-            setting(&path, Setting::SafeDirs).unwrap().as_deref(),
+            setting(&paths, Setting::SafeDirs).unwrap().as_deref(),
             Some("[\"/work\", \"/srv\"]")
         );
-        let config = Config::load(&path).unwrap();
+        let config = path.load().unwrap();
         assert_eq!(config.session.shell, "/bin/zsh");
         assert_eq!(config.git.safe_directories, vec!["/work", "/srv"]);
-        assert!(
-            std::fs::read_to_string(&path)
-                .unwrap()
-                .contains("# mine\n[[binary]]")
-        );
+        assert!(read_back(&path).contains("# mine\n[[binary]]"));
         // `none` switches the setting off; taking a setting out puts back the
         // default, and a table left empty goes with it.
-        set_setting(&path, Setting::SafeDirs, Some("none")).unwrap();
-        assert!(Config::load(&path).unwrap().git.safe_directories.is_empty());
-        set_setting(&path, Setting::SafeDirs, None).unwrap();
-        set_setting(&path, Setting::Shell, None).unwrap();
-        let now = std::fs::read_to_string(&path).unwrap();
+        set_setting(&paths, Setting::SafeDirs, Some("none")).unwrap();
+        assert!(path.load().unwrap().git.safe_directories.is_empty());
+        set_setting(&paths, Setting::SafeDirs, None).unwrap();
+        set_setting(&paths, Setting::Shell, None).unwrap();
+        let now = read_back(&path);
         assert!(
             !now.contains("[session]") && !now.contains("[git]"),
             "{now}"
         );
-        set_setting(&path, Setting::Target, None).unwrap();
-        assert_eq!(setting(&path, Setting::Target).unwrap(), None);
+    }
+
+    #[test]
+    fn a_setting_is_written_into_the_file_it_belongs_in() {
+        let (files, _) = file("");
+        let paths = Paths::beside("/c/config.toml".into(), files);
+        set_setting(&paths, Setting::Target, Some("host")).unwrap();
+        set_setting(&paths, Setting::Bundle, Some("/b.tar")).unwrap();
+        set_setting(&paths, Setting::Shell, Some("/bin/zsh")).unwrap();
+        assert_eq!(
+            setting(&paths, Setting::Target).unwrap().as_deref(),
+            Some("\"host\"")
+        );
+        // The client's own went to its file, the config's to the config: neither
+        // file holds the other's.
+        let client_text = read_back(&paths.client);
+        let config_text = read_back(&paths.config);
+        assert!(client_text.contains("target") && client_text.contains("bundle"));
+        assert!(!client_text.contains("shell"), "{client_text}");
+        assert!(config_text.contains("shell") && !config_text.contains("target"));
+        assert_eq!(paths.client.load().unwrap().target.as_deref(), Some("host"));
+        set_setting(&paths, Setting::Target, None).unwrap();
+        assert_eq!(setting(&paths, Setting::Target).unwrap(), None);
     }
 
     #[test]
     fn secrets_are_added_changed_and_removed_as_inline_tables() {
-        let (_dir, path) = file("");
+        let (_dir, path) = client_file("");
         let new = NewSecret {
             name: "GH_TOKEN".into(),
             from: SecretFrom::Command("gh auth token".into()),
             as_: SecretAs::Env,
         };
         add_secret(&path, &new).unwrap();
-        let now = std::fs::read_to_string(&path).unwrap();
+        let now = read_back(&path);
         assert!(
             now.contains("from = { command = \"gh auth token\" }"),
             "{now}"
@@ -1047,10 +1086,10 @@ mod tests {
         );
         assert_eq!(listed[0].targets.as_deref(), Some("[\"me@box\"]"));
         // What the secret checks refuse is refused here: nothing written.
-        let before = std::fs::read_to_string(&path).unwrap();
+        let before = read_back(&path);
         assert!(rename_secret(&path, "GH_TOKEN", "not a name").is_err());
         assert!(set_secret_from(&path, "GH_TOKEN", &SecretFrom::Command(" ".into())).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(read_back(&path), before);
         set_secret_targets(&path, "GH_TOKEN", &[]).unwrap();
         rename_secret(&path, "GH_TOKEN", "TOKEN").unwrap();
         remove_secret(&path, "TOKEN").unwrap();
@@ -1060,7 +1099,7 @@ mod tests {
 
     #[test]
     fn a_secret_can_read_from_the_credential_store() {
-        let (_dir, path) = file("");
+        let (_dir, path) = client_file("");
         let new = NewSecret {
             name: "CLAUDE_CODE_OAUTH_TOKEN".into(),
             from: SecretFrom::Store("claude_token".into()),
@@ -1074,10 +1113,10 @@ mod tests {
         );
         // The checks of the config apply: an entry name a script cannot take is
         // refused, and nothing is written.
-        let before = std::fs::read_to_string(&path).unwrap();
+        let before = read_back(&path);
         let bad = SecretFrom::Store("not a name".into());
         assert!(set_secret_from(&path, "CLAUDE_CODE_OAUTH_TOKEN", &bad).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(read_back(&path), before);
         // And it can be changed to another kind and back.
         set_secret_from(
             &path,
@@ -1091,5 +1130,42 @@ mod tests {
             list_secrets(&path).unwrap()[0].from.as_deref(),
             Some("{ store = \"other\" }")
         );
+    }
+
+    #[test]
+    fn a_disk_that_refuses_is_an_error_that_names_the_file_and_changes_nothing() {
+        let (files, path) = file("[[binary]]\nname = \"a\"\npath = \"/a\"\n");
+        let files = files.refusing("disk full");
+        let before = read_back(&path);
+        let e = add(&path, &NewEntry::binary("b", "/b".into())).unwrap_err();
+        let said = format!("{e:#}");
+        assert!(
+            said.contains("writing /c/config.toml") && said.contains("disk full"),
+            "{said}"
+        );
+        assert_eq!(read_back(&path), before);
+        assert_eq!(files.writes(), 0);
+    }
+
+    #[test]
+    fn nothing_is_written_when_the_result_would_not_load() {
+        let (files, path) = file("[[binary]]\nname = \"a\"\npath = \"/a\"\n");
+        assert!(add(&path, &NewEntry::binary("a", "/other".into())).is_err());
+        assert_eq!(files.writes(), 0, "a refused edit never reaches the disk");
+        add(&path, &NewEntry::binary("b", "/b".into())).unwrap();
+        assert_eq!(files.writes(), 1);
+    }
+
+    #[test]
+    fn a_config_and_a_client_file_kept_in_one_place_stay_each_in_its_own_file() {
+        let files = MemoryFiles::new();
+        let paths = Paths::beside("/c/config.toml".into(), files.clone());
+        add(&paths.config, &NewEntry::binary("a", "/a".into())).unwrap();
+        add_bundle(&paths.client, "/b.tar").unwrap();
+        assert!(files.text("/c/config.toml").unwrap().contains("[[binary]]"));
+        assert!(!files.text("/c/config.toml").unwrap().contains("bundles"));
+        assert!(files.text("/c/client.toml").unwrap().contains("bundles"));
+        assert_eq!(paths.config.load().unwrap().binaries.len(), 1);
+        assert_eq!(paths.client.load().unwrap().bundles, ["/b.tar"]);
     }
 }

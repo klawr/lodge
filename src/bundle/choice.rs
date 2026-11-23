@@ -1,12 +1,12 @@
 //! Which bundle to inject from, when there is more than one to pick.
 //!
-//! The config names a **default** (`bundle =`, or the packed config when it is not
+//! The client file names a **default** (`bundle =`, or the packed config when it is not
 //! set) and may list **others** (`bundles = [...]`). Together they are what a
 //! person is offered; nothing here asks, or reads a file, or knows what a
 //! reference means. That is the command layer's, which asks and writes, and the
 //! stores', which read.
 
-use crate::config::Config;
+use crate::config::client::Client;
 
 /// One way to get a bundle: a reference, or the config packed as it is now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,8 +41,8 @@ impl From<Option<&str>> for Offer {
 }
 
 /// The bundle used when nothing says otherwise.
-pub fn default(config: &Config) -> Offer {
-    config.bundle.as_deref().into()
+pub fn default(settings: &Client) -> Offer {
+    settings.bundle.as_deref().into()
 }
 
 /// What `up` offers: the `default` first, then the listed `others`, each once.
@@ -88,20 +88,21 @@ pub fn after_switch(others: &[String], old: &Offer, new: &Offer) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::client::Client;
 
-    fn config(bundle: Option<&str>, bundles: &[&str]) -> Config {
-        Config {
+    fn config(bundle: Option<&str>, bundles: &[&str]) -> Client {
+        Client {
             bundle: bundle.map(Into::into),
             bundles: bundles.iter().map(|b| b.to_string()).collect(),
-            ..Config::default()
+            ..Client::default()
         }
     }
 
-    fn options(c: &Config) -> Vec<Offer> {
+    fn options(c: &Client) -> Vec<Offer> {
         super::options(&default(c), &c.bundles)
     }
 
-    fn selectable(c: &Config, can_pack: bool) -> Vec<Offer> {
+    fn selectable(c: &Client, can_pack: bool) -> Vec<Offer> {
         super::selectable(&default(c), &c.bundles, can_pack)
     }
 

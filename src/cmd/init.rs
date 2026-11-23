@@ -1,16 +1,22 @@
 //! `ldg init`: a commented starting config, with the tools found on this
-//! machine filled in (commented out, so nothing is injected until you choose).
+//! machine filled in (commented out, so nothing is injected until you choose),
+//! and a commented client file beside it for what is this machine's own.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
 use super::Ctx;
+use crate::config::Document;
 use crate::layout::tilde;
 use crate::output::{info, line, note};
 
 /// Where editors and TOML tools fetch the schema of `config.toml` from.
 pub const SCHEMA_URL: &str =
     "https://raw.githubusercontent.com/klawr/lodge/master/docs/config.schema.json";
+
+/// The same for `client.toml`.
+pub const CLIENT_SCHEMA_URL: &str =
+    "https://raw.githubusercontent.com/klawr/lodge/master/docs/client.schema.json";
 
 /// A tool `init` looks for: its binary on `PATH`, and the paths under the home
 /// directory (its config) worth bringing along when they exist. What it keeps
@@ -89,32 +95,41 @@ const KNOWN: &[Known] = &[
     },
     Known {
         binary: "claude",
-        note: "Claude Code; deliver a token (`claude setup-token`) with a [[secret]] below, not its files as data",
+        note: "Claude Code; deliver a token (`claude setup-token`) with a [[secret]] in client.toml, not its files as data",
         config: &[],
     },
 ];
 
-pub fn run(ctx: &Ctx, force: bool, print: bool) -> Result<()> {
+pub fn run(ctx: &Ctx, force: bool, print: bool, print_client: bool) -> Result<()> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let found = detect(&home, &ctx.local.var("PATH").unwrap_or_default());
     let text = render(&found, &home);
 
     if print {
-        crate::output::raw_stdout(&text);
+        // One file's text, so what is printed can be redirected into it.
+        crate::output::raw_stdout(&if print_client { render_client() } else { text });
         return Ok(());
     }
-    let path = &ctx.config_path;
+    let path = &ctx.paths.config;
     if path.exists() && !force {
         bail!(
             "{} already exists (--force overwrites it, --print shows what would be written)",
             path.display()
         );
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    }
-    std::fs::write(path, &text).with_context(|| format!("writing {}", path.display()))?;
+    path.write_text(&text)?;
     info!("wrote {}", path.display());
+    // The client's file may hold secrets' sources a person wrote: never overwritten.
+    let client = &ctx.paths.client;
+    if client.exists() {
+        note!(
+            "{} is there already and was left as it is",
+            client.display()
+        );
+    } else {
+        client.write_text(&render_client())?;
+        info!("wrote {}", client.display());
+    }
     if found.is_empty() {
         note!("no known tools found on PATH; add [[binary]] and [[data]] entries by hand");
     } else {
@@ -158,13 +173,14 @@ pub(super) fn detect(home: &Path, path_var: &std::ffi::OsStr) -> Vec<Detected> {
         .collect()
 }
 
-fn render(found: &[Detected], home: &Path) -> String {
+/// The client's file: nothing is set until a line is uncommented.
+fn render_client() -> String {
     let mut s = format!(
-        "#:schema {SCHEMA_URL}\n\
+        "#:schema {CLIENT_SCHEMA_URL}\n\
          #\n\
-         # lodge config: what `ldg up` brings into a container.\n\
-         # Reference: https://github.com/klawr/lodge/blob/master/docs/configuration.md\n\
-         # Check it with `ldg doctor`.\n\n"
+         # lodge client settings: what depends on this machine and the person using it.\n\
+         # Never part of a bundle; the config (config.toml) is.\n\
+         # Reference: https://github.com/klawr/lodge/blob/master/docs/configuration.md\n\n"
     );
     s.push_str(&format!(
         "# ── Target ───────────────────────────────────────────────────────────\n\
@@ -177,6 +193,35 @@ fn render(found: &[Detected], home: &Path) -> String {
             .join(", "),
         super::targets::default_name()
     ));
+    s.push_str(
+        "# ── Bundle ───────────────────────────────────────────────────────────\n\
+          # Inject from a bundle instead of packing config.toml's entries: a file, or\n\
+          # a registry (`ldg bundle use` changes it).\n\
+          # bundle = \"oci://ghcr.io/me/lodge:1\"\n\
+          \n\
+          # ── Secrets (delivered at attach, never stored in a bundle) ──────────\n\
+          # [[secret]]\n\
+          # name = \"GH_TOKEN\"\n\
+          # from = { command = \"gh auth token\" }\n\
+          # as   = \"env\"\n\
+          \n\
+          # A value kept in this machine's credential store (`ldg secret set claude_token`):\n\
+          # [[secret]]\n\
+          # name = \"CLAUDE_CODE_OAUTH_TOKEN\"   # from `claude setup-token`\n\
+          # from = { store = \"claude_token\" }\n\
+          # as   = \"env\"\n",
+    );
+    s
+}
+
+fn render(found: &[Detected], home: &Path) -> String {
+    let mut s = format!(
+        "#:schema {SCHEMA_URL}\n\
+         #\n\
+         # lodge config: what `ldg up` brings into a container.\n\
+         # Reference: https://github.com/klawr/lodge/blob/master/docs/configuration.md\n\
+         # Check it with `ldg doctor`.\n\n"
+    );
     s.push_str("# ── Programs ─────────────────────────────────────────────────────────\n");
     s.push_str("# Each [[binary]] copies a program, with the libraries it needs.\n");
     s.push_str("# Uncomment what you want in your containers.\n");
@@ -215,17 +260,8 @@ fn render(found: &[Detected], home: &Path) -> String {
          # [session]\n\
          # shell = \"/bin/bash\"   # must exist in the container\n\
          \n\
-         # ── Secrets (delivered at attach, never stored in a bundle) ──────────\n\
-         # [[secret]]\n\
-         # name = \"GH_TOKEN\"\n\
-         # from = { command = \"gh auth token\" }\n\
-         # as   = \"env\"\n\
-         \n\
-         # A value kept in this machine's credential store (`ldg secret set claude_token`):\n\
-         # [[secret]]\n\
-         # name = \"CLAUDE_CODE_OAUTH_TOKEN\"   # from `claude setup-token`\n\
-         # from = { store = \"claude_token\" }\n\
-         # as   = \"env\"\n",
+         # What is this machine's own (the target, where a bundle is read from, secrets,\n\
+         # keys) is in client.toml, beside this file.\n",
     );
     s
 }
@@ -239,6 +275,18 @@ mod tests {
         note: "Neovim",
         config: &[".config/nvim"],
     };
+
+    #[test]
+    fn the_rendered_client_file_parses_and_sets_nothing_until_uncommented() {
+        let text = render_client();
+        assert!(text.starts_with("#:schema "));
+        let c = crate::config::client::Client::parse(&text, Path::new("/x/client.toml")).unwrap();
+        assert!(c.target.is_none() && c.bundle.is_none() && c.secret.is_empty());
+        // Uncommenting a secret gives a valid one.
+        let on = text.replace("# [[secret]]\n# name = \"GH_TOKEN\"\n# from = { command = \"gh auth token\" }\n# as   = \"env\"", "[[secret]]\nname = \"GH_TOKEN\"\nfrom = { command = \"gh auth token\" }\nas = \"env\"");
+        let c = crate::config::client::Client::parse(&on, Path::new("/x/client.toml")).unwrap();
+        assert_eq!(c.secret.len(), 1);
+    }
 
     #[test]
     fn the_rendered_config_parses_and_injects_nothing_until_uncommented() {

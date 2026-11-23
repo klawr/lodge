@@ -44,6 +44,9 @@ use std::sync::Arc;
 use crate::bundle::store::{FileSink, FileStore, OciSink, OciStore, Replace, Sinks, Stores};
 use crate::cli::{Cli, Command};
 use crate::config::Config;
+use crate::config::client::{self, Client};
+use crate::config::{ClientFile, Document, Paths};
+use crate::files::{DiskFiles, Files};
 use crate::forward::{DetachedDaemon, ForwardDaemon};
 use crate::history::{FileHistory, History, Place, Route};
 use crate::host::{HostRef, LocalHost, SshHost};
@@ -66,14 +69,14 @@ fn uses_target(command: &Command) -> bool {
     )
 }
 
-/// Which target this run works in: `--target`, else `target` in the config file,
+/// Which target this run works in: `--target`, else `target` in the client file,
 /// else the default. A command that never touches one (`init`, the generated
-/// completions and man page) does not read the config for it, so a bad value
-/// can't stop `ldg init --force` from fixing the file.
+/// completions and man page) does not read the file for it, so a bad value
+/// can't stop `ldg init --force` from fixing the config.
 fn choose_target(
     flag: Option<String>,
     command: &Command,
-    config: &std::path::Path,
+    client: &ClientFile,
 ) -> Result<&'static str> {
     if let Some(target) = flag {
         return targets::check(&target);
@@ -81,29 +84,29 @@ fn choose_target(
     if !uses_target(command) {
         return Ok(targets::default_name());
     }
-    match crate::config::target_setting(config)? {
+    match client::target_setting(client)? {
         Some(target) => targets::check(&target)
-            .with_context(|| format!("invalid `target` in {}", config.display())),
+            .with_context(|| format!("invalid `target` in {}", client.display())),
         None => Ok(targets::default_name()),
     }
 }
 
-/// Builds the endpoints of `target`, from the settings the config gives it. A
+/// Builds the endpoints of `target`, from the settings the client file gives it. A
 /// command that never uses a target builds none that matters: the default, with no
-/// settings, so a bad table can't stop `ldg init --force` from fixing the file.
+/// settings, so a bad table can't stop `ldg init --force` from fixing the config.
 fn build_endpoints(
     target: &str,
-    config: &std::path::Path,
+    client: &ClientFile,
     project: Option<&Path>,
     with: Wiring,
     command: &Command,
 ) -> Result<Box<dyn Endpoints>> {
     let kind = targets::find(target).with_context(|| format!("no target `{target}`"))?;
     let settings = if uses_target(command) {
-        let user = crate::config::target_settings(config, target)?;
+        let user = client::target_settings(client, target)?;
         match project.filter(|_| kind.per_project()) {
             Some(dir) => {
-                let theirs = crate::config::project_target_settings(dir, target)?;
+                let theirs = client::project_target_settings(client.files(), dir, target)?;
                 kind.merge_project(&user, &theirs)
             }
             None => user,
@@ -112,7 +115,7 @@ fn build_endpoints(
         toml::Table::new()
     };
     kind.build(with, &settings)
-        .with_context(|| format!("setting up the {target} target (from {})", config.display()))
+        .with_context(|| format!("setting up the {target} target (from {})", client.display()))
 }
 
 /// The command line, with the targets this build knows as the values `--target`
@@ -195,19 +198,26 @@ pub struct Ctx {
     pub choose: Box<dyn prompt::Choose>,
     /// How this run got here: the target and the remote it works through.
     pub route: Route,
-    pub config_path: PathBuf,
+    /// Where the config and the client's own file are, made once for the run.
+    pub paths: Paths,
 }
 
 impl Ctx {
     /// Loads and validates the config. Commands call this once.
     pub fn config(&self) -> Result<Config> {
-        let config = Config::load(&self.config_path)?;
+        self.paths.config.load()
+    }
+
+    /// Loads and validates the client's own file. Commands call this once.
+    pub fn client(&self) -> Result<Client> {
+        let path = &self.paths.client;
+        let client = path.load()?;
         // A table for a target that does not exist is a typo, and nothing reads it.
-        for name in config.targets.keys() {
+        for name in client.targets.keys() {
             targets::check(name)
-                .with_context(|| format!("`[targets.{name}]` in {}", self.config_path.display()))?;
+                .with_context(|| format!("`[targets.{name}]` in {}", path.display()))?;
         }
-        Ok(config)
+        Ok(client)
     }
 
     /// Notes that a session is being opened in `place`, under the name the endpoint
@@ -295,8 +305,7 @@ fn registry_credentials(local: Arc<dyn Local>) -> Box<dyn Credentials> {
 }
 
 /// Works on the config alone: no host, no target, no engine.
-fn configure_config(config: Option<PathBuf>, terminal: &prompt::Terminal) -> Result<()> {
-    let path = crate::config::path_for(config)?;
+fn configure_config(paths: Paths, terminal: &prompt::Terminal) -> Result<()> {
     let home = SystemLocal.home();
     let path_var = SystemLocal.var("PATH").unwrap_or_default();
     let local: Arc<dyn Local> = Arc::new(SystemLocal);
@@ -319,7 +328,7 @@ fn configure_config(config: Option<PathBuf>, terminal: &prompt::Terminal) -> Res
         bundles: &packer,
         host: &LocalHost,
     };
-    configure::run(&path, &machine, terminal, terminal, terminal)?;
+    configure::run(paths, &machine, terminal, terminal, terminal)?;
     Ok(())
 }
 
@@ -340,11 +349,12 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
     // else takes; a new way of reaching a machine or a new target is one more arm.
     // The helper tools (`ldd`, `patchelf`, the registry client) are chosen here too.
     let history = FileHistory::in_data_dir();
-    // The keys come from the config, which is read here on its own: the first
+    // The keys come from the client file, which is read here on its own: the first
     // screen is asked before any command has loaded it.
-    let terminal = prompt::Terminal::new(crate::config::keymap(&crate::config::path_for(
-        cli.config.clone(),
-    )?)?);
+    // The files lodge keeps for itself are this machine's, chosen here.
+    let files: Arc<dyn Files> = Arc::new(DiskFiles);
+    let paths = Paths::for_run(cli.config.clone(), files)?;
+    let terminal = prompt::Terminal::new(client::keymap(&paths.client)?);
     // Without a subcommand, the person picks one of the places they were in. That
     // comes first because the pick says which host and target to build.
     // The machine a project was looked for on, already connected.
@@ -390,7 +400,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                 }
                 Some(resume::Home::Configure) => {
                     // Leaving the config goes back to the places, not out of ldg.
-                    configure_config(cli.config.clone(), &terminal)?;
+                    configure_config(paths.clone(), &terminal)?;
                     continue;
                 }
                 None => return Ok(ExitCode::SUCCESS),
@@ -413,8 +423,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
             host
         }
     };
-    let config_path = crate::config::path_for(cli.config)?;
-    let target = choose_target(cli.target, &subcommand, &config_path)?;
+    let target = choose_target(cli.target, &subcommand, &paths.client)?;
     let route = Route {
         target: target.to_string(),
         remote,
@@ -441,7 +450,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
     let project = project_dir(&subcommand, cli.project_dir);
     let endpoints = build_endpoints(
         target,
-        &config_path,
+        &paths.client,
         project.as_deref(),
         Wiring {
             host: host.clone(),
@@ -464,7 +473,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
         tools,
         host,
         local,
-        config_path,
+        paths,
     };
 
     match subcommand {
@@ -518,7 +527,11 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
         Command::Secret { command } => secret::run(&ctx, command)?,
         Command::Registry { command } => login::run(&ctx, command)?,
         Command::Inject { command } => inject::run(&ctx, command)?,
-        Command::Init { force, print } => init::run(&ctx, force, print)?,
+        Command::Init {
+            force,
+            print,
+            client,
+        } => init::run(&ctx, force, print, client)?,
         Command::Doctor { project, json } => {
             if !doctor::run(&ctx, project.path, json)? {
                 return Ok(ExitCode::FAILURE);
@@ -614,10 +627,10 @@ mod tests {
         assert!(err.contains("docker") && err.contains("host"), "{err}");
     }
 
-    fn config_with(text: &str) -> (crate::tmpfile::TempDir, std::path::PathBuf) {
+    fn config_with(text: &str) -> (crate::tmpfile::TempDir, ClientFile) {
         let dir = crate::tmpfile::TempDir::new("target-config").unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, text).unwrap();
+        let path = ClientFile::new(dir.path().join("client.toml"), crate::files::disk());
+        std::fs::write(path.path(), text).unwrap();
         (dir, path)
     }
 
@@ -629,7 +642,15 @@ mod tests {
         assert_eq!(choose_target(None, &ls, &with).unwrap(), "podman");
         assert_eq!(choose_target(None, &ls, &without).unwrap(), "docker");
         assert_eq!(
-            choose_target(None, &ls, &without.with_file_name("none.toml")).unwrap(),
+            choose_target(
+                None,
+                &ls,
+                &ClientFile::new(
+                    without.path().with_file_name("none.toml"),
+                    crate::files::disk()
+                )
+            )
+            .unwrap(),
             "docker"
         );
         // The flag wins over the file, even a bad one.
@@ -738,7 +759,7 @@ mod tests {
         let (_dir, path) = config_with("[targets.kubernetes]\nselector = \"app=api\"\n");
         let project = crate::tmpfile::TempDir::new("project").unwrap();
         std::fs::write(
-            project.path().join(crate::config::PROJECT_FILE),
+            project.path().join(client::PROJECT_FILE),
             "[targets.kubernetes]\npod = \"dev-0\"\nnamespace = \"mine\"\n",
         )
         .unwrap();

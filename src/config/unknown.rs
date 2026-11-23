@@ -1,5 +1,5 @@
-//! What a config file holds that this version of lodge does not know: a key it
-//! has no use for, a table it dropped. They are found by asking the config's own
+//! What a config or client file holds that this version of lodge does not know: a
+//! key it has no use for, a table it dropped, a key that belongs in the other file. They are found by asking the config's own
 //! types (which refuse unknown keys), so there is no second list of the known
 //! keys to keep in step, and they can be taken out of the text one by one.
 //!
@@ -9,8 +9,7 @@
 
 use toml_edit::{ArrayOfTables, DocumentMut, ImDocument, Item, Table, Value};
 
-use super::Config;
-use super::secret::RawSecret;
+use super::Document;
 
 /// A step from the top of the file to a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,13 +30,14 @@ pub struct Unknown {
 /// More than this is not a config someone mends one key at a time.
 const MOST: usize = 200;
 
-/// Everything in `raw` that the types do not know, in the order they are found.
-/// Empty when `raw` is not TOML at all, or knows everything in it.
-pub fn find(raw: &str) -> Vec<Unknown> {
+/// Everything in `raw`, a text of the kind `file` is, that its types do not know, in
+/// the order they are found. Empty when `raw` is not TOML at all, or knows
+/// everything in it.
+pub fn find(raw: &str, file: &dyn Document) -> Vec<Unknown> {
     let mut text = raw.to_string();
     let mut found = Vec::new();
     while found.len() < MOST {
-        let Some(next) = next(&text) else { break };
+        let Some(next) = next(&text, file) else { break };
         let Some(without) = without(&text, &next) else {
             break;
         };
@@ -49,16 +49,16 @@ pub fn find(raw: &str) -> Vec<Unknown> {
 
 /// `raw` with `which` taken out, or `None` when it is not there (the file changed
 /// since it was found).
-pub fn remove(raw: &str, which: &Unknown) -> Option<String> {
-    find(raw)
+pub fn remove(raw: &str, which: &Unknown, file: &dyn Document) -> Option<String> {
+    find(raw, file)
         .contains(which)
         .then(|| without(raw, which))
         .flatten()
 }
 
 /// The first unknown key the types stop at.
-fn next(text: &str) -> Option<Unknown> {
-    let error = toml::from_str::<Config<RawSecret>>(text).err()?;
+fn next(text: &str, file: &dyn Document) -> Option<Unknown> {
+    let error = file.unknown_field(text)?;
     if !error.message().starts_with("unknown field `") {
         return None;
     }
@@ -192,15 +192,30 @@ fn list_table(list: &mut ArrayOfTables, i: usize) -> Option<&mut Table> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ClientFile, ConfigFile};
+
+    fn config() -> ConfigFile {
+        ConfigFile::new("/x/config.toml", crate::files::disk())
+    }
+
+    fn client() -> ClientFile {
+        ClientFile::new("/x/client.toml", crate::files::disk())
+    }
 
     fn labels(raw: &str) -> Vec<String> {
-        find(raw).into_iter().map(|u| u.label).collect()
+        find(raw, &config()).into_iter().map(|u| u.label).collect()
+    }
+
+    fn client_labels(raw: &str) -> Vec<String> {
+        find(raw, &client()).into_iter().map(|u| u.label).collect()
     }
 
     #[test]
     fn a_config_that_knows_everything_in_it_has_nothing_unknown() {
+        assert!(labels("[[binary]]\nname = \"a\"\npath = \"/a\"\n").is_empty());
         assert!(
-            labels("target = \"docker\"\n[[binary]]\nname = \"a\"\npath = \"/a\"\n").is_empty()
+            client_labels("target = \"docker\"\n[[secret]]\nname = \"A\"\nfrom = { env = \"A\" }\nas = \"env\"\n")
+                .is_empty()
         );
         assert!(labels("= not toml").is_empty());
         assert!(labels("").is_empty());
@@ -225,13 +240,25 @@ mod tests {
     }
 
     #[test]
+    fn a_setting_in_the_file_it_does_not_belong_in_is_unknown_there() {
+        // The client's settings written into the config, which does not take them.
+        let raw = "target = \"docker\"\n[[secret]]\nname = \"A\"\nfrom = { env = \"A\" }\nas = \"env\"\n\
+                   [[binary]]\nname = \"a\"\npath = \"/a\"\n";
+        assert_eq!(labels(raw), ["target = \"docker\"", "[[secret]]"]);
+        assert_eq!(
+            client_labels("[[binary]]\nname = \"a\"\npath = \"/a\"\n"),
+            ["[[binary]]"]
+        );
+    }
+
+    #[test]
     fn what_is_removed_is_all_that_goes_and_the_rest_of_the_text_stays() {
         let raw = "# mine\n[[config]]\nname = \"x\"\n\n[[binary]]\nname = \"a\"\npath = \"/a\"\n\
                    copy_dep = true # typo\n\n[[binary]]\nname = \"b\"\npath = \"/b\"\nbogus = 2\n";
-        let all = find(raw);
+        let all = find(raw, &config());
         assert_eq!(all.len(), 3);
         // Each goes by itself, the others and the comments left as they were.
-        let text = remove(raw, &all[1]).unwrap();
+        let text = remove(raw, &all[1], &config()).unwrap();
         assert!(
             text.contains("# mine") && text.contains("[[config]]"),
             "{text}"
@@ -242,13 +269,13 @@ mod tests {
         );
         // All three taken out, the file is a config again.
         let mut text = raw.to_string();
-        while let Some(next) = find(&text).first() {
-            text = remove(&text, next).unwrap();
+        while let Some(next) = find(&text, &config()).first() {
+            text = remove(&text, next, &config()).unwrap();
         }
-        assert!(find(&text).is_empty());
+        assert!(find(&text, &config()).is_empty());
         crate::config::Config::parse(&text, std::path::Path::new("/x/config.toml")).unwrap();
         // What is no longer there cannot be removed.
-        assert_eq!(remove(&text, &all[0]), None);
+        assert_eq!(remove(&text, &all[0], &config()), None);
     }
 
     #[test]
@@ -258,9 +285,9 @@ mod tests {
         let raw = "[[config]]\nname = \"nvim\"\npath = \"~/.config/nvim\"\ntarget = \"~/.config/nvim\"\n\n\
                    [[config]]\nname = \"tmux\"\npath = \"~/.config/tmux\"\ntarget = \"~/.config/tmux\"\n\n\
                    [[binary]]\nname = \"nvim\"\npath = \"/usr/local/bin/nvim\"\n";
-        let all = find(raw);
+        let all = find(raw, &config());
         assert_eq!(all.len(), 1);
-        let text = remove(raw, &all[0]).unwrap();
+        let text = remove(raw, &all[0], &config()).unwrap();
         assert_eq!(
             text.trim(),
             "[[binary]]\nname = \"nvim\"\npath = \"/usr/local/bin/nvim\""

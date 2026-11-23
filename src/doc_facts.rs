@@ -110,11 +110,33 @@ fn the_docs_name_every_target() {
     }
 }
 
+/// Writes `schema` to `docs/<file>` when `make schema` asks, else says whether
+/// what is there is current.
+fn schema_is_current(file: &str, schema: &serde_json::Value) {
+    let text = serde_json::to_string_pretty(schema).unwrap() + "\n";
+    let path = root().join("docs").join(file);
+    if std::env::var_os("UPDATE_SCHEMA").is_some() {
+        std::fs::write(&path, &text).unwrap();
+        return;
+    }
+    let committed = std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(
+        committed == text,
+        "docs/{file} is out of date: run `make schema`"
+    );
+}
+
 #[test]
 fn the_config_schema_is_current() {
+    let schema = serde_json::to_value(schemars::schema_for!(crate::config::Config)).unwrap();
+    schema_is_current("config.schema.json", &schema);
+}
+
+#[test]
+fn the_client_schema_is_current() {
     // The schema describes the file as written, so secrets in their raw form.
     let mut schema = serde_json::to_value(schemars::schema_for!(
-        crate::config::Config<crate::config::secret::RawSecret>
+        crate::config::client::Client<crate::config::secret::RawSecret>
     ))
     .unwrap();
     // What each target lets you say is its own to describe: the file's schema
@@ -144,15 +166,34 @@ fn the_config_schema_is_current() {
         .collect();
     schema["properties"]["keys"]["properties"] = actions.into();
     schema["properties"]["keys"]["additionalProperties"] = false.into();
-    let text = serde_json::to_string_pretty(&schema).unwrap() + "\n";
-    let path = root().join("docs/config.schema.json");
-    if std::env::var_os("UPDATE_SCHEMA").is_some() {
-        std::fs::write(&path, &text).unwrap();
-        return;
-    }
-    let committed = std::fs::read_to_string(&path).unwrap_or_default();
+    schema_is_current("client.schema.json", &schema);
+}
+
+/// The keys a file's type accepts at the top, from its schema.
+fn top_keys(schema: serde_json::Value) -> std::collections::BTreeSet<String> {
+    schema["properties"]
+        .as_object()
+        .expect("a schema with properties")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn the_two_files_hold_different_keys() {
+    use crate::config::{Config, client};
+    let config = top_keys(serde_json::to_value(schemars::schema_for!(Config)).unwrap());
+    let clients = top_keys(
+        serde_json::to_value(schemars::schema_for!(
+            client::Client<crate::config::secret::RawSecret>
+        ))
+        .unwrap(),
+    );
+    // Nothing the client file takes can be written into a file a bundle is made
+    // from: that is what keeps it out of one.
     assert!(
-        committed == text,
-        "docs/config.schema.json is out of date: run `make schema`"
+        config.is_disjoint(&clients),
+        "a key is in both files: {:?}",
+        config.intersection(&clients).collect::<Vec<_>>()
     );
 }

@@ -1,53 +1,33 @@
-//! The user's `config.toml`: what to inject, how to open sessions, which
-//! secrets to deliver. Loaded once per run and validated as a whole, so every
-//! mistake in it is reported together, before anything starts.
+//! The user's `config.toml`: what to inject and how to open sessions. It is what
+//! may travel with a bundle, so nothing in it depends on the machine lodge runs
+//! on. What does (the target, where a bundle is read from, which secrets to
+//! deliver and from where, the keys) is the [`client`]'s own file, `client.toml`.
+//! Each is loaded once per run and validated as a whole, so every mistake in it
+//! is reported together, before anything starts.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+pub mod client;
 pub mod edit;
 pub mod secret;
 pub mod unknown;
 
-use crate::keys::{KeyList, Keymap};
+use crate::files::Files;
 use crate::shell::{container_path_problem, is_plain_name};
-use secret::{RawSecret, SecretDecl};
 
-// The user's config. `S` is how a `[[secret]]` entry is held: as written
-// (`RawSecret`, what the file is parsed into and the schema is made from), or
-// checked (`SecretDecl`, the default, what the rest of lodge works with). A
-// plain comment, not a doc comment: doc comments become the schema's text.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, bound(deserialize = "S: Deserialize<'de>"))]
+/// The user's config. What is in it is what a bundle is made from.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(
     test,
     derive(Serialize, schemars::JsonSchema),
     schemars(rename = "Config")
 )]
-pub struct Config<S = SecretDecl> {
-    /// Where to work, unless `--target` says otherwise. Default: docker.
-    #[serde(default)]
-    pub target: Option<String>,
-    /// What each target lets you say about it, by target name: `[targets.docker]`.
-    /// The keys of a table are checked by the target that reads it.
-    #[serde(default)]
-    #[cfg_attr(
-        test,
-        schemars(with = "BTreeMap<String, serde_json::Map<String, serde_json::Value>>")
-    )]
-    pub targets: BTreeMap<String, toml::Table>,
-    /// A bundle to inject from instead of packing the `[[binary]]` and `[[data]]`
-    /// entries: a file, or a registry as `oci://ghcr.io/me/lodge:1`. A relative
-    /// file path is relative to this file's folder.
-    #[serde(default)]
-    pub bundle: Option<String>,
-    /// Other bundles to choose from, as `bundle` is written. `ldg up` offers them
-    /// (with `bundle`, or the packed config when that is not set) when it injects
-    /// into a project it has not opened before. `ldg pack -o` adds what it writes.
-    #[serde(default)]
-    pub bundles: Vec<String>,
+pub struct Config {
     /// Programs to inject, each with the shared libraries it needs.
     #[serde(default, rename = "binary")]
     pub binaries: Vec<BinaryEntry>,
@@ -60,33 +40,6 @@ pub struct Config<S = SecretDecl> {
     /// Git settings applied in the container.
     #[serde(default)]
     pub git: GitConfig,
-    /// Secrets to deliver at attach time. Local config only, never in a bundle.
-    #[serde(default)]
-    // Generic, so schemars can't work the default out itself.
-    #[cfg_attr(test, schemars(extend("default" = [])))]
-    pub secret: Vec<S>,
-    /// The keys of the interactive screens, by what they do: `up = ["up", "k"]`.
-    /// An action given here has only the keys given; one left out keeps its own.
-    /// Local only, never in a bundle.
-    #[serde(default)]
-    pub keys: BTreeMap<String, KeyList>,
-}
-
-impl<S> Default for Config<S> {
-    fn default() -> Self {
-        Self {
-            target: None,
-            targets: BTreeMap::new(),
-            bundle: None,
-            bundles: Vec::new(),
-            binaries: Vec::new(),
-            data: Vec::new(),
-            session: SessionConfig::default(),
-            git: GitConfig::default(),
-            secret: Vec::new(),
-            keys: BTreeMap::new(),
-        }
-    }
 }
 
 /// A program to inject: the binary, relinked, with its libraries.
@@ -132,6 +85,183 @@ impl DataEntry {
             None => crate::layout::tilde(&self.path, home),
         }
     }
+}
+
+/// The file's name, in the config folder.
+pub const FILE: &str = "config.toml";
+
+/// A file lodge reads and edits as one kind of document: it knows how to check a
+/// text as itself, what its types do not know, and where it is kept ([`Files`]).
+/// The edit functions take the kind they work on, so a setting can't be written
+/// into the wrong file, and the parts that work on either (checking, finding
+/// what is unknown) take this.
+pub trait Document {
+    fn path(&self) -> &Path;
+    /// Where its text is read from and written to.
+    fn files(&self) -> &dyn Files;
+    /// Checks `raw` as this kind of file. An error is every problem with it.
+    fn check(&self, raw: &str) -> Result<()>;
+    /// How many things are wrong with `raw`: none for a text that is valid.
+    fn problem_count(&self, raw: &str) -> usize;
+    /// The error its types stop at, when `raw` holds a key they do not know.
+    fn unknown_field(&self, raw: &str) -> Option<toml::de::Error>;
+
+    /// What the file holds, `None` when it is not there.
+    fn read_text(&self) -> Result<Option<String>> {
+        self.files()
+            .read(self.path())
+            .with_context(|| format!("reading {}", self.path().display()))
+    }
+
+    /// Replaces what the file holds with `text`, which is not checked here.
+    fn write_text(&self, text: &str) -> Result<()> {
+        self.files()
+            .write(self.path(), text)
+            .with_context(|| format!("writing {}", self.path().display()))
+    }
+
+    fn exists(&self) -> bool {
+        self.files().exists(self.path())
+    }
+}
+
+/// The path of the config, `config.toml`: what is injected.
+#[derive(Clone)]
+pub struct ConfigFile(PathBuf, Arc<dyn Files>);
+
+/// The path of the client's own file, `client.toml`.
+#[derive(Clone)]
+pub struct ClientFile(PathBuf, Arc<dyn Files>);
+
+macro_rules! file_path {
+    ($t:ident) => {
+        impl $t {
+            pub fn new(path: impl Into<PathBuf>, files: Arc<dyn Files>) -> Self {
+                Self(path.into(), files)
+            }
+        }
+        impl $t {
+            /// For messages: the path.
+            pub fn display(&self) -> std::path::Display<'_> {
+                self.0.display()
+            }
+        }
+        impl PartialEq for $t {
+            fn eq(&self, other: &Self) -> bool {
+                self.0 == other.0
+            }
+        }
+        impl std::fmt::Debug for $t {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_tuple(stringify!($t)).field(&self.0).finish()
+            }
+        }
+    };
+}
+file_path!(ConfigFile);
+file_path!(ClientFile);
+
+impl ConfigFile {
+    /// The files it is kept in, for another path to be kept in the same ones.
+    pub fn files_handle(&self) -> Arc<dyn Files> {
+        self.1.clone()
+    }
+
+    /// The config in this file. A missing file is an empty config: nothing is
+    /// injected, and you still get a shell.
+    pub fn load(&self) -> Result<Config> {
+        match self.read_text()? {
+            Some(raw) => Config::parse(&raw, &self.0),
+            None => Ok(Config::default()),
+        }
+    }
+}
+
+impl ClientFile {
+    /// The settings in this file. A missing file is an empty one: every setting
+    /// has its default.
+    pub fn load(&self) -> Result<client::Client> {
+        match self.read_text()? {
+            Some(raw) => client::Client::parse(&raw, &self.0),
+            None => Ok(client::Client::default()),
+        }
+    }
+}
+
+impl Document for ConfigFile {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+    fn files(&self) -> &dyn Files {
+        self.1.as_ref()
+    }
+    fn check(&self, raw: &str) -> Result<()> {
+        Config::parse(raw, &self.0).map(drop)
+    }
+    fn problem_count(&self, raw: &str) -> usize {
+        Config::problem_count(raw)
+    }
+    fn unknown_field(&self, raw: &str) -> Option<toml::de::Error> {
+        toml::from_str::<Config>(raw).err()
+    }
+}
+
+impl Document for ClientFile {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+    fn files(&self) -> &dyn Files {
+        self.1.as_ref()
+    }
+    fn check(&self, raw: &str) -> Result<()> {
+        client::Client::parse(raw, &self.0).map(drop)
+    }
+    fn problem_count(&self, raw: &str) -> usize {
+        client::Client::problem_count(raw, &self.0)
+    }
+    fn unknown_field(&self, raw: &str) -> Option<toml::de::Error> {
+        toml::from_str::<client::Client<secret::RawSecret>>(raw).err()
+    }
+}
+
+/// Where the two files are for this run, and the files they are kept in. Made
+/// once, in the composition root, and handed down: nothing derives one path from
+/// the other.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Paths {
+    pub config: ConfigFile,
+    pub client: ClientFile,
+}
+
+impl Paths {
+    /// The files for the config at `config`: the client's is `client.toml` in the
+    /// same folder.
+    pub fn beside(config: PathBuf, files: Arc<dyn Files>) -> Self {
+        Self {
+            client: ClientFile::new(config.with_file_name(client::FILE), files.clone()),
+            config: ConfigFile::new(config, files),
+        }
+    }
+
+    /// The files for this run: the config `-c` names, which must exist, or the
+    /// default one (see [`path_for`]), and the client's beside it.
+    pub fn for_run(flag: Option<PathBuf>, files: Arc<dyn Files>) -> Result<Self> {
+        path_for(flag, files.as_ref()).map(|config| Self::beside(config, files))
+    }
+
+    /// Both, the config first.
+    pub fn documents(&self) -> [&dyn Document; 2] {
+        [&self.config, &self.client]
+    }
+}
+
+/// Every problem as one error: the only one as it is, several as a list.
+fn report(path: &Path, what: &str, mut problems: Vec<String>) -> anyhow::Error {
+    let report = match problems.len() {
+        1 => problems.swap_remove(0),
+        _ => format!("\n  - {}", problems.join("\n  - ")),
+    };
+    anyhow::anyhow!(report).context(format!("invalid {what}{}", path.display()))
 }
 
 /// The home directory, or `/` where there is none (and so no place is relative to it).
@@ -204,19 +334,25 @@ pub fn default_path() -> Result<PathBuf> {
     Ok(dirs::config_dir()
         .context("this system has no config directory; give the config with -c")?
         .join("lodge")
-        .join("config.toml"))
+        .join(FILE))
 }
 
 /// The config file for this run: `-c FILE`, which must exist, or the default
 /// location, which may not. Absolute, so a relative `bundle =` resolves the same
 /// wherever lodge runs from.
-pub fn path_for(flag: Option<PathBuf>) -> Result<PathBuf> {
+pub fn path_for(flag: Option<PathBuf>, files: &dyn Files) -> Result<PathBuf> {
     let Some(path) = flag else {
         return default_path();
     };
     let path = expand_tilde(path);
-    if !path.is_file() {
+    if !files.exists(&path) {
         anyhow::bail!("config file {} does not exist", path.display());
+    }
+    if path.file_name().is_some_and(|n| n == client::FILE) {
+        anyhow::bail!(
+            "{} is the client's file, which sits beside the config; give the config with -c",
+            path.display()
+        );
     }
     Ok(std::path::absolute(&path).unwrap_or(path))
 }
@@ -258,139 +394,36 @@ fn resolve_against(config_file: &Path, path: PathBuf) -> PathBuf {
         .map_or(path.clone(), |dir| dir.join(&path))
 }
 
-/// The `target` the config at `path` names, if it does. Read on its own, before
-/// the whole config is loaded, because the target is chosen before a command
-/// loads the config. A file that is missing or is not valid TOML names none: the
-/// command that loads the config reports that. A value that is not a string is an
-/// error here; whether it names a target is for the command layer, which knows them.
-pub fn target_setting(path: &Path) -> Result<Option<String>> {
-    let Some(table) = peek(path) else {
-        return Ok(None);
-    };
-    table
-        .get("target")
-        .map(|v| v.clone().try_into::<String>())
-        .transpose()
-        .with_context(|| format!("invalid `target` in {}", path.display()))
-}
-
-/// The `[targets.<name>]` table of the config at `path`, read on its own like
-/// [`target_setting`] (the target is built before a command loads the config). A
-/// table that is missing, or a file that is missing or not TOML, gives an empty
-/// table; one that is not a table is an error. What is *in* it is for the target
-/// to check.
-pub fn target_settings(path: &Path, name: &str) -> Result<toml::Table> {
-    let Some(file) = peek(path) else {
-        return Ok(toml::Table::new());
-    };
-    file.get("targets")
-        .and_then(|t| t.get(name))
-        .map(|v| v.clone().try_into::<toml::Table>())
-        .transpose()
-        .map(Option::unwrap_or_default)
-        .with_context(|| format!("invalid [targets.{name}] in {}", path.display()))
-}
-
-/// The file in a project's folder that says what is particular to the project:
-/// only `[targets.<name>]` tables, for the targets that take settings per project.
-pub const PROJECT_FILE: &str = "lodge.toml";
-
-/// The `[targets.<name>]` table of the project file in `dir`: an empty table when
-/// there is no file or no such table. The file may hold nothing but `targets`, so
-/// a stray key (a `[[binary]]` that would be ignored) is an error and not a
-/// silent no-op; what is *in* the table is for the target to check.
-pub fn project_target_settings(dir: &Path, name: &str) -> Result<toml::Table> {
-    let path = dir.join(PROJECT_FILE);
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(toml::Table::new()),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let file: toml::Table = raw
-        .parse()
-        .with_context(|| format!("invalid {}", path.display()))?;
-    if let Some(key) = file.keys().find(|k| *k != "targets") {
-        anyhow::bail!(
-            "invalid {}: `{key}` is not allowed; a project file holds only [targets.<name>] \
-             tables (everything else is in your own config)",
-            path.display()
-        );
-    }
-    file.get("targets")
-        .and_then(|t| t.get(name))
-        .map(|v| v.clone().try_into::<toml::Table>())
-        .transpose()
-        .map(Option::unwrap_or_default)
-        .with_context(|| format!("invalid [targets.{name}] in {}", path.display()))
-}
-
-/// The keys of the interactive screens, from the config at `path` and read on
-/// its own like [`target_setting`]: the first screen comes before any command
-/// loads the config. A file that is missing, or not TOML, gives the defaults (the
-/// command that loads the config reports the latter); a `[keys]` that is wrong
-/// is an error, with everything that is wrong with it.
-pub fn keymap(path: &Path) -> Result<Keymap> {
-    let Some(file) = peek(path) else {
-        return Ok(Keymap::default());
-    };
-    let Some(table) = file.get("keys") else {
-        return Ok(Keymap::default());
-    };
-    let settings: BTreeMap<String, KeyList> = table
-        .clone()
-        .try_into()
-        .with_context(|| format!("invalid [keys] in {}", path.display()))?;
-    Keymap::build(&settings).map_err(|problems| {
-        anyhow::anyhow!("\n  - {}", problems.join("\n  - "))
-            .context(format!("invalid [keys] in {}", path.display()))
-    })
-}
-
-/// The config file as a raw table, `None` if it is missing or not TOML.
-fn peek(path: &Path) -> Option<toml::Table> {
-    std::fs::read_to_string(path).ok()?.parse().ok()
+/// A file as a raw table, `None` if it is missing, unreadable or not TOML.
+fn peek(file: &dyn Document) -> Option<toml::Table> {
+    file.read_text().ok()??.parse().ok()
 }
 
 impl Config {
-    /// Reads and validates the config at `path`. A missing file is an empty
-    /// config: nothing is injected, and you still get a shell.
-    pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config at {}", path.display()))?;
-        Self::parse(&raw, path)
-    }
-
-    /// Parses `raw` as if read from `path` (which relative paths resolve
-    /// against), and checks it. What the file's syntax and types get wrong is
-    /// reported on its own; everything else is reported together.
+    /// Parses `raw` as if read from `path`, and checks it. What the file's syntax
+    /// and types get wrong is reported on its own; everything else is reported
+    /// together.
     pub fn parse(raw: &str, path: &Path) -> Result<Self> {
-        Self::read(raw, path).map_err(|mut problems| {
-            let report = match problems.len() {
-                1 => problems.swap_remove(0),
-                _ => format!("\n  - {}", problems.join("\n  - ")),
-            };
-            anyhow::anyhow!(report).context(format!("invalid config {}", path.display()))
-        })
+        Self::read(raw).map_err(|problems| report(path, "config ", problems))
     }
 
     /// How many things are wrong with `raw`: none for a config that is valid.
     /// A file the types reject is one problem, the first they find.
-    pub fn problem_count(raw: &str, path: &Path) -> usize {
-        Self::read(raw, path)
-            .err()
-            .map_or(0, |problems| problems.len())
+    pub fn problem_count(raw: &str) -> usize {
+        Self::read(raw).err().map_or(0, |problems| problems.len())
     }
 
     /// The config in `raw`, or every problem with it.
-    fn read(raw: &str, path: &Path) -> std::result::Result<Self, Vec<String>> {
-        let file: Config<RawSecret> = toml::from_str(raw)
+    fn read(raw: &str) -> std::result::Result<Self, Vec<String>> {
+        let mut cfg: Config = toml::from_str(raw)
             .map_err(|e| vec![format!("{}{}", e.message(), location(raw, &e))])?;
-        let mut problems = Vec::new();
-        let cfg = Self::from_file(file, path, &mut problems);
-        problems.extend(cfg.problems());
+        for item in &mut cfg.binaries {
+            item.path = expand_tilde(std::mem::take(&mut item.path));
+        }
+        for item in &mut cfg.data {
+            item.path = expand_tilde(std::mem::take(&mut item.path));
+        }
+        let problems = cfg.problems();
         if problems.is_empty() {
             Ok(cfg)
         } else {
@@ -398,60 +431,10 @@ impl Config {
         }
     }
 
-    /// The config as read from `path`, with its host paths resolved and each
-    /// `[[secret]]` checked; what is wrong with a secret goes to `problems`.
-    fn from_file(file: Config<RawSecret>, path: &Path, problems: &mut Vec<String>) -> Self {
-        let Config {
-            target,
-            targets,
-            bundle,
-            bundles,
-            mut binaries,
-            mut data,
-            session,
-            git,
-            secret,
-            keys,
-        } = file;
-        for item in &mut binaries {
-            item.path = expand_tilde(std::mem::take(&mut item.path));
-        }
-        for item in &mut data {
-            item.path = expand_tilde(std::mem::take(&mut item.path));
-        }
-        let secret = secret
-            .into_iter()
-            .filter_map(|raw| SecretDecl::try_from(raw).map_err(|e| problems.push(e)).ok())
-            .map(|mut decl| {
-                if let secret::Source::File(p) = &mut decl.from {
-                    *p = expand_tilde(std::mem::take(p));
-                }
-                decl
-            })
-            .collect();
-        Self {
-            target,
-            targets,
-            bundle: bundle.map(|b| resolve_reference(path, b)),
-            bundles: bundles
-                .into_iter()
-                .map(|b| resolve_reference(path, b))
-                .collect(),
-            binaries,
-            data,
-            session,
-            git,
-            secret,
-            keys,
-        }
-    }
-
     /// What the types can't check: every problem, so they are reported at once.
     fn problems(&self) -> Vec<String> {
         let mut problems = self.binary_problems();
         problems.extend(self.data_problems(&home_dir()));
-        problems.extend(secret::problems(&self.secret));
-        problems.extend(Keymap::build(&self.keys).err().unwrap_or_default());
         problems
     }
 
@@ -505,7 +488,8 @@ impl Config {
     }
 }
 
-/// " (line N)" plus a "did you mean" hint for an unknown key, from a toml error.
+/// " (line N)" plus a "did you mean" for an unknown key that is close to a known
+/// one, from a toml error.
 fn location(raw: &str, e: &toml::de::Error) -> String {
     let mut out = String::new();
     if let Some(span) = e.span() {
@@ -556,40 +540,6 @@ mod tests {
     }
 
     #[test]
-    fn keys_are_checked_with_the_rest_of_the_config() {
-        assert!(parse("[keys]\nleave = [\"esc\"]\npack = \"ctrl-k\"\n").is_ok());
-        let e = format!(
-            "{:#}",
-            parse("[keys]\nlieve = [\"q\"]\nup = [\"bogus\"]\n[[binary]]\nname = \"a b\"\npath = \"/x\"\n")
-                .unwrap_err()
-        );
-        assert!(e.contains("`lieve` is not something a key does"), "{e}");
-        assert!(e.contains("`up`: `bogus` is not a key"), "{e}");
-        assert!(e.contains("[[binary]] `a b`"), "all together: {e}");
-    }
-
-    #[test]
-    fn the_keymap_is_read_on_its_own_and_a_missing_file_gives_the_defaults() {
-        use crate::keys::{Action, Context};
-        let dir = std::env::temp_dir().join(format!("lodge-keys-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("config.toml");
-        let q = "q".parse().unwrap();
-        assert_eq!(
-            keymap(&dir.join("none.toml"))
-                .unwrap()
-                .action(Context::List, q),
-            Some(Action::Leave)
-        );
-        std::fs::write(&file, "[keys]\nleave = [\"esc\"]\n").unwrap();
-        assert_eq!(keymap(&file).unwrap().action(Context::List, q), None);
-        std::fs::write(&file, "[keys]\nup = [\"nope\"]\n").unwrap();
-        let e = format!("{:#}", keymap(&file).unwrap_err());
-        assert!(e.contains("invalid [keys]") && e.contains("`up`"), "{e}");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
     fn empty_config_uses_defaults() {
         let c = parse("").unwrap();
         assert!(c.binaries.is_empty() && c.data.is_empty());
@@ -634,142 +584,10 @@ mod tests {
     }
 
     #[test]
-    fn the_target_is_a_name_the_command_layer_checks() {
-        assert_eq!(
-            parse("target = \"docker\"").unwrap().target.as_deref(),
-            Some("docker")
-        );
-        assert_eq!(parse("").unwrap().target, None);
-        // Which names are targets is for the command layer, which knows them; the
-        // config only needs it to be a name.
-        assert_eq!(
-            parse("target = \"nonesuch\"").unwrap().target.as_deref(),
-            Some("nonesuch")
-        );
-        assert!(parse("target = 3").is_err());
-    }
-
-    #[test]
-    fn each_target_has_its_own_table_whose_keys_its_target_checks() {
-        let c = parse(
-            "[targets.docker]\ncontext = \"colima\"\n[targets.podman]\nconnection = \"vm\"\n",
-        )
-        .unwrap();
-        assert_eq!(c.targets["docker"]["context"].as_str(), Some("colima"));
-        assert_eq!(c.targets["podman"]["connection"].as_str(), Some("vm"));
-        assert!(parse("").unwrap().targets.is_empty());
-        // Which tables exist is for the command layer, which knows the targets; a
-        // table that is not a table is the config's own error.
-        assert!(parse("[targets]\ndocker = 3\n").is_err());
-    }
-
-    #[test]
-    fn a_targets_table_can_be_read_alone_like_the_target() {
-        let dir = crate::tmpfile::TempDir::new("target-settings").unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "bogus = 1\n[targets.docker]\ncontext = \"colima\"\n").unwrap();
-        let docker = target_settings(&path, "docker").unwrap();
-        assert_eq!(docker["context"].as_str(), Some("colima"));
-        // Another target's table, a missing table, a missing file, and a file that is
-        // not TOML (the config load reports it) all give an empty table.
-        assert!(target_settings(&path, "podman").unwrap().is_empty());
-        assert!(
-            target_settings(&dir.path().join("none.toml"), "docker")
-                .unwrap()
-                .is_empty()
-        );
-        std::fs::write(&path, "= not toml").unwrap();
-        assert!(target_settings(&path, "docker").unwrap().is_empty());
-        std::fs::write(&path, "[targets]\ndocker = 3\n").unwrap();
-        let err = target_settings(&path, "docker").unwrap_err();
-        assert!(
-            format!("{err:#}").contains("invalid [targets.docker]"),
-            "{err:#}"
-        );
-    }
-
-    #[test]
-    fn the_target_alone_can_be_read_from_a_file_that_is_otherwise_unchecked() {
-        let dir = crate::tmpfile::TempDir::new("target-peek").unwrap();
-        let path = dir.path().join("c.toml");
-        // Wrong in other ways (an unknown key): not this function's business.
-        std::fs::write(&path, "target = \"docker\"\nbogus = 1\n").unwrap();
-        assert_eq!(target_setting(&path).unwrap().as_deref(), Some("docker"));
-        // Not TOML at all: no target named; loading the config reports it.
-        std::fs::write(&path, "= = =").unwrap();
-        assert_eq!(target_setting(&path).unwrap(), None);
-        assert_eq!(target_setting(&dir.path().join("none.toml")).unwrap(), None);
-    }
-
-    #[test]
-    fn a_relative_bundle_is_relative_to_the_config_file() {
-        let cfg = Path::new("/srv/deploy/config.toml");
-        assert_eq!(
-            resolve_against(cfg, "bundle.tar".into()),
-            Path::new("/srv/deploy/bundle.tar")
-        );
-        assert_eq!(
-            resolve_against(cfg, "/abs/x.tar".into()),
-            Path::new("/abs/x.tar")
-        );
-        assert_eq!(
-            parse("bundle = \"b.tar\"").unwrap().bundle.unwrap(),
-            Path::new("/srv/lodge").join("b.tar").to_string_lossy()
-        );
-    }
-
-    #[test]
-    fn a_bundle_with_a_scheme_is_not_a_path_and_is_left_alone() {
-        assert_eq!(
-            parse("bundle = \"oci://ghcr.io/me/lodge:1\"")
-                .unwrap()
-                .bundle
-                .unwrap(),
-            "oci://ghcr.io/me/lodge:1"
-        );
-    }
-
-    #[test]
-    fn the_listed_bundles_are_read_like_the_default_one() {
-        let c = parse("bundles = [\"b.tar\", \"oci://ghcr.io/me/lodge:2\"]").unwrap();
-        let b = Path::new("/srv/lodge").join("b.tar");
-        assert_eq!(
-            c.bundles,
-            [&*b.to_string_lossy(), "oci://ghcr.io/me/lodge:2"]
-        );
-        assert!(parse("").unwrap().bundles.is_empty());
-    }
-
-    #[test]
-    fn a_reference_written_into_the_config_keeps_its_scheme_and_its_tilde() {
-        assert_eq!(
-            absolute_reference("oci://ghcr.io/me/lodge:1"),
-            "oci://ghcr.io/me/lodge:1"
-        );
-        assert_eq!(absolute_reference("~/x.tar"), "~/x.tar");
-        assert!(Path::new(&absolute_reference("x.tar")).is_absolute());
-        assert!(absolute_reference("x.tar").ends_with("x.tar"));
-    }
-
-    #[test]
-    fn parses_secret_declarations() {
-        let c = parse(
-            "[[secret]]\nname = \"GH_TOKEN\"\nfrom = { command = \"gh auth token\" }\nas = \"env\"\n",
-        )
-        .unwrap();
-        assert_eq!(c.secret.len(), 1);
-    }
-
-    #[test]
     fn host_paths_expand_the_tilde() {
-        let c = parse(
-            "[[binary]]\nname = \"x\"\npath = \"~/bin/x\"\n\
-             [[secret]]\nname = \"T\"\nfrom = { file = \"~/tok\" }\nas = \"env\"\n",
-        )
-        .unwrap();
+        let c = parse("[[binary]]\nname = \"x\"\npath = \"~/bin/x\"\n").unwrap();
         let home = dirs::home_dir().unwrap();
         assert_eq!(c.binaries[0].path.as_path(), home.join("bin/x").as_path());
-        assert_eq!(c.secret[0].from, secret::Source::File(home.join("tok")));
     }
 
     #[test]
@@ -820,9 +638,7 @@ mod tests {
                  [[data]]\npath = \"/t\"\ntarget = \"rel/x\"\n\
                  [[data]]\npath = \"/m\"\ntarget = \"/same\"\n\
                  [[data]]\npath = \"/n\"\ntarget = \"/same\"\n\
-                 [[data]]\npath = \"/o\"\nfor = \"nope\"\n\
-                 [[secret]]\nname = \"S\"\nfrom = { env = \"A\", file = \"/b\" }\nas = \"env\"\n\
-                 [[secret]]\nname = \"T\"\nfrom = { env = \"A\" }\nas = \"socket\"\n"
+                 [[data]]\npath = \"/o\"\nfor = \"nope\"\n"
             )
             .unwrap_err()
         );
@@ -840,11 +656,6 @@ mod tests {
             err.contains("[[data]] `/o`: `for` names `nope`, which is not a [[binary]]"),
             "{err}"
         );
-        assert!(
-            err.contains("secret \"S\": `from` needs exactly one"),
-            "{err}"
-        );
-        assert!(err.contains("secret \"T\": unknown `as`"), "{err}");
     }
 
     #[test]
@@ -858,34 +669,5 @@ mod tests {
             None
         );
         assert_eq!(edit_distance("kitten", "sitting"), 3);
-    }
-
-    #[test]
-    fn a_project_file_gives_a_targets_table_and_nothing_else() {
-        let dir = crate::tmpfile::TempDir::new("project-file").unwrap();
-        // No file: nothing.
-        assert!(
-            project_target_settings(dir.path(), "kubernetes")
-                .unwrap()
-                .is_empty()
-        );
-        std::fs::write(
-            dir.path().join(PROJECT_FILE),
-            "[targets.kubernetes]\npod = \"dev-0\"\n[targets.docker]\ncontext = \"x\"\n",
-        )
-        .unwrap();
-        let table = project_target_settings(dir.path(), "kubernetes").unwrap();
-        assert_eq!(table["pod"].as_str(), Some("dev-0"));
-        assert!(
-            project_target_settings(dir.path(), "podman")
-                .unwrap()
-                .is_empty()
-        );
-        // A key that would be ignored is refused, and so is a file that is not TOML.
-        std::fs::write(dir.path().join(PROJECT_FILE), "[[binary]]\nname = \"x\"\n").unwrap();
-        let err = project_target_settings(dir.path(), "kubernetes").unwrap_err();
-        assert!(err.to_string().contains("`binary` is not allowed"), "{err}");
-        std::fs::write(dir.path().join(PROJECT_FILE), "= not toml").unwrap();
-        assert!(project_target_settings(dir.path(), "kubernetes").is_err());
     }
 }

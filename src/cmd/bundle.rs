@@ -12,7 +12,9 @@ use crate::bundle::choice::{self, Offer};
 use crate::bundle::reader::Bundle;
 use crate::bundle::store::{Identity, Replace, Sinks};
 use crate::cli::{BundleCommand, CacheCommand};
+use crate::config::client::Client;
 use crate::config::edit::{self, Setting};
+use crate::config::{ClientFile, Document, Paths};
 use crate::output::{info, line, note, plural, warning};
 use crate::tmpfile::TempDir;
 use crate::tools::Toolchain;
@@ -25,11 +27,11 @@ pub struct LivePacker {
 }
 
 impl super::configure::Bundles for LivePacker {
-    fn pack(&self, path: &Path, output: Option<&str>, replace: Replace) -> Result<String> {
-        let config = crate::config::Config::load(path)?;
+    fn pack(&self, paths: &Paths, output: Option<&str>, replace: Replace) -> Result<String> {
+        let config = paths.config.load()?;
         let packed = pack_config(
             &config,
-            path,
+            &paths.client,
             &self.tools,
             &self.sinks,
             output.map(str::to_string),
@@ -83,7 +85,7 @@ pub fn pack(ctx: &Ctx, output: Option<String>, replace: Replace) -> Result<()> {
     let config = ctx.config()?;
     let packed = pack_config(
         &config,
-        &ctx.config_path,
+        &ctx.paths.client,
         &ctx.tools,
         &ctx.sinks,
         output,
@@ -104,13 +106,13 @@ pub struct Packed {
     pub offered: Option<String>,
 }
 
-/// Packs `config`, read from `config_path`, into `output` (a file, or an `oci://`
-/// reference to publish to; `lodge-<arch>.tar` here when none is given), and puts
-/// it on offer in the config (see [`offer`]). What was made is returned, for the
+/// Packs `config` into `output` (a file, or an `oci://` reference to publish to;
+/// `lodge-<arch>.tar` here when none is given), and puts it on offer in the client
+/// file `client` (see [`offer`]). What was made is returned, for the
 /// caller to say where it is said.
 pub fn pack_config(
     config: &crate::config::Config,
-    config_path: &Path,
+    client: &ClientFile,
     tools: &Toolchain,
     sinks: &Sinks,
     output: Option<String>,
@@ -140,31 +142,41 @@ pub fn pack_config(
         written,
         manifest.id()
     );
-    let offered = offer(config, config_path, &output);
+    let offered = offer(client, &output);
     Ok(Packed { summary, offered })
 }
 
-/// Lists `reference`, which was just written, in the config's `bundles`, so it can
-/// be chosen later: unless it is already on offer, or there is no config file to
-/// put it in (one is not made for this). The bundle is written either way, so a
-/// config that cannot be changed is said and not an error. What is to be said of
-/// it when it was put on offer is returned.
-fn offer(config: &crate::config::Config, config_path: &Path, reference: &str) -> Option<String> {
-    if !config_path.is_file() {
+/// Lists `reference`, which was just written, in the client file's `bundles`, so it
+/// can be chosen later: unless it is already on offer, or there is no client file
+/// to put it in (one is not made for this). The bundle is written either way, so a
+/// file that cannot be changed is said and not an error. What is to be said of it
+/// when it was put on offer is returned.
+fn offer(client: &ClientFile, reference: &str) -> Option<String> {
+    if !client.exists() {
         return None;
     }
     let reference = crate::config::absolute_reference(reference);
-    if on_offer(config, &reference) {
+    let settings = match client.load() {
+        Ok(settings) => settings,
+        Err(e) => {
+            warning!("could not put {reference} on offer: {e:#}");
+            return None;
+        }
+    };
+    if on_offer(&settings, &reference) {
         return None;
     }
-    match edit::add_bundle(config_path, &reference) {
+    match edit::add_bundle(client, &reference) {
         Ok(true) => Some(format!(
             "{reference} is on offer now (`bundles` in {})",
-            config_path.display()
+            client.display()
         )),
         Ok(false) => None,
         Err(e) => {
-            warning!("could not put {reference} on offer in the config: {e:#}");
+            warning!(
+                "could not put {reference} on offer in {}: {e:#}",
+                client.display()
+            );
             None
         }
     }
@@ -228,8 +240,8 @@ pub fn pick(
 }
 
 /// Whether `reference` is the default or listed in `bundles`.
-fn on_offer(config: &crate::config::Config, reference: &str) -> bool {
-    choice::options(&choice::default(config), &config.bundles)
+fn on_offer(settings: &Client, reference: &str) -> bool {
+    choice::options(&choice::default(settings), &settings.bundles)
         .iter()
         .any(|c| c.reference() == Some(reference))
 }
@@ -237,7 +249,7 @@ fn on_offer(config: &crate::config::Config, reference: &str) -> bool {
 /// `ldg bundle use`: the bundle is `reference`, or the packed config, or one
 /// picked from what is on offer.
 fn use_bundle(ctx: &Ctx, reference: Option<String>, live: bool) -> Result<()> {
-    let config = ctx.config()?;
+    let settings = ctx.client()?;
     let can_pack = ctx.tools.packer.is_some();
     let new = match (reference, live) {
         (Some(reference), _) => Offer::Reference(crate::config::absolute_reference(&reference)),
@@ -253,21 +265,21 @@ fn use_bundle(ctx: &Ctx, reference: Option<String>, live: bool) -> Result<()> {
                 ctx.choose.can_ask(),
                 "no terminal to choose on: give a bundle (`ldg bundle use FILE|oci://REF`) or --live"
             );
-            let default = choice::default(&config);
-            let offered = choice::selectable(&default, &config.bundles, can_pack);
+            let default = choice::default(&settings);
+            let offered = choice::selectable(&default, &settings.bundles, can_pack);
             match pick(ctx.choose.as_ref(), "Use which bundle?", &offered, &default)? {
                 Some(chosen) => chosen,
                 None => return Ok(()),
             }
         }
     };
-    adopt(ctx, &config, new)
+    adopt(ctx, &settings, new)
 }
 
-/// Makes `new` the default. A bundle is fetched and checked before the config is
-/// touched; the old default stays on offer.
-fn adopt(ctx: &Ctx, config: &crate::config::Config, new: Offer) -> Result<()> {
-    let old = choice::default(config);
+/// Makes `new` the default. A bundle is fetched and checked before the client file
+/// is touched; the old default stays on offer.
+fn adopt(ctx: &Ctx, settings: &Client, new: Offer) -> Result<()> {
+    let old = choice::default(settings);
     if new == old {
         note!("{} is the default already", new.label());
         return Ok(());
@@ -278,12 +290,12 @@ fn adopt(ctx: &Ctx, config: &crate::config::Config, new: Offer) -> Result<()> {
         info!("bundle {} is ready", prepared.bundle.manifest().id());
     }
     // As written in the file, so what is kept keeps its form (`~/x.tar`).
-    let path = &ctx.config_path;
-    let written_old = edit::setting(path, Setting::Bundle)?
+    let path = &ctx.paths.client;
+    let written_old = edit::setting(&ctx.paths, Setting::Bundle)?
         .map(|b| b.trim_matches('"').to_string())
         .map_or(Offer::Live, Offer::Reference);
     let others = edit::bundles(path)?;
-    edit::set_setting(path, Setting::Bundle, new.reference())?;
+    edit::set_setting(&ctx.paths, Setting::Bundle, new.reference())?;
     let kept = choice::after_switch(&others, &written_old, &new);
     if kept != others {
         edit::set_bundles(path, &kept)?;
@@ -298,30 +310,32 @@ fn adopt(ctx: &Ctx, config: &crate::config::Config, new: Offer) -> Result<()> {
 
 /// `ldg bundle add`: puts a bundle on offer, after checking that it is there.
 fn add_bundle(ctx: &Ctx, reference: &str) -> Result<()> {
-    let config = ctx.config()?;
+    let settings = ctx.client()?;
     let reference = crate::config::absolute_reference(reference);
     ctx.bundles
         .find(&reference)?
         .identify(&reference, Arch::host().ok())?;
-    if on_offer(&config, &reference) {
+    if on_offer(&settings, &reference) {
         note!("{reference} is on offer already");
         return Ok(());
     }
-    edit::add_bundle(&ctx.config_path, &reference)?;
+    edit::add_bundle(&ctx.paths.client, &reference)?;
     info!("{reference} is on offer");
     Ok(())
 }
 
 /// `ldg bundle rm`: takes a bundle off the list. The default is not on the list.
 fn remove_bundle(ctx: &Ctx, reference: &str) -> Result<()> {
-    let config = ctx.config()?;
+    let settings = ctx.client()?;
     let absolute = crate::config::absolute_reference(reference);
-    let path = &ctx.config_path;
+    let path = &ctx.paths.client;
     if edit::remove_bundle(path, reference)? || edit::remove_bundle(path, &absolute)? {
         info!("{reference} is not on offer any more");
         return Ok(());
     }
-    if config.bundle.as_deref() == Some(&absolute) || config.bundle.as_deref() == Some(reference) {
+    if settings.bundle.as_deref() == Some(&absolute)
+        || settings.bundle.as_deref() == Some(reference)
+    {
         anyhow::bail!(
             "{reference} is the default: make another one the default first (`ldg bundle use`)"
         );
@@ -331,8 +345,8 @@ fn remove_bundle(ctx: &Ctx, reference: &str) -> Result<()> {
 
 /// `ldg bundle ls`: what is on offer, the default first.
 fn list_bundles(ctx: &Ctx) -> Result<()> {
-    let config = ctx.config()?;
-    let offered = choice::options(&choice::default(&config), &config.bundles);
+    let settings = ctx.client()?;
+    let offered = choice::options(&choice::default(&settings), &settings.bundles);
     for (i, candidate) in offered.iter().enumerate() {
         let mark = if i == 0 { "*" } else { " " };
         line!("{mark} {}", candidate.label());
@@ -435,14 +449,15 @@ pub fn cache(command: Option<CacheCommand>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
 
-    fn config_at(text: &str) -> (TempDir, PathBuf, Config) {
+    fn client_at(text: &str) -> (TempDir, ClientFile) {
         let dir = TempDir::new("bundle-offer").unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, text).unwrap();
-        let config = Config::load(&path).unwrap();
-        (dir, path, config)
+        let path = ClientFile::new(
+            dir.path().join(crate::config::client::FILE),
+            crate::files::disk(),
+        );
+        std::fs::write(path.path(), text).unwrap();
+        (dir, path)
     }
 
     #[test]
@@ -460,26 +475,26 @@ mod tests {
 
     #[test]
     fn what_pack_writes_is_put_on_offer_in_the_config() {
-        let (_dir, path, config) = config_at("target = \"docker\"\n");
-        offer(&config, &path, "oci://ghcr.io/me/lodge:1");
+        let (_dir, path) = client_at("target = \"docker\"\n");
+        offer(&path, "oci://ghcr.io/me/lodge:1");
         assert_eq!(edit::bundles(&path).unwrap(), ["oci://ghcr.io/me/lodge:1"]);
         // The default is not listed as well.
-        let (_dir, path, config) = config_at("bundle = \"oci://r/x:1\"\n");
-        offer(&config, &path, "oci://r/x:1");
+        let (_dir, path) = client_at("bundle = \"oci://r/x:1\"\n");
+        offer(&path, "oci://r/x:1");
         assert!(edit::bundles(&path).unwrap().is_empty());
     }
 
     #[test]
     fn a_bundle_on_offer_already_is_not_listed_again() {
-        let (_dir, path, config) = config_at("bundles = [\"oci://r/x:1\"]\n");
-        offer(&config, &path, "oci://r/x:1");
+        let (_dir, path) = client_at("bundles = [\"oci://r/x:1\"]\n");
+        offer(&path, "oci://r/x:1");
         assert_eq!(edit::bundles(&path).unwrap(), ["oci://r/x:1"]);
     }
 
     #[test]
     fn a_file_is_listed_by_its_absolute_path() {
-        let (_dir, path, config) = config_at("");
-        offer(&config, &path, "lodge-x86_64.tar");
+        let (_dir, path) = client_at("");
+        offer(&path, "lodge-x86_64.tar");
         let listed = edit::bundles(&path).unwrap();
         assert_eq!(listed.len(), 1);
         assert!(Path::new(&listed[0]).is_absolute(), "{listed:?}");
@@ -489,8 +504,11 @@ mod tests {
     #[test]
     fn there_is_no_config_file_made_just_to_list_a_bundle() {
         let dir = TempDir::new("bundle-offer-none").unwrap();
-        let path = dir.path().join("config.toml");
-        offer(&Config::default(), &path, "oci://r/x:1");
+        let path = ClientFile::new(
+            dir.path().join(crate::config::client::FILE),
+            crate::files::disk(),
+        );
+        offer(&path, "oci://r/x:1");
         assert!(!path.exists());
     }
 

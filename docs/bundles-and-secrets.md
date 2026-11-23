@@ -23,16 +23,21 @@ ldg bundle inspect lodge-x86_64.tar      # what it holds (both also take oci://�
 ldg up --bundle lodge-x86_64.tar         # anywhere with a container runtime (or just ssh with -r)
 ```
 
-or set `bundle = "~/lodge-x86_64.tar"` at the top of `config.toml`. A configured
-bundle replaces the `[[binary]]` and `[[data]]` entries on that machine; `[session]` stays local.
+or set `bundle = "~/lodge-x86_64.tar"` at the top of `client.toml`. A configured
+bundle replaces the `[[binary]]` and `[[data]]` entries of `config.toml` on that
+machine; `[session]` stays local.
+
+A bundle is made from `config.toml` alone. The settings that depend on the machine
+(`target`, `bundle`, `bundles`, `[[secret]]`, `[keys]`) are in `client.toml`, so none
+of them can end up in one.
 
 A machine that only *uses* a bundle needs just the bundle (a file, or a registry
-reference as below) and a small config of its own: the `bundle =` line,
-`[session]`, and any `[[secret]]` (see below). Keep them in one folder and point
-lodge at it with `-c`:
+reference as below) and a small `client.toml` of its own: the `bundle =` line and any
+`[[secret]]` (see below), and an empty `config.toml` beside it (or one with `[session]`).
+Keep them in one folder and point lodge at it with `-c`:
 
 ```toml
-# deploy/config.toml
+# deploy/client.toml
 bundle = "bundle.tar"          # relative to this file's folder
 
 [[secret]]
@@ -45,8 +50,9 @@ as   = "env"
 ldg -c deploy/config.toml --remote me@host:2222 up /devel/project
 ```
 
-`-c` replaces `~/.config/lodge/config.toml` for the run (the file must exist);
-`--bundle` on the command line still overrides the config's `bundle`. A bundle is
+`-c` replaces `~/.config/lodge/config.toml` for the run (the file must exist), and with
+it the `client.toml` beside it; `--bundle` on the command line still overrides the
+client file's `bundle`. A bundle is
 for one CPU architecture and must match the container's (from a registry, the
 image for the machine you run `ldg` on is used, so for a container of another
 architecture use a file or a tag of its own). It can hold credentials if you list
@@ -66,6 +72,7 @@ ldg up --bundle oci://ghcr.io/me/lodge@sha256:4f1c…   # pinned to exact conten
 ```
 
 ```toml
+# client.toml
 bundle = "oci://ghcr.io/me/lodge:1"
 ```
 
@@ -88,7 +95,7 @@ Publishing needs a login with an account that may write there. Keep one with
 `ldg registry login <registry>` (the password or access token is typed without being
 shown, or piped in; with two-factor authentication on, registries want an access
 token, not the account password). It goes in this machine's credential store, not in
-the config or a bundle, so it is per machine and per user. lodge reads it first, then
+either file or a bundle, so it is per machine and per user. lodge reads it first, then
 the login `docker login` keeps in docker's config file or its credential helper. When
 a registry refuses and you are at a terminal, `ldg` asks for a login on the spot,
 tries it, and offers to keep it; with no terminal it fails as before (see
@@ -131,7 +138,7 @@ says what the tag resolves to and whether it is cached, and fetches nothing.
 
 ### Several bundles
 
-A config can name one bundle as the default (`bundle =`, or the packed config when
+The client file can name one bundle as the default (`bundle =`, or the packed config when
 it is not set) and list others (`bundles = [...]`, each written like `bundle`).
 Together they are what is **on offer**.
 
@@ -144,12 +151,12 @@ ldg bundle add ~/work.tar           # put one on offer without making it the def
 ldg bundle rm ~/work.tar
 ```
 
-- `use` fetches and checks the bundle **before** it touches the config, so a wrong
+- `use` fetches and checks the bundle **before** it touches `client.toml`, so a wrong
   reference, or an image for another architecture, changes nothing. The bundle that
   was the default stays on offer, and one that was on offer and is now the default
   is no longer listed as well.
 - `ldg pack -o …` puts what it wrote on offer, a file by its absolute path and a
-  registry as written (the tag, not the digest). It does that when the config file
+  registry as written (the tag, not the digest). It does that when `client.toml`
   exists, and only says so if it cannot.
 - A container keeps the bundle it was injected from. After switching, `ldg up
   --reinject` (or `--reinject -b REF` for one container only) injects the new one,
@@ -160,7 +167,7 @@ ldg bundle rm ~/work.tar
   into a place it has no history for (a new project) or with `--reinject`, and more
   than one bundle is on offer, it asks which. Declining, or having no terminal
   (`--no-attach`, CI, a pipe), takes the default. What you answered is used for that
-  run and kept in the history; the config is not changed.
+  run and kept in the history; `client.toml` is not changed.
 - The history (a bare `ldg`) shows the bundle each place was last opened with. It is
   shown, not replayed: opening a place again uses the default.
 - The config screen (`c`) chooses the bundle in use on its `bundle` line.
@@ -168,10 +175,11 @@ ldg bundle rm ~/work.tar
 ## Secrets
 
 Things you want in the container but must **not** be in a bundle (an API key, a
-GitHub token, a credential file) are declared as `[[secret]]` in your local
-`config.toml`. A bundle is a shareable artifact; secrets never go into one. They
-are declared in the config of the machine you attach from, so they work the same
-with a live `ldg up` and with a bundle.
+GitHub token, a credential file) are declared as `[[secret]]` in your
+`client.toml`. A bundle is a shareable artifact; secrets never go into one, and
+they are not in the file a bundle is made from (`config.toml`). They are declared on
+the machine you attach from, so they work the same with a live `ldg up` and with a
+bundle.
 
 ```toml
 # A token from `pass`, as an environment variable in the session.
@@ -205,7 +213,7 @@ as   = { file = "~/.ssh/deploy_key", mode = "0600" }
 
 A `store` source reads the value from your operating system's credential store
 (Windows Credential Manager, the macOS Keychain, or the Secret Service on Linux:
-GNOME Keyring, KeePassXC, …), so neither the config nor a file on disk holds it:
+GNOME Keyring, KeePassXC, …), so neither `client.toml` nor a file on disk holds it:
 
 ```toml
 [[secret]]
@@ -216,7 +224,7 @@ as   = "env"
 
 ```sh
 ldg secret set claude_token     # typed without being shown (or: ldg secret set claude_token < file)
-ldg secret ls                   # the entries your config reads, and whether each is set
+ldg secret ls                   # the entries your client file reads, and whether each is set
 ldg secret rm claude_token
 ```
 

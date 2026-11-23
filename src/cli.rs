@@ -429,12 +429,14 @@ pub enum Command {
         #[command(subcommand)]
         command: Option<CacheCommand>,
     },
-    /// Write a starting config, with the tools found on this machine filled in
+    /// Write a starting config and client file, with the tools found on this machine filled in
     #[command(
         long_about = "Write a commented config.toml (at ~/.config/lodge/config.toml, or the \
             file given with -c). Editors and tools found on PATH (nvim, hx, rg, fzf, …) \
             are added as [[binary]] and [[data]] entries, commented out, so you pick what to bring. \
-            Refuses to overwrite an existing file unless --force."
+            Refuses to overwrite an existing file unless --force. Beside it, writes a commented \
+            client.toml (the target, secrets, keys: what is this machine's own) unless there is \
+            one already, which is never overwritten."
     )]
     Init {
         /// Overwrite an existing config
@@ -443,6 +445,9 @@ pub enum Command {
         /// Print the config instead of writing it
         #[arg(long)]
         print: bool,
+        /// With --print: print the client file instead of the config
+        #[arg(long, requires = "print")]
+        client: bool,
     },
     /// Check that everything lodge needs is available
     #[command(

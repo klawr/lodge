@@ -17,6 +17,7 @@ mod credstore;
 mod devcontainer;
 #[cfg(test)]
 mod doc_facts;
+mod files;
 mod fingerprint;
 mod forward;
 mod history;

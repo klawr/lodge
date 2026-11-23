@@ -402,6 +402,13 @@ impl Sandbox {
         std::fs::write(self.root.join("config/lodge/config.toml"), toml).expect("writing config");
     }
 
+    /// Writes the client's own file (the target and its settings, secrets, which
+    /// bundle to use), beside the config.
+    pub fn client(&self, toml: &str) {
+        std::fs::write(self.root.join("config/lodge/client.toml"), toml)
+            .expect("writing client file");
+    }
+
     /// Puts an `ssh` on `PATH` that skips its options and runs the remote command
     /// locally, the way a remote login shell would receive it.
     pub fn use_fake_ssh(&mut self) {

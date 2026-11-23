@@ -1,0 +1,326 @@
+{
+  "$defs": {
+    "KeyList": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "What `[keys]` says for one action: a key, or several."
+    },
+    "RawAs": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "properties": {
+            "file": {
+              "type": "string"
+            },
+            "mode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "file"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "`\"env\"`, or a file in the container."
+    },
+    "RawFrom": {
+      "additionalProperties": false,
+      "description": "Where the value comes from on this machine: exactly one of the four.",
+      "properties": {
+        "command": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "env": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "store": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Secret": {
+      "additionalProperties": false,
+      "properties": {
+        "as": {
+          "$ref": "#/$defs/RawAs"
+        },
+        "from": {
+          "$ref": "#/$defs/RawFrom"
+        },
+        "name": {
+          "type": "string"
+        },
+        "targets": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "from",
+        "as"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "bundle": {
+      "default": null,
+      "description": "A bundle to inject from instead of packing the `[[binary]]` and `[[data]]`\nentries of config.toml: a file, or a registry as `oci://ghcr.io/me/lodge:1`.\nA relative file path is relative to this file's folder.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "bundles": {
+      "default": [],
+      "description": "Other bundles to choose from, as `bundle` is written. `ldg up` offers them\n(with `bundle`, or the packed config when that is not set) when it injects\ninto a project it has not opened before. `ldg pack -o` adds what it writes.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "keys": {
+      "additionalProperties": false,
+      "default": {},
+      "description": "The keys of the interactive screens, by what they do: `up = [\"up\", \"k\"]`.\nAn action given here has only the keys given; one left out keeps its own.",
+      "properties": {
+        "add_binary": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "add_data": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "add_secret": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "choose": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "clear_line": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "config": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "down": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "everywhere": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "first": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "last": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "leave": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "look_where": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "mark": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "new": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "next_list": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "open_file": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "pack": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "prev_list": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "publish": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "recreate": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "reinject": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "remove": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "skip": {
+          "$ref": "#/$defs/KeyList"
+        },
+        "up": {
+          "$ref": "#/$defs/KeyList"
+        }
+      },
+      "type": "object"
+    },
+    "secret": {
+      "default": [],
+      "description": "Secrets to deliver at attach time, and where each comes from on this machine.",
+      "items": {
+        "$ref": "#/$defs/Secret"
+      },
+      "type": "array"
+    },
+    "target": {
+      "default": null,
+      "description": "Where to work, unless `--target` says otherwise. Default: docker.",
+      "enum": [
+        "docker",
+        "podman",
+        "host",
+        "kubernetes",
+        null
+      ],
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "targets": {
+      "additionalProperties": false,
+      "default": {},
+      "description": "What each target lets you say about it, by target name: `[targets.docker]`.\nThe keys of a table are checked by the target that reads it.",
+      "properties": {
+        "docker": {
+          "additionalProperties": false,
+          "description": "What the user can say about docker, under `[targets.docker]` in the config.",
+          "properties": {
+            "context": {
+              "default": null,
+              "description": "The docker context to use (`docker --context NAME`): which engine to talk\nto when you have several (a remote one, Colima, Docker Desktop). Default:\nthe one `docker context use` selected.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "title": "DockerOptions",
+          "type": "object"
+        },
+        "host": {
+          "additionalProperties": false,
+          "type": "object"
+        },
+        "kubernetes": {
+          "additionalProperties": false,
+          "description": "What the user can say about Kubernetes, under `[targets.kubernetes]` in the\nconfig.",
+          "properties": {
+            "container": {
+              "default": null,
+              "description": "The container of the pod to work in (`kubectl exec -c NAME`). Default: the\none kubectl picks, as for `kubectl exec`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "context": {
+              "default": null,
+              "description": "The kubectl context to use (`kubectl --context NAME`): which cluster to\ntalk to when you have several. Default: the current one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "namespace": {
+              "default": null,
+              "description": "The namespace of the pod (`kubectl --namespace NAME`). Default: the\ncontext's.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pod": {
+              "default": null,
+              "description": "The pod to work in (`kubectl exec POD`). Every command that uses the\ntarget needs this or `selector`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "selector": {
+              "default": null,
+              "description": "A label selector (`kubectl get pods -l SELECTOR`, such as `app=api`) that\nfinds the pod instead of its name, for pods whose names change. It must\nmatch exactly one running pod: lodge does not pick among several. The pod\nis looked up once per run of `ldg`; use it instead of `pod`, not with it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workdir": {
+              "default": null,
+              "description": "The directory in the pod a session starts in. Default: the home of the\nuser the pod runs as. The project path of `ldg up` is a folder on the host,\nso it plays no part here.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "title": "KubeOptions",
+          "type": "object"
+        },
+        "podman": {
+          "additionalProperties": false,
+          "description": "What the user can say about podman, under `[targets.podman]` in the config.",
+          "properties": {
+            "connection": {
+              "default": null,
+              "description": "The podman connection to use (`podman --connection NAME`): which engine to\ntalk to when you have several (a remote machine, a podman machine).\nDefault: the one `podman system connection default` selected.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "title": "PodmanOptions",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "title": "Client",
+  "type": "object"
+}

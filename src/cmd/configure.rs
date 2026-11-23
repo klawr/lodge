@@ -1,5 +1,5 @@
-//! The config screen, reached with `c` from a bare `ldg`: the whole config file as a
-//! form, every value a line that can be changed, programs and data chosen from
+//! The config screen, reached with `c` from a bare `ldg`: the config file and the
+//! client's own file beside it as one form, every value a line that can be changed, programs and data chosen from
 //! what this machine has, and the bundle packed or published from it. Each step is
 //! a question put through [`Choose`] and [`Ask`], and each change is made by
 //! [`crate::config::edit`], so what is written is checked the way `ldg inject`
@@ -24,11 +24,11 @@ use super::prompt::{
 use super::table::{Cell, Table, Tone};
 use crate::bundle::choice::{self, Offer};
 use crate::bundle::store::Replace;
-use crate::config::Config;
 use crate::config::edit::{
     self, Field, Kind, NewEntry, NewSecret, RawEntry, RawSecret, SecretAs, SecretFrom, Setting,
 };
 use crate::config::unknown::Unknown;
+use crate::config::{ClientFile, ConfigFile, Document, Paths};
 use crate::host::{Entry, Host, Want};
 use crate::keys::Action;
 use crate::layout::tilde;
@@ -83,7 +83,7 @@ pub trait Bundles {
     /// Packs the config at `config` into `output`: a file, or an `oci://` reference
     /// to publish to (a file named for this machine, here, when none).
     /// Returns what was made, in a line.
-    fn pack(&self, config: &Path, output: Option<&str>, replace: Replace) -> Result<String>;
+    fn pack(&self, paths: &Paths, output: Option<&str>, replace: Replace) -> Result<String>;
     /// The file a bundle is written to when none is named.
     fn default_file(&self) -> Result<String>;
     /// Whether the bundle file `reference` is there.
@@ -158,7 +158,8 @@ enum Stop {
     Unknown(usize),
 }
 
-/// What the file holds, as written.
+/// What the two files hold, as written: the config at the path, and the client's
+/// own file beside it.
 struct File {
     settings: Vec<(Setting, Option<String>)>,
     binaries: Vec<RawEntry>,
@@ -166,26 +167,38 @@ struct File {
     secrets: Vec<RawSecret>,
     /// The bundles listed besides the default, as written.
     bundles: Vec<String>,
-    /// What lodge does not know in it, to be shown and taken out.
-    unknown: Vec<Unknown>,
-    /// Why it does not load, when it does not: the form is shown all the same.
+    /// What lodge does not know in either file, to be shown and taken out, and
+    /// which file it is in (an index into [`Paths::documents`]).
+    unknown: Vec<(usize, Unknown)>,
+    /// Why a file does not load, when it does not: the form is shown all the same.
     problem: Option<String>,
 }
 
 impl File {
-    fn read(path: &Path) -> Result<File> {
+    fn read(paths: &Paths) -> Result<File> {
         let mut settings = Vec::new();
         for which in Setting::ALL {
-            settings.push((which, edit::setting(path, which)?));
+            settings.push((which, edit::setting(paths, which)?));
         }
+        let mut unknown = Vec::new();
+        for (n, file) in paths.documents().into_iter().enumerate() {
+            unknown.extend(edit::unknown(file)?.into_iter().map(|u| (n, u)));
+        }
+        let problems: Vec<String> = [
+            paths.config.load().err().map(|e| why(&e)),
+            paths.client.load().err().map(|e| why(&e)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         Ok(File {
             settings,
-            binaries: edit::list(path, Kind::Binary)?,
-            data: edit::list(path, Kind::Data)?,
-            secrets: edit::list_secrets(path)?,
-            bundles: edit::bundles(path)?,
-            unknown: edit::unknown(path)?,
-            problem: Config::load(path).err().map(|e| why(&e)),
+            binaries: edit::list(&paths.config, Kind::Binary)?,
+            data: edit::list(&paths.config, Kind::Data)?,
+            secrets: edit::list_secrets(&paths.client)?,
+            bundles: edit::bundles(&paths.client)?,
+            unknown,
+            problem: (!problems.is_empty()).then(|| problems.join(" · ")),
         })
     }
 
@@ -216,18 +229,18 @@ impl File {
 }
 
 pub fn run(
-    path: &Path,
+    paths: Paths,
     machine: &Machine,
     choose: &dyn Choose,
     ask: &dyn Ask,
     wait: &dyn Pause,
 ) -> Result<()> {
-    let mut path = path.to_path_buf();
+    let mut paths = paths;
     let mut status = String::new();
     loop {
         // A file that is not TOML at all has no form to show; one that does not load
         // as a config does, with what is wrong with it, so it can be mended here.
-        let file = match File::read(&path) {
+        let file = match File::read(&paths) {
             Ok(file) => file,
             Err(e) => {
                 warning!("{e:#}");
@@ -235,15 +248,15 @@ pub fn run(
             }
         };
         let title = match status.as_str() {
-            "" => format!("Config {}", path.display()),
+            "" => format!("Config {}", paths.config.display()),
             // First, so a long path cannot push it off the line.
-            said => format!("{said}   {}", path.display()),
+            said => format!("{said}   {}", paths.config.display()),
         };
         let (doc, stops) = form(&file);
         let done = match choose.view(&title, &doc, KEYS)? {
             Some(Choice::Left) => return Ok(()),
             Some(choice) => act(
-                &mut path,
+                &mut paths,
                 choice,
                 &stops,
                 &file,
@@ -251,7 +264,7 @@ pub fn run(
                 choose,
                 &Talk { ask, wait },
             ),
-            None => match table(&path, &file, machine, choose, ask)? {
+            None => match table(&paths, &file, machine, choose, ask)? {
                 Some(done) => done,
                 None => return Ok(()),
             },
@@ -285,7 +298,7 @@ struct Talk<'a> {
 
 /// What a key or Enter on a line of the form does.
 fn act(
-    path: &mut PathBuf,
+    paths: &mut Paths,
     choice: Choice,
     stops: &[Stop],
     file: &File,
@@ -301,39 +314,39 @@ fn act(
     };
     let stop = stops.get(row).copied();
     match key {
-        Some(Action::AddBinary) => add(path, Kind::Binary, file, machine, choose, ask),
-        Some(Action::AddData) => add(path, Kind::Data, file, machine, choose, ask),
-        Some(Action::AddSecret) => add_secret(path, choose, ask),
-        Some(Action::Pack) => pack(path, file, machine, choose, ask, wait),
-        Some(Action::Publish) => publish(path, file, machine, ask, wait),
-        Some(Action::OpenFile) => open_file(path, machine, choose, ask),
+        Some(Action::AddBinary) => add(&paths.config, Kind::Binary, file, machine, choose, ask),
+        Some(Action::AddData) => add(&paths.config, Kind::Data, file, machine, choose, ask),
+        Some(Action::AddSecret) => add_secret(&paths.client, choose, ask),
+        Some(Action::Pack) => pack(paths, file, machine, choose, ask, wait),
+        Some(Action::Publish) => publish(paths, file, machine, ask, wait),
+        Some(Action::OpenFile) => open_file(paths, machine, choose, ask),
         // The entry the line belongs to is taken out, with all its fields; a
         // setting, which can't be, goes back to its default.
         Some(Action::Remove) => match stop {
             Some(Stop::Entry { kind, entry, .. }) => {
                 let key = file.entries(kind)[entry].key();
-                edit::remove(path, kind, key)?;
+                edit::remove(&paths.config, kind, key)?;
                 Ok(format!("removed {} `{key}`", kind.key()))
             }
             Some(Stop::Secret { entry, .. }) => {
                 let name = &file.secrets[entry].name;
-                edit::remove_secret(path, name)?;
+                edit::remove_secret(&paths.client, name)?;
                 Ok(format!("removed secret `{name}`"))
             }
-            Some(Stop::Setting(which)) => clear_setting(path, which),
+            Some(Stop::Setting(which)) => clear_setting(paths, which),
             Some(Stop::Unknown(i)) => {
-                let which = &file.unknown[i];
-                edit::remove_unknown(path, which)?;
+                let (in_file, which) = &file.unknown[i];
+                edit::remove_unknown(paths.documents()[*in_file], which)?;
                 Ok(format!("removed {}", which.label))
             }
             None => Ok(String::new()),
         },
         Some(_) => Ok(String::new()),
         None => match stop {
-            Some(Stop::Setting(Setting::Bundle)) => edit_bundle(path, file, machine, choose, ask),
-            Some(Stop::Setting(which)) => edit_setting(path, which, file, choose, ask),
+            Some(Stop::Setting(Setting::Bundle)) => edit_bundle(paths, file, machine, choose, ask),
+            Some(Stop::Setting(which)) => edit_setting(paths, which, file, choose, ask),
             Some(Stop::Entry { kind, entry, field }) => edit_field(
-                path,
+                &paths.config,
                 &file.entries(kind)[entry],
                 field,
                 file,
@@ -342,7 +355,7 @@ fn act(
                 ask,
             ),
             Some(Stop::Secret { entry, field }) => {
-                edit_secret(path, &file.secrets[entry], field, choose, ask)
+                edit_secret(&paths.client, &file.secrets[entry], field, choose, ask)
             }
             Some(Stop::Unknown(_)) => anyhow::bail!(NOT_USED),
             None => Ok(String::new()),
@@ -388,9 +401,9 @@ impl Builder {
     }
 }
 
-/// The file as a form shaped like the TOML: the single values first (`target`,
-/// `bundle`, then `[session]` and `[git]`), then each `[[binary]]`, `[[data]]`
-/// and `[[secret]]` with all of its fields under it, the ones that are not set
+/// The two files as a form shaped like the TOML: the client's (`target`, `bundle`
+/// and each `[[secret]]`), then the config's (`[session]` and `[git]`, then each
+/// `[[binary]]` and `[[data]]`), each entry with all of its fields under it, the ones that are not set
 /// shown as such. Every value is a line that can be selected. A kind with no
 /// entries shows the key that adds one.
 fn form(file: &File) -> (Doc, Vec<Stop>) {
@@ -419,6 +432,13 @@ fn form(file: &File) -> (Doc, Vec<Stop>) {
         );
         f.blank();
     }
+    f.text(
+        format!(
+            "# {}: this machine's own, never in a bundle",
+            crate::config::client::FILE
+        ),
+        Tone::Muted,
+    );
     setting(&mut f, Setting::Target, 6);
     setting(&mut f, Setting::Bundle, 6);
     if file.setting(Setting::Bundle).is_some() {
@@ -433,11 +453,41 @@ fn form(file: &File) -> (Doc, Vec<Stop>) {
             Tone::Muted,
         );
     }
+    f.blank();
+    if file.secrets.is_empty() {
+        f.text("# [[secret]]  press s to add a secret", Tone::Muted);
+    }
+    for (n, s) in file.secrets.iter().enumerate() {
+        if n > 0 {
+            f.blank();
+        }
+        f.text("[[secret]]", Tone::Strong);
+        for field in SecretField::ALL {
+            let (value, unset) = match field {
+                SecretField::Name => (Some(quote(&s.name)), String::new()),
+                SecretField::From => (s.from.clone(), "(not set)".to_string()),
+                SecretField::As => (s.as_.clone(), "(not set)".to_string()),
+                SecretField::Targets => (s.targets.clone(), "(anywhere)".to_string()),
+            };
+            f.value(
+                Stop::Secret { entry: n, field },
+                field.key(),
+                7,
+                value,
+                unset,
+            );
+        }
+    }
+
+    f.blank();
+    f.text("# config.toml: what is injected", Tone::Muted);
     for (section, which, width) in [
         ("[session]", Setting::Shell, 5),
         ("[git]", Setting::SafeDirs, 16),
     ] {
-        f.blank();
+        if which != Setting::Shell {
+            f.blank();
+        }
         f.text(section, Tone::Accent);
         setting(&mut f, which, width);
     }
@@ -481,39 +531,23 @@ fn form(file: &File) -> (Doc, Vec<Stop>) {
         }
     }
 
-    f.blank();
-    if file.secrets.is_empty() {
-        f.text("# [[secret]]  press s to add a secret", Tone::Muted);
-    }
-    for (n, s) in file.secrets.iter().enumerate() {
-        if n > 0 {
-            f.blank();
-        }
-        f.text("[[secret]]", Tone::Strong);
-        for field in SecretField::ALL {
-            let (value, unset) = match field {
-                SecretField::Name => (Some(quote(&s.name)), String::new()),
-                SecretField::From => (s.from.clone(), "(not set)".to_string()),
-                SecretField::As => (s.as_.clone(), "(not set)".to_string()),
-                SecretField::Targets => (s.targets.clone(), "(anywhere)".to_string()),
-            };
-            f.value(
-                Stop::Secret { entry: n, field },
-                field.key(),
-                7,
-                value,
-                unset,
-            );
-        }
-    }
     if !file.unknown.is_empty() {
         f.blank();
         f.text(
             "# not known to this version of lodge: r removes",
             Tone::Accent,
         );
-        for (n, u) in file.unknown.iter().enumerate() {
-            f.pick(Stop::Unknown(n), u.label.clone(), Tone::Normal);
+        for (n, (in_file, u)) in file.unknown.iter().enumerate() {
+            // The config is the form's own; the other file is named.
+            let place = match in_file {
+                0 => String::new(),
+                _ => format!("  ({})", crate::config::client::FILE),
+            };
+            f.pick(
+                Stop::Unknown(n),
+                format!("{}{place}", u.label),
+                Tone::Normal,
+            );
         }
     }
     (
@@ -565,7 +599,7 @@ fn pick_one(
 // ── single values ────────────────────────────────────────────────────────────
 
 fn edit_setting(
-    path: &Path,
+    paths: &Paths,
     which: Setting,
     file: &File,
     choose: &dyn Choose,
@@ -593,7 +627,7 @@ fn edit_setting(
         },
     };
     let _ = file;
-    edit::set_setting(path, which, Some(&typed))?;
+    edit::set_setting(paths, which, Some(&typed))?;
     Ok(format!("{} is {typed}", which.key()))
 }
 
@@ -601,7 +635,7 @@ fn edit_setting(
 /// config as it is, where it can be packed), or one typed. With nothing to choose
 /// from, it is typed. The bundle that was in use stays on offer.
 fn edit_bundle(
-    path: &Path,
+    paths: &Paths,
     file: &File,
     machine: &Machine,
     choose: &dyn Choose,
@@ -636,16 +670,16 @@ fn edit_bundle(
     if new == current {
         return Ok(format!("{} is in use already", new.label()));
     }
-    edit::set_setting(path, Setting::Bundle, new.reference())?;
+    edit::set_setting(paths, Setting::Bundle, new.reference())?;
     let kept = choice::after_switch(&file.bundles, &current, &new);
     if kept != file.bundles {
-        edit::set_bundles(path, &kept)?;
+        edit::set_bundles(&paths.client, &kept)?;
     }
     Ok(format!("bundle is {}", new.label()))
 }
 
-fn clear_setting(path: &Path, which: Setting) -> Result<String> {
-    edit::set_setting(path, which, None)?;
+fn clear_setting(paths: &Paths, which: Setting) -> Result<String> {
+    edit::set_setting(paths, which, None)?;
     Ok(format!("{} is back to its default", which.key()))
 }
 
@@ -655,7 +689,7 @@ fn clear_setting(path: &Path, which: Setting) -> Result<String> {
 /// name or a target is typed, `for` is chosen among the programs, `copy_deps` is
 /// turned over.
 fn edit_field(
-    path: &Path,
+    path: &ConfigFile,
     entry: &RawEntry,
     field: Field,
     file: &File,
@@ -851,7 +885,7 @@ fn pick_path(
 /// Adds entries of `kind`, chosen from what this machine has: each Enter adds the
 /// one selected and marks it, and the list stays open for the next.
 fn add(
-    path: &Path,
+    path: &ConfigFile,
     kind: Kind,
     file: &File,
     machine: &Machine,
@@ -907,7 +941,7 @@ fn add(
 
 /// Writes `entry` into the config, and says what was added. A program brings what
 /// sits beside it as data, as `ldg inject add binary` does.
-fn place(path: &Path, entry: &NewEntry, home: &Path) -> Result<String> {
+fn place(path: &ConfigFile, entry: &NewEntry, home: &Path) -> Result<String> {
     match entry.kind() {
         Kind::Binary => {
             let data = add_binary(path, entry.clone(), home, true)?;
@@ -988,7 +1022,7 @@ fn ask_as(choose: &dyn Choose, ask: &dyn Ask) -> Result<Option<SecretAs>> {
     }
 }
 
-fn add_secret(path: &Path, choose: &dyn Choose, ask: &dyn Ask) -> Result<String> {
+fn add_secret(path: &ClientFile, choose: &dyn Choose, ask: &dyn Ask) -> Result<String> {
     let Some(name) = ask.ask("name of the secret (it is the variable's name too)")? else {
         return Ok(String::new());
     };
@@ -1007,7 +1041,7 @@ fn add_secret(path: &Path, choose: &dyn Choose, ask: &dyn Ask) -> Result<String>
 }
 
 fn edit_secret(
-    path: &Path,
+    path: &ClientFile,
     secret: &RawSecret,
     field: SecretField,
     choose: &dyn Choose,
@@ -1057,14 +1091,14 @@ fn edit_secret(
 /// wrong is the error. Warnings were printed on the terminal's main screen, which
 /// the form is about to cover, so those (and only those) are waited on.
 fn pack_into(
-    path: &Path,
+    paths: &Paths,
     machine: &Machine,
     wait: &dyn Pause,
     output: &str,
     replace: Replace,
 ) -> Result<String> {
     let warned = crate::output::warnings();
-    let made = machine.bundles.pack(path, Some(output), replace);
+    let made = machine.bundles.pack(paths, Some(output), replace);
     if crate::output::warnings() != warned {
         wait.pause();
     }
@@ -1075,7 +1109,7 @@ fn pack_into(
 /// one) or delete with `x`, and a row to type the name of a new file on. A delete
 /// leaves the list as it was, less the file: the config is back when the list is.
 fn pack(
-    path: &Path,
+    paths: &Paths,
     file: &File,
     machine: &Machine,
     choose: &dyn Choose,
@@ -1086,12 +1120,12 @@ fn pack(
     let mut reread: Option<File> = None;
     loop {
         let shown = reread.as_ref().unwrap_or(file);
-        match pack_list(path, shown, machine, choose, ask, wait)? {
+        match pack_list(paths, shown, machine, choose, ask, wait)? {
             Listed::Done(made) => return Ok(made),
             Listed::Left => return Ok(said),
             Listed::Deleted(what) => {
                 said = what;
-                reread = Some(File::read(path)?);
+                reread = Some(File::read(paths)?);
             }
         }
     }
@@ -1107,7 +1141,7 @@ enum Listed {
 }
 
 fn pack_list(
-    path: &Path,
+    paths: &Paths,
     file: &File,
     machine: &Machine,
     choose: &dyn Choose,
@@ -1143,7 +1177,7 @@ fn pack_list(
     ]);
     let table = Table::new(vec!["", ""], rows, 1);
     // A new name does not take the place of a file that is there.
-    let new_file = |name: &str| pack_into(path, machine, wait, name, Replace::No);
+    let new_file = |name: &str| pack_into(paths, machine, wait, name, Replace::No);
     // What fails stays in the list, in red, with what was typed: it is tried again
     // or left, and the form is not back until then.
     let mut notice: Option<String> = None;
@@ -1171,7 +1205,7 @@ fn pack_list(
                 tried
             }
             Entered::Chose(Choice::Key(Action::Remove, row)) => match existing.get(row) {
-                Some(reference) => match delete_bundle(path, file, machine, choose, reference) {
+                Some(reference) => match delete_bundle(paths, file, machine, choose, reference) {
                     Ok(Some(said)) => return Ok(Listed::Deleted(said)),
                     // Kept: the list stays as it was.
                     Ok(None) => continue,
@@ -1180,7 +1214,7 @@ fn pack_list(
                 None => return Ok(Listed::Left),
             },
             Entered::Chose(Choice::Row(row)) => match existing.get(row) {
-                Some(reference) => pack_into(path, machine, wait, reference, Replace::Yes),
+                Some(reference) => pack_into(paths, machine, wait, reference, Replace::Yes),
                 // The row to type on, where the terminal can't type on it.
                 None => match ask.ask_or(&format!("write the bundle to [{default}]"), &default)? {
                     Some(name) => {
@@ -1204,7 +1238,7 @@ fn pack_list(
 /// the list; what it did, or `None` when they did not agree. The one in use is
 /// kept: it is changed first.
 fn delete_bundle(
-    path: &Path,
+    paths: &Paths,
     file: &File,
     machine: &Machine,
     choose: &dyn Choose,
@@ -1223,14 +1257,14 @@ fn delete_bundle(
         return Ok(None);
     }
     machine.bundles.delete(reference)?;
-    edit::remove_bundle(path, reference)?;
+    edit::remove_bundle(&paths.client, reference)?;
     Ok(Some(format!("deleted {reference}")))
 }
 
 /// Publishes the bundle to a registry: the reference the config already names,
 /// when it names one, or one typed.
 fn publish(
-    path: &Path,
+    paths: &Paths,
     file: &File,
     machine: &Machine,
     ask: &dyn Ask,
@@ -1254,7 +1288,7 @@ fn publish(
     if !machine.bundles.is_registry(&reference) {
         anyhow::bail!("`{reference}` is a file, not a registry: use `p` to pack to a file");
     }
-    pack_into(path, machine, wait, &reference, Replace::Yes)?;
+    pack_into(paths, machine, wait, &reference, Replace::Yes)?;
     Ok(format!("published {reference}"))
 }
 
@@ -1307,12 +1341,12 @@ fn config_files(current: &Path, machine: &Machine) -> Vec<PathBuf> {
 
 /// Chooses which config file the screen works on.
 fn open_file(
-    path: &mut PathBuf,
+    paths: &mut Paths,
     machine: &Machine,
     choose: &dyn Choose,
     ask: &dyn Ask,
 ) -> Result<String> {
-    let known = config_files(path, machine);
+    let known = config_files(paths.config.path(), machine);
     let mut scope = scope(machine, None);
     let chosen = loop {
         // The config files that are known, then any other file the scope reaches.
@@ -1328,7 +1362,11 @@ fn open_file(
                 added: false,
                 tab: 0,
                 name: tilde(f, machine.home),
-                kind: if f == path { "current" } else { "" },
+                kind: if f == paths.config.path() {
+                    "current"
+                } else {
+                    ""
+                },
                 detail: String::new(),
             })
             .collect();
@@ -1372,8 +1410,9 @@ fn open_file(
     };
     // A file that is not there yet is made by the first thing added to it.
     let chosen = crate::config::expand_tilde(chosen);
-    *path = std::path::absolute(&chosen).unwrap_or(chosen);
-    Ok(format!("editing {}", path.display()))
+    let files = paths.config.files_handle();
+    *paths = Paths::beside(std::path::absolute(&chosen).unwrap_or(chosen), files);
+    Ok(format!("editing {}", paths.config.display()))
 }
 
 // ── without the form ─────────────────────────────────────────────────────────
@@ -1388,7 +1427,7 @@ enum Row {
 /// The entries and two ways to add one, for a terminal that can't show the form:
 /// programs and data only.
 fn table(
-    path: &Path,
+    paths: &Paths,
     file: &File,
     machine: &Machine,
     choose: &dyn Choose,
@@ -1404,7 +1443,7 @@ fn table(
         ]);
         rows.push(Row::Entry(e.kind, e.key().to_string()));
     }
-    for (n, u) in file.unknown.iter().enumerate() {
+    for (n, (_, u)) in file.unknown.iter().enumerate() {
         cells.push(vec![
             Cell::new("unknown", Tone::Accent),
             Cell::new("", Tone::Strong),
@@ -1424,31 +1463,32 @@ fn table(
         rows.push(Row::Add(kind));
     }
     let table = Table::new(vec!["KIND", "NAME", "PATH"], cells, 2);
-    let title = format!("Config {}", path.display());
+    let title = format!("Config {}", paths.config.display());
     Ok(match choose.choose_with(&title, &table, &[])? {
         Choice::Row(i) => Some(match rows.get(i) {
             Some(Row::Entry(kind, name)) => {
                 let options = [("remove it", ""), ("back", "")];
                 if pick_one(choose, name, &options)? == Some(0) {
-                    edit::remove(path, *kind, name)
+                    edit::remove(&paths.config, *kind, name)
                         .map(|()| format!("removed {} `{name}`", kind.key()))
                 } else {
                     Ok(String::new())
                 }
             }
             Some(Row::Unknown(i)) => {
-                let which = &file.unknown[*i];
+                let (in_file, which) = &file.unknown[*i];
                 let options = [
                     ("remove it", "this version of lodge does not use it"),
                     ("back", ""),
                 ];
                 if pick_one(choose, &which.label, &options)? == Some(0) {
-                    edit::remove_unknown(path, which).map(|()| format!("removed {}", which.label))
+                    edit::remove_unknown(paths.documents()[*in_file], which)
+                        .map(|()| format!("removed {}", which.label))
                 } else {
                     Ok(String::new())
                 }
             }
-            Some(Row::Add(kind)) => add(path, *kind, file, machine, choose, ask),
+            Some(Row::Add(kind)) => add(&paths.config, *kind, file, machine, choose, ask),
             None => Ok(String::new()),
         }),
         _ => None,
@@ -1471,11 +1511,11 @@ mod tests {
         can_pack: bool,
     }
     impl Bundles for Packs {
-        fn pack(&self, config: &Path, output: Option<&str>, replace: Replace) -> Result<String> {
+        fn pack(&self, paths: &Paths, output: Option<&str>, replace: Replace) -> Result<String> {
             self.replaced.borrow_mut().push(replace);
             self.asked
                 .borrow_mut()
-                .push((config.to_path_buf(), output.map(String::from)));
+                .push((paths.config.path().to_path_buf(), output.map(String::from)));
             if self.fail {
                 anyhow::bail!("ldd is missing");
             }
@@ -1629,27 +1669,48 @@ mod tests {
 
     struct Run {
         config: String,
+        client: String,
         screen: Screen,
         packs: Packs,
         dir: TempDir,
     }
 
-    fn drive(text: &str, screen: Screen, typed: Vec<Option<&'static str>>) -> Run {
+    /// What a test starts with: the text of each file.
+    struct Seed {
+        config: &'static str,
+        client: &'static str,
+    }
+    impl From<&'static str> for Seed {
+        /// A config alone.
+        fn from(config: &'static str) -> Seed {
+            Seed { config, client: "" }
+        }
+    }
+    impl From<(&'static str, &'static str)> for Seed {
+        fn from((config, client): (&'static str, &'static str)) -> Seed {
+            Seed { config, client }
+        }
+    }
+
+    fn drive(text: impl Into<Seed>, screen: Screen, typed: Vec<Option<&'static str>>) -> Run {
         drive_with(text, screen, typed, Packs::default())
     }
 
     fn drive_with(
-        text: &str,
+        text: impl Into<Seed>,
         screen: Screen,
         typed: Vec<Option<&'static str>>,
         packs: Packs,
     ) -> Run {
+        let text = text.into();
         let dir = TempDir::new("configure").unwrap();
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join(".bashrc"), "x").unwrap();
         let config = dir.path().join("config.toml");
-        std::fs::write(&config, text).unwrap();
+        let client = dir.path().join("client.toml");
+        std::fs::write(&config, text.config).unwrap();
+        std::fs::write(&client, text.client).unwrap();
         let machine = Machine {
             home: &home,
             path_var: OsStr::new(""),
@@ -1658,7 +1719,7 @@ mod tests {
             host: &crate::host::LocalHost,
         };
         run(
-            &config,
+            Paths::beside(config.clone(), crate::files::disk()),
             &machine,
             &screen,
             &Typed(RefCell::new(typed)),
@@ -1667,6 +1728,7 @@ mod tests {
         .unwrap();
         Run {
             config: std::fs::read_to_string(&config).unwrap(),
+            client: std::fs::read_to_string(&client).unwrap(),
             screen,
             packs,
             dir,
@@ -1680,11 +1742,14 @@ mod tests {
         }
     }
 
-    const FILE: &str = "# keep\ntarget = \"podman\"\n\n[session]\nshell = \"/bin/zsh\"\n\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\n\n[[binary]]\nname = \"b\"\npath = \"/bin/ls\"\n\n[[data]]\npath = \"/etc/hostname\"\n\n[[secret]]\nname = \"TOKEN\"\nfrom = { env = \"HOST_TOKEN\" }\nas = \"env\"\n";
+    const FILE: (&str, &str) = (
+        "[session]\nshell = \"/bin/zsh\"\n\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\n\n[[binary]]\nname = \"b\"\npath = \"/bin/ls\"\n\n[[data]]\npath = \"/etc/hostname\"\n",
+        "# keep\ntarget = \"podman\"\n\n[[secret]]\nname = \"TOKEN\"\nfrom = { env = \"HOST_TOKEN\" }\nas = \"env\"\n",
+    );
 
-    // Stops of FILE: 0 target, 1 bundle, 2 shell, 3 safe_directories; binary a
-    // 4-7, binary b 8-11 (name, path, target, copy_deps); data 12-14 (path,
-    // target, for); secret 15-18 (name, from, as, targets).
+    // Stops of FILE: 0 target, 1 bundle, secret 2-5 (name, from, as, targets);
+    // 6 shell, 7 safe_directories; binary a 8-11, binary b 12-15 (name, path,
+    // target, copy_deps); data 16-18 (path, target, for).
 
     #[test]
     fn the_form_is_the_toml_with_every_value_and_says_what_is_not_set() {
@@ -1696,11 +1761,19 @@ mod tests {
         );
         let text: Vec<&str> = text.iter().map(String::as_str).collect();
         assert_eq!(
-            text[..13],
+            text[..21],
             [
+                "# client.toml: this machine's own, never in a bundle",
                 "target = \"podman\"",
                 "bundle = (not set)",
                 "",
+                "[[secret]]",
+                "name    = \"TOKEN\"",
+                "from    = { env = \"HOST_TOKEN\" }",
+                "as      = \"env\"",
+                "targets = (anywhere)",
+                "",
+                "# config.toml: what is injected",
                 "[session]",
                 "shell = \"/bin/zsh\"",
                 "",
@@ -1737,7 +1810,7 @@ mod tests {
     #[test]
     fn a_bundle_in_the_config_is_said_to_replace_the_entries() {
         let r = drive(
-            "bundle = \"oci://r/x:1\"\n",
+            ("", "bundle = \"oci://r/x:1\"\n"),
             views(vec![Choice::Left]),
             vec![],
         );
@@ -1748,7 +1821,7 @@ mod tests {
         );
     }
 
-    const WITH_BUNDLES: &str = "bundle = \"a.tar\"\nbundles = [\"b.tar\"]\n";
+    const WITH_BUNDLES: (&str, &str) = ("", "bundle = \"a.tar\"\nbundles = [\"b.tar\"]\n");
 
     #[test]
     fn the_bundle_in_use_is_chosen_from_those_on_offer_and_the_old_one_stays_on_offer() {
@@ -1758,10 +1831,14 @@ mod tests {
             ..Screen::default()
         };
         let r = drive(WITH_BUNDLES, screen, vec![]);
-        assert!(r.config.contains("bundle = \"b.tar\""), "{}", r.config);
-        assert!(r.config.contains("bundles = ["), "{}", r.config);
+        assert!(r.client.contains("bundle = \"b.tar\""), "{}", r.config);
+        assert!(r.client.contains("bundles = ["), "{}", r.config);
         assert_eq!(
-            edit::bundles(&r.dir.path().join("config.toml")).unwrap(),
+            edit::bundles(&ClientFile::new(
+                r.dir.path().join("client.toml"),
+                crate::files::disk()
+            ))
+            .unwrap(),
             ["a.tar"]
         );
         // The form says what else is on offer.
@@ -1782,9 +1859,13 @@ mod tests {
             ..Screen::default()
         };
         let r = drive(WITH_BUNDLES, screen, vec![Some("c.tar")]);
-        assert!(r.config.contains("bundle = \"c.tar\""), "{}", r.config);
+        assert!(r.client.contains("bundle = \"c.tar\""), "{}", r.config);
         assert_eq!(
-            edit::bundles(&r.dir.path().join("config.toml")).unwrap(),
+            edit::bundles(&ClientFile::new(
+                r.dir.path().join("client.toml"),
+                crate::files::disk()
+            ))
+            .unwrap(),
             ["b.tar", "a.tar"]
         );
     }
@@ -1802,9 +1883,13 @@ mod tests {
             ..Packs::default()
         };
         let r = drive_with(WITH_BUNDLES, screen, vec![], packs);
-        assert!(!r.config.contains("bundle = "), "{}", r.config);
+        assert!(!r.client.contains("bundle = "), "{}", r.config);
         assert_eq!(
-            edit::bundles(&r.dir.path().join("config.toml")).unwrap(),
+            edit::bundles(&ClientFile::new(
+                r.dir.path().join("client.toml"),
+                crate::files::disk()
+            ))
+            .unwrap(),
             ["b.tar", "a.tar"]
         );
     }
@@ -1813,14 +1898,14 @@ mod tests {
     fn enter_changes_the_value_and_x_removes_the_entry() {
         let screen = Screen {
             views: RefCell::new(vec![
-                Choice::Row(2),                 // shell: typed
-                Choice::Row(3),                 // safe_directories: typed
-                Choice::Row(0),                 // target: chosen from the list (the third)
-                Choice::Row(1),                 // bundle: typed
-                Choice::Key(Action::Remove, 2), // shell: back to the default
-                Choice::Row(6),                 // target of binary a: typed
-                Choice::Row(7),                 // copy_deps of a: turned off
-                Choice::Key(Action::Remove, 9), // an entry of b: removed
+                Choice::Row(6),                  // shell: typed
+                Choice::Row(7),                  // safe_directories: typed
+                Choice::Row(0),                  // target: chosen from the list (the third)
+                Choice::Row(1),                  // bundle: typed
+                Choice::Key(Action::Remove, 6),  // shell: back to the default
+                Choice::Row(10),                 // target of binary a: typed
+                Choice::Row(11),                 // copy_deps of a: turned off
+                Choice::Key(Action::Remove, 13), // an entry of b: removed
                 Choice::Left,
             ]),
             picks: RefCell::new(vec![Some(2)]),
@@ -1836,12 +1921,12 @@ mod tests {
                 Some("~/.local/bin/a"),
             ],
         );
-        assert!(r.config.contains("# keep"), "{}", r.config);
-        assert!(r.config.contains("target = \"host\""), "{}", r.config);
+        assert!(r.client.contains("# keep"), "{}", r.client);
+        assert!(r.client.contains("target = \"host\""), "{}", r.client);
         assert!(
-            r.config.contains("bundle = \"deploy/bundle.tar\""),
+            r.client.contains("bundle = \"deploy/bundle.tar\""),
             "{}",
-            r.config
+            r.client
         );
         assert!(
             r.config
@@ -1961,15 +2046,15 @@ mod tests {
 
     #[test]
     fn secrets_are_added_from_a_kind_and_a_value_then_changed_field_by_field() {
-        // FILE's secret TOKEN is stops 15-18 (name, from, as, targets); the one
-        // added comes after it, at 19-22.
+        // FILE's secret TOKEN is stops 2-5 (name, from, as, targets); the one
+        // added comes after it, at 6-9.
         let screen = Screen {
             views: RefCell::new(vec![
                 Choice::Key(Action::AddSecret, 0), // add: name, kind (a command), value
-                Choice::Row(21),                   // as: a file in the container, and its mode
-                Choice::Row(22),                   // targets
-                Choice::Row(16),                   // from of TOKEN: an environment variable
-                Choice::Key(Action::Remove, 15),   // TOKEN removed
+                Choice::Row(8),                    // as: a file in the container, and its mode
+                Choice::Row(9),                    // targets
+                Choice::Row(3),                    // from of TOKEN: an environment variable
+                Choice::Key(Action::Remove, 2),    // TOKEN removed
                 Choice::Left,
             ]),
             picks: RefCell::new(vec![Some(2), Some(1), Some(0)]),
@@ -1988,21 +2073,21 @@ mod tests {
             ],
         );
         assert!(
-            r.config.contains("from = { command = \"gh auth token\" }"),
+            r.client.contains("from = { command = \"gh auth token\" }"),
             "{}",
-            r.config
+            r.client
         );
         assert!(
-            r.config
+            r.client
                 .contains("as = { file = \"/run/gh\", mode = \"0400\" }"),
             "{}",
-            r.config
+            r.client
         );
-        assert!(r.config.contains("targets"), "{}", r.config);
+        assert!(r.client.contains("targets"), "{}", r.client);
         assert!(
-            !r.config.contains("name = \"TOKEN\""),
+            !r.client.contains("name = \"TOKEN\""),
             "removed: {}",
-            r.config
+            r.client
         );
         let titles: Vec<String> = r
             .screen
@@ -2032,7 +2117,7 @@ mod tests {
             vec![Some("CLAUDE_CODE_OAUTH_TOKEN"), Some("claude_token")],
         );
         assert!(
-            r.config.contains("from = { store = \"claude_token\" }"),
+            r.client.contains("from = { store = \"claude_token\" }"),
             "{}",
             r.config
         );
@@ -2147,9 +2232,12 @@ mod tests {
         assert_eq!(*r.packs.deleted.borrow(), ["b.tar"]);
         assert!(r.packs.asked.borrow().is_empty());
         assert!(
-            edit::bundles(&r.dir.path().join("config.toml"))
-                .unwrap()
-                .is_empty()
+            edit::bundles(&ClientFile::new(
+                r.dir.path().join("client.toml"),
+                crate::files::disk()
+            ))
+            .unwrap()
+            .is_empty()
         );
         assert!(
             titles_of(&r)[1].contains("✓ deleted b.tar"),
@@ -2170,7 +2258,11 @@ mod tests {
         let r = drive(WITH_BUNDLES, screen, vec![]);
         assert!(r.packs.deleted.borrow().is_empty());
         assert_eq!(
-            edit::bundles(&r.dir.path().join("config.toml")).unwrap(),
+            edit::bundles(&ClientFile::new(
+                r.dir.path().join("client.toml"),
+                crate::files::disk()
+            ))
+            .unwrap(),
             ["b.tar"]
         );
         let screen = Screen {
@@ -2225,7 +2317,10 @@ mod tests {
     #[test]
     fn shift_p_publishes_to_the_reference_in_the_config_or_one_typed_and_only_to_a_registry() {
         let r = drive(
-            "bundle = \"oci://ghcr.io/me/lodge:1\"\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\n",
+            (
+                "[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\n",
+                "bundle = \"oci://ghcr.io/me/lodge:1\"\n",
+            ),
             views(vec![
                 Choice::Key(Action::Publish, 0),
                 Choice::Key(Action::Publish, 0),
@@ -2296,7 +2391,10 @@ mod tests {
     fn a_config_that_does_not_load_is_shown_with_why_and_what_it_does_not_know() {
         // The stops are the four settings, the four of binary a, then what lodge does not know.
         let r = drive(
-            "# mine\ntarget = \"podman\"\n\n[[inject]]\nname = \"x\"\n\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\ncopy_dep = true\n",
+            (
+                "[[inject]]\nname = \"x\"\n\n# mine\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\ncopy_dep = true\n",
+                "target = \"podman\"\n",
+            ),
             views(vec![Choice::Row(8), Choice::Row(9), Choice::Left]),
             vec![],
         );
@@ -2333,7 +2431,10 @@ mod tests {
     #[test]
     fn what_a_config_does_not_know_is_removed_with_x_until_it_loads_again() {
         let r = drive(
-            "# mine\ntarget = \"podman\"\n\n[[inject]]\nname = \"x\"\n\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\ncopy_dep = true\n",
+            (
+                "[[inject]]\nname = \"x\"\n\n# mine\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\ncopy_dep = true\n",
+                "target = \"podman\"\n",
+            ),
             views(vec![
                 Choice::Key(Action::Remove, 8),
                 Choice::Key(Action::Remove, 8),
@@ -2342,10 +2443,11 @@ mod tests {
             vec![],
         );
         assert!(
-            r.config.starts_with("# mine\ntarget = \"podman\""),
+            r.config.trim_start().starts_with("# mine\n[[binary]]"),
             "{}",
             r.config
         );
+        assert_eq!(r.client, "target = \"podman\"\n");
         assert!(
             !r.config.contains("inject") && !r.config.contains("copy_dep"),
             "{}",
@@ -2375,7 +2477,9 @@ mod tests {
             !last.contains("does not load") && !last.contains("not known"),
             "{last}"
         );
-        Config::load(&r.dir.path().join("config.toml")).unwrap();
+        ConfigFile::new(r.dir.path().join("config.toml"), crate::files::disk())
+            .load()
+            .unwrap();
     }
 
     #[test]
@@ -2410,7 +2514,7 @@ mod tests {
         }
         let dir = TempDir::new("configure-table").unwrap();
         let config = dir.path().join("config.toml");
-        std::fs::write(&config, FILE).unwrap();
+        std::fs::write(&config, FILE.0).unwrap();
         let machine = Machine {
             home: dir.path(),
             path_var: OsStr::new(""),
@@ -2419,7 +2523,14 @@ mod tests {
             host: &crate::host::LocalHost,
         };
         let typed = Typed(RefCell::new(vec![Some("/bin/true")]));
-        run(&config, &machine, &Words(screen), &typed, &NoWait).unwrap();
+        run(
+            Paths::beside(config.clone(), crate::files::disk()),
+            &machine,
+            &Words(screen),
+            &typed,
+            &NoWait,
+        )
+        .unwrap();
         let now = std::fs::read_to_string(&config).unwrap();
         assert!(!now.contains("name = \"b\""), "{now}");
         assert!(now.contains("[[data]]\npath = \"/bin/true\""), "{now}");

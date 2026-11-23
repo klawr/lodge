@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use super::candidates;
 use crate::config::edit::{self, Kind, NewEntry};
-use crate::config::expand_tilde;
+use crate::config::{ConfigFile, expand_tilde};
 use crate::layout::tilde;
 
 /// Adds a program and, when `with_data`, what it keeps beside it (see
@@ -14,7 +14,7 @@ use crate::layout::tilde;
 /// does here. Returns the paths of the data added, as written in the config; what
 /// the config has already is not added again.
 pub(super) fn add_binary(
-    path: &Path,
+    path: &ConfigFile,
     entry: NewEntry,
     home: &Path,
     with_data: bool,
@@ -59,7 +59,7 @@ mod tests {
     fn a_program_is_added_with_what_sits_beside_it_and_nothing_twice() {
         let dir = TempDir::new("add-binary").unwrap();
         let tool = prefix_with_share(dir.path());
-        let config = dir.path().join("config.toml");
+        let config = ConfigFile::new(dir.path().join("config.toml"), crate::files::disk());
         let entry = || NewEntry::binary("tool", tool.display().to_string());
 
         let added = add_binary(&config, entry(), dir.path(), true).unwrap();
@@ -81,7 +81,7 @@ mod tests {
     fn a_program_can_be_added_alone() {
         let dir = TempDir::new("add-binary-alone").unwrap();
         let tool = prefix_with_share(dir.path());
-        let config = dir.path().join("config.toml");
+        let config = ConfigFile::new(dir.path().join("config.toml"), crate::files::disk());
         let entry = NewEntry::binary("tool", tool.display().to_string());
         assert!(
             add_binary(&config, entry, dir.path(), false)

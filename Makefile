@@ -37,8 +37,8 @@ check: ## What CI gates on: fmt, clippy, docs, unit tests
 integration: ## The real binary against docker (~30 s); narrow with T=name
 	@cargo test --test integration --quiet -- --ignored $(T)
 
-schema: ## Regenerate docs/config.schema.json from the config types
-	UPDATE_SCHEMA=1 cargo test --quiet the_config_schema_is_current
+schema: ## Regenerate docs/config.schema.json and docs/client.schema.json from the types
+	UPDATE_SCHEMA=1 cargo test --quiet _schema_is_current
 
 deny: ## Licenses, advisories and sources of dependencies (needs cargo-deny)
 	cargo deny --config .github/deny.toml check

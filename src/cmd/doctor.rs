@@ -6,7 +6,8 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 
 use super::{Ctx, print_json};
-use crate::config::Config;
+use crate::config::client::Client;
+use crate::config::{ClientFile, Config, ConfigFile, Document};
 use crate::host_tools::{self, Need, Tool};
 use crate::output::{info, line, plural, warning};
 
@@ -103,22 +104,29 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
         });
     }
 
-    let config = Config::load(&ctx.config_path);
-    checks.push(config_check(&ctx.config_path, &config));
+    let config = ctx.paths.config.load();
+    checks.push(config_check(&ctx.paths.config, &config));
+    let settings = ctx.client();
+    checks.push(client_check(&ctx.paths.client, &settings));
 
-    let packs_live = config
-        .as_ref()
-        .is_ok_and(|c| c.bundle.is_none() && crate::bundle::pack::needs_tools(c));
+    let packs_live = config.as_ref().is_ok_and(|c| {
+        settings.as_ref().is_ok_and(|s| s.bundle.is_none()) && crate::bundle::pack::needs_tools(c)
+    });
     checks.extend(host_tool_checks(
         remote.is_some(),
         ctx.tools.packer().map(|_| ()),
         packs_live,
     ));
 
-    if let Ok(cfg) = &config {
-        if let Some(bundle) = &cfg.bundle {
+    if let Ok(settings) = &settings {
+        if let Some(bundle) = &settings.bundle {
             checks.push(bundle_check(bundle, ctx));
         }
+        for decl in &settings.secret {
+            checks.push(secret_check(decl, ctx.local.as_ref()));
+        }
+    }
+    if let Ok(cfg) = &config {
         for item in &cfg.binaries {
             checks.push(binary_check(&item.name, &item.path));
             if let Some(missing) = unlisted_data_check(&item.name, &item.path, &cfg.data) {
@@ -127,9 +135,6 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
         }
         for item in &cfg.data {
             checks.push(data_path_check(&item.path));
-        }
-        for decl in &cfg.secret {
-            checks.push(secret_check(decl, ctx.local.as_ref()));
         }
     }
 
@@ -217,7 +222,7 @@ fn tool_check(tool: &Tool, required: bool) -> Check {
     }
 }
 
-fn config_check(path: &Path, config: &Result<Config>) -> Check {
+fn config_check(path: &ConfigFile, config: &Result<Config>) -> Check {
     match config {
         Ok(c) if path.exists() => Check::new(
             "config",
@@ -238,6 +243,31 @@ fn config_check(path: &Path, config: &Result<Config>) -> Check {
             ),
         ),
         Err(e) => Check::new("config", Level::Missing, format!("{e:#}")),
+    }
+}
+
+/// The client's own file: valid, or what is wrong with it. Nothing is wrong with
+/// one that is not there.
+fn client_check(path: &ClientFile, client: &Result<Client>) -> Check {
+    match client {
+        Ok(c) if path.exists() => Check::new(
+            "client",
+            Level::Ok,
+            format!(
+                "{} ({})",
+                path.display(),
+                plural(c.secret.len(), "secret", "secrets")
+            ),
+        ),
+        Ok(_) => Check::new(
+            "client",
+            Level::Optional,
+            format!(
+                "no client file at {}; every setting has its default",
+                path.display()
+            ),
+        ),
+        Err(e) => Check::new("client", Level::Missing, format!("{e:#}")),
     }
 }
 
