@@ -8,8 +8,10 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub const IMAGE: &str = "debian:stable-slim";
 
@@ -628,18 +630,15 @@ impl Sandbox {
         cmd
     }
 
-    /// Runs `ldg <args>` on a pseudo-terminal, as a person would, feeding it
-    /// `input` (which should end with `exit` if a session opens); the whole run is
-    /// cut off after 90 s. Output includes what the session printed, with `\r\n`
-    /// line ends.
-    pub fn session(&self, args: &[&str], host_env: &[(&str, &str)], input: &str) -> Out {
-        use std::io::Write as _;
+    /// The command that runs `ldg <args>` on a pseudo-terminal made by `script`, cut
+    /// off after `secs` seconds, with `host_env` added to ldg's environment.
+    fn session_command(&self, args: &[&str], host_env: &[(&str, &str)], secs: u64) -> Command {
         fn quote(s: &str) -> String {
             format!("'{}'", s.replace('\'', "'\\''"))
         }
         let ldg = self.command();
         let mut line = format!(
-            "exec timeout 90 {}",
+            "exec timeout {secs} {}",
             quote(&ldg.get_program().to_string_lossy())
         );
         for a in args {
@@ -655,6 +654,16 @@ impl Sandbox {
             };
         }
         cmd.envs(host_env.iter().copied());
+        cmd
+    }
+
+    /// Runs `ldg <args>` on a pseudo-terminal, as a person would, feeding it
+    /// `input` (which should end with `exit` if a session opens); the whole run is
+    /// cut off after 90 s. Output includes what the session printed, with `\r\n`
+    /// line ends.
+    pub fn session(&self, args: &[&str], host_env: &[(&str, &str)], input: &str) -> Out {
+        use std::io::Write as _;
+        let mut cmd = self.session_command(args, host_env, 90);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -674,6 +683,33 @@ impl Sandbox {
             text,
             stdout,
         }
+    }
+
+    /// Like [`session`](Self::session), but returns at once with the session still
+    /// open: what it prints can be waited for and more can be typed, so that
+    /// another session can be started meanwhile. It is killed when dropped, and
+    /// cut off after 180 s.
+    pub fn session_open(&self, args: &[&str], host_env: &[(&str, &str)]) -> Live {
+        use std::io::Read as _;
+        let mut cmd = self.session_command(args, host_env, 180);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().expect("spawning script");
+        let stdin = child.stdin.take();
+        let mut stdout = child.stdout.take().expect("stdout");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+        Live { child, stdin, seen }
     }
 
     /// Runs `ldg <args>`.
@@ -801,6 +837,66 @@ impl Drop for Sandbox {
     }
 }
 
+/// An `ldg` session that is still open, on a pseudo-terminal.
+pub struct Live {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    seen: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Live {
+    /// Types `text` into the session.
+    pub fn send(&mut self, text: &str) {
+        use std::io::Write as _;
+        let stdin = self.stdin.as_mut().expect("the session's input is open");
+        stdin.write_all(text.as_bytes()).expect("typing");
+        stdin.flush().expect("typing");
+    }
+
+    /// Everything the session has printed so far, with `\r\n` line ends.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.seen.lock().unwrap()).into_owned()
+    }
+
+    /// Waits up to `secs` for `needle` to have been printed.
+    pub fn wait_for(&self, needle: &str, secs: u64) -> bool {
+        let end = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < end {
+            if self.text().contains(needle) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        self.text().contains(needle)
+    }
+
+    /// The exit status if the session has ended, `None` while it runs.
+    pub fn exited(&mut self) -> Option<ExitStatus> {
+        self.child.try_wait().expect("asking whether it ended")
+    }
+
+    /// Waits up to `secs` for the session to end.
+    pub fn wait_exit(&mut self, secs: u64) -> Option<ExitStatus> {
+        let end = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < end {
+            if let Some(status) = self.exited() {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        self.exited()
+    }
+}
+
+impl Drop for Live {
+    // A session still open when a test ends (or fails) must not outlive it.
+    #[allow(clippy::let_underscore_must_use)]
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// A project directory, and the container ldg makes for it.
 pub struct Project<'a> {
     sb: &'a Sandbox,
@@ -873,6 +969,15 @@ impl Project<'_> {
             .collect::<Vec<_>>()
             .join("\n");
         out
+    }
+
+    /// [`attach`](Self::attach), but returns with the session still open; see
+    /// [`Sandbox::session_open`].
+    pub fn attach_open(&self, flags: &[&str], host_env: &[(&str, &str)]) -> Live {
+        let dir = self.dir.to_string_lossy().into_owned();
+        let mut args = flags.to_vec();
+        args.extend(["up", dir.as_str()]);
+        self.sb.session_open(&args, host_env)
     }
 
     /// The name of this project's container (the first, for compose).

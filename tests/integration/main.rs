@@ -984,6 +984,124 @@ as = "env"
     assert!(out.has("P=here M=[]"), "{}", out.tail(15));
 }
 
+/// How many processes in the container have a command line that starts with `cmd`.
+fn running(p: &Project, cmd: &str) -> String {
+    p.sh(&format!(
+        "for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < $f 2>/dev/null; echo; done \
+         | grep -c '^{cmd}'; true"
+    ))
+    .trim()
+    .to_string()
+}
+
+#[test]
+#[ignore = "needs docker"]
+fn a_new_attach_ends_the_session_in_the_container_and_asks_before_ending_another_clients() {
+    let sb = Sandbox::new();
+    sb.config(
+        r#"
+[[secret]]
+name = "TK"
+from = { env = "LODGE_IT_TK" }
+as = "env"
+"#,
+    );
+    let p = sb.project("takeover", &json(r#"{ "image": "@IMAGE@" }"#));
+    // Clients are told apart by user and machine; the machine is the same here, so
+    // the user is what differs.
+    let env = |user| [("LODGE_IT_TK", SECRET), ("USER", user)];
+    let dir = "/dev/shm/lodge-secrets-0";
+    let record = format!("{ROOT_PREFIX}/session");
+    // Who holds the container, per the record ("none" when there is none).
+    let holder = || {
+        p.sh(&format!("cat {record} 2>/dev/null || echo none"))
+            .trim()
+            .to_string()
+    };
+    let gone = |path: &str| {
+        p.sh(&format!("[ -e {path} ] && echo there || echo gone"))
+            .trim()
+            .to_string()
+    };
+
+    // alice opens a session and starts something in the background.
+    let mut alice = p.attach_open(&[], &env("alice"));
+    alice.send("echo READY_$TK; sleep 4321 &\r");
+    assert!(
+        alice.wait_for(&format!("READY_{SECRET}"), 60),
+        "{}",
+        alice.text()
+    );
+    assert_eq!(running(&p, "sleep 4321"), "1");
+    assert!(
+        holder().contains(" alice@"),
+        "step 1: record is {}",
+        holder()
+    );
+
+    // The same user on the same machine attaches: nothing is asked, the earlier
+    // session ends, and its shell takes the background job with it.
+    let mut again = p.attach_open(&[], &env("alice"));
+    assert!(
+        again.wait_for("replacing the session this machine left open", 60),
+        "{}",
+        again.text()
+    );
+    assert!(alice.wait_exit(30).is_some(), "the first session went on");
+    assert_eq!(
+        running(&p, "sleep 4321"),
+        "0",
+        "its background job survived"
+    );
+    again.send("echo READY_$TK\r");
+    assert!(
+        again.wait_for(&format!("READY_{SECRET}"), 60),
+        "{}",
+        again.text()
+    );
+
+    // Another user attaches: it is asked first, and the session is untouched
+    // while the question is open.
+    let mut bob = p.attach_open(&[], &env("bob"));
+    assert!(bob.wait_for("has a session open", 60), "{}", bob.text());
+    assert!(bob.text().contains("alice@"), "{}", bob.text());
+    assert!(again.exited().is_none(), "ended before the answer");
+    // Enter takes the first row: end it and attach.
+    bob.send("\r");
+    assert!(
+        bob.wait_for("ended the session that was open", 60),
+        "{}",
+        bob.text()
+    );
+    assert!(again.wait_exit(30).is_some(), "the session was not ended");
+    // The new shell claims the container when it starts, a moment after the note.
+    bob.send("echo READY_$TK\r");
+    assert!(
+        bob.wait_for(&format!("READY_{SECRET}"), 60),
+        "{}",
+        bob.text()
+    );
+    assert!(holder().contains(" bob@"), "step 3: record is {}", holder());
+
+    // A third user says no (down to "cancel", Enter): nothing changes.
+    let mut carol = p.attach_open(&[], &env("carol"));
+    assert!(carol.wait_for("has a session open", 60), "{}", carol.text());
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    carol.send("\x1b[B");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    carol.send("\r");
+    assert!(carol.wait_for("not attaching", 60), "{}", carol.text());
+    assert!(carol.wait_exit(30).is_some());
+    assert!(bob.exited().is_none(), "declining ended the other session");
+    assert!(holder().contains(" bob@"), "step 4: record is {}", holder());
+
+    // With the last session over, its secrets and the record are gone.
+    bob.send("exit\r");
+    assert!(bob.wait_exit(30).is_some());
+    assert_eq!(gone(dir), "gone", "the secrets outlived the last session");
+    assert_eq!(gone(&record), "gone");
+}
+
 #[test]
 #[ignore = "needs docker"]
 fn secrets_are_added_on_the_machine_that_uses_a_tarred_bundle() {
