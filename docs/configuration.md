@@ -125,11 +125,12 @@ lodge opens a shell and nothing else.
 | field | default | meaning |
 | --- | --- | --- |
 | `shell` | `/bin/bash` | must exist in the container (bash, zsh, sh, dash). Started once as a login shell so the profile runs, then as the interactive shell |
+| `start` | none | commands run in order just before the shell opens, with the injected tools on `PATH`. `["clear"]` tidies the screen; an `exec` command takes the place of the shell |
 
 ### Keeping a session alive
 
 A multiplexer (tmux, zellij, screen) is a tool like any other: inject it and start it
-from your shell's rc file. The container keeps it running, so the next `ldg up` lands
+with `start` (or from your shell's rc file). The container keeps it running, so the next `ldg up` lands
 in the same session. After a dropped `--remote` connection `ldg` reconnects, opens a
 new shell, and the rc file attaches again.
 
@@ -148,7 +149,14 @@ target = "~/.tmux.conf"
 for    = "tmux"
 ```
 
-`tmux-rc` (or add this to the `~/.bashrc` you inject):
+To attach on every session, without an rc file:
+
+```toml
+[session]
+start = ["exec tmux new-session -A -s main"]
+```
+
+Or with the rc file `tmux-rc` (or add this to the `~/.bashrc` you inject):
 
 ```sh
 if [ -z "$TMUX" ] && command -v tmux >/dev/null; then

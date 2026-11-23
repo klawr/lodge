@@ -82,6 +82,14 @@
           "default": "/bin/bash",
           "description": "Shell to launch inside the container (default: /bin/bash).",
           "type": "string"
+        },
+        "start": {
+          "default": [],
+          "description": "Commands run in the container, in order, just before the shell opens\n(default: none). They see the injected tools on `PATH`. `exec` hands the\nsession over, e.g. `exec tmux new-session -A -s main` attaches to tmux\ninstead of opening the shell.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "type": "object"
@@ -119,7 +127,8 @@
     "session": {
       "$ref": "#/$defs/SessionConfig",
       "default": {
-        "shell": "/bin/bash"
+        "shell": "/bin/bash",
+        "start": []
       },
       "description": "How the interactive session is opened."
     }

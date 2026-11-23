@@ -276,12 +276,19 @@ pub struct SessionConfig {
     /// Shell to launch inside the container (default: /bin/bash).
     #[serde(default = "default_shell")]
     pub shell: String,
+    /// Commands run in the container, in order, just before the shell opens
+    /// (default: none). They see the injected tools on `PATH`. `exec` hands the
+    /// session over, e.g. `exec tmux new-session -A -s main` attaches to tmux
+    /// instead of opening the shell.
+    #[serde(default)]
+    pub start: Vec<String>,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             shell: default_shell(),
+            start: Vec::new(),
         }
     }
 }

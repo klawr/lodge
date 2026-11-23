@@ -1,8 +1,9 @@
 //! The interactive session: a login shell in the container.
 //!
-//! lodge starts a shell and nothing else. Keeping a session alive across a
-//! disconnect is the user's business: a multiplexer they inject and start from
-//! their shell's rc file is just another program in that shell.
+//! lodge starts a shell and whatever `[session] start` says to run before it.
+//! Keeping a session alive across a disconnect is the user's business: a
+//! multiplexer they inject is just another program, started from `start`
+//! (`exec tmux new-session -A -s main`) or their shell's rc file.
 //!
 //! The session is what puts lodge's tools within reach: it makes the user's
 //! prefix `bin/` the first directory on `PATH` ([`startup_script`]), so that
@@ -67,10 +68,18 @@ pub struct Session<'a> {
 /// script puts the prefix's `bin/` first and appends whatever the container had
 /// that the profile dropped, and only then executes the shell, interactively. A
 /// shell started that way reads its interactive startup files (`.bashrc`,
-/// `.zshrc`) as usual. The script is plain `sh`, run through the login shell with
+/// `.zshrc`) as usual. `start` are the person's own commands, run with that
+/// `PATH` just before the shell, so `clear` tidies the screen and
+/// `exec tmux new-session -A -s main` attaches to a multiplexer instead of
+/// opening the shell. The script is plain `sh`, run through the login shell with
 /// `exec sh -c`, so it works with any shell that has `-l` and `-c`.
-pub(crate) fn startup_script(layout: &Layout, shell: &str, preamble: &str) -> String {
-    let finish = path_script(layout);
+pub(crate) fn startup_script(
+    layout: &Layout,
+    shell: &str,
+    start: &[String],
+    preamble: &str,
+) -> String {
+    let finish = path_script(layout, start);
     let after_login = format!(
         "exec sh -c {} sh {} -i",
         shell_quote(&finish),
@@ -87,11 +96,13 @@ pub(crate) fn startup_script(layout: &Layout, shell: &str, preamble: &str) -> St
 /// the command to run as its arguments: `PATH` becomes the prefix's `bin/`, then
 /// what the login shell made it, then the container's own entries that are
 /// missing from that (`$LODGE_ORIG_PATH`, set before the login shell started).
-fn path_script(layout: &Layout) -> String {
+fn path_script(layout: &Layout, start: &[String]) -> String {
+    // Globbing was switched off for the loop above; the person's commands get it back.
+    let start: String = start.iter().map(|c| format!("{c}\n")).collect();
     format!(
         "set -f; p=$PATH; IFS=:; \
          for d in $LODGE_ORIG_PATH; do case \":$p:\" in *\":$d:\"*) ;; *) p=\"$p:$d\";; esac; done; \
-         unset IFS LODGE_ORIG_PATH; PATH={}:$p; export PATH; exec \"$@\"",
+         unset IFS LODGE_ORIG_PATH; PATH={}:$p; export PATH; set +f\n{start}exec \"$@\"",
         shell_quote(&layout.bin())
     )
 }
@@ -136,6 +147,7 @@ pub fn enter(
     let inner = startup_script(
         s.layout,
         shell,
+        &config.start,
         &format!(
             "{}{}{term_setup}{set_title}; ",
             lease::claim(s.layout, s.id, s.client),
@@ -267,7 +279,7 @@ mod tests {
     #[cfg(unix)]
     fn path_after(login: &str, orig: &str) -> String {
         let out = Command::new("sh")
-            .args(["-c", &path_script(&layout()), "sh", "printenv", "PATH"])
+            .args(["-c", &path_script(&layout(), &[]), "sh", "printenv", "PATH"])
             .env("PATH", login)
             .env("LODGE_ORIG_PATH", orig)
             .output()
@@ -305,12 +317,31 @@ mod tests {
         assert_eq!(got, format!("{bin}:/usr/bin:/opt/my tools/bin:/opt/*/bin"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn start_commands_run_in_order_before_the_command_and_exec_replaces_it() {
+        let run = |start: &[&str]| {
+            let start: Vec<String> = start.iter().map(|s| s.to_string()).collect();
+            let out = Command::new("sh")
+                .args(["-c", &path_script(&layout(), &start), "sh", "echo", "shell"])
+                .env("PATH", "/usr/bin:/bin")
+                .env("LODGE_ORIG_PATH", "")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        assert_eq!(run(&["echo one", "echo two"]), "one\ntwo\nshell\n");
+        assert_eq!(run(&["echo one", "exec echo taken"]), "one\ntaken\n");
+        // Globbing works for them even though the PATH setup turned it off.
+        assert_eq!(run(&["echo /usr/bi?"]), "/usr/bin\nshell\n");
+    }
+
     #[test]
     fn the_helper_variable_does_not_leak_into_the_shell() {
         let out = Command::new("sh")
             .args([
                 "-c",
-                &path_script(&layout()),
+                &path_script(&layout(), &[]),
                 "sh",
                 "sh",
                 "-c",
@@ -336,7 +367,7 @@ mod tests {
         .unwrap();
         crate::platform::set_mode(&shell, 0o755).unwrap();
 
-        let script = startup_script(&layout(), &shell.to_string_lossy(), "");
+        let script = startup_script(&layout(), &shell.to_string_lossy(), &[], "");
         assert_eq!(
             sh(&script, "/opt/go/bin:/usr/bin:/bin"),
             "/home/dev/.local/share/lodge/bin:/usr/bin:/bin:/opt/go/bin"
@@ -362,6 +393,7 @@ mod tests {
         let script = startup_script(
             &l,
             &shell.to_string_lossy(),
+            &[],
             &lease::claim(&l, "abc123", "kai@laptop"),
         );
         let pid = sh(&script, "/usr/bin:/bin");
@@ -384,7 +416,7 @@ mod tests {
 
     #[test]
     fn the_preamble_runs_first_and_the_shell_is_a_login_shell() {
-        let s = startup_script(&layout(), "/bin/bash", "export A=1; ");
+        let s = startup_script(&layout(), "/bin/bash", &[], "export A=1; ");
         assert!(s.starts_with("export A=1; "), "{s}");
         assert!(s.contains("exec '/bin/bash' -lc "), "{s}");
         assert!(s.contains("-i"), "{s}");
@@ -392,7 +424,7 @@ mod tests {
 
     #[test]
     fn a_shell_path_with_odd_characters_is_quoted() {
-        let s = startup_script(&layout(), "/opt/my shell/bash", "");
+        let s = startup_script(&layout(), "/opt/my shell/bash", &[], "");
         assert!(s.contains("'/opt/my shell/bash'"), "{s}");
     }
 
