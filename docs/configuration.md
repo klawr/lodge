@@ -432,5 +432,7 @@ before. `ldg bundle use|add|rm|ls` change both keys without opening the file, an
 ## `[[secret]]`
 
 Values (API keys, tokens, credential files) delivered when you attach, and
-never stored in a bundle. See [Bundles and secrets](bundles-and-secrets.md#secrets)
-for the fields and how delivery works.
+never stored in a bundle. A value comes from an environment variable, a file, a
+command or this machine's credential store (`ldg secret set`), and appears in the
+session as a variable or a file. See [Bundles and secrets](bundles-and-secrets.md#secrets)
+for the fields, how delivery works and which credentials to deliver at all.

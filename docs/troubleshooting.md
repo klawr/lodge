@@ -140,6 +140,49 @@ seconds apart; any other failure is not, so on a flaky connection run `ldg up`
 again: a feature that was already installed is not installed twice. A registry
 reached through a proxy needs `HTTPS_PROXY` (and `NO_PROXY` for what is not).
 
+## Secrets and sessions
+
+```
+[lodge] warning: secret not delivered: secret CLAUDE_CODE_OAUTH_TOKEN: store entry claude_token: is not set; add it with `ldg secret set`
+```
+
+The credential store has nothing under that name on this machine. Run
+`ldg secret set claude_token`; the store belongs to your user on each machine, so set it
+on every client that should deliver the value. `ldg secret ls` shows which entries your
+config reads and whether each is set. For an `env`, `file` or `command` source the
+message names that source instead (never its value).
+
+```
+no credential store is available here (…); on Linux that is a Secret Service …
+```
+
+A `store` source needs an operating system credential store. On Linux that is a Secret
+Service (GNOME Keyring, KeePassXC, …) running in your session; a headless server has
+none. Use an `env`, `file` or `command` source there.
+
+```
+[lodge] error: kai@desktop has a session open in <container>; attaching would end it and remove its secrets. Run this from a terminal to confirm
+```
+
+A container has one lodge session at a time. A session of the same user on the same
+machine is replaced without asking; one from another client is asked about, and
+without a terminal there is nobody to ask. Run `ldg up` from a terminal and answer, or
+end the other session from where it is.
+
+**`this session was ended: bob@desktop attached to <container>`.** Another client
+attached to the container you were in. A container has one lodge session at a time, so
+yours was ended and the secrets are now that client's; attach again to take it back
+(you will be asked, as they were).
+
+**A tool lost its login after I attached from another machine.** Attaching replaces the
+secrets with that client's and ends the earlier session, so a `file` secret the tool was
+reading is gone. A login the tool made itself inside the container is not touched; see
+[which credentials to deliver](bundles-and-secrets.md#which-credentials-to-inject-and-which-to-leave-in-the-container).
+
+**A secret is missing in a shell I left running.** Secrets are removed when the session
+that placed them ends. An `env` secret stays in the environment of processes that session
+started (a multiplexer, say); a `file` secret does not.
+
 ## A plain host
 
 `ldg --target host up` works on the machine itself, as the user you connect as. If

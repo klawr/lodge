@@ -183,6 +183,29 @@ pub fn holds(env: &dyn Env, user: &ContainerUser, layout: &Layout, id: &str) -> 
     Ok(out.trim() == "ours")
 }
 
+/// The client that holds the container now, waited for: the new shell writes its
+/// record a moment after the session before it was ended, so an absent record is
+/// looked for again, up to `tries` times, `wait` apart. For a session that was hung
+/// up, to say who took the container over. `None` when nobody turns up or the
+/// container can't be asked, so nothing is claimed that is not known.
+pub fn holder_soon(
+    env: &dyn Env,
+    user: &ContainerUser,
+    layout: &Layout,
+    tries: u32,
+    wait: std::time::Duration,
+) -> Option<String> {
+    for attempt in 0..tries {
+        if let Ok(Some(client)) = holder(env, user, layout) {
+            return Some(client);
+        }
+        if attempt + 1 < tries {
+            std::thread::sleep(wait);
+        }
+    }
+    None
+}
+
 /// Gives the container up at the end of session `id`: removes the record and
 /// `also_remove`, if the session still holds it. True when it did. A session that
 /// was taken over leaves everything alone, since it is now the other client's.
@@ -225,7 +248,9 @@ pub fn with_holder(
 mod tests {
     use super::*;
     use crate::runtime::fake::FakeEnv;
+    #[cfg(unix)]
     use crate::tmpfile::TempDir;
+    #[cfg(unix)]
     use std::process::Command;
 
     fn user() -> ContainerUser {
@@ -273,6 +298,23 @@ mod tests {
     }
 
     #[test]
+    fn the_new_holder_is_named_or_nothing_is_claimed() {
+        let none = std::time::Duration::ZERO;
+        let record = layout().session();
+        let who = script_argv(WHO_SCRIPT, &[&record]);
+        let go = |env: &FakeEnv| holder_soon(env, &user(), &layout(), 3, none);
+
+        let env = FakeEnv::new().with_output(&who, "bob@desktop\n");
+        assert_eq!(go(&env).as_deref(), Some("bob@desktop"));
+        // Nobody holds it (it was never claimed, or the new shell never came up).
+        let env = FakeEnv::new().with_output(&who, "");
+        assert_eq!(go(&env), None);
+        // The container can't be asked.
+        let env = FakeEnv::new().with_failure(&who);
+        assert_eq!(go(&env), None);
+    }
+
+    #[test]
     fn releasing_names_the_record_the_id_and_what_else_to_remove() {
         let record = layout().session();
         let argv = script_argv(RELEASE_SCRIPT, &[&record, "abc", "/dev/shm/s"]);
@@ -285,6 +327,7 @@ mod tests {
         assert!(release(&env, &user(), &layout(), "abc", &["/dev/shm/s"]).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_release_script_removes_only_for_the_session_that_holds_the_container() {
         let tmp = TempDir::new("lease").unwrap();
@@ -385,6 +428,7 @@ mod tests {
     }
 
     /// Runs `script` with `args` the way the container does.
+    #[cfg(unix)]
     fn run(script: &str, args: &[&str]) -> String {
         let argv = script_argv(script, args);
         let out = Command::new(argv[0]).args(&argv[1..]).output().unwrap();
@@ -458,6 +502,7 @@ mod tests {
         assert!(!std::path::Path::new(record).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_claim_records_the_shells_pid_and_exports_the_id() {
         let tmp = TempDir::new("lease").unwrap();
@@ -478,6 +523,7 @@ mod tests {
         assert_eq!(run(HOLDER_SCRIPT, &[&l.session(), "other"]), "");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_claim_that_cannot_be_written_does_not_stop_the_session() {
         let l = Layout::new("/nonexistent-lodge-dir");

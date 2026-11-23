@@ -59,6 +59,8 @@ a running program) and add it to your user `PATH` once; open a new terminal afte
 - Windows files have no execute bits, so a local file copied into a container gets
   mode `0644` (`0755` for a directory). A bundle carries the modes it was packed
   with, so put programs in the bundle.
+- Secrets work as on Linux; `ldg secret set` keeps a value in Credential Manager (see
+  [Bundles and secrets](docs/bundles-and-secrets.md#keeping-a-value-in-the-credential-store)).
 - Status: the build and the unit tests run in CI on Windows. The integration
   tests, which drive a real engine, run on Linux only.
 
@@ -190,6 +192,9 @@ linked binaries are copied as they are.
   way into the same container (an IDE terminal, a hand-run `docker exec`) does not
   see them, unless a `[[binary]]` sets `target`, which also writes a
   wrapper script at that path.
+- A container has one lodge session at a time: attaching ends one left open from the
+  same machine and asks before ending another client's, and the secrets are removed when
+  the session ends (see [Bundles and secrets](docs/bundles-and-secrets.md#secrets)).
 - Libraries loaded at run time (`dlopen`, interpreters) are invisible to `ldd`;
   list them as `[[data]]` entries.
 - Dynamic port forwarding needs the container's bridge IP to be reachable from

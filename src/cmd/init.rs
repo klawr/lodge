@@ -89,7 +89,7 @@ const KNOWN: &[Known] = &[
     },
     Known {
         binary: "claude",
-        note: "Claude Code; deliver its login with a [[secret]] below, not as data",
+        note: "Claude Code; deliver a token (`claude setup-token`) with a [[secret]] below, not its files as data",
         config: &[],
     },
 ];
@@ -219,6 +219,12 @@ fn render(found: &[Detected], home: &Path) -> String {
          # [[secret]]\n\
          # name = \"GH_TOKEN\"\n\
          # from = { command = \"gh auth token\" }\n\
+         # as   = \"env\"\n\
+         \n\
+         # A value kept in this machine's credential store (`ldg secret set claude_token`):\n\
+         # [[secret]]\n\
+         # name = \"CLAUDE_CODE_OAUTH_TOKEN\"   # from `claude setup-token`\n\
+         # from = { store = \"claude_token\" }\n\
          # as   = \"env\"\n",
     );
     s

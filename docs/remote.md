@@ -60,6 +60,14 @@ terminal's output open for as long as it lives.
 From a machine that isn't your Linux workstation (a CI runner, or Windows),
 combine `--remote` with a bundle: see [Bundles and secrets](bundles-and-secrets.md).
 
+## Secrets with `--remote`
+
+Secrets from your config reach a remote container over the same ssh connection, on the
+command's stdin, and sit in that container's memory for the session. Anyone who is root
+on that machine, or who can run a command in the container, can read them, so use
+`--remote` only with machines you trust with those values. See
+[Bundles and secrets](bundles-and-secrets.md#secrets).
+
 ## From Windows
 
 `ldg` runs natively on Windows as a client for a Linux host (see the
@@ -76,6 +84,8 @@ own. That is slower than on Linux, and it means:
   early if the host cannot be reached.
 - The forwarding daemon runs in the background without a console window; `ldg
   ports` and `ldg logs` show and explain it as elsewhere.
+- Secrets work as on Linux: `env`, `file` and `command` sources (a command runs through
+  `cmd /C`), and `store`, which is Credential Manager (`ldg secret set`).
 
 The `Host` aliases, `IdentityFile`, jump hosts and ports of `%USERPROFILE%\.ssh\config`
 apply as on any ssh.

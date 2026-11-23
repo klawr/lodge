@@ -495,6 +495,8 @@ pub enum SecretFrom {
     Env(String),
     File(String),
     Command(String),
+    /// An entry of this machine's credential store (`ldg secret set`).
+    Store(String),
 }
 
 impl SecretFrom {
@@ -503,12 +505,16 @@ impl SecretFrom {
             SecretFrom::Env(_) => "env",
             SecretFrom::File(_) => "file",
             SecretFrom::Command(_) => "command",
+            SecretFrom::Store(_) => "store",
         }
     }
 
     fn item(&self) -> Item {
         let (kind, text) = match self {
-            SecretFrom::Env(v) | SecretFrom::File(v) | SecretFrom::Command(v) => (self.kind(), v),
+            SecretFrom::Env(v)
+            | SecretFrom::File(v)
+            | SecretFrom::Command(v)
+            | SecretFrom::Store(v) => (self.kind(), v),
         };
         let mut t = InlineTable::new();
         t.insert(kind, text.as_str().into());
@@ -1050,5 +1056,40 @@ mod tests {
         remove_secret(&path, "TOKEN").unwrap();
         assert!(list_secrets(&path).unwrap().is_empty());
         assert!(remove_secret(&path, "TOKEN").is_err());
+    }
+
+    #[test]
+    fn a_secret_can_read_from_the_credential_store() {
+        let (_dir, path) = file("");
+        let new = NewSecret {
+            name: "CLAUDE_CODE_OAUTH_TOKEN".into(),
+            from: SecretFrom::Store("claude_token".into()),
+            as_: SecretAs::Env,
+        };
+        add_secret(&path, &new).unwrap();
+        let listed = list_secrets(&path).unwrap();
+        assert_eq!(
+            listed[0].from.as_deref(),
+            Some("{ store = \"claude_token\" }")
+        );
+        // The checks of the config apply: an entry name a script cannot take is
+        // refused, and nothing is written.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let bad = SecretFrom::Store("not a name".into());
+        assert!(set_secret_from(&path, "CLAUDE_CODE_OAUTH_TOKEN", &bad).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        // And it can be changed to another kind and back.
+        set_secret_from(
+            &path,
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            &SecretFrom::Env("T".into()),
+        )
+        .unwrap();
+        let back = SecretFrom::Store("other".into());
+        set_secret_from(&path, "CLAUDE_CODE_OAUTH_TOKEN", &back).unwrap();
+        assert_eq!(
+            list_secrets(&path).unwrap()[0].from.as_deref(),
+            Some("{ store = \"other\" }")
+        );
     }
 }

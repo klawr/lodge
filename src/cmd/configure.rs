@@ -934,10 +934,14 @@ fn entry_for(kind: Kind, home: &Path, typed: &str) -> Result<NewEntry> {
 
 // ── secrets ──────────────────────────────────────────────────────────────────
 
-const FROM_KINDS: [(&str, &str); 3] = [
+const FROM_KINDS: [(&str, &str); 4] = [
     ("env", "an environment variable of the shell lodge runs in"),
     ("file", "a file on this machine"),
     ("command", "a command whose output is the value"),
+    (
+        "store",
+        "an entry of this machine's credential store (`ldg secret set`)",
+    ),
 ];
 
 /// Where a secret comes from: the kind chosen, the value typed.
@@ -945,14 +949,20 @@ fn ask_from(choose: &dyn Choose, ask: &dyn Ask) -> Result<Option<SecretFrom>> {
     let Some(kind) = pick_one(choose, "Where the value comes from", &FROM_KINDS)? else {
         return Ok(None);
     };
-    let what = ["name of the variable", "path of the file", "command"][kind];
+    let what = [
+        "name of the variable",
+        "path of the file",
+        "command",
+        "name of the store entry",
+    ][kind];
     let Some(typed) = ask.ask(what)? else {
         return Ok(None);
     };
     Ok(Some(match kind {
         0 => SecretFrom::Env(typed),
         1 => SecretFrom::File(typed),
-        _ => SecretFrom::Command(typed),
+        2 => SecretFrom::Command(typed),
+        _ => SecretFrom::Store(typed),
     }))
 }
 
@@ -2006,6 +2016,26 @@ mod tests {
             "{titles:?}"
         );
         assert!(titles[5].contains("✓ removed secret `TOKEN`"), "{titles:?}");
+    }
+
+    #[test]
+    fn a_secret_can_be_added_from_the_credential_store() {
+        // The fourth kind: a name of an entry, not a path or a command.
+        let screen = Screen {
+            views: RefCell::new(vec![Choice::Key(Action::AddSecret, 0), Choice::Left]),
+            picks: RefCell::new(vec![Some(3)]),
+            ..Screen::default()
+        };
+        let r = drive(
+            FILE,
+            screen,
+            vec![Some("CLAUDE_CODE_OAUTH_TOKEN"), Some("claude_token")],
+        );
+        assert!(
+            r.config.contains("from = { store = \"claude_token\" }"),
+            "{}",
+            r.config
+        );
     }
 
     #[test]

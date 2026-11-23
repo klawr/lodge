@@ -176,6 +176,17 @@ fn the_terminal_is_taken_over_in_one_file() {
 }
 
 #[test]
+fn the_credential_store_names_its_crate_in_one_file() {
+    // The operating system's credential store is a dependency like the network:
+    // `keyring` is named only by `credstore.rs`, and everything else reads and writes
+    // values through `Local::store`.
+    assert_eq!(
+        files_containing(&["keyring::"], &["credstore.rs"]),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
 fn the_registry_client_names_its_crates_in_one_file_each() {
     // The network and the hash are dependencies like any other: the HTTP crate is
     // named only in the `Http` implementation, the hash crate only where digests

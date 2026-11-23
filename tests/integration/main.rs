@@ -1048,6 +1048,17 @@ as = "env"
         again.text()
     );
     assert!(alice.wait_exit(30).is_some(), "the first session went on");
+    // The one that was ended is told who ended it, not that something failed.
+    assert!(
+        alice.wait_for("this session was ended: alice@", 30),
+        "{}",
+        alice.text()
+    );
+    assert!(
+        !alice.text().contains("session exited with failure"),
+        "{}",
+        alice.text()
+    );
     assert_eq!(
         running(&p, "sleep 4321"),
         "0",
@@ -1074,6 +1085,11 @@ as = "env"
         bob.text()
     );
     assert!(again.wait_exit(30).is_some(), "the session was not ended");
+    assert!(
+        again.wait_for("this session was ended: bob@", 30),
+        "{}",
+        again.text()
+    );
     // The new shell claims the container when it starts, a moment after the note.
     bob.send("echo READY_$TK\r");
     assert!(

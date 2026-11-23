@@ -254,7 +254,28 @@ fn attach(
             container.display_name()
         );
     }
-    result
+    // A shell that was hung up because another client attached would only look like a
+    // failure: say who took over instead. (After the release above, which must not be
+    // undone by the check: it only gives up what this session still holds.)
+    match result {
+        Err(e)
+            if e.downcast_ref::<session::Ended>()
+                .is_some_and(|e| e.hung_up()) =>
+        {
+            let wait = std::time::Duration::from_millis(400);
+            match session::lease::holder_soon(container, &user, &layout, 6, wait) {
+                Some(client) => {
+                    note!(
+                        "this session was ended: {client} attached to {}",
+                        container.display_name()
+                    );
+                    Ok(())
+                }
+                None => Err(e),
+            }
+        }
+        other => other,
+    }
 }
 
 /// Ends the session that holds the container so this client's can open. A

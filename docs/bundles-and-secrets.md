@@ -227,7 +227,7 @@ When you attach (`ldg up`, not with `--no-attach`):
 - The value is read on your machine and sent over the container command's
   **stdin**, never as an argument, so it is in neither `ps` nor the `-v` trace.
 - It is stored under `/dev/shm/lodge-secrets-<uid>/`: memory only, owner-only,
-  never in an image layer, gone when the container stops.
+  never in an image layer, and removed when the session ends (see the limits below).
 - An `env` secret is exported by the session start-up script, which reads it from
   that file. A `file` secret is symlinked from the path you gave.
 - lodge prints secret *names*, never values. `ldg status` shows which declared
@@ -269,31 +269,80 @@ and in several containers at once.
 A tool that keeps its login in the operating system's keychain instead of a file
 cannot have it copied into a container: log in inside the container.
 
+### Windows, VS Code and a corporate GitHub login
+
+Being logged in on your Windows machine, or in VS Code, does not log you in inside a
+container: lodge delivers only what you declare, and it does not read another tool's
+login. What follows is what the tools' own documentation says at the time of writing;
+check it if a tool changes.
+
+- **Claude Code.** Its login is kept in `%USERPROFILE%\.claude\.credentials.json` on
+  Windows, `~/.claude/.credentials.json` on Linux and the Keychain on macOS. Do not
+  copy the file. Run `claude setup-token` (a one-year token, for the paid plans), keep
+  it with `ldg secret set` (on Windows that is Credential Manager) and deliver it as
+  `CLAUDE_CODE_OAUTH_TOKEN`, as above. An `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`
+  or `apiKeyHelper` takes precedence over it.
+- **GitHub Copilot.** VS Code keeps its sign-in itself, and what its Dev Containers
+  support forwards into a container is VS Code's own doing. With lodge there is no
+  VS Code in the container, so the tool you use there signs in on its own. Two ways,
+  with the Copilot CLI as the example:
+  - *Log in inside the container* with `copilot login`. In a dev container or over
+    ssh it uses the device-code flow: it prints a code, and you approve it in a
+    browser on your own machine (single sign-on included). With no system keychain in
+    the container, the CLI offers to keep the token in a plaintext file in the
+    container's home (`~/.copilot/config.json`). That is a login the tool owns: it
+    lasts as long as the container, and a new container means logging in again.
+  - *Deliver a token at every attach.* The CLI reads `COPILOT_GITHUB_TOKEN`, then
+    `GH_TOKEN`, then `GITHUB_TOKEN`. It accepts an OAuth token (`gho_…`), a
+    fine-grained personal access token with the "Copilot Requests" permission (owned
+    by a personal account) or a GitHub App user token (`ghu_…`), but not a classic
+    token (`ghp_…`).
+
+    ```toml
+    [[secret]]
+    name = "COPILOT_GITHUB_TOKEN"
+    from = { command = "gh auth token --hostname github.example.com" }
+    as   = "env"
+    ```
+
+    Whether the CLI accepts the token that `gh auth token` prints is not documented;
+    try it. An environment variable overrides a login stored in the container without
+    a warning, so declare one only when you want it used.
+  - GitHub's page covers GitHub Enterprise Cloud with data residency (`*.ghe.com`,
+    `copilot login --host`). It does not mention a self-hosted GitHub Enterprise
+    Server.
+- A token in a container is readable by anyone who can run a command there (see the
+  limits below).
+
 Limits:
 
-- Secrets live in `/dev/shm` and only as long as the session that placed them:
-  when the shell lodge started ends, they are removed (unless another client has
-  taken the container over, when they are its secrets). A `file` secret is gone for
-  everything. An `env` secret is not: every process the session started has it in
-  its environment, so a multiplexer or any background process you started from that
-  shell keeps it until it ends. A session that ends without lodge getting to clean up (a killed terminal, a lost
-  connection that is not restored) leaves them until the container stops or the
-  next attach. What is placed is what the client that attached last declares: any
-  other value is removed, so removing some or *every* `[[secret]]` takes effect on
-  the next attach, and so does `ldg clean`. A secret you declare whose source can't
-  be read this time keeps the value already placed, with a warning.
+- Secrets live in `/dev/shm`, and only as long as the session that placed them: when
+  the shell lodge started ends, they are removed (unless another client has taken the
+  container over, in which case they are its secrets).
+  - A `file` secret's file is gone for every process. An `env` secret is not: every
+    process the session started has it in its environment, so a multiplexer or any
+    background process you started from that shell keeps it until it ends.
+  - A session that ends without lodge getting to clean up (a killed terminal, a lost
+    connection that is not restored) leaves the secrets until the next attach or until
+    the container stops.
+  - What is placed is what the client that attached last declares: any other value is
+    removed, so removing some or *every* `[[secret]]` takes effect on the next attach,
+    and so does `ldg clean`. A secret you declare whose source can't be read this time
+    keeps the value already placed, with a warning.
 - A container is one person's workspace, with one lodge session at a time. Attaching
   ends the session lodge opened earlier (the shell it started, found through a record
-  in `~/.local/share/lodge/session` that names the user and machine it was opened
-  from), and the secrets become the new client's.
+  in lodge's directory in the container, `~/.local/share/lodge/session`, that names the
+  user and machine it was opened from), and the secrets become the new client's.
   - From the same user and machine, the earlier session is replaced without asking:
     it is nearly always one that was left behind, and a second terminal from the
     same machine ends the first, so use a multiplexer for several panes.
   - From another client, lodge asks first (ending it also takes its secrets away; a
     stale connection is fine to end). Without a terminal to ask on, it refuses and
     says whose session is there.
-  - The earlier client's shell just ends. A client whose connection dropped does not
-    reopen a session once another has taken over. A multiplexer started from the
+  - The earlier client's shell is hung up, and its `ldg` says who took over
+    (`this session was ended: bob@desktop attached to <container>`) instead of
+    reporting a failure. A client whose connection dropped does not reopen a session
+    once another has taken over. A multiplexer started from the
     ended shell keeps running; a hand-run `docker exec` or an IDE terminal is not a
     lodge session and is left alone.
 - What this protects, and what it does not. A value is never in a bundle, an image
@@ -304,6 +353,7 @@ Limits:
   have it. For a remote target the value crosses ssh and sits in the remote
   container's memory, so you trust that machine's root. Whoever controls the
   container engine controls its secrets.
-- A tool that refreshes a credential file may replace the symlink with a real
-  file in the home directory, which then stays on disk.
+- A tool that refreshes a credential file may replace the symlink with a real file in
+  the home directory, which then stays on disk until the next attach replaces it with
+  the link again. Declare only files the tool just reads (see above).
 - `/dev/shm` is 64 MB by default in Docker: enough for tokens, not for large files.

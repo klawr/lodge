@@ -22,6 +22,26 @@ use anyhow::Result;
 use std::io::IsTerminal as _;
 use std::time::{Duration, Instant};
 
+/// A session whose shell ended with a failure status.
+#[derive(Debug)]
+pub struct Ended(pub std::process::ExitStatus);
+
+impl Ended {
+    /// Whether the shell was hung up (exit status 129, SIGHUP), as it is when another
+    /// client takes the container over, or when its terminal goes away.
+    pub fn hung_up(&self) -> bool {
+        self.0.code() == Some(129)
+    }
+}
+
+impl std::fmt::Display for Ended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("session exited with failure")
+    }
+}
+
+impl std::error::Error for Ended {}
+
 /// Where and how to open the session.
 pub struct Session<'a> {
     pub workdir: &'a str,
@@ -167,7 +187,7 @@ pub fn enter(
     let result = if status.success() {
         Ok(())
     } else {
-        Err(anyhow::anyhow!("session exited with failure"))
+        Err(anyhow::Error::new(Ended(status)))
     };
 
     // A remote session that fails almost instantly is the signature of the host
@@ -346,6 +366,19 @@ mod tests {
         let pid = sh(&script, "/usr/bin:/bin");
         let record = std::fs::read_to_string(l.session()).unwrap();
         assert_eq!(record.trim(), format!("{pid} abc123 kai@laptop"));
+    }
+
+    #[test]
+    fn only_a_hang_up_counts_as_having_been_ended_from_outside() {
+        let ended = |code| Ended(crate::platform::exit_status(code));
+        // SIGHUP, as the shell has when another client takes the container over.
+        assert!(ended(129).hung_up());
+        // An ordinary failing exit, a plain failure, or a lost ssh connection (255).
+        assert!(!ended(1).hung_up());
+        assert!(!ended(130).hung_up());
+        assert!(!ended(255).hung_up());
+        // What the person sees is unchanged.
+        assert_eq!(ended(1).to_string(), "session exited with failure");
     }
 
     #[test]

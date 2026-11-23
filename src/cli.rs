@@ -234,7 +234,10 @@ pub enum Command {
             the container).\n\n\
             Supports dockerComposeFile, image, build, and dockerFile backends. \
             Forwards ports declared in forwardPorts and any port that starts \
-            listening at runtime."
+            listening at runtime.\n\n\
+            A container has one lodge session at a time: one left open from this machine \
+            is ended first, and one from another client is asked about (it takes that \
+            client's secrets with it)."
     )]
     Up {
         #[command(flatten)]
@@ -260,8 +263,9 @@ pub enum Command {
             and it is treated as somebody's workload, so a file that is already there \
             is left as it is (with a warning) and git's ownership check is not loosened. \
             It acts as the user the container runs as. Works on the engine of the target \
-            (`--target docker|podman`, and `--remote`). `ldg clean --container NAME` takes \
-            lodge out again."
+            (`--target docker|podman`, and `--remote`). A container has one lodge session \
+            at a time: one left open from this machine is ended first, and one from another \
+            client is asked about. `ldg clean --container NAME` takes lodge out again."
     )]
     Attach {
         /// The container's name or id

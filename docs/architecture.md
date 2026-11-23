@@ -73,11 +73,11 @@ every subcommand.
 | `layout.rs` | Every path lodge writes inside a container: `Layout`, the paths inside the user's prefix (the table under "What lives where"); the provisioning state, which is the devcontainer's own and root-owned; and the secrets directory. Nothing else spells these paths out. |
 | `secret/` | Secrets that must not be in a bundle. Their `[[secret]]` declarations are config (`config/secret.rs`: validated; names reach shell scripts). `mod` is the `Secret` value type (redacted `Debug`, no `Display`), matching `targets` globs, and `resolve` (env, file or a command run on *this* machine with a timeout, with errors that never contain the value). `place` writes values into a container under `/dev/shm/lodge-secrets-<uid>/` and builds the session lines that export them; `clear` removes the user's (`ldg clean`). `deliver` picks the secrets whose `targets` match, resolves and places them (or clears them when none are declared; a declared secret whose source can't be read keeps its placed value), and prints names only. A `store` source is read through `Local::store`. |
 | `credstore.rs` | `CredentialStore`: this machine's own store of secret values by name, with `OsCredentialStore` (the `keyring` crate: Windows Credential Manager, the macOS Keychain, the Linux Secret Service) and, in tests, `FakeCredentialStore`. The one file that names `keyring`; it is reached through `Local::store`, and `ldg secret` is its only writer. |
-| `session/` | Opens the interactive session: `docker exec -it`, and nothing around it (but for `lease`, below); after a lost `--remote` connection it reconnects by itself (tries for about two and a half minutes) and opens a new shell, without asking. Its start-up script (`startup_script`) starts the shell as a login shell, so the profile scripts run, then puts the user's prefix `bin/` first on `PATH` and restores what the profile dropped before running the shell interactively; that is how the injected tools reach the session without any file outside the prefix. `lease` says which session holds a container: the start-up script records `<pid> <id> <user@host>` in `<prefix>/session` and exports `LODGE_SESSION`, a later attach reads who holds it (`holder`, which only believes a record whose process still carries the id), ends that session (`take_over`) and, when the session ends, gives the container up (`release`, one script, so a client that attached in between is not undone); the question to the person is `cmd/attach.rs`'s. `terminfo` makes the terminal the session is opened from work in the container (copies its entry from this machine into the prefix when the container lacks it, and sets `TERM`). |
+| `session/` | Opens the interactive session: `docker exec -it`, and nothing around it (but for `lease`, below); after a lost `--remote` connection it reconnects by itself (tries for about two and a half minutes) and opens a new shell, without asking. Its start-up script (`startup_script`) starts the shell as a login shell, so the profile scripts run, then puts the user's prefix `bin/` first on `PATH` and restores what the profile dropped before running the shell interactively; that is how the injected tools reach the session without any file outside the prefix. `lease` says which session holds a container: the start-up script records `<pid> <id> <user@host>` in `<prefix>/session` and exports `LODGE_SESSION`, a later attach reads who holds it (`holder`, which only believes a record whose process still carries the id), ends that session (`take_over`) and, when the session ends, gives the container up (`release`, one script, so a client that attached in between is not undone); a shell that was hung up (exit status 129, `session::Ended`) is told who took over (`holder_soon`) instead of reporting a failure; the question to the person is `cmd/attach.rs`'s. `terminfo` makes the terminal the session is opened from work in the container (copies its entry from this machine into the prefix when the container lacks it, and sets `TERM`). |
 | `forward/` | Port forwarding. `mod` has the `ForwardDaemon` trait (`start`, `stop`; `DetachedDaemon` spawns the daemon, and `stop` leaves it a note to end, which it looks for between polls; a test records instead) and owns its state files (log, lock, and the ports file `ldg ports` reads, which starts with the daemon's pid so a dead daemon's file is ignored), `daemon` is the `_forward` loop (declared ports plus whatever starts listening), `tunnel` one forward behind the `Forward` and `Forwarders` traits: `HostForwarders` starts the tunnel process the `Host` provides (`ssh -L` for `SshHost`) or else the in-process TCP proxy; the daemon's start, restart, re-point and cooldown logic is tested with a fake `Forwarders`. The daemon decodes its own `--port` flags, re-points a forward when its destination's address changes (looked up again every 30 s), and exits when the container stops, not when the engine merely can't be reached for a while, or when `ldg clean` asks it to (a machine is always up, so nothing else ends the daemon for a plain host). `up` starts none for an endpoint that says it has nothing to forward (`Container::forwards_ports`: this machine as a plain host). |
 | `history.rs` | The places a session was opened in, most recent first, for a bare `ldg`: an `Entry` is a `Place` (a project folder, or a container `ldg attach` worked in, with its `--workdir`), the `Route` it was reached by (the target and the `--remote` host) and a name (the devcontainer's `name`, else the folder or container name). It records no flags of a single run (`--build`, `--reinject`, `--bundle`) to replay, so resuming is the same as typing the command again, and `up` still wakes a stopped container; the bundle the session was injected from is kept with it (`bundle`) only to be shown. `History` is the seam (`entries`, `remember`; `Memory` in tests); `FileHistory` keeps the list in `~/.local/share/lodge/history.json`, written whole through a temporary file and a rename, readable by the user only (it names folders and hosts), at most 50 entries, a repeat moving to the front instead of adding one. Recording happens once a session is about to open, and failing to record is a warning, never an error. |
 | `provision.rs` | `TargetKind` (one kind of endpoint the user can name: its name, its one-line description, and how to build its `Endpoints` from the `Wiring` and the `[targets.<name>]` settings it was given; the whole of what is particular to a target outside its endpoint) and the seam between making an endpoint and working in one: `Endpoints` (provision a project's endpoint, find it, its status, hand out a handle by id for the forward daemon, which engine is behind it, whether `--remote` needs a project path, and an optional `Lifecycle`) returns `Attached` (the endpoint, the name it calls itself, its user, workdir, forward ports, whether it was just created, and the post-attach hook). `cmd::attach::up` is `provision` then `attach`, and `attach` takes only an `Attached`, so it is tested with a fake container and no provisioner. |
-| `plain_host.rs` | A machine you can reach as an endpoint (`--target host`): `PlainHost` is an `Env` and `Container` built on a `Host` only (commands and `tar` through `Host::exec`, secrets on stdin, the session through `Host::interactive`), acting as the user the host connects as and not [disposable](#capabilities); `PlainHostEndpoints` is its `Endpoints`: nothing to create, so it has no `Lifecycle` (`down`, `rm` and `ls` say so). |
+| `plain_host.rs` | A machine you can reach as an endpoint (`--target host`): `PlainHost` is an `Env` and `Container` built on a `Host` only (commands and `tar` through `Host::exec`, secrets on stdin, the session through `Host::interactive`), acting as the user the host connects as and not [disposable](#runtime-traits); `PlainHostEndpoints` is its `Endpoints`: nothing to create, so it has no `Lifecycle` (`down`, `rm` and `ls` say so). |
 | `port.rs` | `PortForward`, a port to forward: what the devcontainer spec declares and the daemon carries out, so neither depends on the other. |
 | `tools/` | The build-time helpers behind interfaces: `DepReader` (which libraries a binary needs), `ElfEditor` (relink a copy of a binary for the bundle's prefix) and `OciFetcher` (pull an artifact's layers from a registry), bundled as a `Toolchain` that `cmd::run` builds. `external` runs the programs (`Ldd`, `Patchelf`, parsing `ldd`'s output); `oci/` is the in-process registry client (see [`tools/oci/`](#toolsoci)). Packing, the bundle cache and feature fetching take the interfaces and are tested with fakes. |
 | `host_tools.rs` | The helper programs lodge may run here (`ssh`, `ldd`, `patchelf`): what each is needed for (a `Need`, which decides when `doctor` requires it) and how to get it. `doctor` reports from this table and each tool is started only through it (the `tools` implementations and `host/ssh.rs`). |
@@ -370,6 +370,7 @@ what `ldg clean` removes:
 | `<prefix>/lib/` | Copied libraries and the dynamic linker, one copy. |
 | `<prefix>/injected` | The id of the bundle last injected, and the wrappers, data and git `safe.directory` entries placed outside the prefix. `ldg status` shows the id, `ldg clean` removes the wrappers and the `safe.directory` entries lodge added (never one that was already there) and reports the data, and its presence is how both find the prefix. |
 | `<prefix>/terminfo/` | The user's terminfo entry, when the container lacked it. |
+| `<prefix>/session` | Which lodge session holds the container: `<pid> <id> <user@host>`, written by the session's start-up script and removed when it ends (`session::lease`). |
 
 Provisioning state, which is the devcontainer's own and written as root when the
 container is created (so `ldg clean` keeps it):
@@ -548,7 +549,7 @@ just how it is done.
 | Dependency | Interface | Implementations |
 | --- | --- | --- |
 | How a machine is reached | `host::Host` | `LocalHost`, `SshHost`, and `FakeHost` for tests; anything else that can run a command implements `run`, `interactive`, `tunnel` and `spawn` |
-| The machine lodge runs on | `local::Local` | `SystemLocal` (environment, files a secret names, a local shell); `FakeLocal` for tests |
+| The machine lodge runs on | `local::Local` | `SystemLocal` (environment, files a secret names, a local shell, the credential store); `FakeLocal` for tests |
 | The container engine | `runtime::Runtime`, `Compose`, `Container`, `Env` | `runtime::cli`, and the in-memory `FakeRuntime` for tests |
 | The build-time helpers | `tools::DepReader`, `ElfEditor`, `OciFetcher` (a `Toolchain`) | `Ldd`, `Patchelf`, `NativeOci` (on `Http` and `Credentials`: `UreqHttp`, `DockerConfig`); a test passes fakes |
 | Making an endpoint ready, and finding it again | `provision::Endpoints` | `devcontainer::Devcontainer` (a devcontainer on an engine), `plain_host::PlainHostEndpoints` (the machine itself), `kube::KubeEndpoints` (a running pod, found by name or by a label selector, through `kubectl` on a `Host`). An endpoint also says what `doctor` should check about it (`Endpoints::checks`: for a pod, `kubectl` and that the pod is there), so `doctor` never asks which kind it is |
@@ -606,7 +607,8 @@ nothing to swap or fake there:
   files, loading the config, finding `ldg`'s own executable to start the forward
   daemon). `conventions.rs` lists which files still reach for the process itself,
   and the list may only shrink. The environment, the files a secret names, a
-  secret's `command` and `${localEnv:…}` go through `local::Local`.
+  secret's `command`, its credential-store entry and `${localEnv:…}` go through
+  `local::Local`.
 
 Making one of these a choice follows the same recipe as the others.
 
@@ -662,7 +664,10 @@ erode.
   (`ldd`, `patchelf`) only in `tools/external.rs`, through `host_tools`,
   behind `DepReader` and `ElfEditor`. The registry is spoken to in-process
   (`tools/oci/`, behind `OciFetcher`): the HTTP crate is named only in
-  `http.rs` and the hash crate only in `digest.rs`. lodge never runs a local
+  `http.rs` and the hash crate only in `digest.rs`. The operating system's credential
+  store (the `keyring` crate) is named only in `credstore.rs`, behind
+  `CredentialStore`, and the terminal (`crossterm`: raw mode and key events, so also
+  a value typed without echo) only in `cmd/select.rs`. lodge never runs a local
   `tar`; tar streams are built and unpacked in-process. `host/ssh.rs` builds
   every `ssh` command from one private `base`. *Enforced:* the tests in
   `conventions.rs`.
@@ -728,8 +733,8 @@ during `docker run` (the retry starts what it finds instead of running again),
 build and compose retries, secrets staying out of the arguments, and everything
 that reads a project through a host (config discovery, the drift hash, local
 features, `start` and `status`). `FakeLocal` does the same for the machine lodge
-runs on: environment variables, a secret's file and command, `${localEnv:…}`, the
-terminal. `conventions.rs` checks the architecture rules above.
+runs on: environment variables, a secret's file, command and credential-store entry,
+`${localEnv:…}`, the terminal. `conventions.rs` checks the architecture rules above.
 
 `FakeEnv` is strict on purpose. It emulates a handful of commands, and a test
 declares anything else it depends on (`with_output`, `with_failure`, which
@@ -738,8 +743,8 @@ was told about panics, so a test can't pass because the fake said "success" to
 something a real container might refuse; and a `FakeRuntime` container that is
 stopped refuses every command, as `docker exec` does. The one exception is a `sh -c` script run for its effect, which is
 recorded and assumed to work; tests assert on the recorded script, and scripts
-whose behaviour matters (secrets, `ldg clean`'s removal script, the prefix probe, the session's `PATH` script) are also run for
-real against a temp directory. The fake records who each command ran as
+whose behaviour matters (secrets, `ldg clean`'s removal script, the prefix probe, the session's `PATH` script, the scripts that end a session and give the container up) are also run for
+real against a temp directory (the lease's against real processes). The fake records who each command ran as
 (`ran_as`), so "as root" and "as `remoteUser`" are tested too. Tests that need
 scratch files use `tmpfile::TempDir`, which removes itself even when the test
 fails.
@@ -748,8 +753,10 @@ fails.
 real container engine: create and reuse, hooks, drift, injection and library
 refresh, the architecture refusal, uid alignment, container settings and
 variables, compose, forwarding (loopback-only, one daemon), `--remote`, bundles
-(pack, inspect, verify, damage, the cache, injecting without `ldd`/`patchelf`)
-secrets (never in the image, the trace or the disk; scoping), hooks and feature
+(pack, inspect, verify, damage, the cache, injecting without `ldd`/`patchelf`),
+secrets (never in the image, the trace or the disk; scoping; removed when the session
+ends), takeover between clients (the same user replaced, another asked, a refusal
+leaves the session alone: three sessions at once on pseudo-terminals), hooks and feature
 scripts as `remoteUser`, local features over `--remote`, one container per
 folder however it is spelled, `ls`/`status --json`/`ports`/`logs`/`clean`, config
 typos, `init`/`completions`/`man`, a glibc tool in an Alpine
