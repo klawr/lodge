@@ -309,9 +309,25 @@ mod tests {
             parse("bundles = [\"b.tar\"]\ndefault_bundle = \"a.tar\"\n").unwrap_err()
         );
         assert!(e.contains("is not one of `bundles`"), "{e}");
-        // Listed, it is fine; written two ways that mean the same file, too.
+        // Listed, it is fine: written relative to the file's folder, or in full (an
+        // absolute path of this platform, in a TOML literal string so a Windows
+        // path's backslashes are not escapes).
         assert!(parse("bundles = [\"a.tar\", \"b.tar\"]\ndefault_bundle = \"b.tar\"\n").is_ok());
-        assert!(parse("bundles = [\"/srv/lodge/a.tar\"]\ndefault_bundle = \"a.tar\"\n").is_ok());
+        let full = std::env::temp_dir()
+            .join("a.tar")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            parse(&format!(
+                "bundles = ['{full}']\ndefault_bundle = '{full}'\n"
+            ))
+            .is_ok()
+        );
+        let e = format!(
+            "{:#}",
+            parse(&format!("bundles = ['{full}']\ndefault_bundle = 'b.tar'\n")).unwrap_err()
+        );
+        assert!(e.contains("is not one of `bundles`"), "{e}");
         // No default is fine with or without a list: the config is packed as it is.
         assert!(parse("bundles = [\"a.tar\"]\n").is_ok());
     }
