@@ -58,6 +58,12 @@ pub trait Choose {
         true
     }
 
+    /// A value typed or pasted without being shown (a token). An error when there
+    /// is nobody to ask, or the person gives up.
+    fn hidden(&self, question: &str) -> Result<String> {
+        bail!("cannot ask \"{question}\" without a terminal")
+    }
+
     /// The index of the option picked, or `None` when the person declines. An
     /// error when there is nobody to ask.
     fn choose(&self, question: &str, options: &Table) -> Result<Option<usize>>;
@@ -274,6 +280,11 @@ impl Terminal {
 impl Choose for Terminal {
     fn can_ask(&self) -> bool {
         io::stdin().is_terminal() && io::stderr().is_terminal()
+    }
+
+    fn hidden(&self, question: &str) -> Result<String> {
+        Self::check(question)?;
+        select::hidden(question)
     }
 
     fn choose(&self, question: &str, options: &Table) -> Result<Option<usize>> {

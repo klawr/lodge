@@ -29,6 +29,7 @@ mod new_project;
 mod project;
 mod prompt;
 mod resume;
+mod secret;
 mod select;
 mod table;
 pub(crate) mod targets;
@@ -489,6 +490,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
         }
         Command::Bundle { command } => bundle::bundle(&ctx, command)?,
         Command::Cache { command } => bundle::cache(command)?,
+        Command::Secret { command } => secret::run(&ctx, command)?,
         Command::Inject { command } => inject::run(&ctx, command)?,
         Command::Init { force, print } => init::run(&ctx, force, print)?,
         Command::Doctor { project, json } => {

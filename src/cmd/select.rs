@@ -1406,6 +1406,83 @@ fn draw(err: &mut impl Write, lines: &[Line], width: usize) -> io::Result<()> {
     err.flush()
 }
 
+// ── a value typed without being shown ─────────────────────────────────────────
+
+/// What a key did to the line being typed.
+#[derive(Debug, PartialEq, Eq)]
+enum HiddenStep {
+    Typing,
+    Done,
+    Cancel,
+}
+
+/// Applies `key` to `line`: characters are added, Backspace removes one, Enter or
+/// Ctrl-D ends the line, Esc or Ctrl-C gives up.
+fn apply_hidden(line: &mut String, key: KeyEvent) -> HiddenStep {
+    if key.kind == KeyEventKind::Release {
+        return HiddenStep::Typing;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Enter => HiddenStep::Done,
+        KeyCode::Esc => HiddenStep::Cancel,
+        KeyCode::Char('c') if ctrl => HiddenStep::Cancel,
+        KeyCode::Char('d') if ctrl => HiddenStep::Done,
+        KeyCode::Backspace => {
+            line.pop();
+            HiddenStep::Typing
+        }
+        KeyCode::Char(c) if !ctrl => {
+            line.push(c);
+            HiddenStep::Typing
+        }
+        _ => HiddenStep::Typing,
+    }
+}
+
+/// Takes the terminal out of raw mode again, whichever way reading ends.
+struct HiddenRaw;
+
+impl HiddenRaw {
+    fn enter() -> std::io::Result<Self> {
+        terminal::enable_raw_mode()?;
+        Ok(HiddenRaw)
+    }
+}
+
+impl Drop for HiddenRaw {
+    // There is no one to tell if the terminal can't be restored.
+    #[allow(clippy::let_underscore_must_use)]
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+/// Asks `prompt` on the terminal and reads one line without echoing it.
+pub fn hidden(prompt: &str) -> anyhow::Result<String> {
+    let mut err = std::io::stderr();
+    write!(err, "{prompt}")?;
+    err.flush()?;
+    let mut line = String::new();
+    let outcome = {
+        let _raw = HiddenRaw::enter()?;
+        loop {
+            if let Event::Key(key) = event::read()? {
+                match apply_hidden(&mut line, key) {
+                    HiddenStep::Typing => {}
+                    done => break done,
+                }
+            }
+        }
+    };
+    // The line was not echoed, so the cursor is still after the prompt.
+    writeln!(err)?;
+    if outcome == HiddenStep::Cancel {
+        anyhow::bail!("cancelled");
+    }
+    Ok(line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2327,5 +2404,59 @@ mod tests {
         f.knobs[0].changed = true;
         let shown = texts(&find_frame("Add", &["Files"], &list, &f, "", 5, 80));
         assert_eq!(shown[2], " looking in ~ (changed)", "{shown:?}");
+    }
+
+    fn hidden_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn typed_hidden(keys: &[KeyEvent]) -> (String, HiddenStep) {
+        let mut line = String::new();
+        for k in keys {
+            match apply_hidden(&mut line, *k) {
+                HiddenStep::Typing => {}
+                end => return (line, end),
+            }
+        }
+        (line, HiddenStep::Typing)
+    }
+
+    #[test]
+    fn characters_are_collected_and_backspace_removes_one() {
+        let keys = [
+            hidden_key(KeyCode::Char('a')),
+            hidden_key(KeyCode::Char('x')),
+            hidden_key(KeyCode::Backspace),
+            hidden_key(KeyCode::Char('b')),
+            hidden_key(KeyCode::Enter),
+        ];
+        assert_eq!(typed_hidden(&keys), ("ab".to_string(), HiddenStep::Done));
+    }
+
+    #[test]
+    fn escape_and_ctrl_c_give_up_and_ctrl_d_ends_the_line() {
+        assert_eq!(
+            typed_hidden(&[hidden_key(KeyCode::Esc)]).1,
+            HiddenStep::Cancel
+        );
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        assert_eq!(typed_hidden(&[ctrl('c')]).1, HiddenStep::Cancel);
+        let (line, end) = typed_hidden(&[hidden_key(KeyCode::Char('t')), ctrl('d')]);
+        assert_eq!((line.as_str(), end), ("t", HiddenStep::Done));
+    }
+
+    #[test]
+    fn a_control_chord_adds_nothing_and_a_released_key_is_ignored() {
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(typed_hidden(&[ctrl_a]), (String::new(), HiddenStep::Typing));
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('z'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert_eq!(
+            typed_hidden(&[release]),
+            (String::new(), HiddenStep::Typing)
+        );
     }
 }

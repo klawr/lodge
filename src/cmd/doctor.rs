@@ -170,6 +170,7 @@ fn secret_check(
         Source::Env(var) => format!("env {var}"),
         Source::File(path) => format!("file {}", path.display()),
         Source::Command(cmd) => format!("command {}", cmd.split_whitespace().next().unwrap_or("")),
+        Source::Store(name) => format!("store {name}"),
     };
     let name = format!("secret {}", decl.name);
     match crate::secret::resolve(decl, local) {

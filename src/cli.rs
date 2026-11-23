@@ -198,6 +198,30 @@ pub enum CacheCommand {
 }
 
 #[derive(Subcommand)]
+pub enum SecretCommand {
+    /// Store a value in this machine's credential store (typed hidden, or piped in)
+    #[command(
+        long_about = "Store a secret's value in this machine's credential store (Windows \
+            Credential Manager, the macOS Keychain, or the Linux Secret Service), under \
+            NAME. On a terminal the value is typed without being shown; otherwise it is \
+            read from stdin, so `ldg secret set token < file` works. It is never an \
+            argument. A [[secret]] reads it with `from = { store = \"NAME\" }`."
+    )]
+    Set {
+        /// The entry's name (letters, digits and underscores)
+        name: String,
+    },
+    /// Show the store entries your config reads, and whether each is set
+    #[command(alias = "list")]
+    Ls,
+    /// Remove an entry from the credential store
+    Rm {
+        /// The entry's name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum Command {
     /// Start a devcontainer and inject your environment
     #[command(
@@ -360,6 +384,11 @@ pub enum Command {
     Bundle {
         #[command(subcommand)]
         command: BundleCommand,
+    },
+    /// Keep secret values in this machine's credential store
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommand,
     },
     /// Show or clear the cache of prepared bundles
     Cache {

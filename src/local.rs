@@ -1,6 +1,6 @@
 //! What lodge reads from the machine it runs on, behind one interface: environment
-//! variables, files it was pointed at (a secret's source), and a local shell for a
-//! secret's `command`. Nothing else asks the process for them, so a test hands in
+//! variables, files it was pointed at (a secret's source), a local shell for a
+//! secret's `command`, and the OS credential store for a secret's `store`. Nothing else asks the process for them, so a test hands in
 //! `fake::FakeLocal` and the real one ([`SystemLocal`]) is built once, in `cmd/`.
 //!
 //! This is the machine lodge *runs on*. The project's machine, which a `--remote`
@@ -11,6 +11,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+use crate::credstore::{CredentialStore, OsCredentialStore};
 
 /// The machine lodge runs on.
 pub trait Local: Send + Sync {
@@ -42,6 +44,10 @@ pub trait Local: Send + Sync {
         input: &[u8],
         timeout: Duration,
     ) -> Result<ProgramOutput>;
+
+    /// This machine's own store of secret values (the OS credential store), where
+    /// a `from = { store = "…" }` secret is read from.
+    fn store(&self) -> &dyn CredentialStore;
 }
 
 /// What a program printed and whether it succeeded.
@@ -54,6 +60,8 @@ pub struct ProgramOutput {
 
 /// This machine, for real.
 pub struct SystemLocal;
+
+static OS_STORE: OsCredentialStore = OsCredentialStore;
 
 impl Local for SystemLocal {
     fn var(&self, name: &str) -> Option<OsString> {
@@ -98,6 +106,10 @@ impl Local for SystemLocal {
             stdout: out.stdout,
             stderr: out.stderr,
         })
+    }
+
+    fn store(&self) -> &dyn CredentialStore {
+        &OS_STORE
     }
 }
 
@@ -174,6 +186,7 @@ pub mod fake {
         programs: BTreeMap<String, (bool, Vec<u8>)>,
         /// What each program was asked, and fed.
         pub asked: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+        store: crate::credstore::fake::FakeCredentialStore,
     }
 
     impl FakeLocal {
@@ -202,6 +215,23 @@ pub mod fake {
             self.programs
                 .insert(command.into(), (success, stdout.to_vec()));
             self
+        }
+
+        /// The credential store holds `value` under `name`.
+        pub fn with_stored(mut self, name: &str, value: &[u8]) -> Self {
+            self.store = self.store.with(name, value);
+            self
+        }
+
+        /// The credential store cannot be used.
+        pub fn with_unusable_store(mut self) -> Self {
+            self.store = crate::credstore::fake::FakeCredentialStore::unavailable();
+            self
+        }
+
+        /// What the credential store holds under `name`.
+        pub fn stored(&self, name: &str) -> Option<Vec<u8>> {
+            self.store.value(name)
         }
 
         /// `script` fails with `message`.
@@ -251,6 +281,10 @@ pub mod fake {
                 }),
                 None => bail!("{program} was not found"),
             }
+        }
+
+        fn store(&self) -> &dyn CredentialStore {
+            &self.store
         }
 
         fn run_sh(&self, script: &str, _timeout: Duration) -> Result<Vec<u8>> {

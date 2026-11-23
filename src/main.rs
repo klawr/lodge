@@ -13,6 +13,7 @@ mod cmd;
 mod config;
 #[cfg(test)]
 mod conventions;
+mod credstore;
 mod devcontainer;
 #[cfg(test)]
 mod doc_facts;

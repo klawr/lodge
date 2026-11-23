@@ -212,15 +212,16 @@ fn attach(
     if no_attach {
         return Ok(());
     }
-    ctx.remember(place, attached.name.as_deref(), used);
-    attached.run_post_attach();
     // The container is one person's workspace and the secrets are about to become
-    // this client's, so a session an earlier client left running goes first.
+    // this client's, so a session an earlier client left running goes first. Asked
+    // before anything is recorded or run for this attach, since the answer may be no.
     let client = session::lease::client(ctx.local.as_ref());
     if !make_room(ctx.choose.as_ref(), container, &user, &layout, &client)? {
         note!("not attaching; the other session is still there");
         return Ok(());
     }
+    ctx.remember(place, attached.name.as_deref(), used);
+    attached.run_post_attach();
     let session_id = session::lease::new_id();
     let setup = secret::deliver::deliver(
         container,

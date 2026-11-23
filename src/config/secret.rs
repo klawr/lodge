@@ -18,6 +18,8 @@ pub enum Source {
     File(PathBuf),
     /// A shell command whose trimmed stdout is the value.
     Command(String),
+    /// An entry of this machine's credential store (`ldg secret set`).
+    Store(String),
 }
 
 /// How a secret is presented inside the container.
@@ -42,7 +44,7 @@ pub struct SecretDecl {
     pub targets: Vec<String>,
 }
 
-/// Where the value comes from on this machine: exactly one of the three.
+/// Where the value comes from on this machine: exactly one of the four.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(test, derive(Serialize, schemars::JsonSchema))]
@@ -50,6 +52,7 @@ struct RawFrom {
     env: Option<String>,
     file: Option<PathBuf>,
     command: Option<String>,
+    store: Option<String>,
 }
 
 /// `"env"`, or a file in the container.
@@ -91,18 +94,27 @@ impl TryFrom<RawSecret> for SecretDecl {
         validate_name(&name).map_err(|e| e.to_string())?;
         let ctx = |e: String| format!("secret {name:?}: {e}");
 
-        let from = match (raw.from.env, raw.from.file, raw.from.command) {
-            (Some(v), None, None) => {
+        let from = match (
+            raw.from.env,
+            raw.from.file,
+            raw.from.command,
+            raw.from.store,
+        ) {
+            (Some(v), None, None, None) => {
                 validate_name(&v).map_err(|e| ctx(format!("from.env: {e}")))?;
                 Source::Env(v)
             }
             // `~` is expanded by `Config::parse`, like every host path.
-            (None, Some(p), None) => Source::File(p),
-            (None, None, Some(c)) if !c.trim().is_empty() => Source::Command(c),
-            (None, None, Some(_)) => return Err(ctx("from.command is empty".into())),
+            (None, Some(p), None, None) => Source::File(p),
+            (None, None, Some(c), None) if !c.trim().is_empty() => Source::Command(c),
+            (None, None, Some(_), None) => return Err(ctx("from.command is empty".into())),
+            (None, None, None, Some(s)) => {
+                validate_name(&s).map_err(|e| ctx(format!("from.store: {e}")))?;
+                Source::Store(s)
+            }
             _ => {
                 return Err(ctx(
-                    "`from` needs exactly one of env, file or command".into()
+                    "`from` needs exactly one of env, file, command or store".into(),
                 ));
             }
         };
@@ -138,7 +150,7 @@ impl TryFrom<RawSecret> for SecretDecl {
 }
 
 /// Names reach shell scripts (as variable names), so keep them to the portable set.
-fn validate_name(name: &str) -> Result<()> {
+pub(crate) fn validate_name(name: &str) -> Result<()> {
     if !is_var_name(name) {
         bail!(
             "invalid name {name:?}: use letters, digits and underscores, not starting with a digit"
@@ -268,6 +280,20 @@ mod tests {
         let e = err("[[secret]]\nname='A'\nfrom = { command='  ' }\nas='env'");
         assert!(e.contains("empty"), "{e}");
         assert!(parse("[[secret]]\nname='A'\nfrom = { cmd='x' }\nas='env'").is_err());
+    }
+
+    #[test]
+    fn a_store_source_names_an_entry_and_nothing_else() {
+        let s = parse("[[secret]]\nname='A'\nfrom = { store='claude_login' }\nas='env'").unwrap();
+        assert_eq!(s[0].from, Source::Store("claude_login".into()));
+        // One source only, and the name is kept to what a script can take.
+        let e = err("[[secret]]\nname='A'\nfrom = { store='x', env='Y' }\nas='env'");
+        assert!(e.contains("exactly one") && e.contains("store"), "{e}");
+        let e = err("[[secret]]\nname='A'\nfrom = { store='a b; rm' }\nas='env'");
+        assert!(
+            e.contains("from.store") && e.contains("invalid name"),
+            "{e}"
+        );
     }
 
     #[test]

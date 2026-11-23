@@ -336,6 +336,7 @@ fn dependencies() -> Vec<(String, String, String)> {
 /// None of it knows about lodge's features.
 const FOUNDATION: &[&str] = &[
     "arch",
+    "credstore",
     "fingerprint",
     "host",
     "host_tools",

@@ -116,7 +116,7 @@
     },
     "RawFrom": {
       "additionalProperties": false,
-      "description": "Where the value comes from on this machine: exactly one of the three.",
+      "description": "Where the value comes from on this machine: exactly one of the four.",
       "properties": {
         "command": {
           "type": [
@@ -131,6 +131,12 @@
           ]
         },
         "file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "store": {
           "type": [
             "string",
             "null"

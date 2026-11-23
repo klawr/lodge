@@ -191,9 +191,34 @@ as   = { file = "~/.claude/.credentials.json", mode = "0600" }
 | field     | required | meaning |
 | --------- | -------- | ------- |
 | `name`    | yes      | letters, digits and `_`; the variable name for `as = "env"`, otherwise just a label. Unique. |
-| `from`    | yes      | where the value comes from on **this** machine: exactly one of `{ env = "VAR" }`, `{ file = "path" }` or `{ command = "…" }` (stdout, trimmed; 30 s limit, stdin closed). |
+| `from`    | yes      | where the value comes from on **this** machine: exactly one of `{ env = "VAR" }`, `{ file = "path" }`, `{ command = "…" }` (stdout, trimmed; 30 s limit, stdin closed) or `{ store = "entry" }` (this machine's credential store, see below). |
 | `as`      | yes      | `"env"`, or `{ file = "/path/in/container", mode = "0600" }` (`~/` is the container user's home; `mode` defaults to `0600`). |
 | `targets` | no       | globs (`*`, `?`) matched against the container name and the host (`local`, or the `--remote` value and its host part). Omitted: any container. |
+
+### Keeping a value in the credential store
+
+A `store` source reads the value from your operating system's credential store
+(Windows Credential Manager, the macOS Keychain, or the Secret Service on Linux:
+GNOME Keyring, KeePassXC, …), so neither the config nor a file on disk holds it:
+
+```toml
+[[secret]]
+name = "CLAUDE_CODE_OAUTH_TOKEN"
+from = { store = "claude_token" }
+as   = "env"
+```
+
+```sh
+ldg secret set claude_token     # typed without being shown (or: ldg secret set claude_token < file)
+ldg secret ls                   # the entries your config reads, and whether each is set
+ldg secret rm claude_token
+```
+
+The value is never an argument, and it is never printed. The store belongs to your
+user on this machine: a value set on one client is not on another, so set it on each
+client that should deliver it. `ldg doctor` checks that each store entry is set. On
+Linux without a Secret Service (a headless server), a `store` source fails with a
+message that says so; `env`, `file` and `command` sources need nothing.
 
 How they are delivered, when you attach (`ldg up`, not with
 `--no-attach`):

@@ -103,6 +103,13 @@ pub fn resolve(decl: &SecretDecl, local: &dyn Local) -> Result<Secret> {
                 .map_err(|e| anyhow::anyhow!("{}", e.kind()));
             (format!("file {}", path.display()), r)
         }
+        Source::Store(name) => {
+            let r = local
+                .store()
+                .get(name)
+                .and_then(|v| v.context("is not set; add it with `ldg secret set`"));
+            (format!("store entry {name}"), r)
+        }
         Source::Command(cmd) => {
             let program = cmd.split_whitespace().next().unwrap_or_default();
             let r = local
@@ -180,6 +187,23 @@ mod tests {
             msg.contains("`pass`") && !msg.contains("hunter2-entry"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn resolves_a_store_entry_and_says_what_is_wrong_when_it_cannot() {
+        let d = decl(Source::Store("tok".into()));
+        let have = FakeLocal::new().with_stored("tok", b"s3cret");
+        assert_eq!(resolve(&d, &have).unwrap().expose(), b"s3cret");
+        // Missing: the message says how to add it, and names no value.
+        let e = format!("{:#}", resolve(&d, &FakeLocal::new()).unwrap_err());
+        assert!(e.contains("TOKEN") && e.contains("ldg secret set"), "{e}");
+        // A store that cannot be used is reported, not taken for "not set".
+        let e = format!(
+            "{:#}",
+            resolve(&d, &FakeLocal::new().with_unusable_store()).unwrap_err()
+        );
+        assert!(e.contains("no credential store"), "{e}");
+        assert!(!e.contains("is not set"), "{e}");
     }
 
     #[test]
