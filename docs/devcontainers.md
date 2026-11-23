@@ -64,8 +64,9 @@ their homes are set, and `containerEnv` is written to `/etc/profile.d` so login
 shells pick it up.
 
 Registry features are pulled by lodge itself, so there is nothing to install. The
-pull is anonymous unless you have run `docker login` for that registry: lodge
-reads the login from docker's config file (`~/.docker/config.json`, or
+pull is anonymous unless a login is kept for that registry (`ldg registry login
+<registry>`, see [Bundles and secrets](bundles-and-secrets.md#keeping-a-bundle-in-a-registry)),
+or you have run `docker login` for it: lodge reads the login from docker's config file (`~/.docker/config.json`, or
 `$DOCKER_CONFIG`), or asks the credential helper it names (`credsStore`,
 `credHelpers`; `docker-credential-<name> get`). Everything pulled is
 checked against its digest. If a pull fails, see

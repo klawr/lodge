@@ -32,6 +32,22 @@ pub trait Credentials: Send + Sync {
     fn login(&self, registry: &str) -> Result<Option<Login>>;
 }
 
+/// Several sources in order of preference: the first with a login answers. One
+/// that is broken is an error, not a reason to try the next (a login that is
+/// there but unreadable must not turn into an anonymous request).
+pub struct FirstOf(pub Vec<Box<dyn Credentials>>);
+
+impl Credentials for FirstOf {
+    fn login(&self, registry: &str) -> Result<Option<Login>> {
+        for source in &self.0 {
+            if let Some(login) = source.login(registry)? {
+                return Ok(Some(login));
+            }
+        }
+        Ok(None)
+    }
+}
+
 /// The logins `docker login` keeps: in its config file (`$DOCKER_CONFIG` or
 /// `~/.docker`), or, when the file names a credential helper for the registry
 /// (`credHelpers`) or for all (`credsStore`), in whatever that helper holds, which
@@ -115,6 +131,39 @@ fn names_of(registry: &str) -> Vec<&str> {
     } else {
         vec![registry]
     }
+}
+
+/// The name a registry is kept under: the host that serves its API, whatever the
+/// user typed (`ghcr.io`, `https://ghcr.io/v1/`, Docker Hub as `docker.io`).
+pub fn canonical_registry(typed: &str) -> String {
+    let host = host_of(typed.trim());
+    match host {
+        "docker.io" | "index.docker.io" => "registry-1.docker.io".to_string(),
+        host => host.to_string(),
+    }
+}
+
+/// Asks a person for a login when a registry has refused the one lodge had, or
+/// there was none. Behind an interface so the client never names a terminal, and
+/// a test hands in a fake.
+pub trait LoginPrompt: Send + Sync {
+    /// A login typed in answer to `registry` refusing (`rejected`: lodge had one,
+    /// and it was refused). `None` when nobody can be asked or they decline.
+    fn ask(&self, registry: &str, rejected: bool) -> Result<Option<Login>>;
+
+    /// A login that was asked for has been accepted: the place to offer keeping it.
+    fn accepted(&self, registry: &str, login: &Login);
+}
+
+/// Nobody to ask: a daemon, a pipe, a test.
+pub struct NoPrompt;
+
+impl LoginPrompt for NoPrompt {
+    fn ask(&self, _registry: &str, _rejected: bool) -> Result<Option<Login>> {
+        Ok(None)
+    }
+
+    fn accepted(&self, _registry: &str, _login: &Login) {}
 }
 
 impl DockerConfig {
@@ -433,6 +482,27 @@ mod tests {
             .login("x.io")
             .unwrap_err();
         assert!(format!("{err:#}").contains("/dc/config.json"), "{err:#}");
+    }
+
+    #[test]
+    fn the_first_source_with_a_login_answers_and_a_broken_one_stops_the_rest() {
+        use fake::FakeCredentials;
+        let both = FirstOf(vec![
+            Box::new(FakeCredentials::new().with("a.io", "first", "1")),
+            Box::new(
+                FakeCredentials::new()
+                    .with("a.io", "second", "2")
+                    .with("b.io", "second", "2"),
+            ),
+        ]);
+        assert_eq!(both.login("a.io").unwrap().unwrap().username, "first");
+        assert_eq!(both.login("b.io").unwrap().unwrap().username, "second");
+        assert!(both.login("c.io").unwrap().is_none());
+        let broken = FirstOf(vec![
+            Box::new(FakeCredentials::new().broken("a.io", "locked")),
+            Box::new(FakeCredentials::new().with("a.io", "second", "2")),
+        ]);
+        assert!(broken.login("a.io").is_err());
     }
 
     #[test]

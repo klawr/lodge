@@ -25,6 +25,7 @@ mod configure;
 mod doctor;
 mod init;
 mod inject;
+mod login;
 mod new_project;
 mod project;
 mod prompt;
@@ -49,8 +50,10 @@ use crate::host::{HostRef, LocalHost, SshHost};
 use crate::local::{Local, SystemLocal};
 use crate::output::warning;
 use crate::provision::{Endpoints, Wiring};
+use crate::secret::registry::StoredLogins;
 use crate::tools::{
-    DockerConfig, Ldd, NativeOci, OciFetcher, OciPusher, Packer, Patchelf, Toolchain, UreqHttp,
+    Credentials, DockerConfig, FirstOf, Ldd, NativeOci, NoPrompt, OciFetcher, OciPusher, Packer,
+    Patchelf, Toolchain, UreqHttp,
 };
 
 /// Whether a command works in a target at all. `init` and the generated
@@ -282,16 +285,28 @@ fn toolchain(oci: Arc<dyn OciFetcher>) -> Toolchain {
     }
 }
 
+/// Where registry logins come from: what `ldg registry login` stored on this
+/// machine, then what `docker login` keeps.
+fn registry_credentials(local: Arc<dyn Local>) -> Box<dyn Credentials> {
+    Box::new(FirstOf(vec![
+        Box::new(StoredLogins::new(local.clone())),
+        Box::new(DockerConfig::new(local)),
+    ]))
+}
+
 /// Works on the config alone: no host, no target, no engine.
 fn configure_config(config: Option<PathBuf>, terminal: &prompt::Terminal) -> Result<()> {
     let path = crate::config::path_for(config)?;
     let home = SystemLocal.home();
     let path_var = SystemLocal.var("PATH").unwrap_or_default();
     let local: Arc<dyn Local> = Arc::new(SystemLocal);
-    let registry = Arc::new(NativeOci::new(
-        Box::new(UreqHttp::new()),
-        Box::new(DockerConfig::new(local)),
-    ));
+    let registry = Arc::new(
+        NativeOci::new(
+            Box::new(UreqHttp::new()),
+            registry_credentials(local.clone()),
+        )
+        .asking(Box::new(login::TerminalLogin::new(terminal.clone(), local))),
+    );
     let packer = bundle::LivePacker {
         tools: toolchain(registry.clone()),
         sinks: bundle_sinks(registry),
@@ -407,10 +422,20 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
     let local: Arc<dyn Local> = Arc::new(SystemLocal);
     // One registry client, handed to what reads from a registry and to what
     // writes to one: they are separate interfaces and the same implementation.
-    let registry = Arc::new(NativeOci::new(
-        Box::new(UreqHttp::new()),
-        Box::new(DockerConfig::new(local.clone())),
-    ));
+    let registry = Arc::new(
+        NativeOci::new(
+            Box::new(UreqHttp::new()),
+            registry_credentials(local.clone()),
+        )
+        .asking(
+            // The forward daemon has no terminal, and so nobody to ask.
+            if daemon {
+                Box::new(NoPrompt)
+            } else {
+                Box::new(login::TerminalLogin::new(terminal.clone(), local.clone()))
+            },
+        ),
+    );
     let tools = toolchain(registry.clone());
     // Read on this machine, even with `--remote`: the folder you stand in is here.
     let project = project_dir(&subcommand, cli.project_dir);
@@ -491,6 +516,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
         Command::Bundle { command } => bundle::bundle(&ctx, command)?,
         Command::Cache { command } => bundle::cache(command)?,
         Command::Secret { command } => secret::run(&ctx, command)?,
+        Command::Registry { command } => login::run(&ctx, command)?,
         Command::Inject { command } => inject::run(&ctx, command)?,
         Command::Init { force, print } => init::run(&ctx, force, print)?,
         Command::Doctor { project, json } => {

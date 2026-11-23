@@ -3,7 +3,7 @@
 //! checks everything it is given against the digest it was asked for.
 
 use super::auth::{self, Challenge};
-use super::credentials::Credentials;
+use super::credentials::{Credentials, Login, LoginPrompt, NoPrompt};
 use super::digest::{Digest, copy_verified};
 use super::http::{Body, Http, Method, Request, Response};
 use super::manifest::Descriptor;
@@ -55,9 +55,38 @@ pub struct Registry<'a> {
     repository: &'a str,
     access: Access,
     /// What was last agreed with the registry: sent with every request after.
-    authorization: Option<String>,
+    authorization: Option<Agreed>,
     waits: Vec<Duration>,
+    /// Who to ask for a login when the registry refuses, once per registry.
+    prompt: &'a dyn LoginPrompt,
+    /// The login a person typed, which beats the ones that were found.
+    typed: Option<Login>,
+    asked: bool,
 }
+
+/// An `Authorization` the registry accepted a challenge with, and whether a login
+/// went into it (so a later refusal can tell "refused the login" from "wants one").
+struct Agreed {
+    header: String,
+    with_login: bool,
+}
+
+/// What a registry said when it wanted a login and there was none that it
+/// accepted: the one thing a person asked can mend. `rejected` is whether a login
+/// was sent and refused, rather than none having been there.
+#[derive(Debug)]
+struct NeedsLogin {
+    message: String,
+    rejected: bool,
+}
+
+impl std::fmt::Display for NeedsLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for NeedsLogin {}
 
 impl<'a> Registry<'a> {
     pub fn new(
@@ -75,7 +104,16 @@ impl<'a> Registry<'a> {
             access,
             authorization: None,
             waits: RETRY_WAITS.to_vec(),
+            prompt: &NoPrompt,
+            typed: None,
+            asked: false,
         }
+    }
+
+    /// Asks `prompt` for a login when the registry refuses the one there is.
+    pub fn asking(mut self, prompt: &'a dyn LoginPrompt) -> Self {
+        self.prompt = prompt;
+        self
     }
 
     /// The waits before each new try of a request answered with "not now".
@@ -323,9 +361,47 @@ impl<'a> Registry<'a> {
 
     /// A request that answers a 401 once, with whatever the registry asks for. A
     /// token that has gone stale is answered the same way, so a long pull outlives
-    /// it; a second 401 is the registry's answer. Any status comes back: what it
-    /// means is the caller's to say.
+    /// it; a second 401 is the registry's answer, unless a person can be asked for
+    /// a login (once), in which case the request is made again with it. Any status
+    /// comes back: what it means is the caller's to say.
     fn request(
+        &mut self,
+        method: Method,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Body,
+    ) -> Result<Response> {
+        let first = self.answering(method, url, headers, body.clone());
+        // Refused, and whether a login was in it when it was.
+        let refused = match &first {
+            Ok(response) if matches!(response.status, 401 | 403) => {
+                Some(self.authorization.as_ref().is_some_and(|a| a.with_login))
+            }
+            Ok(_) => None,
+            Err(e) => e.downcast_ref::<NeedsLogin>().map(|n| n.rejected),
+        };
+        let Some(rejected) = refused.filter(|_| !self.asked) else {
+            return first;
+        };
+        self.asked = true;
+        let Some(login) = self.prompt.ask(self.registry, rejected)? else {
+            return first;
+        };
+        self.typed = Some(login.clone());
+        self.authorization = None;
+        let again = self.answering(method, url, headers, body);
+        match &again {
+            Ok(response) if !matches!(response.status, 401 | 403) => {
+                self.prompt.accepted(self.registry, &login)
+            }
+            // Not a login to go on with.
+            _ => self.typed = None,
+        }
+        again
+    }
+
+    /// Sends the request, and answers one challenge to it.
+    fn answering(
         &mut self,
         method: Method,
         url: &str,
@@ -349,15 +425,17 @@ impl<'a> Registry<'a> {
     fn failure(&self, status: u16, url: &str) -> anyhow::Error {
         match (status, self.access) {
             (401 | 403, Access::Pull) => anyhow::anyhow!(
-                "{} refused {} ({status}); a private repository needs `docker login`, whose \
-                 login lodge reads from docker's config file or its credential helper",
+                "{} refused {} ({status}); a private repository needs a login: \
+                 `ldg registry login {}` (lodge also reads docker's config file and its \
+                 credential helper)",
                 self.registry,
-                self.repository
+                self.repository,
+                self.registry
             ),
             (401 | 403, Access::Push) => anyhow::anyhow!(
-                "{} refused to write {} ({status}); pushing needs `docker login {}` with an \
-                 account that may write there, whose login lodge reads from docker's \
-                 config file or its credential helper",
+                "{} refused to write {} ({status}); pushing needs a login that may write \
+                 there: `ldg registry login {}` (lodge also reads docker's config file \
+                 and its credential helper)",
                 self.registry,
                 self.repository,
                 self.registry
@@ -379,7 +457,7 @@ impl<'a> Registry<'a> {
             crate::output::trace_line(&format!("{} {url}", method.name()));
             let mut all: Vec<(&str, &str)> = headers.to_vec();
             if let Some(a) = &self.authorization {
-                all.push(("Authorization", a));
+                all.push(("Authorization", &a.header));
             }
             // `Http` answers every status as a response, so an error is the network.
             let response = self
@@ -427,23 +505,37 @@ impl<'a> Registry<'a> {
         }
     }
 
-    /// The `Authorization` value that answers a challenge.
-    fn answer(&self, challenge: &Challenge) -> Result<String> {
-        let login = match self.credentials.login(self.registry) {
+    /// The login to answer a challenge with: what a person typed, else what the
+    /// sources hold. A source that is broken is said so and goes without.
+    fn find_login(&self) -> Option<Login> {
+        if let Some(typed) = &self.typed {
+            return Some(typed.clone());
+        }
+        match self.credentials.login(self.registry) {
             Ok(login) => login,
             Err(e) => {
                 warning!("not using a registry login: {e:#}");
                 None
             }
-        };
+        }
+    }
+
+    /// What answers a challenge.
+    fn answer(&self, challenge: &Challenge) -> Result<Agreed> {
+        let login = self.find_login();
+        let with_login = login.is_some();
+        let agreed = |header: String| Agreed { header, with_login };
         match challenge {
             Challenge::Basic => match login {
-                Some(login) => Ok(auth::basic(&login)),
-                None => bail!(
-                    "{} needs a login (`docker login {}`)",
-                    self.registry,
-                    self.registry
-                ),
+                Some(login) => Ok(agreed(auth::basic(&login))),
+                None => Err(NeedsLogin {
+                    message: format!(
+                        "{} needs a login (`ldg registry login {}`)",
+                        self.registry, self.registry
+                    ),
+                    rejected: false,
+                }
+                .into()),
             },
             Challenge::Bearer {
                 realm,
@@ -483,8 +575,16 @@ impl<'a> Registry<'a> {
                     .http
                     .get(&url, &headers)
                     .map_err(|e| e.context(Unreachable))?;
-                if response.status != 200 {
-                    bail!("the token service refused ({})", response.status);
+                match response.status {
+                    200 => {}
+                    401 | 403 => {
+                        return Err(NeedsLogin {
+                            message: format!("the token service refused ({})", response.status),
+                            rejected: with_login,
+                        }
+                        .into());
+                    }
+                    status => bail!("the token service refused ({status})"),
                 }
                 let body = response.read_limited(MANIFEST_LIMIT)?;
                 let token: Token = serde_json::from_slice(&body).context("reading the token")?;
@@ -492,7 +592,7 @@ impl<'a> Registry<'a> {
                     .token
                     .or(token.access_token)
                     .context("the token service sent no token")?;
-                Ok(format!("Bearer {token}"))
+                Ok(agreed(format!("Bearer {token}")))
             }
         }
     }

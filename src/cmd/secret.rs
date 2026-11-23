@@ -18,7 +18,7 @@ pub fn run(ctx: &Ctx, command: SecretCommand) -> Result<()> {
     match command {
         SecretCommand::Set { name } => {
             validate_name(&name)?;
-            let value = read_value(ctx, &name)?;
+            let value = read_value(ctx, &format!("Value for {name} (not shown): "))?;
             set(ctx.local.store(), &name, value)?;
             info!("stored {name}");
         }
@@ -31,11 +31,11 @@ pub fn run(ctx: &Ctx, command: SecretCommand) -> Result<()> {
     Ok(())
 }
 
-/// The value for `name`: typed without echo on a terminal, else read from stdin.
-fn read_value(ctx: &Ctx, name: &str) -> Result<Vec<u8>> {
+/// A value: typed without echo on a terminal (asking `question`), else read from
+/// stdin.
+pub(super) fn read_value(ctx: &Ctx, question: &str) -> Result<Vec<u8>> {
     if std::io::stdin().is_terminal() {
-        let question = format!("Value for {name} (not shown): ");
-        return Ok(ctx.choose.hidden(&question)?.into_bytes());
+        return Ok(ctx.choose.hidden(question)?.into_bytes());
     }
     let mut value = Vec::new();
     std::io::stdin()

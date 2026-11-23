@@ -127,6 +127,7 @@ for where to put them). Man page: `ldg man | man -l -`.
 | `ldg bundle inspect\|verify FILE` | Show what a bundle holds; check it is intact. |
 | `ldg bundle use\|add\|rm\|ls` | Choose the default bundle (a file, `oci://…`, or `--live` for your config), and keep others on offer to pick from. |
 | `ldg cache [clear]` | Show or clear the cache of prepared bundles. |
+| `ldg registry login\|logout REGISTRY` | Keep a login for a registry (ghcr.io, a private registry) in this machine's credential store, for pulling and publishing bundles there. The password or access token is typed hidden or piped in, never an argument. Without it lodge reads docker's own login, and asks for one when a registry refuses. |
 | `ldg secret set\|ls\|rm NAME` | Keep a secret's value in this machine's credential store (typed hidden or piped in, never an argument); a `[[secret]]` reads it with `from = { store = "NAME" }`. |
 | `ldg completions SHELL`, `ldg man` | Shell completions and the man page. |
 

@@ -95,12 +95,15 @@ names the step that failed:
 - `not found: ghcr.io/owner/name`: the registry has no such repository or tag.
   Check the reference, including the tag.
 - `… refused owner/name (401)`: the repository is private, or needs a login. Run
-  `docker login <registry>`. lodge reads that login only if docker stored it in
+  `ldg registry login <registry>`; at a terminal lodge asks for one when the
+  registry refuses. It also reads a login docker stored, but only if docker stored it in
   its config file; if `credsStore` or `credHelpers` is set there, the login lives
   in a helper that lodge does not ask, and the registry is reached anonymously.
   `the token service refused (…)` is the same thing one step earlier.
-- `… needs a login (docker login <registry>)`: the registry asks for basic auth and
-  there is no login.
+- `… needs a login (ldg registry login <registry>)`: the registry asks for basic auth and
+  there is no login. At a terminal lodge asks for one instead of failing; here there
+  was nobody to ask (a pipe, or the forward daemon), so keep one first. Two-factor
+  accounts need an access token as the password.
 - `content is sha256:…, expected sha256:…`, or `is N bytes, the manifest says M`:
   what came is not what the registry's manifest promised (a broken proxy or
   mirror). Nothing is kept; retry, or check what sits between you and the registry.
@@ -110,9 +113,10 @@ names the step that failed:
   you are online. `… is not in the cache either, so there is nothing to use
   offline`: this tag was never fetched on this machine; use a file, or get online.
 - `… refused to write <repository> (401)`, when publishing with `ldg pack -o
-  oci://…`: run `docker login <registry>` with an account that may write there.
-  As for a pull, the login is read from docker's config file, or from the
-  credential helper it names (`credsStore`, `credHelpers`).
+  oci://…`: run `ldg registry login <registry>` with an account that may write there.
+  As for a pull, the login is the one `ldg registry login` kept, else the one in
+  docker's config file, or in the credential helper it names (`credsStore`,
+  `credHelpers`).
 - `docker-credential-<name> get for <registry> failed: …` or `asking
   docker-credential-<name> …`: the helper the config names is not installed, or it
   failed (a locked keyring). Fix it, or `docker login` again. A helper that holds

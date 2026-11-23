@@ -222,6 +222,31 @@ pub enum SecretCommand {
 }
 
 #[derive(Subcommand)]
+pub enum RegistryCommand {
+    /// Keep a login for a registry in this machine's credential store
+    #[command(
+        long_about = "Keep a login for a registry (ghcr.io, a private registry, Docker Hub) \
+            in this machine's credential store, so `ldg` can pull and publish bundles \
+            there. The password is typed without being shown, or read from stdin; it is \
+            never an argument. With two-factor authentication on, registries want an \
+            access token as the password. Without this, `ldg` also reads docker's own \
+            login, and asks for one when a registry refuses."
+    )]
+    Login {
+        /// The registry's host, as in a reference: `ghcr.io`
+        registry: String,
+        /// The user name; asked for when left out
+        #[arg(short, long)]
+        username: Option<String>,
+    },
+    /// Forget the login kept for a registry
+    Logout {
+        /// The registry's host
+        registry: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum Command {
     /// Start a devcontainer and inject your environment
     #[command(
@@ -393,6 +418,11 @@ pub enum Command {
     Secret {
         #[command(subcommand)]
         command: SecretCommand,
+    },
+    /// Keep registry logins in this machine's credential store
+    Registry {
+        #[command(subcommand)]
+        command: RegistryCommand,
     },
     /// Show or clear the cache of prepared bundles
     Cache {

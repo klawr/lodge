@@ -6,6 +6,7 @@
 
 pub mod deliver;
 pub mod place;
+pub mod registry;
 
 use anyhow::{Context, Result, bail};
 use std::fmt;

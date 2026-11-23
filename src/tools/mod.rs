@@ -18,7 +18,10 @@ mod oci;
 
 pub use crate::arch::Arch;
 pub use external::{Ldd, Patchelf};
-pub use oci::{DockerConfig, NativeOci, UreqHttp};
+pub use oci::{
+    Credentials, DockerConfig, FirstOf, Login, LoginPrompt, NativeOci, NoPrompt, UreqHttp,
+    canonical_registry,
+};
 
 /// What a dynamically linked binary needs.
 #[derive(Clone)]

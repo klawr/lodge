@@ -16,7 +16,9 @@ mod manifest;
 mod reference;
 mod registry;
 
-pub use credentials::{Credentials, DockerConfig};
+pub use credentials::{
+    Credentials, DockerConfig, FirstOf, Login, LoginPrompt, NoPrompt, canonical_registry,
+};
 pub use http::{Http, UreqHttp};
 
 use crate::arch::Arch;
@@ -31,6 +33,7 @@ use std::path::Path;
 pub struct NativeOci {
     http: Box<dyn Http>,
     credentials: Box<dyn Credentials>,
+    prompt: Box<dyn LoginPrompt>,
     waits: Vec<std::time::Duration>,
 }
 
@@ -39,8 +42,15 @@ impl NativeOci {
         Self {
             http,
             credentials,
+            prompt: Box::new(NoPrompt),
             waits: registry::RETRY_WAITS.to_vec(),
         }
+    }
+
+    /// Asks `prompt` for a login when a registry refuses the one there is.
+    pub fn asking(mut self, prompt: Box<dyn LoginPrompt>) -> Self {
+        self.prompt = prompt;
+        self
     }
 
     /// How long to wait before each new try of a request the registry answered
@@ -63,7 +73,8 @@ impl super::OciFetcher for NativeOci {
             &r.repository,
             Access::Pull,
         )
-        .retrying(&self.waits);
+        .retrying(&self.waits)
+        .asking(self.prompt.as_ref());
         let mut bytes = registry.manifest(&r.target)?;
         let mut parsed = Manifest::parse(&bytes)?;
         if let Manifest::Index(entries) = &parsed {
@@ -95,7 +106,8 @@ impl super::OciFetcher for NativeOci {
             &r.repository,
             Access::Pull,
         )
-        .retrying(&self.waits);
+        .retrying(&self.waits)
+        .asking(self.prompt.as_ref());
         let bytes = registry.manifest(&r.target)?;
         let digest = match Manifest::parse(&bytes)? {
             Manifest::Image(_) => Digest::of(&bytes),
@@ -118,7 +130,8 @@ impl OciPusher for NativeOci {
             &r.repository,
             Access::Push,
         )
-        .retrying(&self.waits);
+        .retrying(&self.waits)
+        .asking(self.prompt.as_ref());
         // A refusal comes before anything is sent.
         if artifact.replace == Replace::No
             && let Some(held) =

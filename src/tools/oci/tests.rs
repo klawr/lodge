@@ -365,7 +365,7 @@ fn a_refusal_after_the_handshake_says_how_a_login_is_found() {
         pull(&http, FakeCredentials::new(), None).0.unwrap_err()
     );
     assert!(
-        err.contains("docker login") && err.contains("credential helper"),
+        err.contains("ldg registry login") && err.contains("credential helper"),
         "{err}"
     );
 }
@@ -825,7 +825,7 @@ mod push {
                 .unwrap_err()
         );
         assert!(
-            err.contains("refused to write x/feat") && err.contains("docker login ghcr.io"),
+            err.contains("refused to write x/feat") && err.contains("ldg registry login ghcr.io"),
             "{err}"
         );
     }
@@ -1443,4 +1443,207 @@ fn a_registry_that_serves_only_the_older_docker_types_is_pulled_from() {
     let (result, left) = pull(&http, FakeCredentials::new(), Some(Arch::X86_64));
     result.unwrap();
     assert_eq!(left, vec![l.0.file_name()]);
+}
+
+/// A person at the terminal who types `answers` in turn (`None`: gives up), and
+/// what was asked of them and accepted.
+struct FakePrompt {
+    answers: std::sync::Mutex<Vec<Option<Login>>>,
+    asked: std::sync::Mutex<Vec<(String, bool)>>,
+    accepted: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl FakePrompt {
+    fn typing(answers: Vec<Option<Login>>) -> Arc<Self> {
+        Arc::new(Self {
+            answers: std::sync::Mutex::new(answers),
+            asked: Default::default(),
+            accepted: Default::default(),
+        })
+    }
+}
+
+impl LoginPrompt for Arc<FakePrompt> {
+    fn ask(&self, registry: &str, rejected: bool) -> Result<Option<Login>> {
+        self.asked.lock().unwrap().push((registry.into(), rejected));
+        Ok(self.answers.lock().unwrap().remove(0))
+    }
+
+    fn accepted(&self, registry: &str, login: &Login) {
+        self.accepted
+            .lock()
+            .unwrap()
+            .push((registry.into(), login.username.clone()));
+    }
+}
+
+fn typed(user: &str, password: &str) -> Option<Login> {
+    Some(Login {
+        username: user.into(),
+        password: password.into(),
+    })
+}
+
+fn pull_asking(
+    http: &Arc<FakeHttp>,
+    creds: FakeCredentials,
+    prompt: &Arc<FakePrompt>,
+) -> Result<()> {
+    let dir = crate::tmpfile::TempDir::new("oci-test").unwrap();
+    NativeOci::new(Box::new(http.clone()), Box::new(creds))
+        .retrying(&[Duration::ZERO; 3])
+        .asking(Box::new(prompt.clone()))
+        .pull("ghcr.io/x/feat:1", None, dir.path())
+}
+
+const BASIC: &[(&str, &str)] = &[("www-authenticate", "Basic realm=\"x\"")];
+
+#[test]
+fn a_registry_that_wants_a_login_asks_the_person_and_the_request_is_repeated() {
+    let l = layer();
+    let manifest = format!("{REPO}/manifests/1");
+    let http = Arc::new(
+        FakeHttp::new()
+            .answer(&manifest, 401, BASIC, b"")
+            .answer(&manifest, 401, BASIC, b"")
+            .answer(&manifest, 200, &[], &image(&l.0, l.1.len()))
+            .answer(&format!("{REPO}/blobs/{}", l.0), 200, &[], &l.1),
+    );
+    let prompt = FakePrompt::typing(vec![typed("kai", "pw")]);
+    pull_asking(&http, FakeCredentials::new(), &prompt).unwrap();
+    assert_eq!(
+        *prompt.asked.lock().unwrap(),
+        vec![("ghcr.io".to_string(), false)]
+    );
+    assert!(
+        http.sent(&manifest, 2, "authorization")
+            .unwrap()
+            .starts_with("Basic ")
+    );
+    // The login worked, so the person is offered keeping it.
+    assert_eq!(
+        *prompt.accepted.lock().unwrap(),
+        vec![("ghcr.io".to_string(), "kai".to_string())]
+    );
+}
+
+#[test]
+fn a_token_service_that_refuses_without_a_login_asks_too() {
+    let l = layer();
+    let manifest = format!("{REPO}/manifests/1");
+    let token = format!("https://ghcr.io/token?scope={SCOPE}");
+    let bearer = &[(
+        "www-authenticate",
+        r#"Bearer realm="https://ghcr.io/token""#,
+    )];
+    let http = Arc::new(
+        FakeHttp::new()
+            .answer(&manifest, 401, bearer, b"")
+            .answer(&token, 401, &[], b"")
+            .answer(&manifest, 401, bearer, b"")
+            .answer(&token, 200, &[], br#"{"token": "A"}"#)
+            .answer(&manifest, 200, &[], &image(&l.0, l.1.len()))
+            .answer(&format!("{REPO}/blobs/{}", l.0), 200, &[], &l.1),
+    );
+    let prompt = FakePrompt::typing(vec![typed("kai", "pw")]);
+    pull_asking(&http, FakeCredentials::new(), &prompt).unwrap();
+    assert!(
+        http.sent(&token, 1, "authorization")
+            .unwrap()
+            .starts_with("Basic ")
+    );
+}
+
+#[test]
+fn a_login_that_was_found_and_refused_is_asked_about_again() {
+    let l = layer();
+    let manifest = format!("{REPO}/manifests/1");
+    let http = Arc::new(
+        FakeHttp::new()
+            .answer(&manifest, 401, BASIC, b"")
+            .answer(&manifest, 401, BASIC, b"")
+            .answer(&manifest, 401, BASIC, b"")
+            .answer(&manifest, 200, &[], &image(&l.0, l.1.len()))
+            .answer(&format!("{REPO}/blobs/{}", l.0), 200, &[], &l.1),
+    );
+    let prompt = FakePrompt::typing(vec![typed("kai", "new")]);
+    pull_asking(
+        &http,
+        FakeCredentials::new().with("ghcr.io", "kai", "stale"),
+        &prompt,
+    )
+    .unwrap();
+    // Told that the one it had was refused.
+    assert_eq!(
+        *prompt.asked.lock().unwrap(),
+        vec![("ghcr.io".to_string(), true)]
+    );
+}
+
+#[test]
+fn a_typed_login_that_is_refused_is_not_kept_nor_asked_for_again() {
+    let manifest = format!("{REPO}/manifests/1");
+    let http = Arc::new(
+        FakeHttp::new()
+            .answer(&manifest, 401, BASIC, b"")
+            .answer(&manifest, 401, BASIC, b"")
+            .answer(&manifest, 401, BASIC, b""),
+    );
+    let prompt = FakePrompt::typing(vec![typed("kai", "wrong"), typed("kai", "never asked")]);
+    let err = format!(
+        "{:#}",
+        pull_asking(&http, FakeCredentials::new(), &prompt).unwrap_err()
+    );
+    assert!(err.contains("refused x/feat"), "{err}");
+    assert_eq!(prompt.asked.lock().unwrap().len(), 1);
+    assert!(prompt.accepted.lock().unwrap().is_empty());
+}
+
+#[test]
+fn giving_up_leaves_the_registrys_own_refusal() {
+    let manifest = format!("{REPO}/manifests/1");
+    let http = Arc::new(FakeHttp::new().answer(&manifest, 401, BASIC, b""));
+    let prompt = FakePrompt::typing(vec![None]);
+    let err = format!(
+        "{:#}",
+        pull_asking(&http, FakeCredentials::new(), &prompt).unwrap_err()
+    );
+    assert!(err.contains("ldg registry login ghcr.io"), "{err}");
+    assert!(prompt.accepted.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_registry_that_answers_is_never_asked_about() {
+    let l = layer();
+    let http = Arc::new(serving(&l));
+    let prompt = FakePrompt::typing(vec![]);
+    pull_asking(&http, FakeCredentials::new(), &prompt).unwrap();
+    assert!(prompt.asked.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_token_service_that_refuses_a_login_that_was_sent_says_it_was_refused() {
+    let manifest = format!("{REPO}/manifests/1");
+    let token = format!("https://ghcr.io/token?scope={SCOPE}");
+    let bearer = &[(
+        "www-authenticate",
+        r#"Bearer realm="https://ghcr.io/token""#,
+    )];
+    let http = Arc::new(FakeHttp::new().answer(&manifest, 401, bearer, b"").answer(
+        &token,
+        401,
+        &[],
+        b"",
+    ));
+    let prompt = FakePrompt::typing(vec![None]);
+    let err = pull_asking(
+        &http,
+        FakeCredentials::new().with("ghcr.io", "kai", "stale"),
+        &prompt,
+    );
+    assert!(err.is_err());
+    assert_eq!(
+        *prompt.asked.lock().unwrap(),
+        vec![("ghcr.io".to_string(), true)]
+    );
 }

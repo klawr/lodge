@@ -84,8 +84,14 @@ single image (not made by this lodge) is replaced. Replacing is silent; for CI t
 must not overwrite, `ldg pack -o oci://… --no-clobber` refuses, before uploading
 anything, when the tag already holds an image for this machine (the same flag
 refuses to overwrite an output file that exists).
-Publishing needs `docker login <registry>` with an account that may write there;
-lodge reads that login from docker's config file or its credential helper (see
+Publishing needs a login with an account that may write there. Keep one with
+`ldg registry login <registry>` (the password or access token is typed without being
+shown, or piped in; with two-factor authentication on, registries want an access
+token, not the account password). It goes in this machine's credential store, not in
+the config or a bundle, so it is per machine and per user. lodge reads it first, then
+the login `docker login` keeps in docker's config file or its credential helper. When
+a registry refuses and you are at a terminal, `ldg` asks for a login on the spot,
+tries it, and offers to keep it; with no terminal it fails as before (see
 [Troubleshooting](troubleshooting.md#a-bundle-or-a-feature-cannot-be-pulled-or-published)).
 
 **Using.** lodge asks the registry what the tag points at on every `up`, which is
