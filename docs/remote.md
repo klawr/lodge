@@ -1,91 +1,83 @@
 # Remote containers
 
-`ldg -r <dest> up PATH` (or `--remote`) runs the docker CLI *on the remote host*
-over SSH (`ssh <dest> docker …`), so **no local docker is required**, only an
-`ssh` client. The project path is the path *on the remote host*; the
-devcontainer config is read there, `initializeCommand` and builds run there, and
-features are installed in the remote container. Port forwarding tunnels ports
-back to `127.0.0.1` on your machine.
+`ldg -r <dest> up PATH` (or `--remote`) runs the docker CLI *on the remote host* over
+ssh, so you need no local docker, only an `ssh` client.
 
-`n` in a bare `ldg` finds a new project on this machine or on another one: it asks
-where (this machine, a machine you used before, or `another machine…`, typed as below),
-connects, and lists that machine's projects exactly as it lists local ones (one `find`
-on the remote host, so the list comes at the cost of one round trip). The projects are
-those with a devcontainer config under the remote home, `~` and relative paths mean
-the remote home, and `--remote` on the command line settles the question. A machine
-that can't be reached is asked for again.
+```mermaid
+flowchart LR
+  subgraph me["your machine"]
+    ldg["ldg"]
+    fwd["port-forward daemon"]
+  end
+  ldg ==>|"one shared ssh connection (ControlMaster)"| rem
+  subgraph rem["remote host"]
+    dk["docker"] --> ctr["container<br/>(project path is here)"]
+  end
+  fwd -. "ssh -L" .-> ctr
+  ldg -. "tar stream:<br/>your tools and secrets" .-> ctr
+```
 
-The destination is anything your SSH client understands:
+The project path is the path *on the remote host*: the devcontainer config is read
+there, `initializeCommand` and builds run there, and features install in the remote
+container. Ports are tunnelled back to `127.0.0.1` here. `docker` and `docker compose`
+must be on the remote host. Your injected tools stay local and are streamed in over ssh
+(packed in-process, so no `tar` is needed locally).
 
-- `user@host`: explicit user and host.
-- `myhost`: a `Host` alias from `~/.ssh/config`; its `User`, `Port`,
-  `IdentityFile`, jump hosts and so on all apply.
-- `user@host:2222`: a non-standard SSH port (becomes `-p 2222`).
+`n` in a bare `ldg` finds a project on this or another machine: this machine, one you
+used before, or `another machine…` (typed as below). The remote's projects are those
+with a devcontainer config under its home, found with one `find` (one round trip).
 
-`docker` and `docker compose` must be installed on the remote host. Your
-injected environment lives locally and is streamed into the remote container
-over the SSH connection: lodge packs directories into a tar stream itself (no
-local `tar` needed) and the remote daemon unpacks it.
+The destination is anything your ssh client understands: `user@host`, a `Host` alias
+from `~/.ssh/config` (its `User`, `Port`, `IdentityFile`, jump hosts apply), or
+`user@host:2222`.
 
-Change detection reads the config, Dockerfile, compose files and local
-features from the remote host and hashes them here, the same way as for a local project, so a comment-only edit
-doesn't count as a change either.
+## The connection
 
-lodge opens one SSH connection first and reuses it for the dozens of commands a
-single `ldg up` issues (a `ControlMaster` socket under `$TMPDIR/lodge-ssh/`, kept
-for 10 minutes after the last use; Windows has none, see [From Windows](#from-windows)). It opens it before anything else, with your
-terminal available, so a password, passphrase or 2FA prompt is answered once.
-The port-forwarding daemon has no terminal: it rides on that connection, or on
-key or agent auth if it has to reconnect. None of its ssh commands ever prompts. If the
-connection is lost for good on a host that needs a password or a second factor,
-the daemon cannot log in again. It says so in its log and waits instead of
-exiting, looking every 20 s (each look is a failed login, which a server may
-count against you); the next `ldg` command you run in a terminal opens the
-connection again, and the forwards come back by themselves.
+lodge opens one ssh connection first, with your terminal available, so a password,
+passphrase or 2FA prompt is answered once. The dozens of commands an `ldg up` issues
+reuse it (a `ControlMaster` socket under `$TMPDIR/lodge-ssh/`, kept 10 minutes after
+last use). A link that goes quiet is dropped after about 45 s.
 
-A link that goes quiet is dropped after about 45 seconds (`ServerAliveInterval=15`,
-`ServerAliveCountMax=3`). When the connection is lost during a step that is safe
-to repeat (a read, `mkdir -p`, copying files in, starting a container), lodge
-reconnects and runs it again, up to three tries, waiting 1 s then 2 s. A step that
-is not safe to repeat (your lifecycle hooks, a feature's `install.sh`) is not
-rerun: lodge says so, and running the same command again picks up where it
-stopped. A dead forwarded port is restarted with a growing wait, up to a minute.
-Rejected logins and host-key failures are not retried.
+**Lost connections.** During a step that is safe to repeat (a read, copying files in,
+starting a container) lodge reconnects and reruns it, up to three tries. A step that is
+not safe (your hooks, a feature's `install.sh`) is not rerun: lodge says so, and running
+the same command again picks up where it stopped. If the connection drops under your
+shell, `ldg` reconnects by itself (about two and a half minutes; Ctrl-C gives up) and
+opens a new shell.
 
-If something fails, run with `-v` to see each command, and `-vv`/`-vvv` for ssh's
-own debug output. That goes to a file beside the connection's socket (`ldg` says
-where), not to the terminal: the connection's background process would keep the
-terminal's output open for as long as it lives.
+**The forwarding daemon** has no terminal, so it never prompts: it rides on that
+connection, or on key or agent auth. On a host that needs a password or 2FA it logs that
+it cannot log in and waits (looking every 20 s) instead of exiting; the next `ldg` command
+you run in a terminal reconnects and the forwards come back.
 
-From a machine that isn't your Linux workstation (a CI runner, or Windows),
-combine `--remote` with a bundle: see [Bundles and secrets](bundles-and-secrets.md).
+Run with `-v` to see each command; `-vv`/`-vvv` add ssh's debug output, written to a file
+beside the connection's socket (`ldg` says where).
+
+From a CI runner or Windows, combine `--remote` with a bundle
+([Bundles](bundles-and-secrets.md)).
 
 ## Secrets with `--remote`
 
-Secrets from your config reach a remote container over the same ssh connection, on the
-command's stdin, and sit in that container's memory for the session. Anyone who is root
-on that machine, or who can run a command in the container, can read them, so use
-`--remote` only with machines you trust with those values. See
-[Bundles and secrets](bundles-and-secrets.md#secrets).
+Secrets reach the remote container over the same connection, on stdin, and sit in its
+memory for the session. Anyone who is root there, or can run a command in the container,
+can read them: use `--remote` only with machines you trust with those values
+([Secrets](bundles-and-secrets.md#secrets)).
 
 ## From Windows
 
-`ldg` runs natively on Windows as a client for a Linux host (see the
-[README](../README.md#windows)). It uses the `ssh` that ships with Windows, whose
-OpenSSH has no `ControlMaster`, so lodge does not open a shared connection: each of
-the dozens of commands an `ldg up` issues connects, authenticates and ends on its
-own. That is slower than on Linux, and it means:
+`ldg` runs natively on Windows as a client for a Linux host
+([README](../README.md#install)). Windows' OpenSSH has no `ControlMaster`, so there is
+no shared connection: every command connects, authenticates and ends on its own. That is
+slower, and:
 
-- Log in with a **key or an agent** (`ssh-agent` with the key added). A password,
-  a passphrase that is not in the agent or a second factor would be asked for by
-  every command, and the port-forwarding daemon, which has no terminal, could
-  never answer it.
-- `ldg` still makes one connection first, with the terminal available, to tell you
-  early if the host cannot be reached.
-- The forwarding daemon runs in the background without a console window; `ldg
-  ports` and `ldg logs` show and explain it as elsewhere.
-- Secrets work as on Linux: `env`, `file` and `command` sources (a command runs through
-  `cmd /C`), and `store`, which is Credential Manager (`ldg secret set`).
+- Use a **key or an agent** (`ssh-agent` with the key added). A password, a passphrase
+  not in the agent or a second factor would be asked for by every command, and the
+  daemon could never answer.
+- `ldg` still makes one connection first, with the terminal, to tell you early if the
+  host is unreachable.
+- The forwarding daemon runs in the background without a console window.
+- Secrets work as on Linux: `env`, `file`, `command` (through `cmd /C`) and `store`
+  (Credential Manager).
 
-The `Host` aliases, `IdentityFile`, jump hosts and ports of `%USERPROFILE%\.ssh\config`
-apply as on any ssh.
+`%USERPROFILE%\.ssh\config` aliases, `IdentityFile`, jump hosts and ports apply as on
+any ssh.

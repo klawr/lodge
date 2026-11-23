@@ -1,270 +1,154 @@
 # Configuration
 
-lodge reads two files, both in `~/.config/lodge/`, and neither has to exist:
+lodge reads two files from `~/.config/lodge/`. Neither has to exist (without a
+config you still get a shell, with nothing injected).
 
-| file | holds | travels with a bundle |
+```mermaid
+flowchart LR
+  c["config.toml<br/>what is injected"] -->|ldg pack| b[("bundle")]
+  k["client.toml<br/>this machine and this person"] -. "never" .-> b
+  c --- s["[[binary]] [[data]]<br/>[session] [git]"]
+  k --- t["default_target, targets<br/>default_bundle, bundles<br/>[[secret]] [keys]"]
+```
+
+| file | holds | travels in a bundle |
 | --- | --- | --- |
-| `config.toml` | what is injected and how a session opens: [`[[binary]]`](#binary), [`[[data]]`](#data), [`[session]`](#session), [`[git]`](#git) | yes: `ldg pack` makes a bundle from it |
-| `client.toml` | what is this machine's and this person's own: [`default_target`](#default_target), [`default_bundle`](#default_bundle) and `bundles`, [`[[secret]]`](#secret), [`[keys]`](#keys) | never |
+| `config.toml` | [`[[binary]]`](#binary), [`[[data]]`](#data), [`[session]`](#session), [`[git]`](#git) | yes |
+| `client.toml` | [`default_target`](#targets), [`bundles` and `default_bundle`](#bundles-and-default_bundle), [`[[secret]]`](#secret), [`[keys]`](#keys) | never |
 
-The line between them is whether a setting describes what is injected or depends on
-where lodge runs and who runs it. Nothing in `client.toml` can reach a bundle, because
-a bundle is made from `config.toml` alone. `-c FILE` replaces `config.toml` (the file
-must exist); `client.toml` is the one in the same folder as the config in use, so a
-folder with both is a complete setup (`ldg -c deploy/config.toml …`). Without a
-config nothing is injected, and you still get a shell. `ldg init` writes a commented
-starting point for each, with the tools it finds on your `PATH` filled in; an existing
-`client.toml` is left as it is, even with `--force`.
+A setting is config if it describes *what is injected*; it is the client's if it
+depends on where lodge runs or who runs it. A key in the wrong file is an error
+that names the right one.
 
-Each file is checked as a whole before anything starts: an unknown key (with a
-suggestion for a likely typo), a duplicate name, a target
-path that is neither absolute nor under `~/`, and a malformed secret are all reported
-together. `ldg doctor` shows the same report for both.
+`-c FILE` replaces `config.toml` (it must exist); `client.toml` is the one in the
+same folder, so a folder holding both is a complete setup. `ldg init` writes a
+commented starting point for each, with the tools found on your `PATH` filled in
+(it never overwrites an existing `client.toml`).
 
-**Editor completion.** A JSON schema describes each file:
-[`config.schema.json`](config.schema.json) and
-[`client.schema.json`](client.schema.json). Files written by `ldg init` start with a
-`#:schema` line that taplo / Even Better TOML pick up; add it by hand to a file that lacks it:
+Each file is checked as a whole before anything starts: unknown keys (with a "did
+you mean"), duplicate names, bad target paths and malformed secrets are reported
+together. `ldg doctor` shows the same report.
+
+**Editor completion.** [`config.schema.json`](config.schema.json) and
+[`client.schema.json`](client.schema.json) describe the files. `ldg init` adds the
+`#:schema` line that taplo / Even Better TOML read; add it by hand otherwise:
 
 ```toml
 #:schema https://raw.githubusercontent.com/klawr/lodge/master/docs/config.schema.json
 ```
 
-(and `client.schema.json` for `client.toml`).
-
 ## Example
 
 ```toml
-# Programs: the binary, relinked, with the libraries it needs.
 [[binary]]
 name      = "nvim"
-path      = "/usr/local/bin/nvim"     # host binary to copy in
-target    = "~/.local/bin/nvim"       # also write a wrapper script here (optional)
-copy_deps = true                      # copy shared libs via ldd when packing (default: true)
+path      = "/usr/local/bin/nvim"   # host binary to copy in
+target    = "~/.local/bin/nvim"     # optional: also write a wrapper script here
+copy_deps = true                    # copy shared libs via ldd when packing (default)
 
-# Data: files and directories, copied as they are, to the same place in the
-# container. `for` only says which program one belongs to.
-[[data]]
-path = "/usr/local/share/nvim"        # what a program keeps beside its binary
-for  = "nvim"
+[[data]]                            # copied as is, to the same place in the container
+path = "/usr/local/share/nvim"
+for  = "nvim"                       # only says which program it belongs to
 
 [[data]]
-path = "~/.config/nvim"               # `~/…` stays under the container user's home
-for  = "nvim"
-
-# Ship installed plugins so the container uses your exact host versions instead
-# of re-cloning them at HEAD (which drifts into incompatible versions).
-[[data]]
-path = "~/.local/share/nvim/lazy"
+path = "~/.config/nvim"             # ~/… stays under the container user's home
 for  = "nvim"
 
 [session]
-shell = "/bin/bash"   # shell launched inside the container (default)
+shell = "/bin/bash"
 
 [git]
-# Registered as git `safe.directory` in the container, so git-backed tools
-# (lazy.nvim, gitsigns, …) don't trip over "detected dubious ownership" on the
-# host-owned workspace/plugins. Default: ["*"]; set [] to disable.
-safe_directories = ["*"]
+safe_directories = ["*"]            # git safe.directory in the container; [] disables
 ```
 
 ## `[[binary]]`
 
-A program to bring: its binary, relinked to the bundled glibc, and the shared
-libraries it needs.
+A program: its binary relinked to the bundled glibc, plus its shared libraries.
 
-| field       | required | default | meaning |
-| ----------- | -------- | ------- | ------- |
-| `name`      | yes      | —       | identifier, unique among the binaries |
-| `path`      | yes      | —       | host path to the binary (may start with `~/`) |
-| `target`    | no       | none    | also write a wrapper script that runs the binary at this path in the container (absolute or `~/…`, no `..`). Without it the binary is on the `PATH` of the sessions lodge opens |
-| `copy_deps` | no       | `true`  | copy shared-library dependencies via `ldd` when packing |
+| field | required | default | meaning |
+| --- | --- | --- | --- |
+| `name` | yes | | identifier, unique among binaries |
+| `path` | yes | | host path (may start with `~/`) |
+| `target` | no | none | also write a wrapper script at this path in the container (absolute or `~/…`, no `..`). Without it the binary is on the `PATH` of lodge's sessions |
+| `copy_deps` | no | `true` | copy shared libraries found by `ldd` when packing |
 
 ## `[[data]]`
 
-A file or directory, copied as it is: what a program needs beside its binary (an
-editor's runtime files), a config, a plugin folder, shell setup. A program may have
-several, or none.
+A file or folder copied as it is: a program's runtime files, a config, plugins,
+shell setup.
 
-| field    | required | default                  | meaning |
-| -------- | -------- | ------------------------ | ------- |
-| `path`   | yes      | —                        | host path to the file or directory (may start with `~/`) |
-| `target` | no       | the same place as `path` | where it goes in the container (`~` is the container user's home; absolute or `~/…`, no `..`) |
-| `for`    | no       | none                     | the `name` of the `[[binary]]` it belongs to. It only says what the data is for (the screen and `ldg doctor` use it): it is injected the same either way |
+| field | required | default | meaning |
+| --- | --- | --- | --- |
+| `path` | yes | | host path (may start with `~/`) |
+| `target` | no | same place as `path` | where it goes (absolute or `~/…`, no `..`) |
+| `for` | no | none | the `name` of a `[[binary]]`; informational (the config screen and `doctor` use it) |
 
-A path under your home directory goes under the container user's home (`~/.config/nvim`
-stays `~/.config/nvim`); any other path goes to the same absolute path. Data is told
-apart by where it goes, so no two entries may go to the same place, and `for` must
-name a `[[binary]]` of the config.
+A path under your home goes under the container user's home; any other path goes to
+the same absolute path. No two entries may share a target.
 
-A program built to run from where it was installed looks for its files there. For a
-binary at `<prefix>/bin/<name>`, lodge looks for `<prefix>/share/<name>` and
-`<prefix>/lib/<name>`, and offers them as data for it when you add the program (`ldg
-inject add binary`, and `b` in the config screen add them with it; `--no-data` leaves
-them out) and when you ask `ldg init`. It does not need to know the program: it is
-the layout every installed program follows. A program that keeps its files somewhere
-else needs its `[[data]]` written, and `ldg doctor` says when it finds files beside a
-binary that the config does not bring.
+A program built to run from where it was installed (Neovim) needs the files beside
+its binary. For `<prefix>/bin/<name>` lodge offers `<prefix>/share/<name>` and
+`<prefix>/lib/<name>` as data when you add the program (`--no-data` skips this), and
+`ldg doctor` warns when such files exist and the config does not bring them.
 
-What lodge injects belongs to the container user. A target the user cannot make
-(`/usr/local/share/nvim`, say) is made by root in a container and handed to that user;
-on a real machine, which lodge does not run root commands on, a target must be a place
-the user can write (under `~`, say). A target that fails either way is reported with the
-path and the user named.
-
-Shell aliases and other shell setup are your shell's own config: inject your
-`~/.bashrc` (or your shell and its config) with a `[[data]]` whose `target` is
-where the container user's shell reads it.
+Everything injected belongs to the container user. A target the user cannot create is
+made by root in a container; on a real machine it must be somewhere the user can write.
+Shell aliases are your shell's own config: inject your `~/.bashrc` with a `[[data]]`
+whose `target` is where the shell reads it.
 
 ## Editing the config
 
-Run `ldg` alone and press `c` for the config screen: both files as the form they
-are in the TOML, with every value a line you can move to (↑/↓ or j/k). First the
-client's, under a line that says so: `default_target` and `default_bundle`, then each `[[secret]]`;
-then the config's: `[session]` and `[git]`, then each `[[binary]]` and `[[data]]`,
-each with all of its fields under it, the ones that are not set shown as
-such (`target = (the same place as here)`). Enter changes the selected one: `path`
-opens the list of what this machine has, the rest is typed or chosen from a short
-list (`for`, `target`, how a secret is read and placed), `copy_deps` is turned over.
-`x` removes the entry the line belongs to (on `default_target`, `default_bundle`, `[session]` and
-`[git]`, which are not entries, it puts the value back to its default). What
-each change did is on the first line, and a refused one says why and changes nothing.
-A binary that is renamed takes its data with it, and one that is removed leaves its
-data in place, no longer for anything.
+Run `ldg` and press `c` for the config screen: both files as a form, every value a line.
+Enter changes it, `x` removes the entry (or resets a setting), and a change that would
+add a problem is refused with the reason. Comments and order in the file are kept. `b`
+and `d` add programs and data from a searchable list of what this machine has
+(credentials such as `~/.ssh` are never listed), `s` adds a secret, `p` packs a bundle,
+`P` publishes it, `o` opens another config file. A file that does not load is still
+shown, with the reason on top. The `[targets.<name>]` tables are not in the screen yet.
 
-| key | |
-| --- | --- |
-| `b` | add programs |
-| `d` | add data |
-| `s` | add a secret (a name, where its value comes from) |
-| `p` | pack the bundle: lists the bundle files there are, to replace one, and a row to type the name of a new file on (Enter on it takes `lodge-<arch>.tar`); `x` deletes the one selected, unless it is in use |
-| `P` | publish the bundle to a registry (Enter takes the one `bundle =` names) |
-
-Enter on the `default_bundle` line chooses the default from the bundles on offer (and the config as it is where it can be packed), or lets you type one, which is put on offer; the one that was the default stays on offer. A pack from here says what it made on the status line; if it printed a warning (a data entry that may hold secrets, say), it waits for Enter first so the warning can be read.
-
-| `o` | work on another config file: the ones beside the default and in the folder `ldg` was started in, or a path typed in full |
-
-`b` and `d` open what this machine has (for programs, the tools it knows that are
-installed, then every other program on `PATH`; for data, what sits beside the
-programs in your config, then your `~/.config` and the dotfiles in `~`), narrowing as
-you type. Enter adds the selected one and marks it `[x]`, and the list stays open for
-the next (Esc when done). A program is added with what sits beside it. What is in your
-config already is in the list too, marked from the start; a path typed in full (`/…`,
-`~/…`) is offered as it is, and goes where it is on this machine. Credentials and
-state (`~/.ssh`, `~/.config/gh`, caches) are never listed.
-
-A file that does not load (a misspelled key, say, or one that belongs in the other
-file) is still shown, with why on top, and what this version of lodge does not know (a table it
-dropped, a misspelled key, a setting written into the wrong file) grouped at the end
-as lines of their own (those of `client.toml` say so). `x` removes
-one, and the rest of the file, its comments included, stays as it was. Any other
-change is kept while it leaves the file with fewer problems than it had, so a config
-with several can be mended one at a time; one that would add a problem is refused, as
-for a config that loads. Only a file that is not TOML at all has no form.
-
-Not in the screen yet: the `[targets.<name>]` tables, which each target defines for
-itself.
-
-The same from the command line, without opening the file:
+The same from the command line:
 
 ```sh
-ldg inject                                    # list the entries
-ldg inject add binary rg                      # a program found on PATH
+ldg inject                                     # list the entries
+ldg inject add binary rg                       # found on PATH
 ldg inject add binary nvim /usr/local/bin/nvim --target '~/.local/bin/nvim'
 ldg inject add data ~/.config/nvim --for nvim
 ldg inject rm binary rg
-ldg inject rm data ~/.config/nvim
 ```
 
-The file is edited in place (comments and order stay), and nothing is written
-unless the result is a valid config. With `bundle =` set, the entries are not
-used until you pack again or drop that line.
-
-## `[keys]`
-
-In `client.toml`. The keys of the interactive screens (the places `ldg` lists, the config screen, the
-searches) are the same everywhere, and are yours to change. Each action has the keys
-below; naming one under `[keys]` gives it exactly the keys you list (a list replaces
-the defaults, a single string is one key, `[]` unbinds), and what you leave out keeps
-its own. Every hint line on the screens is written from this, so it always says what
-the keys do.
-
-```toml
-[keys]
-up    = ["up", "ctrl-p"]      # drop j/k
-down  = ["down", "ctrl-n"]
-leave = ["esc", "ctrl-c"]     # q no longer leaves a list
-pack  = "ctrl-k"
-```
-
-A key is a character (`j`, `G`, `?`) or one of `up down left right home end enter esc
-tab backspace space`, after any `ctrl-` or `alt-` (`ctrl-n`, `alt-x`); a capital letter
-is shift. The digits `1`-`9` jump to that row and can't be bound. In a search, or
-where a line is typed, a plain character is text, so there only the named keys and
-Ctrl or Alt combinations act; a plain character given to such an action is not used
-there.
-
-Each key does one thing: two actions on the same key (in a list, or in a search)
-are reported with the rest of the problems in `client.toml`, as is a key that does not
-parse, an action that does not exist, and an empty `choose` or `leave`, which would
-leave no way out of a list. The keys are read from `client.toml` on this machine and are
-never part of a bundle, so they work the same without any config of injected
-programs: a `client.toml` with only `[keys]` in it is enough.
-
-| action | default keys | |
-| --- | --- | --- |
-| `up`, `down` | `up` `k` `ctrl-p`, `down` `j` `ctrl-n` | move over a list |
-| `first`, `last` | `home` `g`, `end` `G` | the ends of a list |
-| `choose` | `enter` | open, accept, add |
-| `leave` | `esc` `q` `ctrl-c` `ctrl-d` | back out (`q` only in lists) |
-| `mark` | `tab` | mark in a search |
-| `prev_list`, `next_list` | `left`, `right` | switch the lists of a search |
-| `clear_line` | `ctrl-u` | empty the line being typed |
-| `look_where`, `skip`, `everywhere` | `ctrl-w`, `ctrl-b`, `ctrl-a` | the settings of a search for programs and data |
-| `add_binary`, `add_data`, `add_secret` | `b`, `d`, `s` | the config screen |
-| `remove` | `x` | remove the entry selected (a `[[binary]]`, `[[data]]` or `[[secret]]`, or a line lodge does not use); a setting goes back to its default; in the pack list, delete the bundle file |
-| `pack`, `publish`, `open_file` | `p`, `P`, `o` | the config screen |
-| `new`, `config`, `reinject`, `recreate` | `n`, `c`, `i`, `r` | the places `ldg` lists |
+With `default_bundle` set, these entries are not used until you pack again or drop it.
 
 ## `[session]`
 
-lodge opens a shell in the container and nothing more. For a session that
-outlives a disconnect, use a multiplexer: see
-[Keeping a session alive](#keeping-a-session-alive).
+lodge opens a shell and nothing else.
 
-| field         | default     | meaning |
-| ------------- | ----------- | ------- |
-| `shell`       | `/bin/bash` | the shell started in the container; it must exist there. bash, zsh, sh and dash are supported. It is started once as a login shell, so the profile scripts run, then as the interactive shell you work in |
+| field | default | meaning |
+| --- | --- | --- |
+| `shell` | `/bin/bash` | must exist in the container (bash, zsh, sh, dash). Started once as a login shell so the profile runs, then as the interactive shell |
 
-## Keeping a session alive
+### Keeping a session alive
 
-A multiplexer (tmux, zellij, screen) is a tool like any other: inject it, and
-start it from your shell's rc file. The container keeps it running when you
-leave, so the next `ldg up` (or `ldg attach`) lands in the same session, with
-your editor as you left it. The same holds after a dropped `--remote` connection: `ldg` reconnects
-by itself and opens a new shell, which reads the rc file again and attaches.
-
-A tmux setup, with a `[[binary]]` and two `[[data]]` entries:
+A multiplexer (tmux, zellij, screen) is a tool like any other: inject it and start it
+from your shell's rc file. The container keeps it running, so the next `ldg up` lands
+in the same session. After a dropped `--remote` connection `ldg` reconnects, opens a
+new shell, and the rc file attaches again.
 
 ```toml
 [[binary]]
 name = "tmux"
 path = "/usr/bin/tmux"
 
-# ~/.bashrc in the container: start tmux once, attaching if it is already there.
-[[data]]
+[[data]]                       # becomes ~/.bashrc in the container
 path   = "~/.config/lodge/tmux-rc"
 target = "~/.bashrc"
 
-# ~/.tmux.conf in the container.
 [[data]]
 path   = "~/.config/lodge/tmux.conf"
 target = "~/.tmux.conf"
 for    = "tmux"
 ```
 
-`~/.config/lodge/tmux-rc` (use your own `~/.bashrc` and add these lines, if you
-already inject one):
+`tmux-rc` (or add this to the `~/.bashrc` you inject):
 
 ```sh
 if [ -z "$TMUX" ] && command -v tmux >/dev/null; then
@@ -272,36 +156,37 @@ if [ -z "$TMUX" ] && command -v tmux >/dev/null; then
 fi
 ```
 
-`~/.config/lodge/tmux.conf`:
+`tmux.conf`:
 
 ```
 set -g default-command bash
 ```
 
-The last line matters. tmux starts each pane as a *login* shell, and on Debian
-and Ubuntu `/etc/profile` resets `PATH`, which would hide everything lodge
-injected (`tmux detach` itself would be "not found"). lodge's own session puts
-its tools back first on `PATH`; a pane started as a plain `bash` instead inherits
-that `PATH` from the tmux server. Use your shell if it isn't bash. Any other
-multiplexer needs the same care: its panes must not be login shells that reset
-`PATH`.
-
-This is covered by an integration test, so it keeps working.
+The last line matters: tmux starts panes as *login* shells, and on Debian and Ubuntu
+`/etc/profile` resets `PATH`, hiding everything injected. A plain `bash` pane inherits
+the right `PATH` from the tmux server. Any multiplexer needs the same care.
 
 ## `[git]`
 
-| field              | default | meaning |
-| ------------------ | ------- | ------- |
-| `safe_directories` | `["*"]` | directories registered as git `safe.directory` for the container user; `[]` disables it |
+| field | default | meaning |
+| --- | --- | --- |
+| `safe_directories` | `["*"]` | registered as git `safe.directory` for the container user; `[]` disables |
 
-## `default_target`
+## Targets
 
-In `client.toml`. A top-level `default_target = "docker"` says where lodge works: a devcontainer on `docker` or
-`podman`, a running pod (`kubernetes`), or `host` for the machine itself (see below). `--target` on the command line
-overrides it, and without either it is `docker`. It is on the machine `--remote`
-names, or on this one. A value that is not a target is an error.
+`client.toml` says where lodge works, with `default_target` or `--target` (default
+`docker`), on this machine or the one `--remote` names.
 
-Which engine to talk to, when you have several, is a setting of the target:
+| target | works on | creates containers |
+| --- | --- | --- |
+| `docker` | a devcontainer on Docker | yes |
+| `podman` | a devcontainer on Podman | yes |
+| `kubernetes` | a running pod, through `kubectl` | no |
+| `host` | the machine itself, no container | no |
+
+Settings for a target go in `[targets.<name>]`; only the chosen target's table is read.
+
+### `docker` and `podman`
 
 ```toml
 [targets.docker]
@@ -311,83 +196,52 @@ context = "colima"      # docker --context colima …
 connection = "vm"       # podman --connection vm …
 ```
 
-Both are optional; without them the engine's own default is used. Only the table of
-the chosen target is read.
-
-With `podman`, lodge runs `podman` the way it runs `docker`, and adds what a
-project bind-mounted into a Podman container needs: `--userns=keep-id` when
-Podman runs without root (so your files are yours inside), and
-`--security-opt label=disable` (so SELinux does not block the mount). A
-`--userns` in `runArgs`, or a `label=` in `securityOpt`, replaces them. What
-differs from docker:
-
-- Compose needs a provider that `podman compose` finds (docker-compose or
-  podman-compose). lodge adds no user-namespace flag to a compose project; set
-  `userns_mode` in the compose file if you need one.
-- Without root, a container's address is not reachable from the host, so only the
-  ports it publishes (`appPort`) are forwarded. With root, or on
-  another machine through `--remote` with a rootful Podman, it works as with docker.
+With Podman lodge adds what a bind-mounted project needs: `--userns=keep-id` when
+rootless, and `--security-opt label=disable` for SELinux. A `--userns` in `runArgs` or
+a `label=` in `securityOpt` replaces them. Compose needs a provider `podman compose`
+finds; lodge adds no user namespace to a compose project (set `userns_mode` in the
+compose file). Rootless Podman has no reachable container address, so only published
+ports (`appPort`) are forwarded.
 
 ### Attaching to a container lodge did not make
 
-`ldg attach CONTAINER` (a name or an id) works in a running container that something
-else started, on the engine of the target (`--target docker|podman`, and `--remote`).
-It injects, delivers secrets and opens a shell as `up` does, in the user's home or
-`--workdir DIR`, but treats the container as somebody's workload, as `host` and
-`kubernetes` do:
-
-- Nothing is created, started or stopped: a container that is not running is refused.
-- It acts as the user the container runs as.
-- Data lodge did not place is left as it is, with a warning, and git's
-  `safe.directory = *` is not set.
-- Ports it listens on are forwarded as for any container.
-
-`ldg clean --container CONTAINER` removes what was injected. A project's `up`, `down`
-and `rm` do not know about it: it belongs to whoever made it.
+`ldg attach CONTAINER` injects into a running container something else started and opens
+a shell in the user's home or `--workdir DIR`. It treats the container as somebody's
+workload: nothing is created, started or stopped, it acts as the user the container runs
+as, and data lodge did not place is left alone. `ldg clean --container CONTAINER` takes
+lodge out again; `up`, `down` and `rm` do not know about it.
 
 ### `host`: no container
 
-`default_target = "host"` (or `--target host`) makes lodge work on the machine itself:
-this one, or another through `--remote`. There is no devcontainer and no engine.
-`ldg up [PATH]` injects your bundle into the user's prefix on that machine, delivers
-secrets, and opens a session in `PATH` (the machine's login directory if you
-leave it out over `--remote`).
-
-Because it is a real machine, lodge is careful with it:
-
-- It acts as the user the machine connects as, and cannot act as another (`root` or a
-  named user is refused).
-- Data lodge did not place is **left as it is**, with a warning, instead of
-  replaced: `ldg up` never overwrites your own dotfiles. One it placed earlier is
-  updated.
-- git's `safe.directory = *` is not set. List folders in `[git] safe_directories`
-  if you want some.
-- The machine must be Linux, and have `tar`. The bundle holds Linux binaries.
-- Nothing is created, so `down` and `rm` say so; `ls` has nothing to list;
-  `ldg clean` removes the prefix and the wrappers, as for a container.
-- Ports listening on a remote machine are forwarded through ssh to this one, as
-  for a container; on this machine there is nothing to forward.
+`ldg up [PATH]` injects into the user's prefix on the machine itself (or another one
+over `--remote`) and opens a session in `PATH`. Because it is a real machine, lodge acts
+only as the user you connect as, never overwrites a file it did not place (it warns), and
+sets no `safe.directory = *`. The machine must be Linux with `tar`. `down` and `rm` have
+nothing to do; `ldg clean` removes the prefix and wrappers.
 
 ### `kubernetes`: a running pod
 
-`default_target = "kubernetes"` (or `--target kubernetes`) makes lodge work in a pod that is
-already running, through `kubectl`. It is run on the machine `--remote` names, or on
-this one, so that machine needs `kubectl` and the cluster's credentials. Which pod
-is a setting of the target:
+lodge runs `kubectl` on this machine or the `--remote` one, which needs `kubectl` and
+the cluster's credentials. Name the pod:
 
 ```toml
 [targets.kubernetes]
-pod = "dev-0"            # kubectl exec dev-0 … (this or `selector`)
-selector = "app=api"     # instead of `pod`: the one running pod with this label
-container = "main"       # kubectl exec -c main (default: kubectl's own pick)
-namespace = "work"       # kubectl --namespace work (default: the context's)
-context = "staging"      # kubectl --context staging (default: the current one)
+pod = "dev-0"            # or `selector`
+selector = "app=api"     # the one running pod with this label
+container = "main"       # kubectl exec -c (default: kubectl's pick)
+namespace = "work"       # default: the context's
+context = "staging"      # default: the current one
 workdir = "/srv/app"     # where a session starts (default: the user's home)
 ```
 
-**Per project.** A project says which pod it uses in a `lodge.toml` in its folder
-(`ldg up [PATH]`'s PATH, else where you run `ldg`), read on this machine even with
-`--remote`:
+A `selector` must match **exactly one running pod**; more is an error that lists
+them. The pod is looked up once per run, so the background port forwarder keeps the
+one it found until `ldg up` runs again. The `PATH` argument of `ldg up` is a folder on
+the host and plays no part: use `workdir`.
+
+**Per project.** A `lodge.toml` in the project folder (read on this machine, even with
+`--remote`) may hold `[targets.kubernetes]` and nothing else. What it sets replaces the
+same key in your own table (a `pod` or `selector` replaces how you found a pod).
 
 ```toml
 # my-project/lodge.toml
@@ -396,60 +250,49 @@ pod = "api-dev-0"
 namespace = "my-team"
 ```
 
-It may hold nothing but `[targets.<name>]` tables, and only `kubernetes` takes one per
-project. What it sets replaces the same key in your own `[targets.kubernetes]`, and
-the rest of your table stands (a `pod` or `selector` in the project replaces how your
-config found a pod, as the two are one setting). `-c FILE` still works for a
-whole config of its own. The background port forwarder is told the folder, so it
-works on the same pod.
-
-Only `pod` or `selector` is needed, not both. A selector (`kubectl get pods -l`) is
-for pods whose names change: it must match **exactly one running pod**, and more than
-one is an error that lists them, because lodge does not choose which workload to
-inject into. The pod is looked up once per `ldg` run (so the background port
-forwarder, which keeps running, keeps the pod it found: run `ldg up` again after the
-pod is replaced). The project path of `ldg up [PATH]` is a folder on the host, so
-it plays no part: use `workdir`. `ldg up` checks that the pod is `Running`, injects
-your bundle into the home of the user the pod runs as, delivers secrets, and opens a
-session. A pod is someone's workload, so, as for `host`:
-
-- It acts as the user the pod runs as, and cannot act as another: `kubectl exec` has
-  no way to switch user, so `root` or a named user is refused.
-- Data lodge did not place is left as it is, with a warning, and git's
-  `safe.directory = *` is not set.
-- The image needs `sh` and `tar`, and `cat` for the forwarder to see which ports
-  listen. The bundle holds Linux binaries, so the pod's architecture must be one it
-  was packed for.
-- Nothing is created, so `down` and `rm` say so, and `ls` has nothing to list. A
-  pod's files are lost when it is replaced: `ldg up` injects again into a new one.
-  `--build` has nothing to rebuild and is ignored.
-- Ports listening in the pod are forwarded to the same ports here with
-  `kubectl port-forward`, one per port, started by the forward daemon and stopped
-  with it. Ports of other pods (peers) are not forwarded. A port that is already in
-  use here fails to forward, which the daemon's log (`ldg logs`) says.
+A pod is treated like `host`: the pod's user only, files it did not place are left alone.
+The image needs `sh` and `tar` (and `cat` for port detection), and its architecture must
+match the bundle. Nothing is created, so a replaced pod needs `ldg up` again and `--build`
+is ignored. Listening ports are forwarded with `kubectl port-forward`.
 
 ## `bundles` and `default_bundle`
 
-In `client.toml`. `bundles = ["oci://ghcr.io/me/lodge:2", "~/work.tar"]` lists the
-bundles on offer: each a file, or a registry (a reference with a scheme is not a
-path: `oci://ghcr.io/me/lodge:1` reads the bundle from a registry). A relative path
-is relative to that file's folder.
+In `client.toml`. `bundles` lists the bundles on offer, each a file or an
+`oci://` reference (relative paths are relative to that file's folder).
+`default_bundle` is the one to inject instead of packing your entries, and must be one
+of `bundles`; without it the config is packed as it is. `--bundle` overrides it for one
+run and need not be listed.
 
-`default_bundle = "~/work.tar"` is the one to inject from, instead of packing the
-`[[binary]]` and `[[data]]` entries, and it must be one of `bundles`. Without it the
-config is packed as it is. `--bundle` on the command line (a file or such a
-reference) overrides it for one run, and need not be listed.
+```toml
+bundles        = ["oci://ghcr.io/me/lodge:2", "~/work.tar"]
+default_bundle = "~/work.tar"
+```
 
-When `ldg up` injects into a project it has not opened before and more than one
-bundle is on offer, it asks which. `ldg bundle use|add|rm|ls` change the two keys
-without opening the file, and `ldg pack -o` adds what it writes to `bundles`. See
-[Several bundles](bundles-and-secrets.md#several-bundles) and
-[Bundles and secrets](bundles-and-secrets.md).
+`ldg bundle use|add|rm|ls` change these without opening the file. See
+[Bundles and secrets](bundles-and-secrets.md#several-bundles).
 
 ## `[[secret]]`
 
-In `client.toml`. Values (API keys, tokens, credential files) delivered when you attach, and
-never stored in a bundle. A value comes from an environment variable, a file, a
-command or this machine's credential store (`ldg secret set`), and appears in the
-session as a variable or a file. See [Bundles and secrets](bundles-and-secrets.md#secrets)
-for the fields, how delivery works and which credentials to deliver at all.
+In `client.toml`. Values (API keys, tokens, credential files) delivered when you
+attach and never stored in a bundle. See
+[Bundles and secrets](bundles-and-secrets.md#secrets).
+
+## `[keys]`
+
+In `client.toml`. The keys of the interactive screens are yours to change: naming an
+action gives it exactly the keys you list (a string is one key, `[]` unbinds), and the
+rest keep their defaults. Every hint line is written from this map.
+
+```toml
+[keys]
+up    = ["up", "ctrl-p"]      # drop j/k
+leave = ["esc", "ctrl-c"]     # q no longer leaves a list
+pack  = "ctrl-k"
+```
+
+A key is a character or one of `up down left right home end enter esc tab backspace
+space`, optionally prefixed `ctrl-` or `alt-`. The actions are `up`, `down`, `first`,
+`last`, `choose`, `leave`, `mark`, `prev_list`, `next_list`, `clear_line`, `remove`,
+`add_binary`, `add_data`, `add_secret`, `pack`, `publish`, `open_file`, `new`, `config`,
+`reinject` and `recreate`; each screen's hint line shows the keys in use. Two actions on
+one key, or an unknown action or key, are reported with the other problems.
