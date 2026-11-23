@@ -58,7 +58,7 @@ jobs:
           arguments: --all-features --config .github/deny.toml
 
   # Windows is a bundle consumer only (no packing; it reaches a Linux target over
-  # ssh or Docker Desktop), so this builds and tests the consumer side natively.
+  # ssh or Docker Desktop), so this builds, lints and tests the consumer side natively.
   # A release gate, like the Linux jobs: its binary is published by
   # `upload-windows`.
   windows:
@@ -68,9 +68,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --target x86_64-pc-windows-msvc
+      - name: Clippy
+        run: cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
       - name: Test
         run: cargo test --target x86_64-pc-windows-msvc
 
