@@ -181,11 +181,11 @@ from    = { command = "gh auth token" }
 as      = "env"
 targets = ["build-*"]
 
-# A credential file, placed where the tool looks for it.
+# A file the tool only reads (a deploy key), placed where it looks for it.
 [[secret]]
-name = "claude_login"
-from = { file = "~/.claude/.credentials.json" }
-as   = { file = "~/.claude/.credentials.json", mode = "0600" }
+name = "deploy_key"
+from = { file = "~/.ssh/deploy_key" }
+as   = { file = "~/.ssh/deploy_key", mode = "0600" }
 ```
 
 | field     | required | meaning |
@@ -220,8 +220,9 @@ client that should deliver it. `ldg doctor` checks that each store entry is set.
 Linux without a Secret Service (a headless server), a `store` source fails with a
 message that says so; `env`, `file` and `command` sources need nothing.
 
-How they are delivered, when you attach (`ldg up`, not with
-`--no-attach`):
+### How they are delivered
+
+When you attach (`ldg up`, not with `--no-attach`):
 
 - The value is read on your machine and sent over the container command's
   **stdin**, never as an argument, so it is in neither `ps` nor the `-v` trace.
@@ -238,6 +239,35 @@ lodge only delivers. Logging in, which credential a tool prefers, and refreshing
 tokens are the tool's business. In particular, if you declare an API key, a tool
 may use it in preference to a subscription login, so declare only what you want
 used.
+
+### Which credentials to inject, and which to leave in the container
+
+There are two kinds, and they should not be mixed.
+
+- **A secret you hold on the client**: an API key, a token. lodge reads it on your
+  machine at every attach and places it for the session; it is gone when the session
+  ends. Any client that has the value can deliver it, and a new container needs
+  nothing done to it.
+- **A login the tool owns**: you log in inside the container (the tool's own
+  `login`), and the tool keeps its credential in the container's home. lodge never
+  touches it. It lasts as long as the container does, so a new container means
+  logging in again. Nothing is copied back to your machine.
+
+The mistake to avoid is declaring a `file` secret for a file the tool also
+**rewrites**. Every attach replaces the container's copy with a link to your
+machine's, so whatever the tool refreshed inside is lost, and a tool that rotates its
+refresh token on each refresh leaves your machine's copy stale, which can log you out.
+Use `as = { file = … }` only for files the tool just reads.
+
+For a tool that has a login, prefer a **long-lived token** you hold yourself over its
+credential file. For Claude Code, `claude setup-token` prints one; keep it in the
+credential store and deliver it as an environment variable, as in the example above
+(`CLAUDE_CODE_OAUTH_TOKEN`). For the GitHub CLI, `GH_TOKEN` from `gh auth token`
+does the same. A token like that does not rotate, so it can be on several clients
+and in several containers at once.
+
+A tool that keeps its login in the operating system's keychain instead of a file
+cannot have it copied into a container: log in inside the container.
 
 Limits:
 
