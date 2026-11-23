@@ -214,7 +214,7 @@ mod tests {
     fn a_config_that_knows_everything_in_it_has_nothing_unknown() {
         assert!(labels("[[binary]]\nname = \"a\"\npath = \"/a\"\n").is_empty());
         assert!(
-            client_labels("target = \"docker\"\n[[secret]]\nname = \"A\"\nfrom = { env = \"A\" }\nas = \"env\"\n")
+            client_labels("default_target = \"docker\"\n[[secret]]\nname = \"A\"\nfrom = { env = \"A\" }\nas = \"env\"\n")
                 .is_empty()
         );
         assert!(labels("= not toml").is_empty());
@@ -242,9 +242,9 @@ mod tests {
     #[test]
     fn a_setting_in_the_file_it_does_not_belong_in_is_unknown_there() {
         // The client's settings written into the config, which does not take them.
-        let raw = "target = \"docker\"\n[[secret]]\nname = \"A\"\nfrom = { env = \"A\" }\nas = \"env\"\n\
+        let raw = "default_target = \"docker\"\n[[secret]]\nname = \"A\"\nfrom = { env = \"A\" }\nas = \"env\"\n\
                    [[binary]]\nname = \"a\"\npath = \"/a\"\n";
-        assert_eq!(labels(raw), ["target = \"docker\"", "[[secret]]"]);
+        assert_eq!(labels(raw), ["default_target = \"docker\"", "[[secret]]"]);
         assert_eq!(
             client_labels("[[binary]]\nname = \"a\"\npath = \"/a\"\n"),
             ["[[binary]]"]

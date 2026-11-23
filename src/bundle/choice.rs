@@ -1,8 +1,8 @@
 //! Which bundle to inject from, when there is more than one to pick.
 //!
-//! The client file names a **default** (`bundle =`, or the packed config when it is not
-//! set) and may list **others** (`bundles = [...]`). Together they are what a
-//! person is offered; nothing here asks, or reads a file, or knows what a
+//! The client file lists the bundles **on offer** (`bundles = [...]`) and points at
+//! one of them as the **default** (`default_bundle =`; without it the default is the
+//! packed config). They are what a person is offered; nothing here asks, or reads a file, or knows what a
 //! reference means. That is the command layer's, which asks and writes, and the
 //! stores', which read.
 
@@ -42,13 +42,14 @@ impl From<Option<&str>> for Offer {
 
 /// The bundle used when nothing says otherwise.
 pub fn default(settings: &Client) -> Offer {
-    settings.bundle.as_deref().into()
+    settings.default_bundle.as_deref().into()
 }
 
-/// What `up` offers: the `default` first, then the listed `others`, each once.
-pub fn options(default: &Offer, others: &[String]) -> Vec<Offer> {
+/// What `up` offers: the `default` first, then the rest of the `listed` bundles
+/// (the default is one of them, when it is a reference), each once.
+pub fn options(default: &Offer, listed: &[String]) -> Vec<Offer> {
     let mut all = vec![default.clone()];
-    for reference in others {
+    for reference in listed {
         let candidate = Offer::Reference(reference.clone());
         if !all.contains(&candidate) {
             all.push(candidate);
@@ -59,28 +60,23 @@ pub fn options(default: &Offer, others: &[String]) -> Vec<Offer> {
 
 /// What `ldg bundle use` offers: [`options`], and the packed config where this
 /// machine can pack it, even when a bundle is the default.
-pub fn selectable(default: &Offer, others: &[String], can_pack: bool) -> Vec<Offer> {
-    let mut all = options(default, others);
+pub fn selectable(default: &Offer, listed: &[String], can_pack: bool) -> Vec<Offer> {
+    let mut all = options(default, listed);
     if can_pack && !all.contains(&Offer::Live) {
         all.push(Offer::Live);
     }
     all
 }
 
-/// The references to list after the default changes from `old` to `new`: the old
-/// default stays selectable, the new one is the default and so no longer an
-/// "other".
-pub fn after_switch(others: &[String], old: &Offer, new: &Offer) -> Vec<String> {
-    let mut list: Vec<String> = others
-        .iter()
-        .filter(|r| Some(r.as_str()) != new.reference())
-        .cloned()
-        .collect();
-    if let Some(old) = old.reference()
-        && old != new.reference().unwrap_or_default()
-        && !list.iter().any(|r| r == old)
+/// The references to list once `new` is the default: the default is one of the
+/// listed bundles, so a reference that is not there yet is added; the packed config
+/// is not a reference and adds nothing. What was the default stays listed.
+pub fn with_default(listed: &[String], new: &Offer) -> Vec<String> {
+    let mut list = listed.to_vec();
+    if let Some(reference) = new.reference()
+        && !list.iter().any(|r| r == reference)
     {
-        list.push(old.to_string());
+        list.push(reference.to_string());
     }
     list
 }
@@ -92,7 +88,7 @@ mod tests {
 
     fn config(bundle: Option<&str>, bundles: &[&str]) -> Client {
         Client {
-            bundle: bundle.map(Into::into),
+            default_bundle: bundle.map(Into::into),
             bundles: bundles.iter().map(|b| b.to_string()).collect(),
             ..Client::default()
         }
@@ -142,33 +138,23 @@ mod tests {
     }
 
     #[test]
-    fn switching_keeps_the_old_default_selectable_and_drops_the_new_one_from_the_others() {
-        let others = vec!["b.tar".to_string(), "c.tar".to_string()];
+    fn making_a_bundle_the_default_lists_it_and_keeps_what_was_listed() {
+        let listed = vec!["a.tar".to_string(), "c.tar".to_string()];
         assert_eq!(
-            after_switch(&others, &reference("a.tar"), &reference("b.tar")),
-            vec!["c.tar".to_string(), "a.tar".to_string()]
+            with_default(&listed, &reference("b.tar")),
+            vec![
+                "a.tar".to_string(),
+                "c.tar".to_string(),
+                "b.tar".to_string()
+            ]
         );
     }
 
     #[test]
-    fn switching_from_the_packed_config_and_to_it_lists_only_references() {
-        let others: Vec<String> = vec![];
-        assert_eq!(
-            after_switch(&others, &Offer::Live, &reference("b.tar")),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            after_switch(&others, &reference("a.tar"), &Offer::Live),
-            vec!["a.tar".to_string()]
-        );
-    }
-
-    #[test]
-    fn switching_to_the_same_default_changes_nothing() {
-        let others = vec!["b.tar".to_string()];
-        assert_eq!(
-            after_switch(&others, &reference("a.tar"), &reference("a.tar")),
-            others
-        );
+    fn a_default_that_is_listed_already_changes_nothing_and_the_packed_config_lists_nothing() {
+        let listed = vec!["a.tar".to_string(), "b.tar".to_string()];
+        assert_eq!(with_default(&listed, &reference("b.tar")), listed);
+        assert_eq!(with_default(&listed, &Offer::Live), listed);
+        assert_eq!(with_default(&[], &Offer::Live), Vec::<String>::new());
     }
 }

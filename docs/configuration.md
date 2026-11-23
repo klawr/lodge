@@ -5,7 +5,7 @@ lodge reads two files, both in `~/.config/lodge/`, and neither has to exist:
 | file | holds | travels with a bundle |
 | --- | --- | --- |
 | `config.toml` | what is injected and how a session opens: [`[[binary]]`](#binary), [`[[data]]`](#data), [`[session]`](#session), [`[git]`](#git) | yes: `ldg pack` makes a bundle from it |
-| `client.toml` | what is this machine's and this person's own: [`target`](#target), [`bundle`](#bundle) and `bundles`, [`[[secret]]`](#secret), [`[keys]`](#keys) | never |
+| `client.toml` | what is this machine's and this person's own: [`default_target`](#default_target), [`default_bundle`](#default_bundle) and `bundles`, [`[[secret]]`](#secret), [`[keys]`](#keys) | never |
 
 The line between them is whether a setting describes what is injected or depends on
 where lodge runs and who runs it. Nothing in `client.toml` can reach a bundle, because
@@ -120,13 +120,13 @@ where the container user's shell reads it.
 
 Run `ldg` alone and press `c` for the config screen: both files as the form they
 are in the TOML, with every value a line you can move to (↑/↓ or j/k). First the
-client's, under a line that says so: `target` and `bundle`, then each `[[secret]]`;
+client's, under a line that says so: `default_target` and `default_bundle`, then each `[[secret]]`;
 then the config's: `[session]` and `[git]`, then each `[[binary]]` and `[[data]]`,
 each with all of its fields under it, the ones that are not set shown as
 such (`target = (the same place as here)`). Enter changes the selected one: `path`
 opens the list of what this machine has, the rest is typed or chosen from a short
 list (`for`, `target`, how a secret is read and placed), `copy_deps` is turned over.
-`x` removes the entry the line belongs to (on `target`, `bundle`, `[session]` and
+`x` removes the entry the line belongs to (on `default_target`, `default_bundle`, `[session]` and
 `[git]`, which are not entries, it puts the value back to its default). What
 each change did is on the first line, and a refused one says why and changes nothing.
 A binary that is renamed takes its data with it, and one that is removed leaves its
@@ -140,7 +140,7 @@ data in place, no longer for anything.
 | `p` | pack the bundle: lists the bundle files there are, to replace one, and a row to type the name of a new file on (Enter on it takes `lodge-<arch>.tar`); `x` deletes the one selected, unless it is in use |
 | `P` | publish the bundle to a registry (Enter takes the one `bundle =` names) |
 
-Enter on the `bundle` line chooses the bundle in use from those on offer (the default, `bundles`, and the config as it is where it can be packed), or lets you type one; the one that was in use stays on offer. A pack from here says what it made on the status line; if it printed a warning (a data entry that may hold secrets, say), it waits for Enter first so the warning can be read.
+Enter on the `default_bundle` line chooses the default from the bundles on offer (and the config as it is where it can be packed), or lets you type one, which is put on offer; the one that was the default stays on offer. A pack from here says what it made on the status line; if it printed a warning (a data entry that may hold secrets, say), it waits for Enter first so the warning can be read.
 
 | `o` | work on another config file: the ones beside the default and in the folder `ldg` was started in, or a path typed in full |
 
@@ -294,9 +294,9 @@ This is covered by an integration test, so it keeps working.
 | ------------------ | ------- | ------- |
 | `safe_directories` | `["*"]` | directories registered as git `safe.directory` for the container user; `[]` disables it |
 
-## `target`
+## `default_target`
 
-In `client.toml`. A top-level `target = "docker"` says where lodge works: a devcontainer on `docker` or
+In `client.toml`. A top-level `default_target = "docker"` says where lodge works: a devcontainer on `docker` or
 `podman`, a running pod (`kubernetes`), or `host` for the machine itself (see below). `--target` on the command line
 overrides it, and without either it is `docker`. It is on the machine `--remote`
 names, or on this one. A value that is not a target is an error.
@@ -347,7 +347,7 @@ and `rm` do not know about it: it belongs to whoever made it.
 
 ### `host`: no container
 
-`target = "host"` (or `--target host`) makes lodge work on the machine itself:
+`default_target = "host"` (or `--target host`) makes lodge work on the machine itself:
 this one, or another through `--remote`. There is no devcontainer and no engine.
 `ldg up [PATH]` injects your bundle into the user's prefix on that machine, delivers
 secrets, and opens a session in `PATH` (the machine's login directory if you
@@ -370,7 +370,7 @@ Because it is a real machine, lodge is careful with it:
 
 ### `kubernetes`: a running pod
 
-`target = "kubernetes"` (or `--target kubernetes`) makes lodge work in a pod that is
+`default_target = "kubernetes"` (or `--target kubernetes`) makes lodge work in a pod that is
 already running, through `kubectl`. It is run on the machine `--remote` names, or on
 this one, so that machine needs `kubectl` and the cluster's credentials. Which pod
 is a setting of the target:
@@ -428,20 +428,23 @@ session. A pod is someone's workload, so, as for `host`:
   with it. Ports of other pods (peers) are not forwarded. A port that is already in
   use here fails to forward, which the daemon's log (`ldg logs`) says.
 
-## `bundle`
+## `bundles` and `default_bundle`
 
-In `client.toml`. A top-level `bundle = "path/to/lodge.tar"` injects from that bundle instead of
-packing the `[[binary]]` and `[[data]]` entries. A relative path is relative to that file's folder. A reference with a scheme is not a path: `bundle =
-"oci://ghcr.io/me/lodge:1"` reads the bundle from a registry. `--bundle` on the
-command line (a file or such a reference) overrides it. See
+In `client.toml`. `bundles = ["oci://ghcr.io/me/lodge:2", "~/work.tar"]` lists the
+bundles on offer: each a file, or a registry (a reference with a scheme is not a
+path: `oci://ghcr.io/me/lodge:1` reads the bundle from a registry). A relative path
+is relative to that file's folder.
+
+`default_bundle = "~/work.tar"` is the one to inject from, instead of packing the
+`[[binary]]` and `[[data]]` entries, and it must be one of `bundles`. Without it the
+config is packed as it is. `--bundle` on the command line (a file or such a
+reference) overrides it for one run, and need not be listed.
+
+When `ldg up` injects into a project it has not opened before and more than one
+bundle is on offer, it asks which. `ldg bundle use|add|rm|ls` change the two keys
+without opening the file, and `ldg pack -o` adds what it writes to `bundles`. See
+[Several bundles](bundles-and-secrets.md#several-bundles) and
 [Bundles and secrets](bundles-and-secrets.md).
-
-`bundles = ["oci://ghcr.io/me/lodge:2", "~/work.tar"]` lists others to choose
-from, written like `bundle`. With `bundle` (or the packed config, when it is not
-set) they are what `ldg up` offers when it injects into a project it has not opened
-before. `ldg bundle use|add|rm|ls` change both keys without opening the file, and
-`ldg pack -o` adds what it writes. See
-[Several bundles](bundles-and-secrets.md#several-bundles).
 
 ## `[[secret]]`
 

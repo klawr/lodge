@@ -185,7 +185,7 @@ fn render_client() -> String {
     s.push_str(&format!(
         "# ── Target ───────────────────────────────────────────────────────────\n\
              # Where to work (--target overrides it): {}. The first is the default.\n\
-             # target = \"{}\"\n\n",
+             # default_target = \"{}\"\n\n",
         super::targets::all()
             .iter()
             .map(|t| format!("\"{}\" ({})", t.name(), t.about()))
@@ -195,9 +195,11 @@ fn render_client() -> String {
     ));
     s.push_str(
         "# ── Bundle ───────────────────────────────────────────────────────────\n\
-          # Inject from a bundle instead of packing config.toml's entries: a file, or\n\
-          # a registry (`ldg bundle use` changes it).\n\
-          # bundle = \"oci://ghcr.io/me/lodge:1\"\n\
+          # The bundles on offer: files, or registries (`ldg pack -o` adds what it writes).\n\
+          # bundles = [\"oci://ghcr.io/me/lodge:1\"]\n\
+          # The one to inject from instead of packing config.toml's entries: one of\n\
+          # `bundles` (`ldg bundle use` changes it).\n\
+          # default_bundle = \"oci://ghcr.io/me/lodge:1\"\n\
           \n\
           # ── Secrets (delivered at attach, never stored in a bundle) ──────────\n\
           # [[secret]]\n\
@@ -281,7 +283,7 @@ mod tests {
         let text = render_client();
         assert!(text.starts_with("#:schema "));
         let c = crate::config::client::Client::parse(&text, Path::new("/x/client.toml")).unwrap();
-        assert!(c.target.is_none() && c.bundle.is_none() && c.secret.is_empty());
+        assert!(c.default_target.is_none() && c.default_bundle.is_none() && c.secret.is_empty());
         // Uncommenting a secret gives a valid one.
         let on = text.replace("# [[secret]]\n# name = \"GH_TOKEN\"\n# from = { command = \"gh auth token\" }\n# as   = \"env\"", "[[secret]]\nname = \"GH_TOKEN\"\nfrom = { command = \"gh auth token\" }\nas = \"env\"");
         let c = crate::config::client::Client::parse(&on, Path::new("/x/client.toml")).unwrap();

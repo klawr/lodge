@@ -39,7 +39,7 @@ pub fn up(
     // Which bundle comes first, and is readied before anything starts, so a
     // problem with it fails before a container is made.
     let bundle = choose_bundle(ctx, &settings, bundle, &place, reinject)?
-        .or_else(|| settings.bundle.clone());
+        .or_else(|| settings.default_bundle.clone());
     let prepared = bundle::source::prepare(&config, bundle.as_deref(), &ctx.bundles, &ctx.tools)?;
     // How an endpoint is made, or found, is the endpoints' business; which
     // endpoints is chosen once, in `cmd::run`.
@@ -121,7 +121,7 @@ pub fn attach_to(
         workdir: workdir.clone(),
     };
     let bundle = choose_bundle(ctx, &settings, bundle, &place, reinject)?
-        .or_else(|| settings.bundle.clone());
+        .or_else(|| settings.default_bundle.clone());
     let prepared = bundle::source::prepare(&config, bundle.as_deref(), &ctx.bundles, &ctx.tools)?;
     let workdir = match workdir {
         Some(dir) => dir,
@@ -650,8 +650,13 @@ mod tests {
 
     fn offering(default: Option<&str>, others: &[&str]) -> Client {
         Client {
-            bundle: default.map(Into::into),
-            bundles: others.iter().map(|o| o.to_string()).collect(),
+            default_bundle: default.map(Into::into),
+            // The default is one of the listed bundles.
+            bundles: default
+                .into_iter()
+                .chain(others.iter().copied())
+                .map(String::from)
+                .collect(),
             ..Client::default()
         }
     }

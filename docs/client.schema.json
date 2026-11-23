@@ -101,21 +101,36 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
-    "bundle": {
+    "bundles": {
+      "default": [],
+      "description": "The bundles on offer: each a file, or a registry as `oci://ghcr.io/me/lodge:1`\n(a relative file path is relative to this file's folder). `ldg up` offers them\nwhen it injects into a project it has not opened before. `ldg pack -o` adds\nwhat it writes.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "default_bundle": {
       "default": null,
-      "description": "A bundle to inject from instead of packing the `[[binary]]` and `[[data]]`\nentries of config.toml: a file, or a registry as `oci://ghcr.io/me/lodge:1`.\nA relative file path is relative to this file's folder.",
+      "description": "The bundle to inject from instead of packing the `[[binary]]` and `[[data]]`\nentries of config.toml, unless `--bundle` says otherwise: one of `bundles`.\nWithout it, the config is packed as it is.",
       "type": [
         "string",
         "null"
       ]
     },
-    "bundles": {
-      "default": [],
-      "description": "Other bundles to choose from, as `bundle` is written. `ldg up` offers them\n(with `bundle`, or the packed config when that is not set) when it injects\ninto a project it has not opened before. `ldg pack -o` adds what it writes.",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
+    "default_target": {
+      "default": null,
+      "description": "Where to work, unless `--target` says otherwise. Without it: docker.",
+      "enum": [
+        "docker",
+        "podman",
+        "host",
+        "kubernetes",
+        null
+      ],
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "keys": {
       "additionalProperties": false,
@@ -204,21 +219,6 @@
         "$ref": "#/$defs/Secret"
       },
       "type": "array"
-    },
-    "target": {
-      "default": null,
-      "description": "Where to work, unless `--target` says otherwise. Default: docker.",
-      "enum": [
-        "docker",
-        "podman",
-        "host",
-        "kubernetes",
-        null
-      ],
-      "type": [
-        "string",
-        "null"
-      ]
     },
     "targets": {
       "additionalProperties": false,

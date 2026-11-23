@@ -289,17 +289,15 @@ fn adopt(ctx: &Ctx, settings: &Client, new: Offer) -> Result<()> {
             bundle::source::from_store(&bundle::cache::root()?, &ctx.bundles, reference)?;
         info!("bundle {} is ready", prepared.bundle.manifest().id());
     }
-    // As written in the file, so what is kept keeps its form (`~/x.tar`).
+    // The default is one of the listed bundles: it is listed first, then pointed at.
+    // What was the default stays listed.
     let path = &ctx.paths.client;
-    let written_old = edit::setting(&ctx.paths, Setting::Bundle)?
-        .map(|b| b.trim_matches('"').to_string())
-        .map_or(Offer::Live, Offer::Reference);
-    let others = edit::bundles(path)?;
-    edit::set_setting(&ctx.paths, Setting::Bundle, new.reference())?;
-    let kept = choice::after_switch(&others, &written_old, &new);
-    if kept != others {
-        edit::set_bundles(path, &kept)?;
+    let listed = edit::bundles(path)?;
+    let with = choice::with_default(&listed, &new);
+    if with != listed {
+        edit::set_bundles(path, &with)?;
     }
+    edit::set_setting(&ctx.paths, Setting::DefaultBundle, new.reference())?;
     info!("using {}", new.label());
     if old.reference().is_some() {
         note!("{} stays on offer (`ldg bundle ls`)", old.label());
@@ -324,21 +322,22 @@ fn add_bundle(ctx: &Ctx, reference: &str) -> Result<()> {
     Ok(())
 }
 
-/// `ldg bundle rm`: takes a bundle off the list. The default is not on the list.
+/// `ldg bundle rm`: takes a bundle off the list. The default stays: another one is
+/// made the default first.
 fn remove_bundle(ctx: &Ctx, reference: &str) -> Result<()> {
     let settings = ctx.client()?;
     let absolute = crate::config::absolute_reference(reference);
     let path = &ctx.paths.client;
-    if edit::remove_bundle(path, reference)? || edit::remove_bundle(path, &absolute)? {
-        info!("{reference} is not on offer any more");
-        return Ok(());
-    }
-    if settings.bundle.as_deref() == Some(&absolute)
-        || settings.bundle.as_deref() == Some(reference)
+    if settings.default_bundle.as_deref() == Some(&absolute)
+        || settings.default_bundle.as_deref() == Some(reference)
     {
         anyhow::bail!(
             "{reference} is the default: make another one the default first (`ldg bundle use`)"
         );
+    }
+    if edit::remove_bundle(path, reference)? || edit::remove_bundle(path, &absolute)? {
+        info!("{reference} is not on offer any more");
+        return Ok(());
     }
     anyhow::bail!("{reference} is not on offer (`ldg bundle ls`)")
 }
@@ -475,13 +474,14 @@ mod tests {
 
     #[test]
     fn what_pack_writes_is_put_on_offer_in_the_config() {
-        let (_dir, path) = client_at("target = \"docker\"\n");
+        let (_dir, path) = client_at("default_target = \"docker\"\n");
         offer(&path, "oci://ghcr.io/me/lodge:1");
         assert_eq!(edit::bundles(&path).unwrap(), ["oci://ghcr.io/me/lodge:1"]);
-        // The default is not listed as well.
-        let (_dir, path) = client_at("bundle = \"oci://r/x:1\"\n");
+        // The default is listed already, and is not listed twice.
+        let (_dir, path) =
+            client_at("bundles = [\"oci://r/x:1\"]\ndefault_bundle = \"oci://r/x:1\"\n");
         offer(&path, "oci://r/x:1");
-        assert!(edit::bundles(&path).unwrap().is_empty());
+        assert_eq!(edit::bundles(&path).unwrap(), ["oci://r/x:1"]);
     }
 
     #[test]

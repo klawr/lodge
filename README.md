@@ -134,7 +134,7 @@ for where to put them). Man page: `ldg man | man -l -`.
 
 Global flags, on every command: `-r/--remote HOST` runs against an engine on
 another machine over SSH, `--target docker` picks the container engine (also
-`target = "docker"` in `client.toml`; `docker`, `podman`, `kubernetes` for a running pod, or `host` for no container at all, docker by default), `-c/--config FILE` uses another config
+`default_target = "docker"` in `client.toml`; `docker`, `podman`, `kubernetes` for a running pod, or `host` for no container at all, docker by default), `-c/--config FILE` uses another config
 file (and the `client.toml` beside it), and `-v/--verbose` prints
 every docker/ssh command lodge runs (`-vv`, `-vvv` add ssh's own debug output).
 `status`, `ls`, `ports` and `doctor` take `--json`.

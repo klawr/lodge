@@ -74,14 +74,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_bundle_is_listed_once_and_what_else_is_written_stays() {
-        let (_dir, path) =
-            client_file("# mine\ntarget = \"docker\"\n\n[targets.docker]\ncontext = \"x\"\n");
+        let (_dir, path) = client_file(
+            "# mine\ndefault_target = \"docker\"\n\n[targets.docker]\ncontext = \"x\"\n",
+        );
         assert!(add_bundle(&path, "/a.tar").unwrap());
         assert!(add_bundle(&path, "oci://r/x:1").unwrap());
         assert!(!add_bundle(&path, "/a.tar").unwrap(), "listed already");
         assert_eq!(bundles(&path).unwrap(), ["/a.tar", "oci://r/x:1"]);
         let now = read_back(&path);
-        assert!(now.starts_with("# mine\ntarget"), "{now}");
+        assert!(now.starts_with("# mine\ndefault_target"), "{now}");
         assert!(now.contains("[targets.docker]\ncontext = \"x\""), "{now}");
         // Still a client file lodge loads, with the list before the first table.
         let settings = path.load().unwrap();

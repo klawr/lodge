@@ -110,7 +110,8 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
     checks.push(client_check(&ctx.paths.client, &settings));
 
     let packs_live = config.as_ref().is_ok_and(|c| {
-        settings.as_ref().is_ok_and(|s| s.bundle.is_none()) && crate::bundle::pack::needs_tools(c)
+        settings.as_ref().is_ok_and(|s| s.default_bundle.is_none())
+            && crate::bundle::pack::needs_tools(c)
     });
     checks.extend(host_tool_checks(
         remote.is_some(),
@@ -119,7 +120,7 @@ pub fn run(ctx: &Ctx, path: Option<PathBuf>, as_json: bool) -> Result<bool> {
     ));
 
     if let Ok(settings) = &settings {
-        if let Some(bundle) = &settings.bundle {
+        if let Some(bundle) = &settings.default_bundle {
             checks.push(bundle_check(bundle, ctx));
         }
         for decl in &settings.secret {

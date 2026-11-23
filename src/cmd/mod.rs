@@ -69,7 +69,7 @@ fn uses_target(command: &Command) -> bool {
     )
 }
 
-/// Which target this run works in: `--target`, else `target` in the client file,
+/// Which target this run works in: `--target`, else `default_target` in the client file,
 /// else the default. A command that never touches one (`init`, the generated
 /// completions and man page) does not read the file for it, so a bad value
 /// can't stop `ldg init --force` from fixing the config.
@@ -86,7 +86,7 @@ fn choose_target(
     }
     match client::target_setting(client)? {
         Some(target) => targets::check(&target)
-            .with_context(|| format!("invalid `target` in {}", client.display())),
+            .with_context(|| format!("invalid `default_target` in {}", client.display())),
         None => Ok(targets::default_name()),
     }
 }
@@ -637,7 +637,7 @@ mod tests {
     #[test]
     fn the_target_comes_from_the_flag_then_the_config_then_the_default() {
         let ls = Cli::try_parse_from(["ldg", "ls"]).unwrap().command.unwrap();
-        let (_dir, with) = config_with("target = \"podman\"\n");
+        let (_dir, with) = config_with("default_target = \"podman\"\n");
         let (_dir2, without) = config_with("");
         assert_eq!(choose_target(None, &ls, &with).unwrap(), "podman");
         assert_eq!(choose_target(None, &ls, &without).unwrap(), "docker");
@@ -654,7 +654,7 @@ mod tests {
             "docker"
         );
         // The flag wins over the file, even a bad one.
-        let (_dir3, bad) = config_with("target = \"nonesuch\"\n");
+        let (_dir3, bad) = config_with("default_target = \"nonesuch\"\n");
         assert_eq!(
             choose_target(Some("host".into()), &ls, &bad).unwrap(),
             "host"
@@ -662,7 +662,8 @@ mod tests {
         let err = choose_target(None, &ls, &bad).unwrap_err();
         let text = format!("{err:#}");
         assert!(
-            text.contains("invalid `target`") && text.contains("docker, podman, host, kubernetes"),
+            text.contains("invalid `default_target`")
+                && text.contains("docker, podman, host, kubernetes"),
             "{text}"
         );
         // Commands that never use a target don't read it, so `init` can fix it.

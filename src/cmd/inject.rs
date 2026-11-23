@@ -108,10 +108,10 @@ pub(super) fn host_path(path: PathBuf, home: &Path) -> Result<String> {
 /// edit looking like it did nothing.
 fn bundle_note(ctx: &Ctx) {
     if let Ok(settings) = ctx.client()
-        && let Some(bundle) = settings.bundle
+        && let Some(bundle) = settings.default_bundle
     {
         warning!(
-            "{} sets `bundle = \"{bundle}\"`, which is injected instead of these \
+            "{} sets `default_bundle = \"{bundle}\"`, which is injected instead of these \
              entries: pack again (`ldg pack`) or remove that line to use the change",
             ctx.paths.client.display()
         );

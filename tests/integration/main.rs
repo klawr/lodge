@@ -1152,7 +1152,7 @@ fn secrets_are_added_on_the_machine_that_uses_a_tarred_bundle() {
     std::fs::write(&deploy_config, "").unwrap();
     std::fs::write(
         deploy.join("client.toml"),
-        "bundle = \"bundle.tar\"\n\n\
+        "bundles = [\"bundle.tar\"]\ndefault_bundle = \"bundle.tar\"\n\n\
          [[secret]]\nname = \"API_KEY\"\nfrom = { env = \"LODGE_IT_API_KEY\" }\nas = \"env\"\n",
     )
     .unwrap();

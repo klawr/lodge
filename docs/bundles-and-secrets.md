@@ -23,12 +23,12 @@ ldg bundle inspect lodge-x86_64.tar      # what it holds (both also take oci://�
 ldg up --bundle lodge-x86_64.tar         # anywhere with a container runtime (or just ssh with -r)
 ```
 
-or set `bundle = "~/lodge-x86_64.tar"` at the top of `client.toml`. A configured
+or list it under `bundles` in `client.toml` and set `default_bundle` to it. A configured
 bundle replaces the `[[binary]]` and `[[data]]` entries of `config.toml` on that
 machine; `[session]` stays local.
 
 A bundle is made from `config.toml` alone. The settings that depend on the machine
-(`target`, `bundle`, `bundles`, `[[secret]]`, `[keys]`) are in `client.toml`, so none
+(`default_target`, `default_bundle`, `bundles`, `[[secret]]`, `[keys]`) are in `client.toml`, so none
 of them can end up in one.
 
 A machine that only *uses* a bundle needs just the bundle (a file, or a registry
@@ -38,7 +38,8 @@ Keep them in one folder and point lodge at it with `-c`:
 
 ```toml
 # deploy/client.toml
-bundle = "bundle.tar"          # relative to this file's folder
+bundles        = ["bundle.tar"]   # relative to this file's folder
+default_bundle = "bundle.tar"
 
 [[secret]]
 name = "ANTHROPIC_API_KEY"
@@ -52,7 +53,7 @@ ldg -c deploy/config.toml --remote me@host:2222 up /devel/project
 
 `-c` replaces `~/.config/lodge/config.toml` for the run (the file must exist), and with
 it the `client.toml` beside it; `--bundle` on the command line still overrides the
-client file's `bundle`. A bundle is
+client file's `default_bundle`. A bundle is
 for one CPU architecture and must match the container's (from a registry, the
 image for the machine you run `ldg` on is used, so for a container of another
 architecture use a file or a tag of its own). It can hold credentials if you list
@@ -73,7 +74,8 @@ ldg up --bundle oci://ghcr.io/me/lodge@sha256:4f1c…   # pinned to exact conten
 
 ```toml
 # client.toml
-bundle = "oci://ghcr.io/me/lodge:1"
+bundles        = ["oci://ghcr.io/me/lodge:1"]
+default_bundle = "oci://ghcr.io/me/lodge:1"
 ```
 
 A reference with a scheme is a registry (or whatever else lodge learns to read or
@@ -138,9 +140,9 @@ says what the tag resolves to and whether it is cached, and fetches nothing.
 
 ### Several bundles
 
-The client file can name one bundle as the default (`bundle =`, or the packed config when
-it is not set) and list others (`bundles = [...]`, each written like `bundle`).
-Together they are what is **on offer**.
+The client file lists the bundles **on offer** (`bundles = [...]`) and points at one of
+them as the default (`default_bundle =`; without it the default is the packed config).
+The default is always one of the listed ones.
 
 ```sh
 ldg bundle ls                       # what is on offer; the default is marked
@@ -152,9 +154,9 @@ ldg bundle rm ~/work.tar
 ```
 
 - `use` fetches and checks the bundle **before** it touches `client.toml`, so a wrong
-  reference, or an image for another architecture, changes nothing. The bundle that
-  was the default stays on offer, and one that was on offer and is now the default
-  is no longer listed as well.
+  reference, or an image for another architecture, changes nothing. The bundle is
+  listed first if it is not (the default is always one of the listed ones), and the
+  one that was the default stays listed.
 - `ldg pack -o …` puts what it wrote on offer, a file by its absolute path and a
   registry as written (the tag, not the digest). It does that when `client.toml`
   exists, and only says so if it cannot.
@@ -170,7 +172,7 @@ ldg bundle rm ~/work.tar
   run and kept in the history; `client.toml` is not changed.
 - The history (a bare `ldg`) shows the bundle each place was last opened with. It is
   shown, not replayed: opening a place again uses the default.
-- The config screen (`c`) chooses the bundle in use on its `bundle` line.
+- The config screen (`c`) chooses the default on its `default_bundle` line.
 
 ## Secrets
 

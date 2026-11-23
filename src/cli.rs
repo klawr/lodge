@@ -31,7 +31,7 @@ pub struct Cli {
     pub remote: Option<String>,
 
     /// Where to work. It is on the host `--remote` names, or on this machine.
-    /// Default: `target` in the config file, else the first one listed.
+    /// Default: `default_target` in `client.toml`, else the first one listed.
     #[arg(long, global = true, value_name = "TARGET")]
     pub target: Option<String>,
 
@@ -97,7 +97,7 @@ pub enum BundleCommand {
     },
     /// Put a bundle on offer, without making it the default
     #[command(
-        long_about = "Add a bundle to `bundles` in the config. When `ldg up` injects into a \
+        long_about = "Add a bundle to `bundles` in `client.toml`. When `ldg up` injects into a \
             project it has not opened before (or with --reinject) and more than one bundle is \
             on offer, it asks which. `ldg pack -o` adds what it writes."
     )]

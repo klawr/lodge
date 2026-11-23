@@ -11,24 +11,24 @@ use crate::config::{Document, Paths};
 /// `[session]`, `safe_directories` under `[git]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Setting {
-    Target,
-    Bundle,
+    DefaultTarget,
+    DefaultBundle,
     Shell,
     SafeDirs,
 }
 
 impl Setting {
     pub const ALL: [Setting; 4] = [
-        Setting::Target,
-        Setting::Bundle,
+        Setting::DefaultTarget,
+        Setting::DefaultBundle,
         Setting::Shell,
         Setting::SafeDirs,
     ];
 
     pub fn key(self) -> &'static str {
         match self {
-            Setting::Target => "target",
-            Setting::Bundle => "bundle",
+            Setting::DefaultTarget => "default_target",
+            Setting::DefaultBundle => "default_bundle",
             Setting::Shell => "shell",
             Setting::SafeDirs => "safe_directories",
         }
@@ -37,7 +37,7 @@ impl Setting {
     /// The table it is in; none for the top of the file.
     pub fn section(self) -> Option<&'static str> {
         match self {
-            Setting::Target | Setting::Bundle => None,
+            Setting::DefaultTarget | Setting::DefaultBundle => None,
             Setting::Shell => Some("session"),
             Setting::SafeDirs => Some("git"),
         }
@@ -48,7 +48,7 @@ impl Setting {
 /// config's for the rest. The one place that knows.
 fn home(paths: &Paths, which: Setting) -> &dyn Document {
     match which {
-        Setting::Target | Setting::Bundle => &paths.client,
+        Setting::DefaultTarget | Setting::DefaultBundle => &paths.client,
         Setting::Shell | Setting::SafeDirs => &paths.config,
     }
 }
@@ -149,11 +149,14 @@ mod tests {
     fn a_setting_is_written_into_the_file_it_belongs_in() {
         let (files, _) = file("");
         let paths = Paths::beside("/c/config.toml".into(), files);
-        set_setting(&paths, Setting::Target, Some("host")).unwrap();
-        set_setting(&paths, Setting::Bundle, Some("/b.tar")).unwrap();
+        set_setting(&paths, Setting::DefaultTarget, Some("host")).unwrap();
+        // The default bundle is one of the listed ones: it cannot be set before it is.
+        assert!(set_setting(&paths, Setting::DefaultBundle, Some("/b.tar")).is_err());
+        crate::config::edit::add_bundle(&paths.client, "/b.tar").unwrap();
+        set_setting(&paths, Setting::DefaultBundle, Some("/b.tar")).unwrap();
         set_setting(&paths, Setting::Shell, Some("/bin/zsh")).unwrap();
         assert_eq!(
-            setting(&paths, Setting::Target).unwrap().as_deref(),
+            setting(&paths, Setting::DefaultTarget).unwrap().as_deref(),
             Some("\"host\"")
         );
         // The client's own went to its file, the config's to the config: neither
@@ -163,8 +166,11 @@ mod tests {
         assert!(client_text.contains("target") && client_text.contains("bundle"));
         assert!(!client_text.contains("shell"), "{client_text}");
         assert!(config_text.contains("shell") && !config_text.contains("target"));
-        assert_eq!(paths.client.load().unwrap().target.as_deref(), Some("host"));
-        set_setting(&paths, Setting::Target, None).unwrap();
-        assert_eq!(setting(&paths, Setting::Target).unwrap(), None);
+        assert_eq!(
+            paths.client.load().unwrap().default_target.as_deref(),
+            Some("host")
+        );
+        set_setting(&paths, Setting::DefaultTarget, None).unwrap();
+        assert_eq!(setting(&paths, Setting::DefaultTarget).unwrap(), None);
     }
 }

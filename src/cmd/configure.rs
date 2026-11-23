@@ -343,7 +343,9 @@ fn act(
         },
         Some(_) => Ok(String::new()),
         None => match stop {
-            Some(Stop::Setting(Setting::Bundle)) => edit_bundle(paths, file, machine, choose, ask),
+            Some(Stop::Setting(Setting::DefaultBundle)) => {
+                edit_bundle(paths, file, machine, choose, ask)
+            }
             Some(Stop::Setting(which)) => edit_setting(paths, which, file, choose, ask),
             Some(Stop::Entry { kind, entry, field }) => edit_field(
                 &paths.config,
@@ -401,7 +403,7 @@ impl Builder {
     }
 }
 
-/// The two files as a form shaped like the TOML: the client's (`target`, `bundle`
+/// The two files as a form shaped like the TOML: the client's (`default_target`, `default_bundle`
 /// and each `[[secret]]`), then the config's (`[session]` and `[git]`, then each
 /// `[[binary]]` and `[[data]]`), each entry with all of its fields under it, the ones that are not set
 /// shown as such. Every value is a line that can be selected. A kind with no
@@ -409,8 +411,8 @@ impl Builder {
 fn form(file: &File) -> (Doc, Vec<Stop>) {
     let mut f = Builder::default();
     let unset = |which: Setting| match which {
-        Setting::Target => format!("(default {})", super::targets::default_name()),
-        Setting::Bundle => "(not set)".to_string(),
+        Setting::DefaultTarget => format!("(default {})", super::targets::default_name()),
+        Setting::DefaultBundle => "(not set)".to_string(),
         Setting::Shell => "(default \"/bin/bash\")".to_string(),
         Setting::SafeDirs => "(default [\"*\"])".to_string(),
     };
@@ -439,9 +441,9 @@ fn form(file: &File) -> (Doc, Vec<Stop>) {
         ),
         Tone::Muted,
     );
-    setting(&mut f, Setting::Target, 6);
-    setting(&mut f, Setting::Bundle, 6);
-    if file.setting(Setting::Bundle).is_some() {
+    setting(&mut f, Setting::DefaultTarget, 14);
+    setting(&mut f, Setting::DefaultBundle, 14);
+    if file.setting(Setting::DefaultBundle).is_some() {
         f.text(
             "# a bundle is used instead of the entries below: pack again to use a change",
             Tone::Muted,
@@ -449,7 +451,7 @@ fn form(file: &File) -> (Doc, Vec<Stop>) {
     }
     if !file.bundles.is_empty() {
         f.text(
-            format!("# also on offer: {}", file.bundles.join(", ")),
+            format!("# bundles on offer: {}", file.bundles.join(", ")),
             Tone::Muted,
         );
     }
@@ -606,7 +608,7 @@ fn edit_setting(
     ask: &dyn Ask,
 ) -> Result<String> {
     let typed = match which {
-        Setting::Target => {
+        Setting::DefaultTarget => {
             let targets = super::targets::all();
             let options: Vec<(&str, &str)> =
                 targets.iter().map(|t| (t.name(), t.about())).collect();
@@ -616,7 +618,7 @@ fn edit_setting(
             }
         }
         // Chosen, not typed, in `edit_bundle`.
-        Setting::Bundle => anyhow::bail!("the bundle is chosen with `edit_bundle`"),
+        Setting::DefaultBundle => anyhow::bail!("the bundle is chosen with `edit_bundle`"),
         Setting::Shell => match ask.ask("shell in the container")? {
             Some(t) => t,
             None => return Ok(String::new()),
@@ -642,7 +644,7 @@ fn edit_bundle(
     ask: &dyn Ask,
 ) -> Result<String> {
     let current = file
-        .setting(Setting::Bundle)
+        .setting(Setting::DefaultBundle)
         .map(|b| b.trim_matches('"').to_string())
         .map_or(Offer::Live, Offer::Reference);
     let options = choice::selectable(&current, &file.bundles, machine.bundles.can_pack());
@@ -670,12 +672,13 @@ fn edit_bundle(
     if new == current {
         return Ok(format!("{} is in use already", new.label()));
     }
-    edit::set_setting(paths, Setting::Bundle, new.reference())?;
-    let kept = choice::after_switch(&file.bundles, &current, &new);
-    if kept != file.bundles {
-        edit::set_bundles(&paths.client, &kept)?;
+    // The default is one of the listed bundles: it is listed first, then pointed at.
+    let with = choice::with_default(&file.bundles, &new);
+    if with != file.bundles {
+        edit::set_bundles(&paths.client, &with)?;
     }
-    Ok(format!("bundle is {}", new.label()))
+    edit::set_setting(paths, Setting::DefaultBundle, new.reference())?;
+    Ok(format!("default bundle is {}", new.label()))
 }
 
 fn clear_setting(paths: &Paths, which: Setting) -> Result<String> {
@@ -1151,7 +1154,7 @@ fn pack_list(
     let default = machine.bundles.default_file()?;
     let mut existing: Vec<String> = Vec::new();
     let in_use = file
-        .setting(Setting::Bundle)
+        .setting(Setting::DefaultBundle)
         .map(|b| b.trim_matches('"').to_string());
     let known = in_use.iter().chain(file.bundles.iter());
     for reference in known.chain(machine.bundles.exists(&default).then_some(&default)) {
@@ -1244,7 +1247,9 @@ fn delete_bundle(
     choose: &dyn Choose,
     reference: &str,
 ) -> Result<Option<String>> {
-    let in_use = file.setting(Setting::Bundle).map(|b| b.trim_matches('"'));
+    let in_use = file
+        .setting(Setting::DefaultBundle)
+        .map(|b| b.trim_matches('"'));
     if in_use == Some(reference) {
         anyhow::bail!("{reference} is in use: choose another bundle first");
     }
@@ -1271,7 +1276,7 @@ fn publish(
     wait: &dyn Pause,
 ) -> Result<String> {
     let current = file
-        .setting(Setting::Bundle)
+        .setting(Setting::DefaultBundle)
         .map(|b| b.trim_matches('"').to_string())
         .filter(|b| machine.bundles.is_registry(b));
     let question = match &current {
@@ -1744,7 +1749,7 @@ mod tests {
 
     const FILE: (&str, &str) = (
         "[session]\nshell = \"/bin/zsh\"\n\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\n\n[[binary]]\nname = \"b\"\npath = \"/bin/ls\"\n\n[[data]]\npath = \"/etc/hostname\"\n",
-        "# keep\ntarget = \"podman\"\n\n[[secret]]\nname = \"TOKEN\"\nfrom = { env = \"HOST_TOKEN\" }\nas = \"env\"\n",
+        "# keep\ndefault_target = \"podman\"\n\n[[secret]]\nname = \"TOKEN\"\nfrom = { env = \"HOST_TOKEN\" }\nas = \"env\"\n",
     );
 
     // Stops of FILE: 0 target, 1 bundle, secret 2-5 (name, from, as, targets);
@@ -1764,8 +1769,8 @@ mod tests {
             text[..21],
             [
                 "# client.toml: this machine's own, never in a bundle",
-                "target = \"podman\"",
-                "bundle = (not set)",
+                "default_target = \"podman\"",
+                "default_bundle = (not set)",
                 "",
                 "[[secret]]",
                 "name    = \"TOKEN\"",
@@ -1810,7 +1815,10 @@ mod tests {
     #[test]
     fn a_bundle_in_the_config_is_said_to_replace_the_entries() {
         let r = drive(
-            ("", "bundle = \"oci://r/x:1\"\n"),
+            (
+                "",
+                "bundles = [\"oci://r/x:1\"]\ndefault_bundle = \"oci://r/x:1\"\n",
+            ),
             views(vec![Choice::Left]),
             vec![],
         );
@@ -1821,7 +1829,10 @@ mod tests {
         );
     }
 
-    const WITH_BUNDLES: (&str, &str) = ("", "bundle = \"a.tar\"\nbundles = [\"b.tar\"]\n");
+    const WITH_BUNDLES: (&str, &str) = (
+        "",
+        "default_bundle = \"a.tar\"\nbundles = [\"a.tar\", \"b.tar\"]\n",
+    );
 
     #[test]
     fn the_bundle_in_use_is_chosen_from_those_on_offer_and_the_old_one_stays_on_offer() {
@@ -1831,7 +1842,11 @@ mod tests {
             ..Screen::default()
         };
         let r = drive(WITH_BUNDLES, screen, vec![]);
-        assert!(r.client.contains("bundle = \"b.tar\""), "{}", r.config);
+        assert!(
+            r.client.contains("default_bundle = \"b.tar\""),
+            "{}",
+            r.client
+        );
         assert!(r.client.contains("bundles = ["), "{}", r.config);
         assert_eq!(
             edit::bundles(&ClientFile::new(
@@ -1839,12 +1854,15 @@ mod tests {
                 crate::files::disk()
             ))
             .unwrap(),
-            ["a.tar"]
+            ["a.tar", "b.tar"]
         );
-        // The form says what else is on offer.
+        // The form says what is on offer.
         let shown = r.screen.shown.borrow();
         assert!(
-            shown[0].1.iter().any(|l| l == "# also on offer: b.tar"),
+            shown[0]
+                .1
+                .iter()
+                .any(|l| l == "# bundles on offer: a.tar, b.tar"),
             "{:?}",
             shown[0].1
         );
@@ -1859,14 +1877,18 @@ mod tests {
             ..Screen::default()
         };
         let r = drive(WITH_BUNDLES, screen, vec![Some("c.tar")]);
-        assert!(r.client.contains("bundle = \"c.tar\""), "{}", r.config);
+        assert!(
+            r.client.contains("default_bundle = \"c.tar\""),
+            "{}",
+            r.client
+        );
         assert_eq!(
             edit::bundles(&ClientFile::new(
                 r.dir.path().join("client.toml"),
                 crate::files::disk()
             ))
             .unwrap(),
-            ["b.tar", "a.tar"]
+            ["a.tar", "b.tar", "c.tar"]
         );
     }
 
@@ -1883,14 +1905,14 @@ mod tests {
             ..Packs::default()
         };
         let r = drive_with(WITH_BUNDLES, screen, vec![], packs);
-        assert!(!r.client.contains("bundle = "), "{}", r.config);
+        assert!(!r.client.contains("default_bundle = "), "{}", r.client);
         assert_eq!(
             edit::bundles(&ClientFile::new(
                 r.dir.path().join("client.toml"),
                 crate::files::disk()
             ))
             .unwrap(),
-            ["b.tar", "a.tar"]
+            ["a.tar", "b.tar"]
         );
     }
 
@@ -1922,9 +1944,13 @@ mod tests {
             ],
         );
         assert!(r.client.contains("# keep"), "{}", r.client);
-        assert!(r.client.contains("target = \"host\""), "{}", r.client);
         assert!(
-            r.client.contains("bundle = \"deploy/bundle.tar\""),
+            r.client.contains("default_target = \"host\""),
+            "{}",
+            r.client
+        );
+        assert!(
+            r.client.contains("default_bundle = \"deploy/bundle.tar\""),
             "{}",
             r.client
         );
@@ -2231,13 +2257,14 @@ mod tests {
         let r = drive(WITH_BUNDLES, screen, vec![]);
         assert_eq!(*r.packs.deleted.borrow(), ["b.tar"]);
         assert!(r.packs.asked.borrow().is_empty());
-        assert!(
+        // What is left on offer is the default.
+        assert_eq!(
             edit::bundles(&ClientFile::new(
                 r.dir.path().join("client.toml"),
                 crate::files::disk()
             ))
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+            ["a.tar"]
         );
         assert!(
             titles_of(&r)[1].contains("✓ deleted b.tar"),
@@ -2263,7 +2290,7 @@ mod tests {
                 crate::files::disk()
             ))
             .unwrap(),
-            ["b.tar"]
+            ["a.tar", "b.tar"]
         );
         let screen = Screen {
             views: RefCell::new(vec![Choice::Key(Action::Pack, 0), Choice::Left]),
@@ -2319,7 +2346,7 @@ mod tests {
         let r = drive(
             (
                 "[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\n",
-                "bundle = \"oci://ghcr.io/me/lodge:1\"\n",
+                "bundles = [\"oci://ghcr.io/me/lodge:1\"]\ndefault_bundle = \"oci://ghcr.io/me/lodge:1\"\n",
             ),
             views(vec![
                 Choice::Key(Action::Publish, 0),
@@ -2393,7 +2420,7 @@ mod tests {
         let r = drive(
             (
                 "[[inject]]\nname = \"x\"\n\n# mine\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\ncopy_dep = true\n",
-                "target = \"podman\"\n",
+                "default_target = \"podman\"\n",
             ),
             views(vec![Choice::Row(8), Choice::Row(9), Choice::Left]),
             vec![],
@@ -2433,7 +2460,7 @@ mod tests {
         let r = drive(
             (
                 "[[inject]]\nname = \"x\"\n\n# mine\n[[binary]]\nname = \"a\"\npath = \"/bin/sh\"\ncopy_dep = true\n",
-                "target = \"podman\"\n",
+                "default_target = \"podman\"\n",
             ),
             views(vec![
                 Choice::Key(Action::Remove, 8),
@@ -2447,7 +2474,7 @@ mod tests {
             "{}",
             r.config
         );
-        assert_eq!(r.client, "target = \"podman\"\n");
+        assert_eq!(r.client, "default_target = \"podman\"\n");
         assert!(
             !r.config.contains("inject") && !r.config.contains("copy_dep"),
             "{}",

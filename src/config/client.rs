@@ -32,9 +32,9 @@ pub const FILE: &str = "client.toml";
     schemars(rename = "Client")
 )]
 pub struct Client<S = SecretDecl> {
-    /// Where to work, unless `--target` says otherwise. Default: docker.
+    /// Where to work, unless `--target` says otherwise. Without it: docker.
     #[serde(default)]
-    pub target: Option<String>,
+    pub default_target: Option<String>,
     /// What each target lets you say about it, by target name: `[targets.docker]`.
     /// The keys of a table are checked by the target that reads it.
     #[serde(default)]
@@ -43,14 +43,15 @@ pub struct Client<S = SecretDecl> {
         schemars(with = "BTreeMap<String, serde_json::Map<String, serde_json::Value>>")
     )]
     pub targets: BTreeMap<String, toml::Table>,
-    /// A bundle to inject from instead of packing the `[[binary]]` and `[[data]]`
-    /// entries of config.toml: a file, or a registry as `oci://ghcr.io/me/lodge:1`.
-    /// A relative file path is relative to this file's folder.
+    /// The bundle to inject from instead of packing the `[[binary]]` and `[[data]]`
+    /// entries of config.toml, unless `--bundle` says otherwise: one of `bundles`.
+    /// Without it, the config is packed as it is.
     #[serde(default)]
-    pub bundle: Option<String>,
-    /// Other bundles to choose from, as `bundle` is written. `ldg up` offers them
-    /// (with `bundle`, or the packed config when that is not set) when it injects
-    /// into a project it has not opened before. `ldg pack -o` adds what it writes.
+    pub default_bundle: Option<String>,
+    /// The bundles on offer: each a file, or a registry as `oci://ghcr.io/me/lodge:1`
+    /// (a relative file path is relative to this file's folder). `ldg up` offers them
+    /// when it injects into a project it has not opened before. `ldg pack -o` adds
+    /// what it writes.
     #[serde(default)]
     pub bundles: Vec<String>,
     /// Secrets to deliver at attach time, and where each comes from on this machine.
@@ -67,9 +68,9 @@ pub struct Client<S = SecretDecl> {
 impl<S> Default for Client<S> {
     fn default() -> Self {
         Self {
-            target: None,
+            default_target: None,
             targets: BTreeMap::new(),
-            bundle: None,
+            default_bundle: None,
             bundles: Vec::new(),
             secret: Vec::new(),
             keys: BTreeMap::new(),
@@ -100,6 +101,13 @@ impl Client {
         let mut problems = Vec::new();
         let client = Self::from_file(file, path, &mut problems);
         problems.extend(secret::problems(&client.secret));
+        if let Some(default) = &client.default_bundle
+            && !client.bundles.contains(default)
+        {
+            problems.push(format!(
+                "`default_bundle` {default} is not one of `bundles` (add it there, or use `ldg bundle use`)"
+            ));
+        }
         problems.extend(Keymap::build(&client.keys).err().unwrap_or_default());
         if problems.is_empty() {
             Ok(client)
@@ -112,9 +120,9 @@ impl Client {
     /// `[[secret]]` checked; what is wrong with a secret goes to `problems`.
     fn from_file(file: Client<RawSecret>, path: &Path, problems: &mut Vec<String>) -> Self {
         let Client {
-            target,
+            default_target,
             targets,
-            bundle,
+            default_bundle,
             bundles,
             secret,
             keys,
@@ -130,9 +138,9 @@ impl Client {
             })
             .collect();
         Self {
-            target,
+            default_target,
             targets,
-            bundle: bundle.map(|b| resolve_reference(path, b)),
+            default_bundle: default_bundle.map(|b| resolve_reference(path, b)),
             bundles: bundles
                 .into_iter()
                 .map(|b| resolve_reference(path, b))
@@ -143,7 +151,7 @@ impl Client {
     }
 }
 
-/// The `target` the client file at `path` names, if it does. Read on its own, before
+/// The `default_target` the client file at `path` names, if it does. Read on its own, before
 /// the whole file is loaded, because the target is chosen before a command
 /// loads it. A file that is missing or is not valid TOML names none: the
 /// command that loads the file reports that. A value that is not a string is an
@@ -153,10 +161,10 @@ pub fn target_setting(file: &ClientFile) -> Result<Option<String>> {
         return Ok(None);
     };
     table
-        .get("target")
+        .get("default_target")
         .map(|v| v.clone().try_into::<String>())
         .transpose()
-        .with_context(|| format!("invalid `target` in {}", file.display()))
+        .with_context(|| format!("invalid `default_target` in {}", file.display()))
 }
 
 /// The `[targets.<name>]` table of the client file at `path`, read on its own like
@@ -282,16 +290,36 @@ mod tests {
         assert!(e.contains("unknown field `binary`"), "{e}");
         let e = format!(
             "{:#}",
-            crate::config::Config::parse("target = \"docker\"\n", Path::new("/x/config.toml"))
-                .unwrap_err()
+            crate::config::Config::parse(
+                "default_target = \"docker\"\n",
+                Path::new("/x/config.toml")
+            )
+            .unwrap_err()
         );
-        assert!(e.contains("unknown field `target`"), "{e}");
+        assert!(e.contains("unknown field `default_target`"), "{e}");
+    }
+
+    #[test]
+    fn the_default_bundle_is_one_of_the_listed_bundles() {
+        // A default that is not listed is a mistake, whichever way it is written.
+        let e = format!("{:#}", parse("default_bundle = \"a.tar\"\n").unwrap_err());
+        assert!(e.contains("is not one of `bundles`"), "{e}");
+        let e = format!(
+            "{:#}",
+            parse("bundles = [\"b.tar\"]\ndefault_bundle = \"a.tar\"\n").unwrap_err()
+        );
+        assert!(e.contains("is not one of `bundles`"), "{e}");
+        // Listed, it is fine; written two ways that mean the same file, too.
+        assert!(parse("bundles = [\"a.tar\", \"b.tar\"]\ndefault_bundle = \"b.tar\"\n").is_ok());
+        assert!(parse("bundles = [\"/srv/lodge/a.tar\"]\ndefault_bundle = \"a.tar\"\n").is_ok());
+        // No default is fine with or without a list: the config is packed as it is.
+        assert!(parse("bundles = [\"a.tar\"]\n").is_ok());
     }
 
     #[test]
     fn an_empty_file_uses_defaults() {
         let c = parse("").unwrap();
-        assert!(c.target.is_none() && c.bundle.is_none());
+        assert!(c.default_target.is_none() && c.default_bundle.is_none());
         assert!(c.bundles.is_empty() && c.secret.is_empty() && c.targets.is_empty());
     }
 
@@ -353,17 +381,23 @@ mod tests {
     #[test]
     fn the_target_is_a_name_the_command_layer_checks() {
         assert_eq!(
-            parse("target = \"docker\"").unwrap().target.as_deref(),
+            parse("default_target = \"docker\"")
+                .unwrap()
+                .default_target
+                .as_deref(),
             Some("docker")
         );
-        assert_eq!(parse("").unwrap().target, None);
+        assert_eq!(parse("").unwrap().default_target, None);
         // Which names are targets is for the command layer, which knows them; the
         // config only needs it to be a name.
         assert_eq!(
-            parse("target = \"nonesuch\"").unwrap().target.as_deref(),
+            parse("default_target = \"nonesuch\"")
+                .unwrap()
+                .default_target
+                .as_deref(),
             Some("nonesuch")
         );
-        assert!(parse("target = 3").is_err());
+        assert!(parse("default_target = 3").is_err());
     }
 
     #[test]
@@ -406,7 +440,7 @@ mod tests {
     #[test]
     fn the_target_alone_can_be_read_from_a_file_that_is_otherwise_unchecked() {
         // Wrong in other ways (an unknown key): not this function's business.
-        let file = client_with(Some("target = \"docker\"\nbogus = 1\n"));
+        let file = client_with(Some("default_target = \"docker\"\nbogus = 1\n"));
         assert_eq!(target_setting(&file).unwrap().as_deref(), Some("docker"));
         // Not TOML at all: no target named; loading the config reports it.
         let file = client_with(Some("= = ="));
@@ -426,7 +460,10 @@ mod tests {
             Path::new("/abs/x.tar")
         );
         assert_eq!(
-            parse("bundle = \"b.tar\"").unwrap().bundle.unwrap(),
+            parse("bundles = [\"b.tar\"]\ndefault_bundle = \"b.tar\"")
+                .unwrap()
+                .default_bundle
+                .unwrap(),
             Path::new("/srv/lodge").join("b.tar").to_string_lossy()
         );
     }
@@ -434,9 +471,9 @@ mod tests {
     #[test]
     fn a_bundle_with_a_scheme_is_not_a_path_and_is_left_alone() {
         assert_eq!(
-            parse("bundle = \"oci://ghcr.io/me/lodge:1\"")
+            parse("bundles = [\"oci://ghcr.io/me/lodge:1\"]\ndefault_bundle = \"oci://ghcr.io/me/lodge:1\"")
                 .unwrap()
-                .bundle
+                .default_bundle
                 .unwrap(),
             "oci://ghcr.io/me/lodge:1"
         );

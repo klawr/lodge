@@ -156,7 +156,7 @@ fn the_client_schema_is_current() {
         .map(Into::into)
         .collect();
     names.push(serde_json::Value::Null);
-    schema["properties"]["target"]["enum"] = names.into();
+    schema["properties"]["default_target"]["enum"] = names.into();
     schema["properties"]["targets"]["additionalProperties"] = false.into();
     // The actions a key can be given to are known, so the editor can offer them.
     let any_keys = schema["properties"]["keys"]["additionalProperties"].clone();
